@@ -8,7 +8,7 @@ const (
 	GroupCommit  FsyncPolicy = "groupcommit"
 )
 
-type Options struct {
+type Config struct {
 	// Fsync strategy
 	FsyncPolicy FsyncPolicy // OnEveryWrite, Periodic, GroupCommit
 
@@ -22,7 +22,4 @@ type Options struct {
 	// Checkpointing
 	CheckpointEveryWrites  int // default: 10000
 	CheckpointEverySeconds int // default: 300 (5 minutes)
-
-	// Per-collection overrides
-	CollectionOptions map[string]*CollectionOptions
 }

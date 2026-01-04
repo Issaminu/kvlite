@@ -1,23 +1,9 @@
 package internal
 
-type CollectionOptions struct {
-	FsyncPolicy FsyncPolicy // OnEveryWrite, Periodic, GroupCommit
-
-	// For background fsync
-	FsyncIntervalMs int // default: 10ms
-
-	// For group commit
-	BatchSize      int // default: 100 writes
-	BatchTimeoutMs int // default: 10ms
-
-	// Checkpointing
-	CheckpointEveryWrites  int // default: 10000
-	CheckpointEverySeconds int // default: 300 (5 minutes)
-}
-
 type Collection struct {
-	name  string
-	store map[string]string
+	name   string
+	store  map[string]string
+	config Config
 }
 
 func (c *Collection) Get(key string) (string, error) {
