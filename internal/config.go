@@ -1,25 +1,36 @@
 package internal
 
-type FsyncPolicy string
+type FsyncPolicy byte
 
 const (
-	OnEveryWrite FsyncPolicy = "oneverywrite"
-	Periodic     FsyncPolicy = "periodic"
-	GroupCommit  FsyncPolicy = "groupcommit"
+	OnEveryWrite FsyncPolicy = 0
+	Periodic     FsyncPolicy = 1
+	GroupCommit  FsyncPolicy = 2
 )
 
 type Config struct {
-	// Fsync strategy
-	FsyncPolicy FsyncPolicy // OnEveryWrite, Periodic, GroupCommit
-
 	// For background fsync
-	FsyncIntervalMs int // default: 10ms
+	FsyncIntervalMs uint32 // default: 10ms
 
 	// For group commit
-	BatchSize      int // default: 100 writes
-	BatchTimeoutMs int // default: 10ms
+	BatchSize      uint32 // default: 100 writes
+	BatchTimeoutMs uint32 // default: 10ms
 
 	// Checkpointing
-	CheckpointEveryWrites  int // default: 10000
-	CheckpointEverySeconds int // default: 300 (5 minutes)
+	CheckpointEveryWrites  uint32 // default: 10000
+	CheckpointEverySeconds uint32 // default: 300 (5 minutes)
+
+	// Fsync strategy
+	FsyncPolicy FsyncPolicy // OnEveryWrite, Periodic, GroupCommit
+}
+
+func DefaultConfig() Config {
+	return Config{
+		FsyncPolicy:            OnEveryWrite,
+		FsyncIntervalMs:        10,
+		BatchSize:              100,
+		BatchTimeoutMs:         10,
+		CheckpointEveryWrites:  10000,
+		CheckpointEverySeconds: 300,
+	}
 }
