@@ -1,4 +1,4 @@
-package warpdb
+package kvlite
 
 import (
 	"bytes"
@@ -7,38 +7,38 @@ import (
 	"log"
 	"os"
 
-	"github.com/Issaminu/warp-db/internal"
+	"github.com/Issaminu/kvlite/internal"
 )
 
 const (
-	MagicNumber = "WARP"
+	MagicNumber = "KVLITE"
 	Version     = 1
 )
 
 // TODO: Add checksums for entire file (in Trailer section) and per-collection (in CollectionHeader)
 
-// FileMetadata is the first 30 bytes of every .warpdb file
+// FileMetadata is the first 30 bytes of every .kvdb file
 type FileMetadata struct {
-	Magic           [6]byte  // "WARPDB"
+	Magic           [6]byte  // "KVLITE"
 	Version         uint32   // File format version
 	Id              [16]byte // Unique identifier for this database file
 	CollectionCount uint32   // Number of collections in this file
 }
 
-type WarpDB struct {
+type KVLite struct {
 	Path        string
 	dbFile      *os.File
 	Metadata    FileMetadata
 	Collections map[string]*internal.Collection
 }
 
-func StartDatabase(path string, globalConfig internal.Config) *WarpDB {
+func StartDatabase(path string, globalConfig internal.Config) *KVLite {
 
 	databaseFile := getOrCreateDatabase(path)
 
 	collections := parseDbFile(databaseFile)
 
-	return &WarpDB{
+	return &KVLite{
 		Path:        path,
 		dbFile:      databaseFile,
 		Collections: collections,
@@ -47,8 +47,8 @@ func StartDatabase(path string, globalConfig internal.Config) *WarpDB {
 }
 
 func getOrCreateDatabase(path string) *os.File {
-	if path[len(path)-7:] != ".warpdb" {
-		log.Fatal("database file path should end in '.warpdb'")
+	if path[len(path)-5:] != ".kvdb" {
+		log.Fatal("database file path should end in '.kvdb'")
 	}
 
 	file, err := os.Open(path)
@@ -71,7 +71,7 @@ func NewFileMetadata() FileMetadata {
 	}
 
 	return FileMetadata{
-		Magic:           [6]byte{'W', 'A', 'R', 'P', 'D', 'B'},
+		Magic:           [6]byte{'K', 'V', 'L', 'I', 'T', 'E'},
 		Version:         Version,
 		Id:              uuid,
 		CollectionCount: 1, // Starts with default collection
@@ -116,11 +116,11 @@ func createDatabase(path string) (*os.File, error) {
 	return file, nil
 }
 
-func (db *WarpDB) Close() error {
+func (db *KVLite) Close() error {
 	return db.dbFile.Close()
 }
 
-func (db *WarpDB) GetCollection(name string) (*internal.Collection, error) {
+func (db *KVLite) GetCollection(name string) (*internal.Collection, error) {
 	collection, found := db.Collections[name]
 	if !found {
 		return nil, fmt.Errorf("collection '%s' not found", name)
@@ -128,7 +128,7 @@ func (db *WarpDB) GetCollection(name string) (*internal.Collection, error) {
 
 	return collection, nil
 }
-func (db *WarpDB) CreateCollection(name string, config internal.Config) (*internal.Collection, error) {
+func (db *KVLite) CreateCollection(name string, config internal.Config) (*internal.Collection, error) {
 	_, found := db.Collections[name]
 	if found {
 		return nil, fmt.Errorf("collection '%s' already exists", name)
@@ -142,7 +142,7 @@ func (db *WarpDB) CreateCollection(name string, config internal.Config) (*intern
 	return newCollection, nil
 }
 
-func (db *WarpDB) DeleteCollection(name string) error {
+func (db *KVLite) DeleteCollection(name string) error {
 	_, found := db.Collections[name]
 	if !found {
 		return fmt.Errorf("collection '%s' not found", name)
@@ -154,7 +154,7 @@ func (db *WarpDB) DeleteCollection(name string) error {
 	return nil
 }
 
-func (db *WarpDB) ListCollections() []string {
+func (db *KVLite) ListCollections() []string {
 	collectionNames := make([]string, 0, len(db.Collections))
 	for name := range db.Collections {
 		collectionNames = append(collectionNames, name)
@@ -162,7 +162,7 @@ func (db *WarpDB) ListCollections() []string {
 	return collectionNames
 }
 
-func (db *WarpDB) Set(collectionName, key, value string) error {
+func (db *KVLite) Set(collectionName, key, value string) error {
 	collection, found := db.Collections[collectionName]
 	if !found {
 		return fmt.Errorf("collection '%s' not found", collectionName)
@@ -172,7 +172,7 @@ func (db *WarpDB) Set(collectionName, key, value string) error {
 	return err
 }
 
-func (db *WarpDB) Get(collectionName, key string) (string, error) {
+func (db *KVLite) Get(collectionName, key string) (string, error) {
 	collection, found := db.Collections[collectionName]
 	if !found {
 		return "", fmt.Errorf("collection '%s' not found", collectionName)
@@ -180,7 +180,7 @@ func (db *WarpDB) Get(collectionName, key string) (string, error) {
 
 	return collection.Get(key)
 }
-func (db *WarpDB) Delete(collectionName, key string) error {
+func (db *KVLite) Delete(collectionName, key string) error {
 	collection, found := db.Collections[collectionName]
 	if !found {
 		return fmt.Errorf("collection '%s' not found", collectionName)
@@ -286,7 +286,7 @@ func parseDbFile(dbFile *os.File) map[string]*internal.Collection {
 	}
 
 	// Validate magic number
-	if string(metadata.Magic[:]) != "WARPDB" {
+	if string(metadata.Magic[:]) != "KVLITE" {
 		log.Println("invalid magic number in database file")
 		return collections
 	}

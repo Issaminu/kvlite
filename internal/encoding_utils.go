@@ -12,7 +12,7 @@ type EncodingOptions struct {
 	ByteOrder binary.ByteOrder // binary.LittleEndian or binary.BigEndian
 }
 
-// DefaultEncodingOptions provides sensible defaults for WarpDB
+// DefaultEncodingOptions provides sensible defaults for KVLite
 func DefaultEncodingOptions() *EncodingOptions {
 	return &EncodingOptions{
 		ByteOrder: binary.LittleEndian,
@@ -78,8 +78,8 @@ func encodeStruct(buf *bytes.Buffer, val reflect.Value, opts *EncodingOptions) e
 			continue
 		}
 
-		// Check for struct tags (e.g., `warp:"skip"`)
-		tag := fieldType.Tag.Get("warp")
+		// Check for struct tags (e.g., `kv:"skip"`)
+		tag := fieldType.Tag.Get("kv")
 		if tag == "skip" || tag == "-" {
 			continue
 		}
@@ -193,7 +193,7 @@ func decodeStruct(buf *bytes.Reader, val reflect.Value, opts *EncodingOptions) e
 		}
 
 		// Check for struct tags
-		tag := fieldType.Tag.Get("warp")
+		tag := fieldType.Tag.Get("kv")
 		if tag == "skip" || tag == "-" {
 			continue
 		}

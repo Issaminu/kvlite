@@ -4,13 +4,13 @@ import (
 	"fmt"
 	"log"
 
-	warpdb "github.com/Issaminu/warp-db"
-	"github.com/Issaminu/warp-db/internal"
+	"github.com/Issaminu/kvlite"
+	"github.com/Issaminu/kvlite/internal"
 )
 
 func main() {
 
-	db := warpdb.StartDatabase("mydb.warpdb", internal.DefaultConfig())
+	db := kvlite.StartDatabase("mydb.kvdb", internal.DefaultConfig())
 
 	fmt.Println("Database started at path:", db.Path)
 
