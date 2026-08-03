@@ -18,6 +18,7 @@ var (
 	ErrBucketNotFound     = errors.New("bucket not found")
 	ErrBucketExists       = errors.New("bucket already exists")
 	ErrBucketNameRequired = errors.New("bucket name required")
+	ErrKeyNotFound        = errors.New("key not found")
 	ErrKeyRequired        = errors.New("key required")
 	ErrKeyTooLarge        = errors.New("key too large")
 	ErrValueTooLarge      = errors.New("value too large")
