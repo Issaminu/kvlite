@@ -7,7 +7,7 @@ import (
 	"os"
 )
 
-const NODE_SIZE = 4096
+var NODE_SIZE = os.Getpagesize()
 
 // Options represents the options that can be set when opening a database.
 // This is a bbolt-compatible subset; fields are added as components land.
@@ -171,7 +171,7 @@ func (db *DB) hasRootNode() bool {
 }
 
 func (db *DB) readNode(pgid int) *Node {
-	offset := int64(pgid) * NODE_SIZE
+	offset := int64(pgid) * int64(NODE_SIZE)
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return nil
 	}

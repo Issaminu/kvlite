@@ -143,23 +143,25 @@ func readNode(r io.Reader) (*Node, error) {
 }
 
 func writeNode(w io.Writer, node *Node) error {
+	var buf bytes.Buffer
+
 	isLeafByte := byte(0)
 	if node.IsLeaf {
 		isLeafByte = 1
 	}
-	if err := writeFull(w, []byte{isLeafByte}); err != nil {
+	if err := writeFull(&buf, []byte{isLeafByte}); err != nil {
 		return fmt.Errorf("write node isLeaf: %w", err)
 	}
-	if err := binary.Write(w, binary.LittleEndian, uint32(len(node.entries))); err != nil {
+	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(node.entries))); err != nil {
 		return fmt.Errorf("write node key count: %w", err)
 	}
 
 	for _, e := range node.entries {
-		if err := writeBytes(w, e.key); err != nil {
+		if err := writeBytes(&buf, e.key); err != nil {
 			return fmt.Errorf("write node key: %w", err)
 		}
 		if node.IsLeaf {
-			if err := writeBytes(w, e.value); err != nil {
+			if err := writeBytes(&buf, e.value); err != nil {
 				return fmt.Errorf("write node value: %w", err)
 			}
 		}
@@ -167,12 +169,23 @@ func writeNode(w io.Writer, node *Node) error {
 
 	if !node.IsLeaf {
 		for _, child := range node.Children {
-			if err := binary.Write(w, binary.LittleEndian, uint64(child)); err != nil {
+			if err := binary.Write(&buf, binary.LittleEndian, uint64(child)); err != nil {
 				return fmt.Errorf("write node child pgid: %w", err)
 			}
 		}
 	}
 
+	written := buf.Len()
+	if _, err := w.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("write node: %w", err)
+	}
+
+	if written < NODE_SIZE {
+		padding := make([]byte, NODE_SIZE-written)
+		if _, err := w.Write(padding); err != nil {
+			return fmt.Errorf("write node padding: %w", err)
+		}
+	}
 	return nil
 }
 
