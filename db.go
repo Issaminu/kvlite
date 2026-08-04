@@ -1,14 +1,13 @@
 package kvlite
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 )
 
-const ITEM_HEADER_SIZE = 8
+const NODE_SIZE = 4096
 
 // Options represents the options that can be set when opening a database.
 // This is a bbolt-compatible subset; fields are added as components land.
@@ -23,15 +22,18 @@ var DefaultOptions = &Options{}
 // DB represents a collection of buckets persisted to a single file on disk.
 // All data access is performed through transactions obtained from the DB.
 type DB struct {
-	path string
-	file *os.File
-
-	// TODO: meta pages, pager, freelist, mmap, rwlock, ... added per component.
+	path     string
+	file     *os.File
+	rootNode *Node
 }
 
 // Open creates and opens a database at the given path. If the file does not
 // exist it is created automatically.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
+	if path == "" {
+		return nil, errors.New("path required")
+	}
+
 	var dbFile *os.File
 	var err error
 
@@ -44,18 +46,30 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	db := &DB{
 		path: path,
 		file: dbFile,
 	}
+
+	if db.hasRootNode() {
+		rootNode, err := readNode(db.file)
+		if err != nil {
+			_ = db.file.Close()
+			return nil, fmt.Errorf("read root node: %w", err)
+		}
+		db.rootNode = rootNode
+	} else {
+		db.rootNode = newLeafNode()
+	}
+
 	return db, nil
 }
 
 // Close releases all database resources. All transactions must be closed before
 // closing the database.
 func (db *DB) Close() error {
-	err := db.file.Close()
-	return err
+	return db.file.Close()
 }
 
 // Path returns the path to the currently open database file.
@@ -65,72 +79,73 @@ func (db *DB) Path() string {
 
 func (db *DB) Put(key []byte, value []byte) error {
 	if len(key) == 0 {
-		return errors.New("key cannot be empty")
+		return ErrKeyEmpty
+	}
+	if len(key) > MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if len(value) > MaxValueSize {
+		return ErrValueTooLarge
 	}
 
-	header := make([]byte, ITEM_HEADER_SIZE)
-	binary.LittleEndian.PutUint32(header[0:4], uint32(len(key)))
-	binary.LittleEndian.PutUint32(header[4:8], uint32(len(value)))
-
-	if err := writeFull(db.file, header); err != nil {
-
-		return fmt.Errorf("write record header: %w", err)
-	}
-	if err := writeFull(db.file, key); err != nil {
-		return fmt.Errorf("write key: %w", err)
-	}
-	if err := writeFull(db.file, value); err != nil {
-		return fmt.Errorf("write value: %w", err)
+	node := db.rootNode
+	for !node.IsLeaf {
+		childIndex := node.findChildIndex(key)
+		node = db.readNode(int(node.Children[childIndex]))
+		if node == nil {
+			return fmt.Errorf("read child node: %w", errNotImplemented)
+		}
 	}
 
-	if err := db.file.Sync(); err != nil {
-		return fmt.Errorf("sync database: %w", err)
+	if err := node.insert(key, value); err != nil {
+		return err
 	}
 
-	return nil
+	// Rung 2: single root leaf; deeper nodes persist when tree splits land.
+	if node != db.rootNode {
+		return errNotImplemented
+	}
+	return db.persistRootNode()
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
-	var result []byte
+	if len(key) == 0 {
+		return nil, ErrKeyEmpty
+	}
+	if len(key) > MaxKeySize {
+		return nil, ErrKeyTooLarge
+	}
 
-	_, err := db.file.Seek(0, io.SeekStart)
+	node := db.rootNode
+	for !node.IsLeaf {
+		childIndex := node.findChildIndex(key)
+		node = db.readNode(int(node.Children[childIndex]))
+		if node == nil {
+			return nil, ErrKeyNotFound
+		}
+	}
 
+	value, found, err := node.get(key)
 	if err != nil {
 		return nil, err
 	}
-
-	header := make([]byte, ITEM_HEADER_SIZE)
-	for {
-		_, err := io.ReadFull(db.file, header)
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil, errors.New("database contains a truncated record header")
-		}
-		if err != nil {
-			return nil, fmt.Errorf("read record header: %w", err)
-		}
-		keyLength := binary.LittleEndian.Uint32(header[0:4])
-		valueLength := binary.LittleEndian.Uint32(header[4:8])
-		storedKey := make([]byte, keyLength)
-		if _, err := io.ReadFull(db.file, storedKey); err != nil {
-			return nil, fmt.Errorf("read stored key: %w", err)
-		}
-		value := make([]byte, valueLength)
-		if _, err := io.ReadFull(db.file, value); err != nil {
-			return nil, fmt.Errorf("read stored value: %w", err)
-		}
-		if string(storedKey) == string(key) {
-			result = value
-		}
-	}
-
-	if len(result) == 0 {
+	if !found {
 		return nil, ErrKeyNotFound
 	}
-	return result, nil
+	return value, nil
+}
 
+func (db *DB) persistRootNode() error {
+	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("seek root node: %w", err)
+	}
+	if err := db.file.Truncate(0); err != nil {
+		return fmt.Errorf("truncate root node: %w", err)
+	}
+	if err := writeNode(db.file, db.rootNode); err != nil {
+		return fmt.Errorf("write root node: %w", err)
+	}
+	return db.file.Sync()
 }
 
 func writeFull(writer io.Writer, data []byte) error {
@@ -145,4 +160,24 @@ func writeFull(writer io.Writer, data []byte) error {
 		data = data[n:]
 	}
 	return nil
+}
+
+func (db *DB) hasRootNode() bool {
+	fi, err := db.file.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Size() > 0
+}
+
+func (db *DB) readNode(pgid int) *Node {
+	offset := int64(pgid) * NODE_SIZE
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		return nil
+	}
+	node, err := readNode(db.file)
+	if err != nil {
+		return nil
+	}
+	return node
 }

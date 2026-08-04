@@ -6,7 +6,6 @@ import "errors"
 // built. Remove each usage as its component is implemented.
 var errNotImplemented = errors.New("kvlite: not implemented")
 
-// Sentinel errors, mirroring bbolt's names so bbolt's tests port cleanly.
 var (
 	ErrDatabaseNotOpen    = errors.New("database not open")
 	ErrInvalid            = errors.New("invalid database")
@@ -21,6 +20,8 @@ var (
 	ErrKeyNotFound        = errors.New("key not found")
 	ErrKeyRequired        = errors.New("key required")
 	ErrKeyTooLarge        = errors.New("key too large")
+	ErrKeyEmpty           = errors.New("key is empty")
 	ErrValueTooLarge      = errors.New("value too large")
+	ErrValueEmpty         = errors.New("value is empty")
 	ErrIncompatibleValue  = errors.New("incompatible value")
 )
