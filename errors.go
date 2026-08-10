@@ -21,6 +21,8 @@ var (
 	ErrKeyRequired        = errors.New("key required")
 	ErrKeyTooLarge        = errors.New("key too large")
 	ErrKeyEmpty           = errors.New("key is empty")
+	ErrNotBranchNode      = errors.New("node is a leaf node, which is not allowed here")
+	ErrNotLeafNode        = errors.New("node is a branch node, which is not allowed here")
 	ErrValueTooLarge      = errors.New("value too large")
 	ErrValueEmpty         = errors.New("value is empty")
 	ErrIncompatibleValue  = errors.New("incompatible value")

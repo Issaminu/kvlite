@@ -27,8 +27,8 @@ type DB struct {
 	rootNode *Node
 }
 
-// Open creates and opens a database at the given path. If the file does not
-// exist it is created automatically.
+// Open creates and opens a database at the given path.
+// If the file does not exist it is created automatically.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if path == "" {
 		return nil, errors.New("path required")
@@ -52,10 +52,13 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		file: dbFile,
 	}
 
+	// if the file is empty, create the root node, otherwise read it
 	if db.hasRootNode() {
 		rootNode, err := readNode(db.file)
 		if err != nil {
-			_ = db.file.Close()
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
 			return nil, fmt.Errorf("read root node: %w", err)
 		}
 		db.rootNode = rootNode
@@ -66,8 +69,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	return db, nil
 }
 
-// Close releases all database resources. All transactions must be closed before
-// closing the database.
+// Close releases all database resources.
+// All transactions must be closed before closing the database.
 func (db *DB) Close() error {
 	return db.file.Close()
 }
@@ -90,10 +93,13 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 	node := db.rootNode
 	for !node.IsLeaf {
-		childIndex := node.findChildIndex(key)
-		node = db.readNode(int(node.Children[childIndex]))
+		childIndex, err := node.findChildIndex(key)
+		if err != nil {
+			return err
+		}
+		node = db.readNode(node.Children[childIndex])
 		if node == nil {
-			return fmt.Errorf("read child node: %w", errNotImplemented)
+			return errNotImplemented
 		}
 	}
 
@@ -118,8 +124,11 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 	node := db.rootNode
 	for !node.IsLeaf {
-		childIndex := node.findChildIndex(key)
-		node = db.readNode(int(node.Children[childIndex]))
+		childIndex, err := node.findChildIndex(key)
+		if err != nil {
+			return nil, err
+		}
+		node = db.readNode(node.Children[childIndex])
 		if node == nil {
 			return nil, ErrKeyNotFound
 		}
@@ -139,27 +148,10 @@ func (db *DB) persistRootNode() error {
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek root node: %w", err)
 	}
-	if err := db.file.Truncate(0); err != nil {
-		return fmt.Errorf("truncate root node: %w", err)
-	}
-	if err := writeNode(db.file, db.rootNode); err != nil {
+	if err := writeNode(db.file, db.rootNode, true); err != nil {
 		return fmt.Errorf("write root node: %w", err)
 	}
 	return db.file.Sync()
-}
-
-func writeFull(writer io.Writer, data []byte) error {
-	for len(data) > 0 {
-		n, err := writer.Write(data)
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-		data = data[n:]
-	}
-	return nil
 }
 
 func (db *DB) hasRootNode() bool {
@@ -170,7 +162,7 @@ func (db *DB) hasRootNode() bool {
 	return fi.Size() > 0
 }
 
-func (db *DB) readNode(pgid int) *Node {
+func (db *DB) readNode(pgid Pgid) *Node {
 	offset := int64(pgid) * int64(NODE_SIZE)
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return nil

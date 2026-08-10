@@ -128,6 +128,116 @@ func TestPutGet_Stress(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// RUNG 3a — Real fixed-size pages: correct padding + offsets.  <-- NEXT
+//
+// No behavior change; the LAYOUT becomes page-based. Every node is padded to a whole
+// NODE_SIZE page and written at a page offset. (Splitting big nodes into one-page nodes
+// so they stay <= a page is Rung 3b.)
+// -----------------------------------------------------------------------------
+
+// TestFile_SinglePage: a small database (fits in one node) is stored as exactly one
+// padded page. RED against variable-length writes; GREEN once nodes are padded to
+// NODE_SIZE.
+func TestFile_SinglePage(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kv := range [][2]string{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
+		if err := db.Put([]byte(kv[0]), []byte(kv[1])); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if size := fileSize(t, path); size != int64(NODE_SIZE) {
+		t.Fatalf("a small DB should occupy exactly one %d-byte page, got %d bytes "+
+			"(nodes must be padded to page boundaries — Rung 3a)", NODE_SIZE, size)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// RUNG 3b — The split: a full node splits, and the tree grows up.  <-- NEXT
+//
+// When a node's serialized size exceeds one page, it splits in two and a separator
+// is pushed to its parent; splitting the root mints a new branch root (tree grows up).
+// -----------------------------------------------------------------------------
+
+// TestSplit_TreeGrows: insert enough to overflow a single leaf, forcing a split. The
+// root must stop being a leaf — a new branch root is born (the tree grows up). RED
+// while everything still lives in one oversized node.
+func TestSplit_TreeGrows(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// 150 x 256B ≈ 38 KB — blows past one page at any OS page size (4 KB or 16 KB).
+	val := bytes.Repeat([]byte("x"), 256)
+	for i := 0; i < 150; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if db.rootNode.IsLeaf {
+		t.Fatal("root is still a single leaf after ~38 KB of entries — a full node must " +
+			"split and grow a branch root (Rung 3b)")
+	}
+	if got, err := db.Get([]byte("key-00042")); err != nil || !bytes.Equal(got, val) {
+		t.Fatalf("key-00042 unreadable after split: err=%v", err)
+	}
+}
+
+// TestSplit_SurvivesReopen: after splits, close + reopen must locate the (now
+// multi-node) root and descend to read every key back.
+func TestSplit_SurvivesReopen(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 150
+	val := bytes.Repeat([]byte("y"), 256)
+	for i := 0; i < n; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for i := 0; i < n; i++ {
+		got, err := db.Get(fmt.Appendf(nil, "key-%05d", i))
+		if err != nil {
+			t.Fatalf("key-%05d after reopen: %v", i, err)
+		}
+		if !bytes.Equal(got, val) {
+			t.Fatalf("key-%05d: wrong value after reopen", i)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
 // RUNG 1 — Walking skeleton: a file-backed KV that survives reopen.  <-- BUILD THIS
 //
 // The dumbest thing that is a real database. []byte API (db.Put/db.Get) — no

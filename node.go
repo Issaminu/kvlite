@@ -5,12 +5,15 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 )
 
 const (
 	MaxKeySize   = 32768         // 32 KiB
 	MaxValueSize = (1 << 31) - 2 // ~2 GiB
 )
+
+type KVLength uint32
 
 type entry struct {
 	key   []byte
@@ -20,7 +23,7 @@ type entry struct {
 type Node struct {
 	IsLeaf   bool
 	entries  []entry
-	Children []Pgid // branch only: len == len(entries)+1
+	Children []Pgid // for non-leaf nodes: len(Children) == len(entries)+1
 	Parent   *Node
 	Index    int
 }
@@ -29,20 +32,30 @@ func newLeafNode() *Node {
 	return &Node{IsLeaf: true}
 }
 
-func (n *Node) findChildIndex(key []byte) int {
+// Find the correct child node for this key.
+// It only returns the correct child for this node, if you actually want to reach the leaf node that has the key, then this function should be called in a loop.
+func (n *Node) findChildIndex(key []byte) (int, error) {
+	if n.IsLeaf {
+		return -1, ErrNotBranchNode
+	}
 	low, high := 0, len(n.entries)
 	for low < high {
 		mid := low + (high-low)/2
-		if bytes.Compare(key, n.entries[mid].key) >= 0 {
-			low = mid + 1
-		} else {
+		if bytes.Compare(key, n.entries[mid].key) < 0 {
 			high = mid
+		} else {
+			low = mid + 1
 		}
 	}
-	return low
+	return low, nil
 }
 
-func (n *Node) findKeyIndex(key []byte) (int, bool) {
+// Find the index of the key in it's leaf node.
+// Returns (index, isFound, err)
+func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
+	if !n.IsLeaf {
+		return -1, false, ErrNotLeafNode
+	}
 	low, high := 0, len(n.entries)
 	for low < high {
 		mid := low + (high-low)/2
@@ -52,21 +65,27 @@ func (n *Node) findKeyIndex(key []byte) (int, bool) {
 		} else if cmp > 0 {
 			low = mid + 1
 		} else {
-			return mid, true
+			return mid, true, nil
 		}
 	}
-	return low, false
+	return low, false, nil
 }
 
 func (n *Node) get(key []byte) ([]byte, bool, error) {
 	if !n.IsLeaf {
-		return nil, false, errNotImplemented
+		return nil, false, ErrNotLeafNode
 	}
-	idx, found := n.findKeyIndex(key)
+	idx, found, err := n.findKeyIndex(key)
+
+	if err != nil {
+		return nil, false, err
+	}
+
 	if !found {
 		return nil, false, nil
 	}
-	value := append([]byte(nil), n.entries[idx].value...)
+
+	value := slices.Clone(n.entries[idx].value)
 	return value, true, nil
 }
 
@@ -81,16 +100,24 @@ func (n *Node) insert(key, value []byte) error {
 		return ErrValueTooLarge
 	}
 	if !n.IsLeaf {
-		return errNotImplemented
+		return ErrNotLeafNode
 	}
 
-	keyCopy := append([]byte(nil), key...)
-	valueCopy := append([]byte(nil), value...)
+	keyCopy := slices.Clone(key)
+	valueCopy := slices.Clone(value)
 
-	idx, found := n.findKeyIndex(key)
+	idx, found, err := n.findKeyIndex(key)
+
+	if err != nil {
+		return err
+	}
 	if found {
 		n.entries[idx].value = valueCopy
 		return nil
+	}
+
+	if n.needsSplit(true, key, value) {
+		return errNotImplemented
 	}
 
 	n.entries = append(n.entries, entry{})
@@ -100,7 +127,7 @@ func (n *Node) insert(key, value []byte) error {
 }
 
 func readNode(r io.Reader) (*Node, error) {
-	var isLeafByte [1]byte
+	var isLeafByte [1]byte // []byte because io.ReadFull expectes a []byte as the destination buffer
 	if _, err := io.ReadFull(r, isLeafByte[:]); err != nil {
 		return nil, fmt.Errorf("read node isLeaf: %w", err)
 	}
@@ -113,19 +140,19 @@ func readNode(r io.Reader) (*Node, error) {
 	node := &Node{IsLeaf: isLeafByte[0] != 0}
 	// looping through the entries (keys and values) of this node
 	for i := uint32(0); i < count; i++ {
-		key, err := readBytes(r)
+		key, err := readLengthPrefixedBytes[KVLength](r)
 		if err != nil {
 			return nil, fmt.Errorf("read node key %d: %w", i, err)
 		}
-		if node.IsLeaf {
-			value, err := readBytes(r)
-			if err != nil {
-				return nil, fmt.Errorf("read node value %d: %w", i, err)
-			}
-			node.entries = append(node.entries, entry{key: key, value: value})
-		} else {
+		if !node.IsLeaf { // meaning we can only read the key
 			node.entries = append(node.entries, entry{key: key})
+			continue
 		}
+		value, err := readLengthPrefixedBytes[KVLength](r)
+		if err != nil {
+			return nil, fmt.Errorf("read node value %d: %w", i, err)
+		}
+		node.entries = append(node.entries, entry{key: key, value: value})
 	}
 
 	if !node.IsLeaf {
@@ -142,7 +169,7 @@ func readNode(r io.Reader) (*Node, error) {
 	return node, nil
 }
 
-func writeNode(w io.Writer, node *Node) error {
+func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 	var buf bytes.Buffer
 
 	isLeafByte := byte(0)
@@ -157,11 +184,11 @@ func writeNode(w io.Writer, node *Node) error {
 	}
 
 	for _, e := range node.entries {
-		if err := writeBytes(&buf, e.key); err != nil {
+		if err := writeLengthPrefixedBytes[KVLength](&buf, e.key); err != nil {
 			return fmt.Errorf("write node key: %w", err)
 		}
 		if node.IsLeaf {
-			if err := writeBytes(&buf, e.value); err != nil {
+			if err := writeLengthPrefixedBytes[KVLength](&buf, e.value); err != nil {
 				return fmt.Errorf("write node value: %w", err)
 			}
 		}
@@ -180,7 +207,7 @@ func writeNode(w io.Writer, node *Node) error {
 		return fmt.Errorf("write node: %w", err)
 	}
 
-	if written < NODE_SIZE {
+	if shouldPad && written < NODE_SIZE {
 		padding := make([]byte, NODE_SIZE-written)
 		if _, err := w.Write(padding); err != nil {
 			return fmt.Errorf("write node padding: %w", err)
@@ -189,24 +216,6 @@ func writeNode(w io.Writer, node *Node) error {
 	return nil
 }
 
-func readBytes(r io.Reader) ([]byte, error) {
-	var length uint32
-	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-		return nil, err
-	}
-	if length > MaxValueSize {
-		return nil, fmt.Errorf("entry length %d exceeds max", length)
-	}
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-func writeBytes(w io.Writer, data []byte) error {
-	if err := binary.Write(w, binary.LittleEndian, uint32(len(data))); err != nil {
-		return err
-	}
-	return writeFull(w, data)
+func (n *Node) needsSplit(afterInsert bool, key, value []byte) bool {
+	return false // TODO: implement
 }
