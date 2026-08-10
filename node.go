@@ -13,16 +13,16 @@ const (
 	MaxValueSize = (1 << 31) - 2 // ~2 GiB
 )
 
-type KVLength uint32
+type KVLength uint32 // Size of the prefixed length of an Entry's `key` or `Value`
 
-type entry struct {
+type Entry struct {
 	key   []byte
 	value []byte
 }
 
 type Node struct {
 	IsLeaf   bool
-	entries  []entry
+	entries  []Entry
 	Children []Pgid // for non-leaf nodes: len(Children) == len(entries)+1
 	Parent   *Node
 	Index    int
@@ -116,13 +116,15 @@ func (n *Node) insert(key, value []byte) error {
 		return nil
 	}
 
-	if n.needsSplit(true, key, value) {
+	newEntry := Entry{key: keyCopy, value: valueCopy}
+
+	n.entries = append(n.entries, Entry{})
+	copy(n.entries[idx+1:], n.entries[idx:])
+	n.entries[idx] = newEntry
+
+	if n.needsSplit() {
 		return errNotImplemented
 	}
-
-	n.entries = append(n.entries, entry{})
-	copy(n.entries[idx+1:], n.entries[idx:])
-	n.entries[idx] = entry{key: keyCopy, value: valueCopy}
 	return nil
 }
 
@@ -145,14 +147,14 @@ func readNode(r io.Reader) (*Node, error) {
 			return nil, fmt.Errorf("read node key %d: %w", i, err)
 		}
 		if !node.IsLeaf { // meaning we can only read the key
-			node.entries = append(node.entries, entry{key: key})
+			node.entries = append(node.entries, Entry{key: key})
 			continue
 		}
 		value, err := readLengthPrefixedBytes[KVLength](r)
 		if err != nil {
 			return nil, fmt.Errorf("read node value %d: %w", i, err)
 		}
-		node.entries = append(node.entries, entry{key: key, value: value})
+		node.entries = append(node.entries, Entry{key: key, value: value})
 	}
 
 	if !node.IsLeaf {
@@ -172,43 +174,15 @@ func readNode(r io.Reader) (*Node, error) {
 func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 	var buf bytes.Buffer
 
-	isLeafByte := byte(0)
-	if node.IsLeaf {
-		isLeafByte = 1
-	}
-	if err := writeFull(&buf, []byte{isLeafByte}); err != nil {
-		return fmt.Errorf("write node isLeaf: %w", err)
-	}
-	if err := binary.Write(&buf, binary.LittleEndian, uint32(len(node.entries))); err != nil {
-		return fmt.Errorf("write node key count: %w", err)
-	}
+	node.encode(&buf)
 
-	for _, e := range node.entries {
-		if err := writeLengthPrefixedBytes[KVLength](&buf, e.key); err != nil {
-			return fmt.Errorf("write node key: %w", err)
-		}
-		if node.IsLeaf {
-			if err := writeLengthPrefixedBytes[KVLength](&buf, e.value); err != nil {
-				return fmt.Errorf("write node value: %w", err)
-			}
-		}
-	}
-
-	if !node.IsLeaf {
-		for _, child := range node.Children {
-			if err := binary.Write(&buf, binary.LittleEndian, uint64(child)); err != nil {
-				return fmt.Errorf("write node child pgid: %w", err)
-			}
-		}
-	}
-
-	written := buf.Len()
 	if _, err := w.Write(buf.Bytes()); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 
-	if shouldPad && written < NODE_SIZE {
-		padding := make([]byte, NODE_SIZE-written)
+	currNodeSize := buf.Len()
+	if shouldPad && currNodeSize < NODE_SIZE {
+		padding := make([]byte, NODE_SIZE-currNodeSize)
 		if _, err := w.Write(padding); err != nil {
 			return fmt.Errorf("write node padding: %w", err)
 		}
@@ -216,6 +190,46 @@ func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 	return nil
 }
 
-func (n *Node) needsSplit(afterInsert bool, key, value []byte) bool {
-	return false // TODO: implement
+func (n *Node) encode(buf *bytes.Buffer) error {
+	isLeafByte := byte(0)
+	if n.IsLeaf {
+		isLeafByte = 1
+	}
+	if err := writeFull(buf, []byte{isLeafByte}); err != nil {
+		return fmt.Errorf("write node isLeaf: %w", err)
+	}
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(n.entries))); err != nil {
+		return fmt.Errorf("write node key count: %w", err)
+	}
+
+	for _, e := range n.entries {
+		if err := writeLengthPrefixedBytes[KVLength](buf, e.key); err != nil {
+			return fmt.Errorf("write node key: %w", err)
+		}
+		if n.IsLeaf {
+			if err := writeLengthPrefixedBytes[KVLength](buf, e.value); err != nil {
+				return fmt.Errorf("write node value: %w", err)
+			}
+		}
+	}
+
+	if !n.IsLeaf {
+		for _, child := range n.Children {
+			if err := binary.Write(buf, binary.LittleEndian, uint64(child)); err != nil {
+				return fmt.Errorf("write node child pgid: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+// Node needs to be split since it surpassed the maximum node size
+func (n *Node) needsSplit() bool {
+	return n.serializedSize() > NODE_SIZE
+}
+
+func (n *Node) serializedSize() int {
+	var buf bytes.Buffer
+	n.encode(&buf)
+	return buf.Len()
 }
