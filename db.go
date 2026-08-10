@@ -151,7 +151,8 @@ func (db *DB) persistRootNode() error {
 	if err := writeNode(db.file, db.rootNode, true); err != nil {
 		return fmt.Errorf("write root node: %w", err)
 	}
-	return db.file.Sync()
+	// return db.file.Sync()
+	return nil
 }
 
 func (db *DB) hasRootNode() bool {
