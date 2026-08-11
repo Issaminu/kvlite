@@ -151,13 +151,15 @@ func TestFile_SinglePage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	pageBytes := db.meta.pageSize
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	if size := fileSize(t, path); size != int64(NODE_SIZE) {
-		t.Fatalf("a small DB should occupy exactly one %d-byte page, got %d bytes "+
-			"(nodes must be padded to page boundaries — Rung 3a)", NODE_SIZE, size)
+	// Decision B: page 0 is the meta page and the single leaf is page 1 -> two pages.
+	if size := fileSize(t, path); size != 2*pageBytes {
+		t.Fatalf("a small DB should occupy exactly two %d-byte pages (meta + one leaf), got %d bytes "+
+			"(nodes must be padded to page boundaries)", pageBytes, size)
 	}
 }
 
@@ -233,6 +235,150 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 		}
 		if !bytes.Equal(got, val) {
 			t.Fatalf("key-%05d: wrong value after reopen", i)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// RUNG 3b — split staircase.  Build in THIS order; each test lights up the next
+// capability. They all fail today with "not implemented" (the overflow insert
+// bails), which IS your to-do list.
+//
+//   1. TestSplit_RootBecomesBranch   — the first split: root leaf -> branch root.
+//   2. TestSplit_EveryNodeFitsInOnePage — the invariant the split exists to keep.
+//   3. TestSplit_PropagatesToParent  — a child leaf splits and pushes a separator
+//                                       up into the already-existing branch root.
+//   4. TestSplit_TreeGrows / _SurvivesReopen (above) then carry you home.
+// -----------------------------------------------------------------------------
+
+// walkNodes visits every node of the on-disk tree rooted at db.rootNode, reading
+// each child by its pgid. It doubles as a reachability check: a bad child pgid
+// (mis-wired separator/split) makes readNode fail and the walk t.Fatal.
+func walkNodes(t *testing.T, db *DB, visit func(n *Node)) {
+	t.Helper()
+	var rec func(n *Node)
+	rec = func(n *Node) {
+		visit(n)
+		if n.IsLeaf {
+			return
+		}
+		for _, childPgid := range n.Children {
+			child := db.readNode(childPgid)
+			if child == nil {
+				t.Fatalf("walk: could not read child pgid %d (broken split wiring?)", childPgid)
+			}
+			rec(child)
+		}
+	}
+	rec(db.rootNode)
+}
+
+// TestSplit_RootBecomesBranch: the first milestone. Insert ~1.5 pages of data so a
+// single leaf overflows once. The root must stop being a leaf, the new branch root
+// must point at both halves, and BOTH the smallest and largest keys must survive
+// (a split that drops a half fails here).
+func TestSplit_RootBecomesBranch(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	pageBytes := int(db.meta.pageSize)
+	val := bytes.Repeat([]byte("x"), 256)
+	// Size the count off the page size so this forces ~one split on any page size.
+	entryBytes := 4 + len("key-00000") + 4 + len(val)
+	n := pageBytes/entryBytes + pageBytes/entryBytes/2 // ~1.5 pages
+
+	for i := 0; i < n; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	if db.rootNode.IsLeaf {
+		t.Fatal("root is still a leaf after overflowing a page — it must split into a branch root")
+	}
+	if len(db.rootNode.Children) < 2 {
+		t.Fatalf("branch root must point at >= 2 children, got %d", len(db.rootNode.Children))
+	}
+	for _, i := range []int{0, n - 1} { // first and last: neither half may be lost
+		k := fmt.Appendf(nil, "key-%05d", i)
+		if got, err := db.Get(k); err != nil || !bytes.Equal(got, val) {
+			t.Fatalf("key %q lost across split: err=%v", k, err)
+		}
+	}
+}
+
+// TestSplit_EveryNodeFitsInOnePage: the invariant the whole rung exists to keep.
+// After many inserts, walk the on-disk tree and assert no node serializes past one
+// page. A "split" that doesn't actually drop each piece below a page fails here.
+func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	val := bytes.Repeat([]byte("z"), 256)
+	for i := 0; i < 300; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	pageBytes := int(db.meta.pageSize)
+	walkNodes(t, db, func(nd *Node) {
+		if sz := nd.serializedSize(); sz > pageBytes {
+			t.Fatalf("node serializes to %d bytes > one %d-byte page — split must keep every node <= a page", sz, pageBytes)
+		}
+	})
+}
+
+// TestSplit_PropagatesToParent: forces enough leaf splits that at least one happens
+// on a NON-root leaf, whose separator must propagate up into the existing branch
+// root. Proven by reaching >= 3 reachable leaves (walk reads each by pgid) and by
+// every key still being readable in-session.
+func TestSplit_PropagatesToParent(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const n = 400
+	val := bytes.Repeat([]byte("w"), 256)
+	for i := 0; i < n; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	if db.rootNode.IsLeaf {
+		t.Fatal("root must be a branch after 400 entries")
+	}
+	leaves := 0
+	walkNodes(t, db, func(nd *Node) {
+		if nd.IsLeaf {
+			leaves++
+		}
+	})
+	if leaves < 3 {
+		t.Fatalf("expected >= 3 leaves (a child-leaf split must add one, propagating a separator up), got %d", leaves)
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		if got, err := db.Get(k); err != nil || !bytes.Equal(got, val) {
+			t.Fatalf("key %q unreadable after propagating splits: err=%v", k, err)
 		}
 	}
 }

@@ -21,15 +21,13 @@ type Entry struct {
 }
 
 type Node struct {
+	db       *DB
 	IsLeaf   bool
 	entries  []Entry
 	Children []Pgid // for non-leaf nodes: len(Children) == len(entries)+1
-	Parent   *Node
-	Index    int
-}
-
-func newLeafNode() *Node {
-	return &Node{IsLeaf: true}
+	Index    int    // this node's index within it's parent node's Children array
+	pgid     Pgid
+	parent   *Node
 }
 
 // Find the correct child node for this key.
@@ -122,9 +120,6 @@ func (n *Node) insert(key, value []byte) error {
 	copy(n.entries[idx+1:], n.entries[idx:])
 	n.entries[idx] = newEntry
 
-	if n.needsSplit() {
-		return errNotImplemented
-	}
 	return nil
 }
 
@@ -180,9 +175,11 @@ func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 		return fmt.Errorf("write node: %w", err)
 	}
 
+	pageSize := int(node.db.meta.pageSize)
+
 	currNodeSize := buf.Len()
-	if shouldPad && currNodeSize < NODE_SIZE {
-		padding := make([]byte, NODE_SIZE-currNodeSize)
+	if shouldPad && currNodeSize < pageSize {
+		padding := make([]byte, pageSize-currNodeSize)
 		if _, err := w.Write(padding); err != nil {
 			return fmt.Errorf("write node padding: %w", err)
 		}
@@ -195,7 +192,7 @@ func (n *Node) encode(buf *bytes.Buffer) error {
 	if n.IsLeaf {
 		isLeafByte = 1
 	}
-	if err := writeFull(buf, []byte{isLeafByte}); err != nil {
+	if err := binary.Write(buf, binary.LittleEndian, isLeafByte); err != nil {
 		return fmt.Errorf("write node isLeaf: %w", err)
 	}
 	if err := binary.Write(buf, binary.LittleEndian, uint32(len(n.entries))); err != nil {
@@ -225,11 +222,42 @@ func (n *Node) encode(buf *bytes.Buffer) error {
 
 // Node needs to be split since it surpassed the maximum node size
 func (n *Node) needsSplit() bool {
-	return n.serializedSize() > NODE_SIZE
+	return n.serializedSize() > int(n.db.meta.pageSize)
 }
 
 func (n *Node) serializedSize() int {
 	var buf bytes.Buffer
 	n.encode(&buf)
 	return buf.Len()
+}
+
+func (n *Node) split(newPgid Pgid) (int, *Node, error) {
+	limit := int(n.db.meta.pageSize / 2)
+	currSize := 0
+
+	var seperatorIndex = -1
+
+	for i, entry := range n.entries {
+		currSize += len(entry.key)
+		if n.IsLeaf {
+			currSize += len(entry.value)
+		}
+
+		if currSize >= limit {
+			seperatorIndex = i
+			break
+		}
+	}
+
+	if seperatorIndex == -1 {
+		return seperatorIndex, nil, ErrNodeNotSaturated
+	}
+
+	rightNode := n.db.newLeafNode(newPgid)
+
+	rightNode.entries = slices.Clone(n.entries[seperatorIndex:])
+
+	n.entries = n.entries[:seperatorIndex]
+
+	return seperatorIndex, rightNode, nil
 }
