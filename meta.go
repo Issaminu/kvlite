@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"os"
+	"unsafe"
 )
 
 const version uint32 = 1 // format version, bumps only when making a breaking change to the DB file format itself
@@ -18,46 +20,54 @@ type Meta struct {
 	pageSize int64
 	pgid     Pgid
 	root     Pgid // pgid of the root node
+	checksum uint64
 }
 
 func NewMeta() *Meta {
-	return &Meta{
+	meta := &Meta{
 		magic:    magic,
 		version:  version,
 		pageSize: int64(os.Getpagesize()),
 		pgid:     1, // Nodes start at pgid 1 (the pgid 0 is occupied by the meta)
 		root:     1, // needs to stay in sync with `pgid` field above
 	}
+	meta.checksum = meta.GenerateChecksum()
+	return meta
 }
 
 func readMeta(r io.Reader) (*Meta, error) {
 	var magic uint32
 	if err := binary.Read(r, binary.LittleEndian, &magic); err != nil {
-		return nil, err
+		return nil, ErrInvalid
 	}
 
 	var version uint32
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
-		return nil, err
+		return nil, ErrInvalid
 	}
 
 	var pageSize int64
 	if err := binary.Read(r, binary.LittleEndian, &pageSize); err != nil {
-		return nil, err
+		return nil, ErrInvalid
 	}
 
 	var pgid Pgid
 	if err := binary.Read(r, binary.LittleEndian, &pgid); err != nil {
-		return nil, err
+		return nil, ErrInvalid
 	}
 
 	var root Pgid
 	if err := binary.Read(r, binary.LittleEndian, &root); err != nil {
-		return nil, err
+		return nil, ErrInvalid
+	}
+
+	var checksum uint64
+	if err := binary.Read(r, binary.LittleEndian, &checksum); err != nil {
+		return nil, ErrInvalid
 	}
 
 	meta := &Meta{
-		magic, version, pageSize, pgid, root,
+		magic, version, pageSize, pgid, root, checksum,
 	}
 	return meta, nil
 }
@@ -94,14 +104,30 @@ func (meta *Meta) encode(buf *bytes.Buffer) error {
 		return fmt.Errorf("write meta root: %w", err)
 	}
 
+	if err := binary.Write(buf, binary.LittleEndian, meta.checksum); err != nil {
+		return fmt.Errorf("write meta checksum: %w", err)
+	}
+
 	return nil
 }
 
 func (m *Meta) Validate() error {
 	if m.magic != magic {
 		return ErrInvalid
-	} else if m.version != version {
+	}
+
+	if m.version != version {
 		return ErrVersionNotSupported
 	}
+
+	if m.checksum != m.GenerateChecksum() {
+		return ErrChecksum
+	}
 	return nil
+}
+
+func (m *Meta) GenerateChecksum() uint64 {
+	hashFunc := fnv.New64a()
+	hashFunc.Write((*[unsafe.Offsetof(Meta{}.checksum)]byte)(unsafe.Pointer(m))[:])
+	return hashFunc.Sum64()
 }

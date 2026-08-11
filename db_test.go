@@ -688,8 +688,6 @@ func TestDB_Path(t *testing.T) {
 // TestOpen_ErrInvalid: opening a non-kvlite file must return ErrInvalid.
 // (Needs a meta page to validate against — Rung 4.)
 func TestOpen_ErrInvalid(t *testing.T) {
-	t.Skip("deferred to Rung 4: needs the meta page")
-
 	path := tempfile()
 	defer os.RemoveAll(path)
 
@@ -712,8 +710,6 @@ func TestOpen_ErrInvalid(t *testing.T) {
 // TestOpen_FileTooSmall: opening a file too small to hold the meta pages errors.
 // (Needs meta/page validation — Rung 4.)
 func TestOpen_FileTooSmall(t *testing.T) {
-	t.Skip("deferred to Rung 4: needs meta/page validation")
-
 	path := tempfile()
 	defer os.RemoveAll(path)
 
@@ -729,13 +725,64 @@ func TestOpen_FileTooSmall(t *testing.T) {
 // ErrVersionMismatch. TODO(Rung 4/meta): create a valid DB, flip `version` in both
 // meta pages, reopen, assert errors.Is(err, ErrVersionMismatch).
 func TestOpen_ErrVersionMismatch(t *testing.T) {
-	t.Skip("deferred to Rung 4: needs meta-page layout")
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Meta lives at offset 0: magic(0-3), version(4-7), pageSize(8-15), pgid(16-23),
+	// root(24-31). Bump the version field, leaving the magic intact.
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf[4] = 0xFF // version was 1 -> now unsupported
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path, 0600, nil); !errors.Is(err, ErrVersionNotSupported) {
+		t.Fatalf("expected ErrVersionNotSupported, got: %v", err)
+	}
 }
 
 // TestOpen_ErrChecksum: a corrupted meta checksum must fail with ErrChecksum.
 // TODO(Rung 4/meta): corrupt a meta field in both pages so the seal mismatches.
 func TestOpen_ErrChecksum(t *testing.T) {
-	t.Skip("deferred to Rung 4: needs meta-page checksum")
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt a meta DATA field (root pgid, uint64 at offset 24). magic + version stay
+	// valid, so ONLY a checksum can catch this — that's what forces the checksum to exist.
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf[24] ^= 0xFF
+	if err := os.WriteFile(path, buf, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(path, 0600, nil); !errors.Is(err, ErrChecksum) {
+		t.Fatalf("expected ErrChecksum, got: %v", err)
+	}
 }
 
 // TestOpen_ReadPageSize_FromMeta1: if meta page 0 is corrupt, recover page size + DB

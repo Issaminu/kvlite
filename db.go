@@ -278,6 +278,9 @@ func (db *DB) readMeta() (*Meta, error) {
 }
 
 func (db *DB) persistMeta() error {
+	// recompute checksum
+	db.meta.checksum = db.meta.GenerateChecksum()
+
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek node: %w", err)
 	}
