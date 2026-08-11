@@ -27,4 +27,5 @@ var (
 	ErrValueEmpty          = errors.New("value is empty")
 	ErrIncompatibleValue   = errors.New("incompatible value")
 	ErrNodeNotSaturated    = errors.New("node entries size hasn't reached a large enough size to split")
+	ErrNodeTooLarge        = errors.New("node is too large to fit page size")
 )

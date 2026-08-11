@@ -53,7 +53,13 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// if the file is empty, create the meta, otherwise read it
 	if db.hasMeta() {
-		db.meta = db.readMeta()
+		db.meta, err = db.readMeta()
+		if err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
+			return nil, fmt.Errorf("read db meta: %w", err)
+		}
 		err := db.meta.Validate()
 		if err != nil {
 			if closeErr := db.Close(); closeErr != nil {
@@ -124,55 +130,69 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 	if !node.needsSplit() {
 		db.persistNode(node)
-	} else {
-		for node.needsSplit() {
-			rightPgid := db.allocate()
-			_, rightNode, err := node.split(rightPgid)
-			if err != nil {
-				return err
-			}
-			rightNode.IsLeaf = node.IsLeaf
-			rightNode.Index = node.Index + 1
-
-			if node == db.rootNode {
-				newRoot := &Node{
-					db:       db,
-					IsLeaf:   false,
-					entries:  []Entry{{key: rightNode.entries[0].key}}, // separator: first key of right (copied up)
-					Children: []Pgid{node.pgid, rightNode.pgid},        // left, right
-					pgid:     db.allocate(),
-				}
-
-				node.parent = newRoot
-				rightNode.parent = newRoot
-
-				db.persistNode(newRoot)
-
-				db.rootNode = newRoot
-				db.meta.root = newRoot.pgid
-			} else { // parent is not a root node
-				parent := node.parent
-				rightNode.parent = parent
-
-				// add seperator to the parent's entries
-				parent.entries = append(parent.entries, Entry{})
-				copy(parent.entries[node.Index+1:], parent.entries[node.Index:])
-				parent.entries[node.Index] = Entry{key: rightNode.entries[0].key}
-
-				// add the new right node `pgid` to the parent's Children
-				parent.Children = append(parent.Children, 0)
-				copy(parent.Children[rightNode.Index+1:], parent.Children[rightNode.Index:])
-				parent.Children[rightNode.Index] = rightNode.pgid
-
-				db.persistNode(parent)
-
-			}
-			db.persistNode(node)
-			db.persistNode(rightNode)
-
-		}
+		return db.persistMeta()
 	}
 
+	for node.needsSplit() {
+		rightPgid := db.allocate()
+		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid)
+		if err != nil {
+			return err
+		}
+
+		if node == db.rootNode {
+			var newEntries []Entry
+
+			if node.IsLeaf {
+				newEntries = []Entry{{key: rightNode.entries[0].key}}
+			} else {
+				newEntries = []Entry{{key: keyAtSeperatorIndex}}
+			}
+
+			newRoot := &Node{
+				db:       db,
+				IsLeaf:   false,
+				entries:  newEntries,                        // separator: first key of right (copied up)
+				Children: []Pgid{node.pgid, rightNode.pgid}, // left, right
+				pgid:     db.allocate(),
+			}
+
+			node.parent = newRoot
+			rightNode.parent = newRoot
+
+			db.persistNode(newRoot)
+
+			db.rootNode = newRoot
+			db.meta.root = newRoot.pgid
+		} else { // parent is not a root node
+			parent := node.parent
+			rightNode.parent = parent
+
+			var newEntry Entry
+			if node.IsLeaf {
+				newEntry = Entry{key: rightNode.entries[0].key}
+			} else {
+				newEntry = Entry{key: keyAtSeperatorIndex}
+			}
+
+			// add seperator to the parent's entries
+			parent.entries = append(parent.entries, Entry{})
+			copy(parent.entries[node.Index+1:], parent.entries[node.Index:])
+
+			parent.entries[node.Index] = newEntry
+
+			// add the new right node `pgid` to the parent's Children
+			parent.Children = append(parent.Children, 0)
+			copy(parent.Children[rightNode.Index+1:], parent.Children[rightNode.Index:])
+			parent.Children[rightNode.Index] = rightNode.pgid
+
+			db.persistNode(parent)
+		}
+		db.persistNode(node)
+		db.persistNode(rightNode)
+
+		node = node.parent
+	}
 	return db.persistMeta()
 }
 
@@ -246,15 +266,15 @@ func (db *DB) readNode(pgid Pgid) *Node {
 	return node
 }
 
-func (db *DB) readMeta() *Meta {
+func (db *DB) readMeta() (*Meta, error) {
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
-		return nil
+		return nil, err
 	}
 	meta, err := readMeta(db.file)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return meta
+	return meta, nil
 }
 
 func (db *DB) persistMeta() error {

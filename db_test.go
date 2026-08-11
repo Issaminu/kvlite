@@ -383,6 +383,73 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 	}
 }
 
+// TestSplit_Cascades: force the tree to depth 3 — enough leaves that the ROOT BRANCH
+// itself overflows a page and must split, minting a new root above two BRANCH children.
+// This is the first test that exercises a BRANCH split (not just a leaf split). Large,
+// same-size keys bloat the separators so the root branch fills fast.
+func TestSplit_Cascades(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pageBytes := int(db.meta.pageSize)
+	keySize := pageBytes / 16 // safely < pageSize/2 (no oversized-entry edge), fat enough to fill branches fast
+	mkKey := func(i int) []byte {
+		k := fmt.Appendf(nil, "key-%08d-", i)
+		for len(k) < keySize {
+			k = append(k, 'x')
+		}
+		return k
+	}
+
+	const n = 400
+	val := []byte("v")
+	for i := 0; i < n; i++ {
+		if err := db.Put(mkKey(i), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+
+	// Depth >= 3: root is a branch AND at least one of its children is ALSO a branch
+	// (which only happens once the root branch itself has split).
+	if db.rootNode.IsLeaf {
+		t.Fatal("root must be a branch")
+	}
+	child := db.readNode(db.rootNode.Children[0])
+	if child == nil {
+		t.Fatal("could not read root's first child")
+	}
+	if child.IsLeaf {
+		t.Fatalf("tree only reached depth 2 — %d fat keys should overflow the root branch and force a BRANCH split (depth 3)", n)
+	}
+
+	// Every key must still route correctly through the branch-split tree.
+	for i := 0; i < n; i++ {
+		if got, err := db.Get(mkKey(i)); err != nil || !bytes.Equal(got, val) {
+			t.Fatalf("key %d unreadable after a branch split (mis-wired separator?): err=%v", i, err)
+		}
+	}
+
+	// And survive a reopen.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < n; i++ {
+		if got, err := db.Get(mkKey(i)); err != nil || !bytes.Equal(got, val) {
+			t.Fatalf("key %d unreadable after reopen: err=%v", i, err)
+		}
+	}
+}
+
 // -----------------------------------------------------------------------------
 // RUNG 1 — Walking skeleton: a file-backed KV that survives reopen.  <-- BUILD THIS
 //

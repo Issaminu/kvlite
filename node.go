@@ -168,16 +168,19 @@ func readNode(r io.Reader) (*Node, error) {
 
 func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 	var buf bytes.Buffer
+	pageSize := int(node.db.meta.pageSize)
 
 	node.encode(&buf)
+
+	currNodeSize := buf.Len()
+
+	if currNodeSize > pageSize {
+		return ErrNodeTooLarge
+	}
 
 	if _, err := w.Write(buf.Bytes()); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
-
-	pageSize := int(node.db.meta.pageSize)
-
-	currNodeSize := buf.Len()
 	if shouldPad && currNodeSize < pageSize {
 		padding := make([]byte, pageSize-currNodeSize)
 		if _, err := w.Write(padding); err != nil {
@@ -231,7 +234,7 @@ func (n *Node) serializedSize() int {
 	return buf.Len()
 }
 
-func (n *Node) split(newPgid Pgid) (int, *Node, error) {
+func (n *Node) split(newPgid Pgid) (*Node, int, []byte, error) { // Returns (new_right_node, seperatorIndex, key at seperatorIndex, error)
 	limit := int(n.db.meta.pageSize / 2)
 	currSize := 0
 
@@ -250,14 +253,33 @@ func (n *Node) split(newPgid Pgid) (int, *Node, error) {
 	}
 
 	if seperatorIndex == -1 {
-		return seperatorIndex, nil, ErrNodeNotSaturated
+		return nil, seperatorIndex, nil, ErrNodeNotSaturated
 	}
 
 	rightNode := n.db.newLeafNode(newPgid)
 
-	rightNode.entries = slices.Clone(n.entries[seperatorIndex:])
+	rightNode.IsLeaf = n.IsLeaf
+	rightNode.Index = n.Index + 1
 
-	n.entries = n.entries[:seperatorIndex]
+	var keyAtSeperatorIndex []byte
+	keyAtSeperatorIndex = n.entries[seperatorIndex].key
 
-	return seperatorIndex, rightNode, nil
+	// Handling entries
+	if n.IsLeaf {
+		rightNode.entries = slices.Clone(n.entries[seperatorIndex:])
+		n.entries = n.entries[:seperatorIndex]
+	} else {
+		rightNode.entries = slices.Clone(n.entries[seperatorIndex+1:])
+		n.entries = n.entries[:seperatorIndex] // removing `entries[seperatorIndex]` from left, since it'll be moved upwards to parent
+
+	}
+
+	// Handling Children
+	if !n.IsLeaf { // children only exist when the node is not a leaf node
+		rightNode.Children = slices.Clone(n.Children[seperatorIndex+1:])
+		n.Children = n.Children[:seperatorIndex+1]
+
+	}
+
+	return rightNode, seperatorIndex, keyAtSeperatorIndex, nil
 }
