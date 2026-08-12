@@ -24,6 +24,8 @@ type DB struct {
 	file     *os.File
 	meta     *Meta
 	rootNode *Node
+	options  *Options
+	wal      *WAL
 }
 
 // Open creates and opens a database at the given path.
@@ -47,12 +49,16 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		path: path,
-		file: dbFile,
+		path:    path,
+		file:    dbFile,
+		options: options,
 	}
 
 	// if the file is empty, create the meta, otherwise read it
-	if db.hasMeta() {
+	isNew := !db.hasMeta()
+	if isNew {
+		db.meta = NewMeta()
+	} else {
 		db.meta, err = db.readMeta()
 		if err != nil {
 			if closeErr := db.Close(); closeErr != nil {
@@ -67,19 +73,61 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			}
 			return nil, fmt.Errorf("db version is unsupported: %w", err)
 		}
-		rootNode := db.readNode(db.meta.root)
-		if rootNode == nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, fmt.Errorf("read root node: %w", err)
+	}
+
+	// if there's no WAL, create it. Otherwise, read it
+	wal, records, err := db.readOrCreateWal()
+	if err != nil {
+		if closeErr := db.Close(); closeErr != nil {
+			return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
 		}
-		db.rootNode = rootNode
-	} else {
-		db.meta = NewMeta()
+		return nil, err
+	}
+
+	db.wal = wal
+
+	if isNew {
+		db.wal.insertMetaRecord(db.meta)
 		db.persistMeta()
 		db.rootNode = db.newLeafNode(db.meta.pgid)
 		db.persistNode(db.rootNode)
+	}
+
+	// if the wal has records already, there has been a crash and we must read and parse it's records into our main db file
+	if records != nil {
+		err = db.ingestWalRecords(records)
+		if err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
+			return nil, err
+		}
+
+		err = db.wal.clear()
+		if err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
+			return nil, err
+		}
+	}
+
+	db.meta, err = db.readMeta()
+	if err != nil {
+		return nil, err
+	}
+
+	// Load the root node from the (now WAL-recovered) main file. A freshly created
+	// DB already has its root in memory.
+	if db.rootNode == nil {
+		rootNode := db.readNode(db.meta.root)
+		if rootNode == nil {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(fmt.Errorf("read root node: got nil"), fmt.Errorf("failed to close database: %w", closeErr))
+			}
+			return nil, fmt.Errorf("read root node: got nil")
+		}
+		db.rootNode = rootNode
 	}
 
 	return db, nil
@@ -88,6 +136,13 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
+	if db.wal != nil {
+		err := db.wal.delete()
+		if closeErr := db.file.Close(); closeErr != nil {
+			return errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+		}
+		return nil
+	}
 	return db.file.Close()
 }
 
@@ -129,8 +184,13 @@ func (db *DB) Put(key []byte, value []byte) error {
 	}
 
 	if !node.needsSplit() {
+		db.wal.insertNodeRecord(node)
 		db.persistNode(node)
-		return db.persistMeta()
+
+		err := db.persistMeta()
+		db.wal.insertMetaRecord(db.meta)
+
+		return err
 	}
 
 	for node.needsSplit() {
@@ -160,6 +220,7 @@ func (db *DB) Put(key []byte, value []byte) error {
 			node.parent = newRoot
 			rightNode.parent = newRoot
 
+			db.wal.insertNodeRecord(newRoot)
 			db.persistNode(newRoot)
 
 			db.rootNode = newRoot
@@ -186,14 +247,22 @@ func (db *DB) Put(key []byte, value []byte) error {
 			copy(parent.Children[rightNode.Index+1:], parent.Children[rightNode.Index:])
 			parent.Children[rightNode.Index] = rightNode.pgid
 
+			db.wal.insertNodeRecord(parent)
 			db.persistNode(parent)
 		}
+
+		db.wal.insertNodeRecord(node)
 		db.persistNode(node)
+		db.wal.insertNodeRecord(rightNode)
 		db.persistNode(rightNode)
 
 		node = node.parent
 	}
-	return db.persistMeta()
+
+	err := db.persistMeta()
+	db.wal.insertMetaRecord(db.meta)
+
+	return err
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
@@ -298,4 +367,38 @@ func (db *DB) newLeafNode(pgid Pgid) *Node {
 func (db *DB) allocate() Pgid {
 	db.meta.pgid++
 	return db.meta.pgid
+}
+
+func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
+	walPath := db.path + "-wal"
+	var walFile *os.File
+	var err error
+
+	if db.options != nil && db.options.ReadOnly {
+		walFile, err = os.OpenFile(walPath, os.O_RDONLY|os.O_CREATE, 0444)
+	} else {
+		walFile, err = os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, 0644)
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	wal := &WAL{
+		db: db, path: walPath, file: walFile,
+	}
+
+	records, err := wal.readRecords()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return wal, records, nil
+}
+
+func (db *DB) ingestWalRecords(records *[]Record) error {
+	for _, record := range *records {
+		db.wal.applyRecordToDatabase(&record, db.meta.pageSize)
+	}
+	return nil
 }

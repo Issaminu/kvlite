@@ -451,6 +451,189 @@ func TestSplit_Cascades(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
+// RUNG 4c — redo WAL (eager / write-through to start).  <-- NEXT
+//
+// Commit = append changed pages to the WAL (convention: main + "-wal") + fsync = the
+// commit point. Main file stays current (eager) so reads are unchanged. A clean Close
+// checkpoints the WAL into the main file and deletes it (single file at rest). A crash
+// (unclean shutdown, WAL left behind) is recovered by replaying the WAL on open.
+// -----------------------------------------------------------------------------
+
+// TestWAL_WrittenThenCheckpointed: the plumbing. During operation the WAL exists and is
+// non-empty; a clean Close checkpoints it away → single file at rest, data intact.
+func TestWAL_WrittenThenCheckpointed(t *testing.T) {
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+
+	// During operation: the WAL exists and holds the committed change.
+	if fi, err := os.Stat(wal); err != nil || fi.Size() == 0 {
+		t.Fatalf("expected a non-empty WAL at %s during operation, stat err=%v", wal, err)
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// After a clean close: WAL checkpointed away → single file at rest.
+	if _, err := os.Stat(wal); !os.IsNotExist(err) {
+		t.Fatalf("WAL should be gone after a clean close (single file at rest), stat err=%v", err)
+	}
+	// And the data survived the checkpoint.
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if v, err := db.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+		t.Fatalf("key a lost after checkpoint+reopen: got %q, err %v", v, err)
+	}
+}
+
+// TestWAL_RecoversAfterCrash: the payoff. We reconstruct the on-disk state of a power
+// loss — the WAL committed, but the main file never got the change — and prove that
+// opening the DB REPLAYS the WAL to recover the committed data. (We capture the file
+// bytes directly, so this exercises the recovery *logic* independent of fsync.)
+func TestWAL_RecoversAfterCrash(t *testing.T) {
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	// Capture a pristine, pre-write main file.
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	emptyMain, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit data; grab the WAL (holding the committed change) before any checkpoint.
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	walBytes, err := os.ReadFile(wal)
+	if err != nil {
+		t.Fatalf("expected a WAL after a commit: %v", err)
+	}
+	_ = db.Close()
+
+	// Reconstruct a crashed state: main is still pre-commit, but the WAL landed.
+	crash := tempfile()
+	crashWal := crash + "-wal"
+	defer os.RemoveAll(crash)
+	defer os.RemoveAll(crashWal)
+	if err := os.WriteFile(crash, emptyMain, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(crashWal, walBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Opening it must replay the WAL and recover the committed key.
+	rec, err := Open(crash, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rec.Close()
+	if v, err := rec.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+		t.Fatalf("committed key not recovered from WAL after crash: got %q, err %v", v, err)
+	}
+}
+
+// TestWAL_RecoversAfterSplitCrash: the harder recovery case. Enough data to force a
+// split, so the ROOT POINTER moves (root leaf -> new branch root at a new pgid). Replay
+// must reconstruct not just the leaf/branch pages but the META (new root pgid) — and the
+// in-memory meta must reflect it afterward. Otherwise recovery rebuilds the tree but the
+// root pointer still aims at the old (now-leaf) page.
+func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	// Pristine, pre-write main file.
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	emptyMain, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Write enough to force at least one split (root must become a branch).
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 100
+	val := bytes.Repeat([]byte("x"), 512) // 100 * ~525B ≈ 50 KB, well past any page
+	for i := 0; i < n; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+	}
+	if db.rootNode.IsLeaf {
+		t.Fatal("test setup: expected a split — root should be a branch")
+	}
+	walBytes, err := os.ReadFile(wal)
+	if err != nil {
+		t.Fatalf("expected a WAL after commits: %v", err)
+	}
+	_ = db.Close()
+
+	// Reconstruct the crash: main is pre-write, the WAL holds every committed change.
+	crash := tempfile()
+	crashWal := crash + "-wal"
+	defer os.RemoveAll(crash)
+	defer os.RemoveAll(crashWal)
+	if err := os.WriteFile(crash, emptyMain, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(crashWal, walBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Recovery must rebuild the whole multi-level tree — including the moved root.
+	rec, err := Open(crash, 0600, nil)
+	if err != nil {
+		t.Fatalf("open crashed db: %v", err)
+	}
+	defer rec.Close()
+	if rec.rootNode.IsLeaf {
+		t.Fatal("recovered root is a leaf — the moved root pointer was not replayed")
+	}
+	for i := 0; i < n; i++ {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		if got, err := rec.Get(k); err != nil || !bytes.Equal(got, val) {
+			t.Fatalf("key %d not recovered after split-crash: err=%v", i, err)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
 // RUNG 1 — Walking skeleton: a file-backed KV that survives reopen.  <-- BUILD THIS
 //
 // The dumbest thing that is a real database. []byte API (db.Put/db.Get) — no

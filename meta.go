@@ -73,8 +73,8 @@ func readMeta(r io.Reader) (*Meta, error) {
 }
 
 func writeMeta(w io.Writer, meta *Meta) error {
-	var buf bytes.Buffer
-	meta.encode(&buf)
+	buf := new(bytes.Buffer)
+	meta.encode(buf)
 
 	if _, err := w.Write(buf.Bytes()); err != nil {
 		return fmt.Errorf("write meta: %w", err)

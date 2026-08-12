@@ -124,17 +124,29 @@ func (n *Node) insert(key, value []byte) error {
 }
 
 func readNode(r io.Reader) (*Node, error) {
-	var isLeafByte [1]byte // []byte because io.ReadFull expectes a []byte as the destination buffer
-	if _, err := io.ReadFull(r, isLeafByte[:]); err != nil {
+	node := &Node{}
+	node, err := decodeNode(r)
+
+	if err != nil {
+		return nil, err
+	}
+	return node, nil
+}
+
+// Decodes an io.Reader (or a type that did implicit interface satisfaction, like *bytes.Buffer) into a *Node
+func decodeNode(r io.Reader) (*Node, error) {
+	node := &Node{}
+	var isLeafByte byte
+	if err := binary.Read(r, binary.LittleEndian, &isLeafByte); err != nil {
 		return nil, fmt.Errorf("read node isLeaf: %w", err)
 	}
+	node.IsLeaf = isLeafByte != 0
 
 	var count uint32
 	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
 		return nil, fmt.Errorf("read node key count: %w", err)
 	}
 
-	node := &Node{IsLeaf: isLeafByte[0] != 0}
 	// looping through the entries (keys and values) of this node
 	for i := uint32(0); i < count; i++ {
 		key, err := readLengthPrefixedBytes[KVLength](r)
@@ -162,15 +174,14 @@ func readNode(r io.Reader) (*Node, error) {
 			node.Children[i] = Pgid(pgid)
 		}
 	}
-
 	return node, nil
 }
 
 func writeNode(w io.Writer, node *Node, shouldPad bool) error {
-	var buf bytes.Buffer
+	buf := new(bytes.Buffer)
 	pageSize := int(node.db.meta.pageSize)
 
-	node.encode(&buf)
+	encodeNode(node, buf)
 
 	currNodeSize := buf.Len()
 
@@ -190,31 +201,32 @@ func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 	return nil
 }
 
-func (n *Node) encode(buf *bytes.Buffer) error {
+// Encodes a *Node instance into a *bytes.Buffer
+func encodeNode(node *Node, buf *bytes.Buffer) error {
 	isLeafByte := byte(0)
-	if n.IsLeaf {
+	if node.IsLeaf {
 		isLeafByte = 1
 	}
 	if err := binary.Write(buf, binary.LittleEndian, isLeafByte); err != nil {
 		return fmt.Errorf("write node isLeaf: %w", err)
 	}
-	if err := binary.Write(buf, binary.LittleEndian, uint32(len(n.entries))); err != nil {
+	if err := binary.Write(buf, binary.LittleEndian, uint32(len(node.entries))); err != nil {
 		return fmt.Errorf("write node key count: %w", err)
 	}
 
-	for _, e := range n.entries {
+	for _, e := range node.entries {
 		if err := writeLengthPrefixedBytes[KVLength](buf, e.key); err != nil {
 			return fmt.Errorf("write node key: %w", err)
 		}
-		if n.IsLeaf {
+		if node.IsLeaf {
 			if err := writeLengthPrefixedBytes[KVLength](buf, e.value); err != nil {
 				return fmt.Errorf("write node value: %w", err)
 			}
 		}
 	}
 
-	if !n.IsLeaf {
-		for _, child := range n.Children {
+	if !node.IsLeaf {
+		for _, child := range node.Children {
 			if err := binary.Write(buf, binary.LittleEndian, uint64(child)); err != nil {
 				return fmt.Errorf("write node child pgid: %w", err)
 			}
@@ -229,8 +241,8 @@ func (n *Node) needsSplit() bool {
 }
 
 func (n *Node) serializedSize() int {
-	var buf bytes.Buffer
-	n.encode(&buf)
+	buf := new(bytes.Buffer)
+	encodeNode(n, buf)
 	return buf.Len()
 }
 
