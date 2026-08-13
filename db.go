@@ -188,9 +188,13 @@ func (db *DB) Put(key []byte, value []byte) error {
 		db.persistNode(node)
 
 		err := db.persistMeta()
+		if err != nil {
+			return err
+		}
 		db.wal.insertMetaRecord(db.meta)
 
-		return err
+		return db.wal.persistCollectedRecords()
+
 	}
 
 	for node.needsSplit() {
@@ -260,9 +264,14 @@ func (db *DB) Put(key []byte, value []byte) error {
 	}
 
 	err := db.persistMeta()
+
+	if err != nil {
+		return err
+	}
+
 	db.wal.insertMetaRecord(db.meta)
 
-	return err
+	return db.wal.persistCollectedRecords()
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
@@ -385,7 +394,7 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 	}
 
 	wal := &WAL{
-		db: db, path: walPath, file: walFile,
+		db: db, path: walPath, file: walFile, collectedRecords: make(map[Pgid]Record),
 	}
 
 	records, err := wal.readRecords()
@@ -397,8 +406,21 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 }
 
 func (db *DB) ingestWalRecords(records *[]Record) error {
+	recordsInCommit := make([]Record, 0)
 	for _, record := range *records {
-		db.wal.applyRecordToDatabase(&record, db.meta.pageSize)
+		if isRecordCommitMarker(&record) {
+			for _, record := range recordsInCommit {
+				err := db.wal.applyRecordToDatabase(&record, db.meta.pageSize)
+				if err != nil {
+					return err
+				}
+			}
+			//clean out commit Records
+			recordsInCommit = recordsInCommit[:0]
+			continue
+		}
+		// record is not a commit marker
+		recordsInCommit = append(recordsInCommit, record)
 	}
 	return nil
 }

@@ -633,6 +633,120 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	}
 }
 
+// TestWAL_TornTransaction_DiscardedAtomically: the commit-frame invariant, and the
+// whole reason a single Put needs a "transaction". A WAL that contains a transaction's
+// page frames but NOT its commit marker (crashed mid-commit, or a torn tail) must be
+// discarded ENTIRELY on recovery — never applied in part. Applying half a transaction
+// = a corrupt tree from one Put (a child page written, its parent/meta not).
+//
+// We commit T1 (key "a"), capture the WAL, commit T2 (key "b"), capture the WAL again.
+// The WAL is append-only, so walAfterT2 == walAfterT1 ++ (T2 frames ++ T2 commit).
+// Truncating walAfterT2 anywhere inside the T2 segment reproduces a torn commit: T1
+// fully committed, T2 incomplete. EVERY such truncation must recover to *exactly* the
+// post-T1 state — "a" present, "b" absent — and Open must SUCCEED (a torn tail is
+// normal recovery, not an error).
+//
+// RED today: recovery has no commit concept. It either errors on the partial record
+// (io.ReadFull fails -> Open fails) or blindly applies T2's leading records without
+// its meta -> wrong state. GREEN needs (1) a commit marker ending each transaction,
+// (2) buffering a txn's dirty pages and appending its frames + commit marker as a unit,
+// (3) replay that scans to the LAST valid commit marker and drops anything after it.
+func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	// Pristine, pre-write main file.
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	emptyMain, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Commit T1, then T2, capturing the append-only WAL after each.
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	walAfterT1, err := os.ReadFile(wal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("b"), []byte("2")); err != nil {
+		t.Fatal(err)
+	}
+	walAfterT2, err := os.ReadFile(wal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	if len(walAfterT2) <= len(walAfterT1) {
+		t.Fatalf("test setup: WAL did not grow across T2 (%d -> %d)", len(walAfterT1), len(walAfterT2))
+	}
+
+	// recover rebuilds a crashed on-disk state (pre-write main + the given WAL bytes)
+	// on a throwaway path and returns the opened DB.
+	recover := func(t *testing.T, walBytes []byte) (*DB, error) {
+		t.Helper()
+		crash := tempfile()
+		crashWal := crash + "-wal"
+		t.Cleanup(func() { os.RemoveAll(crash); os.RemoveAll(crashWal) })
+		if err := os.WriteFile(crash, emptyMain, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(crashWal, walBytes, 0600); err != nil {
+			t.Fatal(err)
+		}
+		return Open(crash, 0600, nil)
+	}
+
+	// Positive control: the FULL WAL (T2's commit marker intact) recovers both keys.
+	// If this fails the harness itself is wrong, not the torn-tail logic.
+	t.Run("full-wal-recovers-both", func(t *testing.T) {
+		rec, err := recover(t, walAfterT2)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer rec.Close()
+		if v, err := rec.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+			t.Fatalf("a: got %q err %v, want \"1\"", v, err)
+		}
+		if v, err := rec.Get([]byte("b")); err != nil || !bytes.Equal(v, []byte("2")) {
+			t.Fatalf("b: got %q err %v, want \"2\"", v, err)
+		}
+	})
+
+	// The invariant: any truncation inside T2 -> recover to exactly post-T1.
+	t2 := len(walAfterT2) - len(walAfterT1) // size of the T2 segment
+	for _, off := range []int{0, 1, t2 / 2, t2 - 1} {
+		off := off
+		t.Run(fmt.Sprintf("torn-at-+%d", off), func(t *testing.T) {
+			rec, err := recover(t, walAfterT2[:len(walAfterT1)+off])
+			if err != nil {
+				t.Fatalf("open must succeed on a torn tail, got: %v", err)
+			}
+			defer rec.Close()
+			if v, err := rec.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+				t.Fatalf("committed T1 lost: a = %q, err %v", v, err)
+			}
+			if _, err := rec.Get([]byte("b")); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("uncommitted T2 leaked into recovery: b should be absent, got err %v", err)
+			}
+		})
+	}
+}
+
 // -----------------------------------------------------------------------------
 // RUNG 1 — Walking skeleton: a file-backed KV that survives reopen.  <-- BUILD THIS
 //
@@ -1005,4 +1119,64 @@ func TestOpen_MultipleGoroutines(t *testing.T) {
 // TestOpen_MetaInitWriteError: write errors during meta init must surface from Open.
 func TestOpen_MetaInitWriteError(t *testing.T) {
 	t.Skip("deferred (fault injection)")
+}
+
+// -----------------------------------------------------------------------------
+// FSYNC DECISION BENCHMARK
+//
+// Decide whether re-enabling fsync (the commented-out db.file.Sync() calls in
+// persistNode/persistMeta/applyRecordToDatabase, and any Sync() added to
+// wal.persistRecord) is acceptable: run this now (fsync off) to get a baseline,
+// enable fsync, run again, and compare ns/op. Every Put currently does 2 WAL
+// record writes (node + meta) and 2 main-file writes even on the non-split path,
+// so each Sync() call you add multiplies the number of syncs per Put — the
+// benchmark should make that cost visible up front, before deciding where to sync.
+// -----------------------------------------------------------------------------
+
+// BenchmarkPut_Sequential: repeated Put with ascending keys — the common case,
+// triggers node splits as the tree grows.
+func BenchmarkPut_Sequential(b *testing.B) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	value := []byte("some-benchmark-value-thats-a-realistic-size")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		key := fmt.Appendf(nil, "key-%08d", i)
+		if err := db.Put(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkPut_SingleKeyOverwrite: repeated Put on ONE key — no splits, isolates
+// the per-Put sync cost from split-induced extra writes.
+func BenchmarkPut_SingleKeyOverwrite(b *testing.B) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("the-one-key")
+	value := []byte("some-benchmark-value-thats-a-realistic-size")
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := db.Put(key, value); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

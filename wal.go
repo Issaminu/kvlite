@@ -10,10 +10,13 @@ import (
 	"os"
 )
 
+const COMMIT_MARKER_RECORD_CHECKSUM = 0x67FBD83D // "KVLT-COMMIT-MARKER"
+
 type WAL struct {
-	db   *DB
-	path string
-	file *os.File
+	db               *DB
+	path             string
+	file             *os.File
+	collectedRecords map[Pgid]Record // Mapping Page ID to it's corresponding record. Only used temporarily to aggregate records that happen within a write operation, then flush at once
 }
 
 type Record struct {
@@ -31,7 +34,8 @@ func (wal *WAL) insertNodeRecord(node *Node) {
 		pageContent: buf.Bytes(),
 	}
 
-	wal.persistRecord(&record)
+	wal.collectRecord(&record)
+	// wal.persistRecord(&record)
 }
 
 func (wal *WAL) insertMetaRecord(meta *Meta) {
@@ -43,7 +47,12 @@ func (wal *WAL) insertMetaRecord(meta *Meta) {
 		pageContent: buf.Bytes(),
 	}
 
-	wal.persistRecord(&record)
+	wal.collectRecord(&record)
+	// wal.persistRecord(&record)
+}
+
+func (wal *WAL) collectRecord(record *Record) {
+	wal.collectedRecords[record.pgid] = *record
 }
 
 func (wal *WAL) readRecords() (*[]Record, error) {
@@ -55,14 +64,16 @@ func (wal *WAL) readRecords() (*[]Record, error) {
 	for {
 		record, err := decodeRecord(wal.file, wal.db.meta.pageSize)
 		if err != nil {
-			if errors.Is(err, io.EOF) { // read all records
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) { // read all records
 				break
 			}
 			return nil, err
 		}
 
-		if err = record.Validate(); err != nil {
-			return nil, err
+		if !isRecordCommitMarker(record) {
+			if err = record.Validate(); err != nil {
+				return nil, err
+			}
 		}
 
 		records = append(records, *record)
@@ -185,4 +196,68 @@ func (record *Record) Validate() error {
 		return ErrChecksum
 	}
 	return nil
+}
+
+func (wal *WAL) persistCollectedRecords() error {
+	if wal.collectedRecords == nil {
+		return nil
+	}
+	largeBuf := new(bytes.Buffer)
+	recordBuffer := new(bytes.Buffer)
+
+	for _, record := range wal.collectedRecords {
+		pageSize := wal.db.meta.pageSize
+		if len(record.pageContent) > int(pageSize) {
+			return fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
+		}
+
+		if len(record.pageContent) < int(pageSize) {
+			padded := make([]byte, pageSize)
+			copy(padded, record.pageContent)
+			record.pageContent = padded
+		}
+
+		record.checksum = record.GenerateChecksum()
+		encodeRecord(recordBuffer, &record, wal.db.meta.pageSize)
+
+		// append to `largeBuf`
+		_, err := largeBuf.ReadFrom(recordBuffer)
+		if err != nil {
+			return err
+		}
+	}
+
+	wal.insertCommitMarker(largeBuf)
+
+	if err := writeFull(wal.file, largeBuf.Bytes()); err != nil {
+		return fmt.Errorf("persist multiple records: %w", err)
+	}
+
+	// reset for the next write batch
+	wal.collectedRecords = make(map[Pgid]Record)
+
+	return nil
+}
+
+func (wal *WAL) insertCommitMarker(buf *bytes.Buffer) error {
+	recordBuffer := new(bytes.Buffer)
+	commitMarker := &Record{
+		pgid:        0,
+		pageContent: []byte{},
+		// pageContent: make([]byte, wal.db.meta.pageSize),
+		checksum: COMMIT_MARKER_RECORD_CHECKSUM,
+	}
+
+	encodeRecord(recordBuffer, commitMarker, wal.db.meta.pageSize)
+
+	_, err := buf.ReadFrom(recordBuffer)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func isRecordCommitMarker(record *Record) bool {
+	return record.checksum == COMMIT_MARKER_RECORD_CHECKSUM
 }
