@@ -263,9 +263,9 @@ func walkNodes(t *testing.T, db *DB, visit func(n *Node)) {
 			return
 		}
 		for _, childPgid := range n.Children {
-			child := db.readNode(childPgid)
-			if child == nil {
-				t.Fatalf("walk: could not read child pgid %d (broken split wiring?)", childPgid)
+			child, err := db.readNode(childPgid)
+			if err != nil || child == nil {
+				t.Fatalf("walk: could not read child pgid %d (broken split wiring?): %v", childPgid, err)
 			}
 			rec(child)
 		}
@@ -419,9 +419,9 @@ func TestSplit_Cascades(t *testing.T) {
 	if db.rootNode.IsLeaf {
 		t.Fatal("root must be a branch")
 	}
-	child := db.readNode(db.rootNode.Children[0])
-	if child == nil {
-		t.Fatal("could not read root's first child")
+	child, err := db.readNode(db.rootNode.Children[0])
+	if err != nil || child == nil {
+		t.Fatalf("could not read root's first child: %v", err)
 	}
 	if child.IsLeaf {
 		t.Fatalf("tree only reached depth 2 — %d fat keys should overflow the root branch and force a BRANCH split (depth 3)", n)
@@ -744,6 +744,249 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 				t.Fatalf("uncommitted T2 leaked into recovery: b should be absent, got err %v", err)
 			}
 		})
+	}
+}
+
+// TestCheckpoint_BoundsWALAndPreservesData: the checkpoint bounds WAL growth and
+// never loses data. We shrink the checkpoint threshold, then write far past it. A
+// checkpoint must fire, drain the committed data into the main file, and reset the
+// WAL — so the WAL at rest stays near the threshold instead of growing with the
+// data. Every key must be readable before the close and after a reopen.
+//
+// This will not compile until you add the trigger + the checkpoint it drives:
+//   - wal.bytesSinceCheckpoint: an in-memory counter, bumped by largeBuf.Len() in
+//     persistCollectedRecords, reset in checkpoint(). No syscall.
+//   - wal.checkpointThresholdBytes: the knob below (rename freely — adjust the test).
+//   - checkpoint(): fsync(main) -> truncate(WAL) -> reset the counter.
+//   - after each commit: if bytesSinceCheckpoint > checkpointThresholdBytes { checkpoint() }
+//   - Close: checkpoint (or fsync(main)) BEFORE wal.delete().
+func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Force frequent checkpoints so we can prove the WAL is bounded.
+	db.wal.checkpointThresholdBytes = 8 * 1024 // 8 KiB
+
+	const n = 400
+	val := bytes.Repeat([]byte("x"), 2048) // ~2 KiB per value: the WAL grows fast
+	want := make(map[string]string, n)
+	for i := 0; i < n; i++ {
+		k := fmt.Sprintf("key-%05d", i)
+		if err := db.Put([]byte(k), val); err != nil {
+			t.Fatalf("put %d: %v", i, err)
+		}
+		want[k] = string(val)
+	}
+
+	// We wrote ~800 KiB, far past the 8 KiB threshold. If the checkpoint fires and
+	// resets the WAL, the WAL at rest holds only the records since the last one.
+	// Without a checkpoint it grows with the data (RED).
+	if got := fileSize(t, wal); got > 128*1024 {
+		t.Fatalf("WAL was not checkpointed: %d bytes at rest after writing ~%d KiB "+
+			"(expected it to reset near the %d-byte threshold)", got, n*len(val)/1024, db.wal.checkpointThresholdBytes)
+	}
+
+	// All data readable before the close.
+	for k, wantV := range want {
+		if got, err := db.Get([]byte(k)); err != nil || string(got) != wantV {
+			t.Fatalf("get %q before close: got %q, err %v", k, got, err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reopen: the checkpoint must have moved everything into the main file, so a
+	// clean close + reopen keeps all data even though the WAL is gone at rest.
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for k, wantV := range want {
+		if got, err := db.Get([]byte(k)); err != nil || string(got) != wantV {
+			t.Fatalf("get %q after reopen: got %q, err %v", k, got, err)
+		}
+	}
+}
+
+// TestMode2_CommitDefersMainWrite_CheckpointDrains: the defining property of Mode 2
+// (SQLite WAL mode). A commit writes only the WAL; the main file is untouched until a
+// checkpoint. Reads still see committed data, served from the in-memory overlay, not
+// the main file. A checkpoint (here, Close) drains the overlay into the main file.
+func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil) // NORMAL by default
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The main file right after Open holds the initial meta + root.
+	mainAfterOpen, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A commit under the checkpoint threshold must NOT touch the main file.
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	mainAfterPut, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(mainAfterOpen, mainAfterPut) {
+		t.Fatal("main file changed on a plain commit: Mode 2 must defer main writes to a checkpoint")
+	}
+
+	// Yet the value is readable, served from the overlay, not from main.
+	if got, err := db.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("committed key not readable before checkpoint: got %q, err %v", got, err)
+	}
+
+	// Close must checkpoint: drain the overlay into main, then remove the WAL.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mainAfterClose, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(mainAfterOpen, mainAfterClose) {
+		t.Fatal("main file unchanged after close: the checkpoint must drain the overlay into main")
+	}
+
+	// Reopen with the WAL gone: the read now comes purely from main. Data must survive.
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got, err := db.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("committed key lost after checkpoint + reopen: got %q, err %v", got, err)
+	}
+}
+
+// TestMode2_RecoversAfterCheckpointThenCrash: the Mode 2 recovery seam that every
+// other crash test skips. All of TestWAL_Recovers* replay a WAL onto a *pristine*
+// (pre-write) main file. Real Mode 2 crashes onto a main file that a PRIOR checkpoint
+// already filled: main holds the checkpointed base, the WAL holds only the delta
+// committed since. Recovery must replay that delta ON TOP OF the non-empty base.
+//
+// It also pins last-write-wins across the checkpoint boundary: a key checkpointed
+// into main with an OLD value, then re-Put with a NEW value that lives only in the
+// WAL, must recover to the NEW value — the replayed WAL page must win over the page
+// already sitting in main. Get it wrong and recovery serves the stale checkpointed
+// value (or silently keeps both).
+//
+// The three post-recovery buckets prove the union is correct:
+//   - keys 0..9    : checkpointed as valBase, then overwritten to valUpd (WAL only)  -> valUpd
+//   - keys 10..99  : checkpointed as valBase, never touched again (main base only)   -> valBase
+//   - keys 100..149: committed only after the checkpoint (WAL only)                  -> valBase
+func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drive checkpoints by hand: a huge threshold stops any auto-checkpoint from
+	// firing mid-test, so we control exactly what sits in main vs the WAL.
+	db.wal.checkpointThresholdBytes = 1 << 30
+
+	valBase := bytes.Repeat([]byte("a"), 512) // ~512B/value forces a multi-level base tree
+	valUpd := bytes.Repeat([]byte("b"), 512)  // same length, distinct content
+
+	// Batch 1: keys 0..99, then a manual checkpoint drains them into the main file.
+	for i := 0; i < 100; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
+			t.Fatalf("base put %d: %v", i, err)
+		}
+	}
+	if err := db.wal.checkpoint(); err != nil {
+		t.Fatalf("manual checkpoint: %v", err)
+	}
+	// After the checkpoint the base lives in main and the WAL is reset. If the base
+	// never split, the "non-empty base" is trivial — make sure the seam is real.
+	if db.rootNode.IsLeaf {
+		t.Fatal("test setup: base tree did not split; the checkpointed base must be multi-level")
+	}
+
+	// Batch 2 (WAL/overlay only — main keeps the checkpointed base):
+	//   overwrite keys 0..9 to valUpd, and add fresh keys 100..149 as valBase.
+	for i := 0; i < 10; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), valUpd); err != nil {
+			t.Fatalf("overwrite put %d: %v", i, err)
+		}
+	}
+	for i := 100; i < 150; i++ {
+		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
+			t.Fatalf("post-checkpoint put %d: %v", i, err)
+		}
+	}
+
+	// Capture the crash image BEFORE any clean close: main = checkpointed base,
+	// WAL = the post-checkpoint delta (overwrites + new keys, never checkpointed).
+	mainBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walBytes, err := os.ReadFile(wal)
+	if err != nil {
+		t.Fatalf("expected a WAL holding the post-checkpoint delta: %v", err)
+	}
+	_ = db.Close()
+
+	// Reconstruct the crash on a throwaway path: a NON-EMPTY main (the base) plus the
+	// delta WAL. This is the seam — replay must land on top of the base, not a blank file.
+	crash := tempfile()
+	crashWal := crash + "-wal"
+	defer os.RemoveAll(crash)
+	defer os.RemoveAll(crashWal)
+	if err := os.WriteFile(crash, mainBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(crashWal, walBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, err := Open(crash, 0600, nil)
+	if err != nil {
+		t.Fatalf("open crashed db: %v", err)
+	}
+	defer rec.Close()
+
+	for i := 0; i < 150; i++ {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		want := valBase
+		if i < 10 {
+			want = valUpd // overwritten in the WAL delta — replay must win over main
+		}
+		got, err := rec.Get(k)
+		if err != nil {
+			t.Fatalf("key %d missing after checkpoint+crash recovery: %v", i, err)
+		}
+		if !bytes.Equal(got, want) {
+			label := "base"
+			if i < 10 {
+				label = "overwritten"
+			}
+			t.Fatalf("key %d (%s) recovered wrong value: WAL delta did not merge over the checkpointed base", i, label)
+		}
 	}
 }
 

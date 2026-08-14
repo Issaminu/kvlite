@@ -7,15 +7,33 @@ import (
 	"os"
 )
 
+type Sync uint8
+
+const (
+	SYNCHRONOUS_DEFAULT Sync = 0 // Default value when `synchronous` is not defined. It uses `DefaultOptions.synchronous`
+	SYNCHRONOUS_FULL    Sync = 1 // Always sync every commit to disk
+	SYNCHRONOUS_NORMAL  Sync = 2 // Sync to disk only once we reach checkpointThresholdBytes
+)
+
 // Options represents the options that can be set when opening a database.
-// This is a bbolt-compatible subset; fields are added as components land.
 type Options struct {
 	// ReadOnly opens the database in read-only mode.
 	ReadOnly bool
+
+	// syncMode defines when we do fsync, every commit (SYNCRONOUS_FULL) vs at checkpoint (SYNCRONOUS_NORMAL)
+	synchronous Sync
+
+	// checkpointThresholdBytes defines the threshold for applying the in-memory changes to disk.
+	// It controls how often the WAL is checkpointed into the main file, in both sync modes; larger = fewer checkpoints, bigger WAL, longer recovery.
+	checkpointThresholdBytes uint32
 }
 
 // DefaultOptions is used when nil options are passed to Open.
-var DefaultOptions = &Options{}
+var DefaultOptions = &Options{
+	ReadOnly:                 false,
+	synchronous:              SYNCHRONOUS_FULL,
+	checkpointThresholdBytes: 1000 * uint32(os.Getpagesize()), // same as SQLite
+}
 
 // DB represents a collection of buckets persisted to a single file on disk.
 // All data access is performed through transactions obtained from the DB.
@@ -49,10 +67,11 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		path:    path,
-		file:    dbFile,
-		options: options,
+		path: path,
+		file: dbFile,
 	}
+
+	db.applyOptions(options)
 
 	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()
@@ -91,6 +110,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		db.persistMeta()
 		db.rootNode = db.newLeafNode(db.meta.pgid)
 		db.persistNode(db.rootNode)
+
+		db.file.Sync()
 	}
 
 	// if the wal has records already, there has been a crash and we must read and parse it's records into our main db file
@@ -103,7 +124,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			return nil, err
 		}
 
-		err = db.wal.clear()
+		err = db.wal.Truncate()
 		if err != nil {
 			if closeErr := db.Close(); closeErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
@@ -120,7 +141,10 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	// Load the root node from the (now WAL-recovered) main file. A freshly created
 	// DB already has its root in memory.
 	if db.rootNode == nil {
-		rootNode := db.readNode(db.meta.root)
+		rootNode, err := db.readNode(db.meta.root)
+		if err != nil {
+			return nil, err
+		}
 		if rootNode == nil {
 			if closeErr := db.Close(); closeErr != nil {
 				return nil, errors.Join(fmt.Errorf("read root node: got nil"), fmt.Errorf("failed to close database: %w", closeErr))
@@ -137,11 +161,17 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
 	if db.wal != nil {
-		err := db.wal.delete()
-		if closeErr := db.file.Close(); closeErr != nil {
-			return errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+		if err := db.wal.checkpoint(); err != nil { // implicitely also fsyncs db.file
+			return err
 		}
-		return nil
+		if err := db.wal.delete(); err != nil {
+			return err
+		}
+	} else {
+		err := db.file.Sync()
+		if err != nil {
+			return err
+		}
 	}
 	return db.file.Close()
 }
@@ -168,7 +198,10 @@ func (db *DB) Put(key []byte, value []byte) error {
 		if err != nil {
 			return err
 		}
-		childNode := db.readNode(node.Children[childIndex])
+		childNode, err := db.readNode(node.Children[childIndex])
+		if err != nil {
+			return err
+		}
 		if childNode == nil {
 			return ErrKeyNotFound
 		}
@@ -185,16 +218,9 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 	if !node.needsSplit() {
 		db.wal.insertNodeRecord(node)
-		db.persistNode(node)
-
-		err := db.persistMeta()
-		if err != nil {
-			return err
-		}
 		db.wal.insertMetaRecord(db.meta)
 
 		return db.wal.persistCollectedRecords()
-
 	}
 
 	for node.needsSplit() {
@@ -225,7 +251,6 @@ func (db *DB) Put(key []byte, value []byte) error {
 			rightNode.parent = newRoot
 
 			db.wal.insertNodeRecord(newRoot)
-			db.persistNode(newRoot)
 
 			db.rootNode = newRoot
 			db.meta.root = newRoot.pgid
@@ -252,21 +277,12 @@ func (db *DB) Put(key []byte, value []byte) error {
 			parent.Children[rightNode.Index] = rightNode.pgid
 
 			db.wal.insertNodeRecord(parent)
-			db.persistNode(parent)
 		}
 
 		db.wal.insertNodeRecord(node)
-		db.persistNode(node)
 		db.wal.insertNodeRecord(rightNode)
-		db.persistNode(rightNode)
 
 		node = node.parent
-	}
-
-	err := db.persistMeta()
-
-	if err != nil {
-		return err
 	}
 
 	db.wal.insertMetaRecord(db.meta)
@@ -288,7 +304,10 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		childNode := db.readNode(node.Children[childIndex])
+		childNode, err := db.readNode(node.Children[childIndex])
+		if err != nil {
+			return nil, err
+		}
 		if childNode == nil {
 			return nil, ErrKeyNotFound
 		}
@@ -329,19 +348,44 @@ func (db *DB) hasMeta() bool {
 	return fi.Size() > 0
 }
 
-func (db *DB) readNode(pgid Pgid) *Node {
+func (db *DB) readNode(pgid Pgid) (*Node, error) {
 	offset := int64(pgid) * db.meta.pageSize
+
+	// check if Node exists in current transaction
+	if record, ok := db.wal.collectedRecords[pgid]; ok {
+		node, err := record.toNode()
+		if err != nil {
+			return nil, err
+		}
+		node.db = db
+		node.pgid = pgid
+		return node, nil
+	}
+
+	// check if Node has been commited (in an earlier transaction) but not yet checkpointed
+	if record, ok := db.wal.overlay[pgid]; ok {
+		node, err := record.toNode()
+		if err != nil {
+			return nil, err
+		}
+		node.db = db
+		node.pgid = pgid
+		return node, nil
+	}
+
+	// Node not found in-memory, so we have to search in db file
+
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
-		return nil
+		return nil, err
 	}
 	node, err := readNode(db.file)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 
 	node.db = db
 	node.pgid = pgid
-	return node
+	return node, nil
 }
 
 func (db *DB) readMeta() (*Meta, error) {
@@ -394,7 +438,7 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 	}
 
 	wal := &WAL{
-		db: db, path: walPath, file: walFile, collectedRecords: make(map[Pgid]Record), nextTxid: 1,
+		db: db, path: walPath, file: walFile, collectedRecords: make(map[Pgid]Record), overlay: make(map[Pgid]Record), nextTxid: 1, checkpointThresholdBytes: db.options.checkpointThresholdBytes, bytesSinceCheckpoint: 0,
 	}
 
 	records, err := wal.readRecords()
@@ -430,5 +474,27 @@ func (db *DB) ingestWalRecords(records *[]Record) error {
 		// record is not a commit marker
 		recordsInCommit = append(recordsInCommit, record)
 	}
-	return nil
+
+	return db.file.Sync()
+}
+
+func (db *DB) applyOptions(options *Options) {
+	// starting with default options
+	opts := *DefaultOptions
+	db.options = &opts
+
+	if options == nil {
+		return
+	}
+
+	// then overriding with any explicitely provided options
+
+	db.options.ReadOnly = options.ReadOnly
+
+	if options.checkpointThresholdBytes > 0 {
+		db.options.checkpointThresholdBytes = options.checkpointThresholdBytes
+	}
+	if options.synchronous != SYNCHRONOUS_DEFAULT {
+		db.options.synchronous = options.synchronous
+	}
 }

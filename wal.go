@@ -20,11 +20,14 @@ const (
 const recordHeaderSize = 1 + 8 + 8 + 4
 
 type WAL struct {
-	db               *DB
-	path             string
-	file             *os.File
-	collectedRecords map[Pgid]Record // Mapping Page ID to it's corresponding record. Only used temporarily to aggregate records that happen within a write operation, then flush at once
-	nextTxid         Txid            // sequence number stamped on the next committed transaction
+	db                       *DB
+	path                     string
+	file                     *os.File
+	checkpointThresholdBytes uint32
+	bytesSinceCheckpoint     uint32
+	collectedRecords         map[Pgid]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
+	overlay                  map[Pgid]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
+	nextTxid                 Txid            // sequence number stamped on the next committed transaction
 }
 
 // RecordHeader is the fixed-size head of every WAL record.
@@ -73,6 +76,7 @@ func (wal *WAL) insertNodeRecord(node *Node) {
 }
 
 func (wal *WAL) insertMetaRecord(meta *Meta) {
+	meta.checksum = meta.GenerateChecksum() // meta is mutated each Put so we should refresh it's checksum before encoding
 	buf := new(bytes.Buffer)
 	meta.encode(buf)
 
@@ -86,6 +90,11 @@ func (wal *WAL) insertMetaRecord(meta *Meta) {
 
 func (wal *WAL) collectRecord(record *Record) {
 	wal.collectedRecords[record.header.pgid] = *record
+	wal.bytesSinceCheckpoint += uint32(record.size())
+}
+
+func (record *Record) size() int {
+	return recordHeaderSize + len(record.pageContent) + 8 // 8 bytes for checksum
 }
 
 func (wal *WAL) readRecords() (*[]Record, error) {
@@ -118,7 +127,7 @@ func (wal *WAL) hasRecords() bool {
 
 // Truncate the WAL file.
 // Important: only truncate the file after making sure that it's content has been ingested to the database
-func (wal *WAL) clear() error {
+func (wal *WAL) Truncate() error {
 	if err := os.Truncate(wal.path, 0); err != nil {
 		return err
 	}
@@ -208,7 +217,6 @@ func (wal *WAL) applyRecordToDatabase(record *Record, pageSize int64) error {
 	if _, err := wal.db.file.Write(page); err != nil {
 		return err
 	}
-	// return wal.db.file.Sync()
 	return nil
 }
 
@@ -250,9 +258,25 @@ func (wal *WAL) persistCollectedRecords() error {
 		return fmt.Errorf("persist multiple records: %w", err)
 	}
 
-	// reset for the next write batch
-	wal.collectedRecords = make(map[Pgid]Record)
+	// transaction complete, reset collectedRecords
 
+	for key := range wal.collectedRecords {
+		wal.overlay[key] = wal.collectedRecords[key]
+	}
+	clear(wal.collectedRecords)
+
+	// check if it's time to fsync the WAL
+	if wal.db.options.synchronous == SYNCHRONOUS_FULL {
+		err := wal.file.Sync()
+		if err != nil {
+			return err
+		}
+	}
+
+	// check if we should checkpoint into the DB file
+	if wal.reachedCheckpointThreshold() {
+		wal.checkpoint()
+	}
 	return nil
 }
 
@@ -275,4 +299,56 @@ func (wal *WAL) insertCommitMarker(buf *bytes.Buffer, txid Txid) error {
 
 func isRecordCommitMarker(record *Record) bool {
 	return record.header.recordType == recordTypeCommit
+}
+
+func (wal *WAL) reachedCheckpointThreshold() bool {
+	return wal.bytesSinceCheckpoint >= wal.checkpointThresholdBytes
+}
+
+func (record *Record) toNode() (*Node, error) {
+	if record.pageContent == nil {
+		return nil, fmt.Errorf("record has no page content")
+	}
+
+	node, err := decodeNode(bytes.NewReader(record.pageContent))
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to deserialize node: %w", err)
+	}
+
+	return node, nil
+}
+
+// checkpoint() flushes the WAL overlay to the main database file and resets the WAL state.
+// It ensures durability by syncing both the WAL and database files, then truncates the WAL
+// and clears the in-memory overlay to prepare for new transactions.
+func (wal *WAL) checkpoint() error {
+	if len(wal.overlay) == 0 {
+		return nil
+	}
+
+	// make WAL durable
+	if err := wal.file.Sync(); err != nil {
+		return err
+	}
+
+	// drain in-memory wal.overlay to main
+	for _, record := range wal.overlay {
+		if err := wal.applyRecordToDatabase(&record, wal.db.meta.pageSize); err != nil {
+			return err
+		}
+	}
+
+	// fsync main db file after applying the records to it
+	if err := wal.db.file.Sync(); err != nil {
+		return err
+	}
+
+	//reset WAL
+	if err := wal.Truncate(); err != nil {
+		return err
+	}
+	clear(wal.overlay)
+	wal.bytesSinceCheckpoint = 0
+	return nil
 }
