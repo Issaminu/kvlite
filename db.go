@@ -394,12 +394,20 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 	}
 
 	wal := &WAL{
-		db: db, path: walPath, file: walFile, collectedRecords: make(map[Pgid]Record),
+		db: db, path: walPath, file: walFile, collectedRecords: make(map[Pgid]Record), nextTxid: 1,
 	}
 
 	records, err := wal.readRecords()
 	if err != nil {
 		return nil, nil, err
+	}
+
+	if records != nil {
+		for _, record := range *records {
+			if record.header.txid >= wal.nextTxid {
+				wal.nextTxid = record.header.txid + 1
+			}
+		}
 	}
 
 	return wal, records, nil

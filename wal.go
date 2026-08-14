@@ -10,18 +10,53 @@ import (
 	"os"
 )
 
-const COMMIT_MARKER_RECORD_CHECKSUM = 0x67FBD83D // "KVLT-COMMIT-MARKER"
+const (
+	recordTypeData   uint8 = 0
+	recordTypeMeta   uint8 = 1
+	recordTypeCommit uint8 = 2 // a commit marker: ends one transaction, no content
+)
+
+// recordHeaderSize is the fixed header size: type(1) + pgid(8) + txid(8) + content_size(4)
+const recordHeaderSize = 1 + 8 + 8 + 4
 
 type WAL struct {
 	db               *DB
 	path             string
 	file             *os.File
 	collectedRecords map[Pgid]Record // Mapping Page ID to it's corresponding record. Only used temporarily to aggregate records that happen within a write operation, then flush at once
+	nextTxid         Txid            // sequence number stamped on the next committed transaction
+}
+
+// RecordHeader is the fixed-size head of every WAL record.
+type RecordHeader struct {
+	recordType  uint8
+	pgid        Pgid
+	txid        Txid
+	contentSize uint32 // length of `Record.pageContent`. In the WAL file, it acts as pageContent's prefixed length
+}
+
+func (h RecordHeader) encode() []byte {
+	b := make([]byte, 0, recordHeaderSize)
+	b = append(b, h.recordType)
+	b = binary.LittleEndian.AppendUint64(b, uint64(h.pgid))
+	b = binary.LittleEndian.AppendUint64(b, uint64(h.txid))
+	b = binary.LittleEndian.AppendUint32(b, h.contentSize)
+	return b
+}
+
+// decodeRecordHeader parses a header from its raw bytes.
+func decodeRecordHeader(raw []byte) RecordHeader {
+	return RecordHeader{
+		recordType:  raw[0],
+		pgid:        Pgid(binary.LittleEndian.Uint64(raw[1:9])),
+		txid:        Txid(binary.LittleEndian.Uint64(raw[9:17])),
+		contentSize: binary.LittleEndian.Uint32(raw[17:21]),
+	}
 }
 
 type Record struct {
-	pgid        Pgid
-	pageContent []byte
+	header      RecordHeader
+	pageContent []byte // actual content of the `Record`. We can identify it's length by a prefixed attribute `header.contentSize`
 	checksum    uint64
 }
 
@@ -30,12 +65,11 @@ func (wal *WAL) insertNodeRecord(node *Node) {
 	encodeNode(node, buf)
 
 	record := Record{
-		pgid:        node.pgid,
+		header:      RecordHeader{recordType: recordTypeData, pgid: node.pgid},
 		pageContent: buf.Bytes(),
 	}
 
 	wal.collectRecord(&record)
-	// wal.persistRecord(&record)
 }
 
 func (wal *WAL) insertMetaRecord(meta *Meta) {
@@ -43,16 +77,15 @@ func (wal *WAL) insertMetaRecord(meta *Meta) {
 	meta.encode(buf)
 
 	record := Record{
-		pgid:        0, // meta page
+		header:      RecordHeader{recordType: recordTypeMeta, pgid: 0}, // 0 is the meta page
 		pageContent: buf.Bytes(),
 	}
 
 	wal.collectRecord(&record)
-	// wal.persistRecord(&record)
 }
 
 func (wal *WAL) collectRecord(record *Record) {
-	wal.collectedRecords[record.pgid] = *record
+	wal.collectedRecords[record.header.pgid] = *record
 }
 
 func (wal *WAL) readRecords() (*[]Record, error) {
@@ -64,18 +97,11 @@ func (wal *WAL) readRecords() (*[]Record, error) {
 	for {
 		record, err := decodeRecord(wal.file, wal.db.meta.pageSize)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) { // read all records
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) { // we have already fully read all records
 				break
 			}
 			return nil, err
 		}
-
-		if !isRecordCommitMarker(record) {
-			if err = record.Validate(); err != nil {
-				return nil, err
-			}
-		}
-
 		records = append(records, *record)
 	}
 
@@ -93,7 +119,11 @@ func (wal *WAL) hasRecords() bool {
 // Truncate the WAL file.
 // Important: only truncate the file after making sure that it's content has been ingested to the database
 func (wal *WAL) clear() error {
-	err := os.Truncate(wal.path, 0)
+	if err := os.Truncate(wal.path, 0); err != nil {
+		return err
+	}
+	// rewind the handle so writes after a recovery start at the beginning
+	_, err := wal.file.Seek(0, io.SeekStart)
 	return err
 }
 
@@ -110,40 +140,26 @@ func (wal *WAL) delete() error {
 	return err
 }
 
-func (wal *WAL) persistRecord(record *Record) error {
-	pageSize := wal.db.meta.pageSize
-	if len(record.pageContent) > int(pageSize) {
-		return fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
-	}
-	if len(record.pageContent) < int(pageSize) {
-		padded := make([]byte, pageSize)
-		copy(padded, record.pageContent)
-		record.pageContent = padded
-	}
-	record.checksum = record.GenerateChecksum()
-	return encodeRecord(wal.file, record, pageSize)
-}
-
 // Encodes a *Record instance into an io.Writer
 func encodeRecord(w io.Writer, record *Record, pageSize int64) error {
-	if err := binary.Write(w, binary.LittleEndian, record.pgid); err != nil {
-		return fmt.Errorf("write record pgid: %w", err)
+	if int64(len(record.pageContent)) > pageSize {
+		return fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
 	}
 
-	page := record.pageContent
-	if len(page) > int(pageSize) {
-		return fmt.Errorf("record page content exceeds page size (%d > %d)", len(page), pageSize)
+	record.header.contentSize = uint32(len(record.pageContent))
+	header := record.header.encode()
+
+	checksum := computeRecordChecksum(header, record.pageContent)
+
+	if err := writeFull(w, header); err != nil {
+		return fmt.Errorf("write record header: %w", err)
 	}
-	if len(page) < int(pageSize) {
-		padded := make([]byte, pageSize)
-		copy(padded, page)
-		page = padded
-	}
-	if err := writeFull(w, page); err != nil {
+	// no need to use `writeLengthPrefixedBytes` here since it's implicitely happening:
+	// the 4 bytes that sit before pageContent is it's prefixed length (`RecordHeader.contentSize`)
+	if err := writeFull(w, record.pageContent); err != nil {
 		return fmt.Errorf("write record pageContent: %w", err)
 	}
-
-	if err := binary.Write(w, binary.LittleEndian, record.checksum); err != nil {
+	if err := binary.Write(w, binary.LittleEndian, checksum); err != nil {
 		return fmt.Errorf("write record checksum: %w", err)
 	}
 
@@ -152,73 +168,74 @@ func encodeRecord(w io.Writer, record *Record, pageSize int64) error {
 
 // Decodes a *Record instance from an io.Reader
 func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
-	record := &Record{}
-
-	if err := binary.Read(r, binary.LittleEndian, &record.pgid); err != nil {
-		return nil, fmt.Errorf("read record pgid: %w", err)
+	header := make([]byte, recordHeaderSize)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, err // io.EOF at a clean boundary; io.ErrUnexpectedEOF on a torn tail
 	}
 
-	record.pageContent = make([]byte, pageSize)
+	record := &Record{header: decodeRecordHeader(header)}
+	if int64(record.header.contentSize) > pageSize {
+		return nil, fmt.Errorf("record content_size %d exceeds page size %d", record.header.contentSize, pageSize)
+	}
+
+	record.pageContent = make([]byte, record.header.contentSize)
 	if _, err := io.ReadFull(r, record.pageContent); err != nil {
-		return nil, fmt.Errorf("read record pageContent: %w", err)
+		return nil, err
 	}
 
 	if err := binary.Read(r, binary.LittleEndian, &record.checksum); err != nil {
-		return nil, fmt.Errorf("read record checksum: %w", err)
+		return nil, err
+	}
+	if computeRecordChecksum(header, record.pageContent) != record.checksum {
+		return nil, ErrChecksum
 	}
 
 	return record, nil
 }
 
 func (wal *WAL) applyRecordToDatabase(record *Record, pageSize int64) error {
-	offset := int64(record.pgid) * pageSize
+	offset := int64(record.header.pgid) * pageSize
 	if _, err := wal.db.file.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}
-	if _, err := wal.db.file.Write(record.pageContent); err != nil {
+	// content is stored unpadded in the WAL; pad it to a full page for the main file
+	page := record.pageContent
+	if int64(len(page)) < pageSize {
+		padded := make([]byte, pageSize)
+		copy(padded, page)
+		page = padded
+	}
+	if _, err := wal.db.file.Write(page); err != nil {
 		return err
 	}
-	// return db.file.Sync()
+	// return wal.db.file.Sync()
 	return nil
 }
 
-func (record *Record) GenerateChecksum() uint64 {
+func computeRecordChecksum(header, content []byte) uint64 {
 	hashFunc := fnv.New64a()
-	var pgidBuf [8]byte
-	binary.LittleEndian.PutUint64(pgidBuf[:], uint64(record.pgid))
-	hashFunc.Write(pgidBuf[:])
-	hashFunc.Write(record.pageContent)
+	hashFunc.Write(header)
+	hashFunc.Write(content)
 	return hashFunc.Sum64()
 }
 
-func (record *Record) Validate() error {
-	if record.checksum != record.GenerateChecksum() {
-		return ErrChecksum
-	}
-	return nil
-}
-
 func (wal *WAL) persistCollectedRecords() error {
-	if wal.collectedRecords == nil {
+	if len(wal.collectedRecords) == 0 {
 		return nil
 	}
+
+	txid := wal.nextTxid
+	wal.nextTxid++
+
 	largeBuf := new(bytes.Buffer)
 	recordBuffer := new(bytes.Buffer)
 
 	for _, record := range wal.collectedRecords {
-		pageSize := wal.db.meta.pageSize
-		if len(record.pageContent) > int(pageSize) {
-			return fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
-		}
+		record.header.txid = txid
 
-		if len(record.pageContent) < int(pageSize) {
-			padded := make([]byte, pageSize)
-			copy(padded, record.pageContent)
-			record.pageContent = padded
+		if err := encodeRecord(recordBuffer, &record, wal.db.meta.pageSize); err != nil {
+			return err
 		}
-
-		record.checksum = record.GenerateChecksum()
-		encodeRecord(recordBuffer, &record, wal.db.meta.pageSize)
 
 		// append to `largeBuf`
 		_, err := largeBuf.ReadFrom(recordBuffer)
@@ -227,7 +244,7 @@ func (wal *WAL) persistCollectedRecords() error {
 		}
 	}
 
-	wal.insertCommitMarker(largeBuf)
+	wal.insertCommitMarker(largeBuf, txid)
 
 	if err := writeFull(wal.file, largeBuf.Bytes()); err != nil {
 		return fmt.Errorf("persist multiple records: %w", err)
@@ -239,13 +256,11 @@ func (wal *WAL) persistCollectedRecords() error {
 	return nil
 }
 
-func (wal *WAL) insertCommitMarker(buf *bytes.Buffer) error {
+func (wal *WAL) insertCommitMarker(buf *bytes.Buffer, txid Txid) error {
 	recordBuffer := new(bytes.Buffer)
 	commitMarker := &Record{
-		pgid:        0,
-		pageContent: []byte{},
-		// pageContent: make([]byte, wal.db.meta.pageSize),
-		checksum: COMMIT_MARKER_RECORD_CHECKSUM,
+		header:      RecordHeader{recordType: recordTypeCommit, pgid: 0, txid: txid},
+		pageContent: nil,
 	}
 
 	encodeRecord(recordBuffer, commitMarker, wal.db.meta.pageSize)
@@ -259,5 +274,5 @@ func (wal *WAL) insertCommitMarker(buf *bytes.Buffer) error {
 }
 
 func isRecordCommitMarker(record *Record) bool {
-	return record.checksum == COMMIT_MARKER_RECORD_CHECKSUM
+	return record.header.recordType == recordTypeCommit
 }
