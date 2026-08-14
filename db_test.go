@@ -24,6 +24,15 @@ func tempfile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("kvlite-%d.db", time.Now().UnixNano()))
 }
 
+// openDB opens a database for tests in NORMAL sync mode, so the suite is not
+// dominated by a per-commit fsync (FULL, the production default, costs ~one macOS
+// F_FULLFSYNC per Put). NORMAL is functionally identical here — it only defers the
+// fsync to the checkpoint — so every test that does not specifically assert
+// per-commit durability uses this.
+func openDB(path string) (*DB, error) {
+	return Open(path, 0600, &Options{synchronous: SYNCHRONOUS_NORMAL})
+}
+
 // fileSize returns the current size of the database file in bytes.
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()
@@ -48,7 +57,7 @@ func TestPut_Overwrite_BoundedGrowth(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +89,7 @@ func TestPutGet_Stress(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +119,7 @@ func TestPutGet_Stress(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +151,7 @@ func TestFile_SinglePage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +186,7 @@ func TestSplit_TreeGrows(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +215,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +231,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +290,7 @@ func TestSplit_RootBecomesBranch(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +329,7 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +358,7 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +400,7 @@ func TestSplit_Cascades(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -438,7 +447,7 @@ func TestSplit_Cascades(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -467,7 +476,7 @@ func TestWAL_WrittenThenCheckpointed(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(wal)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -489,7 +498,7 @@ func TestWAL_WrittenThenCheckpointed(t *testing.T) {
 		t.Fatalf("WAL should be gone after a clean close (single file at rest), stat err=%v", err)
 	}
 	// And the data survived the checkpoint.
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -510,7 +519,7 @@ func TestWAL_RecoversAfterCrash(t *testing.T) {
 	defer os.RemoveAll(wal)
 
 	// Capture a pristine, pre-write main file.
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -523,7 +532,7 @@ func TestWAL_RecoversAfterCrash(t *testing.T) {
 	}
 
 	// Commit data; grab the WAL (holding the committed change) before any checkpoint.
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +558,7 @@ func TestWAL_RecoversAfterCrash(t *testing.T) {
 	}
 
 	// Opening it must replay the WAL and recover the committed key.
-	rec, err := Open(crash, 0600, nil)
+	rec, err := openDB(crash)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -571,7 +580,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	defer os.RemoveAll(wal)
 
 	// Pristine, pre-write main file.
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -584,7 +593,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	}
 
 	// Write enough to force at least one split (root must become a branch).
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -617,7 +626,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	}
 
 	// Recovery must rebuild the whole multi-level tree — including the moved root.
-	rec, err := Open(crash, 0600, nil)
+	rec, err := openDB(crash)
 	if err != nil {
 		t.Fatalf("open crashed db: %v", err)
 	}
@@ -658,7 +667,7 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 	defer os.RemoveAll(wal)
 
 	// Pristine, pre-write main file.
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +680,7 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 	}
 
 	// Commit T1, then T2, capturing the append-only WAL after each.
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -708,7 +717,7 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 		if err := os.WriteFile(crashWal, walBytes, 0600); err != nil {
 			t.Fatal(err)
 		}
-		return Open(crash, 0600, nil)
+		return openDB(crash)
 	}
 
 	// Positive control: the FULL WAL (T2's commit marker intact) recovers both keys.
@@ -766,7 +775,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(wal)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -806,7 +815,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 
 	// Reopen: the checkpoint must have moved everything into the main file, so a
 	// clean close + reopen keeps all data even though the WAL is gone at rest.
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -827,7 +836,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := Open(path, 0600, nil) // NORMAL by default
+	db, err := openDB(path) // NORMAL by default
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -868,7 +877,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 	}
 
 	// Reopen with the WAL gone: the read now comes purely from main. Data must survive.
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -900,7 +909,7 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(wal)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -964,7 +973,7 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rec, err := Open(crash, 0600, nil)
+	rec, err := openDB(crash)
 	if err != nil {
 		t.Fatalf("open crashed db: %v", err)
 	}
@@ -1009,7 +1018,7 @@ func TestPutGet(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1032,7 +1041,7 @@ func TestPutGet_Persists(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1043,7 +1052,7 @@ func TestPutGet_Persists(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1063,7 +1072,7 @@ func TestPut_Overwrite(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1089,7 +1098,7 @@ func TestGet_Missing(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1107,7 +1116,7 @@ func TestPutGet_MultipleKeys(t *testing.T) {
 
 	pairs := map[string]string{"a": "1", "b": "2", "c": "3", "hello": "world"}
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1120,7 +1129,7 @@ func TestPutGet_MultipleKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1146,7 +1155,7 @@ func TestOpen(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	} else if db == nil {
@@ -1183,7 +1192,7 @@ func TestOpen_Reopen(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1191,7 +1200,7 @@ func TestOpen_Reopen(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, nil)
+	db, err = openDB(path)
 	if err != nil {
 		t.Fatalf("reopen failed: %v", err)
 	}
@@ -1208,7 +1217,7 @@ func TestDB_Path(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1242,7 +1251,7 @@ func TestOpen_ErrInvalid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(path, 0600, nil); !errors.Is(err, ErrInvalid) {
+	if _, err := openDB(path); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("expected ErrInvalid, got: %v", err)
 	}
 }
@@ -1256,7 +1265,7 @@ func TestOpen_FileTooSmall(t *testing.T) {
 	if err := os.WriteFile(path, make([]byte, 16), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Open(path, 0600, nil); err == nil {
+	if _, err := openDB(path); err == nil {
 		t.Fatal("expected error opening a too-small file")
 	}
 }
@@ -1268,7 +1277,7 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1287,7 +1296,7 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(path, 0600, nil); !errors.Is(err, ErrVersionNotSupported) {
+	if _, err := openDB(path); !errors.Is(err, ErrVersionNotSupported) {
 		t.Fatalf("expected ErrVersionNotSupported, got: %v", err)
 	}
 }
@@ -1298,7 +1307,7 @@ func TestOpen_ErrChecksum(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1320,7 +1329,7 @@ func TestOpen_ErrChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := Open(path, 0600, nil); !errors.Is(err, ErrChecksum) {
+	if _, err := openDB(path); !errors.Is(err, ErrChecksum) {
 		t.Fatalf("expected ErrChecksum, got: %v", err)
 	}
 }
@@ -1353,7 +1362,7 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	defer os.RemoveAll(wal)
 
 	// Seed a database read-write, then close it (single file at rest).
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1446,7 +1455,7 @@ func BenchmarkPut_Sequential(b *testing.B) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -1470,7 +1479,7 @@ func BenchmarkPut_SingleKeyOverwrite(b *testing.B) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := Open(path, 0600, nil)
+	db, err := openDB(path)
 	if err != nil {
 		b.Fatal(err)
 	}
