@@ -1343,15 +1343,78 @@ func TestOpen_Check(t *testing.T) {
 	t.Skip("deferred: needs tx.Check() integrity checker")
 }
 
-// TestDB_Open_ReadOnly: ReadOnly allows reads, rejects writes, permits concurrent
-// read-only openers. TODO(Rung 4+): needs locking + read-only tx semantics.
+// TestDB_Open_ReadOnly: a read-only open allows reads, rejects writes, and does not
+// mutate the files (no main-file write, no WAL created or deleted).
+// (Concurrent read-only openers need file locking — deferred, see TestOpen_MultipleGoroutines.)
 func TestDB_Open_ReadOnly(t *testing.T) {
-	t.Skip("deferred: needs file locking + read-only tx semantics")
+	path := tempfile()
+	wal := path + "-wal"
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(wal)
+
+	// Seed a database read-write, then close it (single file at rest).
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mainBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Open read-only.
+	rdb, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("read-only open of an existing db: %v", err)
+	}
+
+	// Reads work.
+	if v, err := rdb.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+		t.Fatalf("read-only Get: got %q, err %v", v, err)
+	}
+
+	// Writes are rejected up front, with the read-only error.
+	if err := rdb.Put([]byte("b"), []byte("2")); !errors.Is(err, ErrDatabaseReadOnly) {
+		t.Fatalf("read-only Put: expected ErrDatabaseReadOnly, got %v", err)
+	}
+
+	if err := rdb.Close(); err != nil {
+		t.Fatalf("read-only Close: %v", err)
+	}
+
+	// A read-only session must not have changed the main file...
+	mainAfter, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(mainBefore, mainAfter) {
+		t.Fatal("read-only session modified the main file")
+	}
+	// ...and must not have left a WAL behind.
+	if _, err := os.Stat(wal); !os.IsNotExist(err) {
+		t.Fatalf("read-only session created a WAL, stat err=%v", err)
+	}
 }
 
-// TestDB_Open_ReadOnly_NoCreate: read-only open of a missing path must error, never create.
+// TestDB_Open_ReadOnly_NoCreate: a read-only open of a missing path must error and
+// must not create the file.
 func TestDB_Open_ReadOnly_NoCreate(t *testing.T) {
-	t.Skip("deferred: needs read-only open semantics")
+	path := tempfile() // does not exist yet
+	defer os.RemoveAll(path)
+
+	_, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err == nil {
+		t.Fatal("read-only open of a missing path must error")
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("read-only open created the file, stat err=%v", statErr)
+	}
 }
 
 // TestOpen_MultipleGoroutines: concurrent opens/closes must be safe (exclusive lock).

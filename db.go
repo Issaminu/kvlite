@@ -57,7 +57,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	var err error
 
 	if options != nil && options.ReadOnly {
-		dbFile, err = os.OpenFile(path, os.O_RDONLY|os.O_CREATE, 0444)
+		dbFile, err = os.OpenFile(path, os.O_RDONLY, 0444)
 	} else {
 		dbFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	}
@@ -115,7 +115,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	// if the wal has records already, there has been a crash and we must read and parse it's records into our main db file
-	if records != nil {
+	if records != nil && !db.options.ReadOnly {
 		err = db.ingestWalRecords(records)
 		if err != nil {
 			if closeErr := db.Close(); closeErr != nil {
@@ -160,6 +160,10 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 // Close releases all database resources.
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
+	if db.options.ReadOnly {
+		return db.file.Close()
+	}
+
 	if db.wal != nil {
 		if err := db.wal.checkpoint(); err != nil { // implicitely also fsyncs db.file
 			return err
@@ -182,6 +186,10 @@ func (db *DB) Path() string {
 }
 
 func (db *DB) Put(key []byte, value []byte) error {
+	if db.options.ReadOnly {
+		return ErrDatabaseReadOnly
+	}
+
 	if len(key) == 0 {
 		return ErrKeyEmpty
 	}
@@ -428,13 +436,17 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 	var err error
 
 	if db.options != nil && db.options.ReadOnly {
-		walFile, err = os.OpenFile(walPath, os.O_RDONLY|os.O_CREATE, 0444)
+		walFile, err = os.OpenFile(walPath, os.O_RDONLY, 0444)
 	} else {
 		walFile, err = os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, 0644)
 	}
 
 	if err != nil {
-		return nil, nil, err
+		if errors.Is(err, os.ErrNotExist) {
+			walFile = nil
+		} else {
+			return nil, nil, err
+		}
 	}
 
 	wal := &WAL{
