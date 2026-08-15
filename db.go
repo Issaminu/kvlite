@@ -225,23 +225,16 @@ func (db *DB) Path() string {
 }
 
 func (db *DB) Put(key []byte, value []byte) error {
-	node, err := db._put(db.rootNode, key, value, 0, true) // forceCommit is true for single Put() operation
-	if err != nil {
-		return err
-	}
-	if node != nil {
-		db.rootNode = node
-		db.meta.root = node.pgid
-	}
-
-	return nil
+	return db.Update(func(tx *Tx) error {
+		return tx.Put(key, value)
+	})
 }
 
 // _put() places a key in it's correct place starting from a root *Node.
 // Due to node splitting, it's possible that the the new root (starting from the provided rootNode) is not actually the root of that tree.
 // returns (*NewRootNode, error), since it's possible that the root was split within the process.
 // if `rootNode != NewRootNode`, please assign it as the new root node of the tree.
-func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, forceCommit bool) (*Node, error) {
+func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Node, error) {
 	if db.options.ReadOnly {
 		return nil, ErrDatabaseReadOnly
 	}
@@ -290,12 +283,7 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 	if !node.needsSplit() {
 		db.wal.insertNodeRecord(node)
 		db.wal.insertMetaRecord(db.meta)
-
-		if !forceCommit {
-			return rootNode, nil
-		}
-
-		return rootNode, db.wal.persistCollectedRecords()
+		return rootNode, nil
 	}
 
 	for node.needsSplit() {
@@ -379,24 +367,17 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 	}
 
 	db.wal.insertMetaRecord(db.meta)
-
-	// forceCommit is true for single Put operations, and false for multi Put operations (transaction)
-	// for transactions, the persistCollectedRecords() happens elsewhere
-	if !forceCommit {
-		return rootNode, nil
-	}
-	return rootNode, db.wal.persistCollectedRecords()
+	return rootNode, nil
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
-	value, flags, err := db._get(db.rootNode, key)
-	if err != nil {
-		return nil, err
-	}
-	if flags&BucketLeafFlag != 0 {
-		return nil, ErrIncompatibleValue
-	}
-	return value, nil
+	var value []byte
+	err := db.View(func(tx *Tx) error {
+		var err error
+		value, err = tx.Get(key)
+		return err
+	})
+	return value, err
 }
 
 func (db *DB) _get(rootNode *Node, key []byte) ([]byte, uint32, error) {
@@ -647,6 +628,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	}
 
 	tx := &Tx{db: db, readOnly: false}
+	defer func() { tx.closed = true }()
 
 	// take snapshot
 
@@ -654,10 +636,23 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	records := maps.Clone(db.wal.collectedRecords)
 	overlay := maps.Clone(db.wal.overlay)
 	metaSnapshot := *db.meta
+	walOffset, err := db.wal.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	nextTxid := db.wal.nextTxid
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if err := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid); err != nil {
+				panic(errors.Join(fmt.Errorf("transaction panic: %v", recovered), err))
+			}
+			panic(recovered)
+		}
+	}()
 
 	if err := transaction(tx); err != nil {
 		// transaction failed, revert back to snapshot
-		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot); rbErr != nil {
+		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
@@ -665,7 +660,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 
 	// transaction succeeded
 	if err := db.wal.persistCollectedRecords(); err != nil {
-		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot); rbErr != nil {
+		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
@@ -687,25 +682,20 @@ func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]
 	return nil
 }
 
+func (db *DB) rollbackWriteTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, overlay map[Pgid]Record, metaSnapshot *Meta, walOffset int64, nextTxid Txid) error {
+	memoryErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, metaSnapshot)
+	db.wal.nextTxid = nextTxid
+	if err := db.wal.file.Truncate(walOffset); err != nil {
+		return errors.Join(memoryErr, fmt.Errorf("truncate failed WAL transaction: %w", err))
+	}
+	if _, err := db.wal.file.Seek(walOffset, io.SeekStart); err != nil {
+		return errors.Join(memoryErr, fmt.Errorf("rewind after failed WAL transaction: %w", err))
+	}
+	return memoryErr
+}
+
 func (db *DB) View(transaction func(tx *Tx) error) error {
 	tx := &Tx{db: db, readOnly: true}
-
-	// take snapshot
-
-	bytesSinceCheckpoint := db.wal.bytesSinceCheckpoint
-	records := maps.Clone(db.wal.collectedRecords)
-	overlay := maps.Clone(db.wal.overlay)
-	metaSnapshot := *db.meta
-
-	if err := transaction(tx); err != nil {
-		// transaction failed, revert back to snapshot
-		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot); rbErr != nil {
-			return errors.Join(err, rbErr)
-		}
-		return err
-	}
-
-	// transaction succeeded
-
-	return nil
+	defer func() { tx.closed = true }()
+	return transaction(tx)
 }

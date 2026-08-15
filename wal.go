@@ -123,12 +123,14 @@ func (wal *WAL) hasRecords() bool {
 // Truncate the WAL file.
 // Important: only truncate the file after making sure that it's content has been ingested to the database
 func (wal *WAL) Truncate() error {
-	if err := os.Truncate(wal.path, 0); err != nil {
+	if _, err := wal.file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	// rewind the handle so writes after a recovery start at the beginning
-	_, err := wal.file.Seek(0, io.SeekStart)
-	return err
+	if err := wal.file.Truncate(0); err != nil {
+		_, seekErr := wal.file.Seek(0, io.SeekEnd)
+		return errors.Join(err, seekErr)
+	}
+	return nil
 }
 
 // Delete the WAL file
@@ -356,7 +358,9 @@ func (wal *WAL) checkpoint() error {
 
 	//reset WAL
 	if err := wal.Truncate(); err != nil {
-		return err
+		// The main file is already durable, so the transaction is committed.
+		// Keep the WAL and overlay intact so cleanup can be retried safely.
+		return nil
 	}
 	clear(wal.overlay)
 	wal.bytesSinceCheckpoint = 0

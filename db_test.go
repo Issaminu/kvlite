@@ -508,6 +508,48 @@ func TestWAL_WrittenThenCheckpointed(t *testing.T) {
 	}
 }
 
+func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	walBefore, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.wal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db.wal.file, err = os.Open(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.wal.checkpoint(); err != nil {
+		t.Fatalf("checkpoint returned an error after the main file was durable: %v", err)
+	}
+	walAfter, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(walAfter, walBefore) {
+		t.Fatal("failed WAL cleanup changed the committed WAL")
+	}
+	if got, err := db.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("committed value missing after WAL cleanup failure: got %q, err %v", got, err)
+	}
+}
+
 // TestWAL_RecoversAfterCrash: the payoff. We reconstruct the on-disk state of a power
 // loss — the WAL committed, but the main file never got the change — and prove that
 // opening the DB REPLAYS the WAL to recover the committed data. (We capture the file
@@ -1614,6 +1656,45 @@ func TestTx_UpdateRollsBackOnError(t *testing.T) {
 	}
 }
 
+func TestTx_UpdateRollsBackOnPanic(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	panicValue := "boom"
+	var recovered any
+	var panickedTx *Tx
+	func() {
+		defer func() {
+			recovered = recover()
+		}()
+
+		_ = db.Update(func(tx *Tx) error {
+			panickedTx = tx
+			if err := tx.Put([]byte("doomed"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			panic(panicValue)
+		})
+	}()
+
+	if recovered != panicValue {
+		t.Fatalf("Update did not propagate the callback panic: got %v", recovered)
+	}
+	if err := panickedTx.Put([]byte("late"), []byte("value")); !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("Put through panicked transaction: expected ErrTxClosed, got %v", err)
+	}
+	if _, err := db.Get([]byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("panicked Update changed the database: expected ErrKeyNotFound, got %v", err)
+	}
+}
+
 // TestTx_ViewIsReadOnly: a write attempted inside db.View fails with ErrTxNotWritable
 // and mutates nothing.
 func TestTx_ViewIsReadOnly(t *testing.T) {
@@ -1645,6 +1726,93 @@ func TestTx_ViewIsReadOnly(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestTx_GetAfterViewReturnsTxClosed(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	var savedTx *Tx
+	if err := db.View(func(tx *Tx) error {
+		savedTx = tx
+		value, err := tx.Get([]byte("key"))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(value, []byte("value")) {
+			t.Fatalf("Get returned %q, expected %q", value, "value")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := savedTx.Get([]byte("key")); !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("Get through closed transaction: expected ErrTxClosed, got %v", err)
+	}
+}
+
+func TestBucketReadsAfterViewStopAtClosedTransaction(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("bucket"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("key"), []byte("value")); err != nil {
+			return err
+		}
+		_, err = bucket.CreateBucket([]byte("child"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	var savedTx *Tx
+	var savedBucket *Bucket
+	if err := db.View(func(tx *Tx) error {
+		savedTx = tx
+		savedBucket = tx.Bucket([]byte("bucket"))
+		if savedBucket == nil {
+			t.Fatal("bucket is missing")
+		}
+		if value := savedBucket.Get([]byte("key")); !bytes.Equal(value, []byte("value")) {
+			t.Fatalf("Get returned %q, expected %q", value, "value")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if bucket := savedTx.Bucket([]byte("bucket")); bucket != nil {
+		t.Fatal("closed transaction returned a bucket")
+	}
+	if value := savedBucket.Get([]byte("key")); value != nil {
+		t.Fatalf("closed bucket returned %q", value)
+	}
+	if child, err := savedBucket.Bucket([]byte("child")); child != nil || !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("closed bucket lookup: expected ErrTxClosed, got bucket %v and error %v", child, err)
 	}
 }
 
@@ -1682,6 +1850,50 @@ func TestTx_ViewCannotCreateBucket(t *testing.T) {
 	if err := db.View(func(tx *Tx) error {
 		if b := tx.Bucket([]byte("phantom")); b != nil {
 			t.Fatal("View leaked a bucket: 'phantom' was committed by a later write")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBucketPutAfterUpdateReturnsTxClosed(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var saved *Bucket
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		saved, err = tx.CreateBucket([]byte("b"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := saved.Put([]byte("late"), []byte("value")); !errors.Is(err, ErrTxClosed) {
+		t.Errorf("Put through a closed bucket: expected ErrTxClosed, got %v", err)
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Put([]byte("trigger"), []byte("value"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		b := tx.Bucket([]byte("b"))
+		if b == nil {
+			t.Fatal("bucket b is missing")
+		}
+		if got := b.Get([]byte("late")); got != nil {
+			t.Fatalf("a later transaction committed the closed bucket write: got %q", got)
 		}
 		return nil
 	}); err != nil {
@@ -3122,6 +3334,27 @@ func TestPut_EntryTooLargeForPageReturnsClearError(t *testing.T) {
 	}
 }
 
+func TestPut_EntryTooLargeForPageDoesNotChangeDatabase(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	huge := bytes.Repeat([]byte("x"), int(db.meta.pageSize))
+	if err := db.Put([]byte("large"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
+		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
+	}
+
+	if _, err := db.Get([]byte("large")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("failed Put changed the database: expected ErrKeyNotFound, got %v", err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Bug 6 — a *Bucket must own a private copy of its name. CreateBucket and Bucket
 // stored the caller's []byte directly, and writeBackRoot reads that field again on
@@ -3305,5 +3538,55 @@ func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
 	}
 	if !bytes.Equal(v, []byte("old")) {
 		t.Fatalf("read after a FAILED transaction returned %q, want the pre-transaction value %q", v, "old")
+	}
+}
+
+func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0644, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+
+	db.wal.checkpointThresholdBytes = db.wal.bytesSinceCheckpoint + 1
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Put([]byte("k"), []byte("new")); err == nil {
+		t.Fatal("expected Put to fail when its checkpoint cannot write the database file")
+	}
+
+	got, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get after failed Put: %v", err)
+	}
+	if !bytes.Equal(got, []byte("old")) {
+		t.Fatalf("failed Put changed readable value to %q, want %q", got, "old")
+	}
+
+	if err := db.wal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 0644, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	got, err = reopened.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get after reopen: %v", err)
+	}
+	if !bytes.Equal(got, []byte("old")) {
+		t.Fatalf("failed Put recovered value %q after reopen, want %q", got, "old")
 	}
 }
