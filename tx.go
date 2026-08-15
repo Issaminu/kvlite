@@ -139,6 +139,8 @@ func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
 	}
 
 	bucket.rootNode = newRoot
+	// The parent bucket's root moved, so the child now hangs off the new root.
+	newBucket.parent = bucket.rootNode
 
 	parentRoot, err := bucket.tx.db._put(bucket.parent, bucket.name, encode(bucket.rootNode.pgid), BucketLeafFlag, false)
 	if err != nil {
@@ -149,7 +151,8 @@ func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
 		bucket.tx.db.meta.root = parentRoot.pgid
 	}
 
-	return bucket, nil
+	// Return the newly created child bucket, not the parent we just re-wired.
+	return newBucket, nil
 }
 
 func (bucket *Bucket) Bucket(bucketName []byte) (*Bucket, error) {

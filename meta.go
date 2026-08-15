@@ -13,6 +13,10 @@ const version uint32 = 1 // format version, bumps only when making a breaking ch
 
 const magic uint32 = 0x7317DC29 // magic string is "KVLT"
 
+// metaPgid is the page id that holds the meta. It is always page 0, the first page
+// of the file; node pages start at pgid 1. WAL meta records use this id too.
+const metaPgid Pgid = 0
+
 type Meta struct {
 	magic    uint32
 	version  uint32

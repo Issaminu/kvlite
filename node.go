@@ -21,6 +21,18 @@ type Entry struct {
 	value []byte
 }
 
+// encodedSize reports how many bytes this entry occupies inside an encoded node.
+// It must stay in lockstep with encodeNode: flags(4) + a length-prefixed key
+// (4 + len(key)), plus a length-prefixed value (4 + len(value)) for leaf entries.
+// Branch entries hold only a separator key, so they carry no value.
+func (e Entry) encodedSize(isLeaf bool) int {
+	size := 4 + 4 + len(e.key)
+	if isLeaf {
+		size += 4 + len(e.value)
+	}
+	return size
+}
+
 type Node struct {
 	db       *DB
 	IsLeaf   bool
@@ -262,10 +274,7 @@ func (n *Node) split(newPgid Pgid) (*Node, int, []byte, error) { // Returns (new
 	var seperatorIndex = -1
 
 	for i, entry := range n.entries {
-		currSize += len(entry.key)
-		if n.IsLeaf {
-			currSize += len(entry.value)
-		}
+		currSize += entry.encodedSize(n.IsLeaf)
 
 		if currSize >= limit {
 			seperatorIndex = i

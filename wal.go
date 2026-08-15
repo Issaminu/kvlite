@@ -81,7 +81,7 @@ func (wal *WAL) insertMetaRecord(meta *Meta) {
 	meta.encode(buf)
 
 	record := Record{
-		header:      RecordHeader{recordType: recordTypeMeta, pgid: 0}, // 0 is the meta page
+		header:      RecordHeader{recordType: recordTypeMeta, pgid: metaPgid},
 		pageContent: buf.Bytes(),
 	}
 
@@ -106,7 +106,7 @@ func (wal *WAL) readRecords() (*[]Record, error) {
 	for {
 		record, err := decodeRecord(wal.file, wal.db.meta.pageSize)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) { // we have already fully read all records
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrChecksum) {
 				break
 			}
 			return nil, err
@@ -184,7 +184,10 @@ func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
 
 	record := &Record{header: decodeRecordHeader(header)}
 	if int64(record.header.contentSize) > pageSize {
-		return nil, fmt.Errorf("record content_size %d exceeds page size %d", record.header.contentSize, pageSize)
+		// A torn tail can leave a bogus length prefix. Treat it as an integrity
+		// failure (ErrChecksum) so readRecords stops at this record instead of
+		// failing the whole open. A well-formed record can never exceed a page.
+		return nil, fmt.Errorf("record content_size %d exceeds page size %d: %w", record.header.contentSize, pageSize, ErrChecksum)
 	}
 
 	record.pageContent = make([]byte, record.header.contentSize)

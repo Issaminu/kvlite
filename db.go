@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -128,31 +129,43 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		}
 	}
 
-	// if the wal has records already, there has been a crash and we must read and parse it's records into our main db file
-	if records != nil && !db.options.ReadOnly {
-		err = db.ingestWalRecords(records)
-		if err != nil {
+	// If the WAL has records, the previous run crashed before checkpointing.
+	if records != nil {
+		fail := func(err error) (*DB, error) {
 			if closeErr := db.Close(); closeErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
 			}
 			return nil, err
 		}
-
-		err = db.wal.Truncate()
-		if err != nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+		if db.options.ReadOnly {
+			// A read-only handle cannot rewrite the main file, so it cannot ingest
+			// the WAL. Instead it serves the committed pages from the in-memory
+			// overlay and adopts the latest committed meta, so reads see the same
+			// state a writable open would recover to (a torn tail stays invisible).
+			if err := db.loadCommittedIntoOverlay(records); err != nil {
+				return fail(err)
 			}
+		} else {
+			if err := db.ingestWalRecords(records); err != nil {
+				return fail(err)
+			}
+			if err := db.wal.Truncate(); err != nil {
+				return fail(err)
+			}
+		}
+	}
+
+	// A writable open re-reads meta from the main file. A
+	// read-only open already holds the right meta: from the file when there is no
+	// WAL, or from the committed overlay when a WAL was replayed above.
+	if !db.options.ReadOnly {
+		db.meta, err = db.readMeta()
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	db.meta, err = db.readMeta()
-	if err != nil {
-		return nil, err
-	}
-
-	// Load the root node from the (now WAL-recovered) main file. A freshly created
+	// Load the root node from the main file. A freshly created
 	// DB already has its root in memory.
 	if db.rootNode == nil {
 		rootNode, err := db.readNode(db.meta.root)
@@ -237,6 +250,13 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 		return nil, ErrValueTooLarge
 	}
 
+	// When we operate on the database's own tree (rather than a bucket sub-tree),
+	// a root split must update db.meta.root *before* we collect the meta record
+	// below. Otherwise the record captures the pre-split root, and a commit that
+	// ends on a root split persists a meta pointing at the old root — reopen then
+	// loads a root that holds only the left half of the split.
+	isTopLevel := rootNode == db.rootNode
+
 	node := rootNode
 	for !node.IsLeaf {
 		childIndex, err := node.findChildIndex(key)
@@ -302,6 +322,12 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 			db.wal.insertNodeRecord(newRoot)
 
 			rootNode = newRoot
+
+			// Adopt the new root now, so the meta record collected below records it.
+			if isTopLevel {
+				db.rootNode = newRoot
+				db.meta.root = newRoot.pgid
+			}
 		} else { // parent is not a root node
 			parent := node.parent
 			rightNode.parent = parent
@@ -538,6 +564,35 @@ func (db *DB) ingestWalRecords(records *[]Record) error {
 	}
 
 	return db.file.Sync()
+}
+
+// loadCommittedIntoOverlay replays a crashed WAL into the in-memory overlay instead
+// of the main file. It is the read-only counterpart to ingestWalRecords: a read-only
+// handle may not write the main file, yet it must still expose every committed page.
+// It groups records by commit marker (so a torn, uncommitted tail is dropped), keeps
+// the latest page per pgid, and adopts the committed meta (page 0) so reads resolve
+// the recovered root.
+func (db *DB) loadCommittedIntoOverlay(records *[]Record) error {
+	recordsInCommit := make([]Record, 0)
+	for _, record := range *records {
+		if isRecordCommitMarker(&record) {
+			for _, committed := range recordsInCommit {
+				db.wal.overlay[committed.header.pgid] = committed
+			}
+			recordsInCommit = recordsInCommit[:0]
+			continue
+		}
+		recordsInCommit = append(recordsInCommit, record)
+	}
+
+	if metaRecord, ok := db.wal.overlay[metaPgid]; ok {
+		meta, err := readMeta(bytes.NewReader(metaRecord.pageContent))
+		if err != nil {
+			return fmt.Errorf("read committed meta from WAL: %w", err)
+		}
+		db.meta = meta
+	}
+	return nil
 }
 
 func (db *DB) applyOptions(options *Options) {
