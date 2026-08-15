@@ -11,10 +11,13 @@ package kvlite
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -3482,15 +3485,8 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Bug 7 — a transaction reported as failed must not leave its data readable.
-// persistCollectedRecords moves collectedRecords into wal.overlay (and clears
-// collectedRecords) BEFORE its own trailing fsync/checkpoint step, which can
-// still fail afterward (a checkpoint can fail partway through draining overlay
-// into the main file). Update() treats that as a failed transaction and rolled
-// back meta/rootNode/collectedRecords, but never touched wal.overlay — so
-// readNode kept serving the "failed" transaction's pages from the overlay
-// forever after. Update/View now snapshot wal.overlay too, and restore it on
-// rollback exactly like collectedRecords.
+// Bug 7 — a required WAL sync is the commit point. A checkpoint failure after
+// that sync must keep the committed WAL and overlay state and return success.
 // -----------------------------------------------------------------------------
 
 func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
@@ -3528,16 +3524,16 @@ func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
 	err = db.Update(func(tx *Tx) error {
 		return tx.Put([]byte("k"), []byte("new"))
 	})
-	if err == nil {
-		t.Fatal("expected db.Update to fail once the main file is closed (checkpoint write should fail)")
+	if err != nil {
+		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
 	}
 
 	v, err := db.Get([]byte("k"))
 	if err != nil {
-		t.Fatalf("get after failed update: %v", err)
+		t.Fatalf("get after committed update: %v", err)
 	}
-	if !bytes.Equal(v, []byte("old")) {
-		t.Fatalf("read after a FAILED transaction returned %q, want the pre-transaction value %q", v, "old")
+	if !bytes.Equal(v, []byte("new")) {
+		t.Fatalf("committed update returned %q, want %q", v, "new")
 	}
 }
 
@@ -3561,16 +3557,16 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Put([]byte("k"), []byte("new")); err == nil {
-		t.Fatal("expected Put to fail when its checkpoint cannot write the database file")
+	if err := db.Put([]byte("k"), []byte("new")); err != nil {
+		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
 	}
 
 	got, err := db.Get([]byte("k"))
 	if err != nil {
-		t.Fatalf("get after failed Put: %v", err)
+		t.Fatalf("get after committed Put: %v", err)
 	}
-	if !bytes.Equal(got, []byte("old")) {
-		t.Fatalf("failed Put changed readable value to %q, want %q", got, "old")
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("committed Put returned %q, want %q", got, "new")
 	}
 
 	if err := db.wal.file.Close(); err != nil {
@@ -3586,7 +3582,689 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get after reopen: %v", err)
 	}
-	if !bytes.Equal(got, []byte("old")) {
-		t.Fatalf("failed Put recovered value %q after reopen, want %q", got, "old")
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("committed Put recovered value %q after reopen, want %q", got, "new")
+	}
+}
+
+func TestAudit_TwoWritableHandlesDoNotLoseCommittedData(t *testing.T) {
+	t.Skip("deferred until kvlite implements multiple-writer coordination")
+
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	first, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := first.Put([]byte("first"), []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := second.Put([]byte("second"), []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_ = second.Close()
+	_ = second.file.Close()
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+
+	for key, want := range map[string]string{"first": "one", "second": "two"} {
+		got, err := reopened.Get([]byte(key))
+		if err != nil || !bytes.Equal(got, []byte(want)) {
+			t.Fatalf("committed key %q was lost: got %q, err %v", key, got, err)
+		}
+	}
+}
+
+func TestAudit_GoexitRollsBackUpdate(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = db.Update(func(tx *Tx) error {
+			if err := tx.Put([]byte("doomed"), []byte("value")); err != nil {
+				panic(err)
+			}
+			runtime.Goexit()
+			return nil
+		})
+	}()
+	<-done
+
+	if _, err := db.Get([]byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+		t.Errorf("unfinished Update changed the database: expected ErrKeyNotFound, got %v", err)
+	}
+	if err := db.Put([]byte("keep"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Get([]byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("unfinished Update was persisted: expected ErrKeyNotFound, got %v", err)
+	}
+}
+
+func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("first"), []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("second"), []byte("two")); err != nil {
+		t.Fatal(err)
+	}
+	walBytes, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.wal.file.Close()
+	_ = db.file.Close()
+
+	if len(walBytes) < recordHeaderSize {
+		t.Fatalf("WAL is too small: %d bytes", len(walBytes))
+	}
+	contentSize := int(binary.LittleEndian.Uint32(walBytes[17:21]))
+	checksumOffset := recordHeaderSize + contentSize
+	if checksumOffset >= len(walBytes)-1 {
+		t.Fatalf("first record has no later WAL data: checksum offset %d, WAL size %d", checksumOffset, len(walBytes))
+	}
+	walBytes[checksumOffset] ^= 0xff
+
+	crashPath := tempfile()
+	defer os.RemoveAll(crashPath)
+	defer os.RemoveAll(crashPath + "-wal")
+	if err := os.WriteFile(crashPath, mainBefore, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(crashPath+"-wal", walBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := openDB(crashPath)
+	if err == nil {
+		_ = recovered.Close()
+		t.Fatal("Open accepted a checksum failure before later WAL records")
+	}
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("expected ErrChecksum, got %v", err)
+	}
+}
+
+func TestAudit_FinalWALChecksumFailureReturnsChecksumError(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainBefore, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	walBytes, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.wal.file.Close()
+	_ = db.file.Close()
+
+	if len(walBytes) == 0 {
+		t.Fatal("WAL is empty")
+	}
+	// The last byte belongs to the final record checksum. XOR with 0xff flips every bit.
+	walBytes[len(walBytes)-1] ^= 0xff
+
+	crashPath := tempfile()
+	defer os.RemoveAll(crashPath)
+	defer os.RemoveAll(crashPath + "-wal")
+	if err := os.WriteFile(crashPath, mainBefore, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(crashPath+"-wal", walBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := openDB(crashPath)
+	if err == nil {
+		_ = recovered.Close()
+		t.Fatal("Open accepted a checksum failure on the final WAL record")
+	}
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("expected ErrChecksum, got %v", err)
+	}
+}
+
+func TestAudit_GetAfterCloseReturnsDatabaseNotOpen(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Get([]byte("key")); !errors.Is(err, ErrDatabaseNotOpen) {
+		t.Fatalf("Get after Close: expected ErrDatabaseNotOpen, got %v", err)
+	}
+}
+
+func TestAudit_RejectedTxPutDoesNotChangeReadableState(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	large := bytes.Repeat([]byte("x"), int(db.meta.pageSize))
+	err = db.Update(func(tx *Tx) error {
+		if err := tx.Put([]byte("rejected"), large); !errors.Is(err, ErrEntryTooLargeForPage) {
+			t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("callback returned nil, but Update returned %v", err)
+	}
+
+	if _, err := db.Get([]byte("rejected")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("rejected Put changed readable state: expected ErrKeyNotFound, got %v", err)
+	}
+}
+
+func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	db.wal.checkpointThresholdBytes = 1
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Put([]byte("key"), []byte("new")); err != nil {
+		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
+	}
+	if got, err := db.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("committed overlay value: got %q, err %v", got, err)
+	}
+	if err := db.wal.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, err := reopened.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("recovered committed value: got %q, err %v", got, err)
+	}
+}
+
+func TestAudit_AutomaticCheckpointSyncsWALOnce(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		db.wal.syncFile = nil
+		_ = db.Close()
+	}()
+
+	// One byte makes every non-empty WAL append cross the checkpoint threshold.
+	db.wal.checkpointThresholdBytes = 1
+	syncCalls := 0
+	db.wal.syncFile = func() error {
+		syncCalls++
+		return nil
+	}
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	db.wal.syncFile = nil
+	if syncCalls != 1 {
+		t.Fatalf("automatic checkpoint WAL sync calls: got %d, want 1", syncCalls)
+	}
+}
+
+func TestAudit_CloseAfterFullCommitDoesNotResyncWAL(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if !db.closed {
+			db.wal.syncFile = nil
+			_ = db.Close()
+		}
+	}()
+
+	syncCalls := 0
+	db.wal.syncFile = func() error {
+		syncCalls++
+		return nil
+	}
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("full commit and close WAL sync calls: got %d, want 1", syncCalls)
+	}
+}
+
+func TestAudit_CloseSyncsUnsyncedNormalWAL(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if !db.closed {
+			db.wal.syncFile = nil
+			_ = db.Close()
+		}
+	}()
+
+	syncCalls := 0
+	db.wal.syncFile = func() error {
+		syncCalls++
+		return nil
+	}
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("normal commit and close WAL sync calls: got %d, want 1", syncCalls)
+	}
+}
+
+func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if !db.closed {
+			db.wal.syncFile = nil
+			_ = db.Close()
+		}
+	}()
+
+	if err := db.Put([]byte("stable"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	syncErr := errors.New("injected WAL sync failure")
+	syncCalls := 0
+	db.wal.syncFile = func() error {
+		syncCalls++
+		// The first hooked sync belongs to the failed commit. Any later call is redundant.
+		if syncCalls == 1 {
+			return syncErr
+		}
+		return nil
+	}
+
+	if err := db.Put([]byte("failed"), []byte("value")); !errors.Is(err, syncErr) {
+		t.Fatalf("Put error: got %v, want %v", err, syncErr)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("failed commit and close WAL sync calls: got %d, want 1", syncCalls)
+	}
+}
+
+func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("key"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+
+	walBefore, err := db.wal.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.wal.checkpointThresholdBytes = 1
+	syncErr := errors.New("injected WAL sync failure")
+	syncCalls := 0
+	publishedBeforeSync := false
+	pendingAtSync := false
+	db.wal.syncFile = func() error {
+		syncCalls++
+		publishedBeforeSync = len(db.wal.overlay) != 0
+		pendingAtSync = len(db.wal.collectedRecords) != 0
+		return syncErr
+	}
+
+	err = db.Put([]byte("key"), []byte("new"))
+	db.wal.syncFile = nil
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("Put error: got %v, want %v", err, syncErr)
+	}
+	if syncCalls != 1 {
+		t.Fatalf("WAL sync calls: got %d, want 1", syncCalls)
+	}
+	if publishedBeforeSync {
+		t.Fatal("transaction was published to the overlay before WAL sync succeeded")
+	}
+	if !pendingAtSync {
+		t.Fatal("transaction records were not pending when WAL sync started")
+	}
+	if len(db.wal.overlay) != 0 || len(db.wal.collectedRecords) != 0 {
+		t.Fatalf("failed transaction state remained: overlay=%d, collected=%d", len(db.wal.overlay), len(db.wal.collectedRecords))
+	}
+	if db.wal.bytesSinceCheckpoint != 0 {
+		t.Fatalf("failed transaction byte count: got %d, want 0", db.wal.bytesSinceCheckpoint)
+	}
+	walAfter, err := db.wal.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walAfter.Size() != walBefore.Size() {
+		t.Fatalf("failed transaction WAL size: got %d, want %d", walAfter.Size(), walBefore.Size())
+	}
+	if got, err := db.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("old")) {
+		t.Fatalf("value after WAL sync failure: got %q, err %v", got, err)
+	}
+}
+
+func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("baseline"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	db.wal.checkpointThresholdBytes = 1
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Put([]byte("first"), []byte("one")); err != nil {
+		t.Fatalf("first durable WAL commit returned a checkpoint error: %v", err)
+	}
+	if len(db.wal.overlay) == 0 || db.wal.bytesSinceCheckpoint == 0 {
+		t.Fatalf("failed checkpoint did not retain committed state: overlay=%d, bytes=%d", len(db.wal.overlay), db.wal.bytesSinceCheckpoint)
+	}
+	walBeforeRetry, err := db.wal.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walBeforeRetry.Size() == 0 {
+		t.Fatal("failed checkpoint did not retain the committed WAL")
+	}
+
+	db.file, err = os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("second"), []byte("two")); err != nil {
+		t.Fatalf("second commit did not retry the checkpoint: %v", err)
+	}
+	if len(db.wal.overlay) != 0 || db.wal.bytesSinceCheckpoint != 0 {
+		t.Fatalf("checkpoint retry did not drain committed state: overlay=%d, bytes=%d", len(db.wal.overlay), db.wal.bytesSinceCheckpoint)
+	}
+	walAfterRetry, err := db.wal.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walAfterRetry.Size() != 0 {
+		t.Fatalf("checkpoint retry did not truncate WAL: size=%d", walAfterRetry.Size())
+	}
+	for key, want := range map[string]string{"first": "one", "second": "two"} {
+		if got, err := db.Get([]byte(key)); err != nil || !bytes.Equal(got, []byte(want)) {
+			t.Fatalf("value %q after checkpoint retry: got %q, err %v", key, got, err)
+		}
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	for key, want := range map[string]string{"first": "one", "second": "two"} {
+		if got, err := reopened.Get([]byte(key)); err != nil || !bytes.Equal(got, []byte(want)) {
+			t.Fatalf("reopened value %q after checkpoint retry: got %q, err %v", key, got, err)
+		}
+	}
+}
+
+func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.wal.file.Close()
+	_ = db.file.Close()
+
+	mainBytes, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainBytes[24] ^= 0xff
+	if err := os.WriteFile(path, mainBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := openDB(path)
+	if err != nil {
+		t.Fatalf("valid WAL did not recover damaged main metadata: %v", err)
+	}
+	defer recovered.Close()
+	got, err := recovered.Get([]byte("key"))
+	if err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("recovered value: got %q, err %v", got, err)
+	}
+}
+
+func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	firstWAL, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	secondWAL, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = db.wal.file.Close()
+	_ = db.file.Close()
+
+	commitMarkerSize := recordHeaderSize + 8
+	if len(firstWAL) <= commitMarkerSize || len(secondWAL) <= commitMarkerSize {
+		t.Fatal("WAL transaction is too small")
+	}
+	firstMarker := firstWAL[len(firstWAL)-commitMarkerSize:]
+	if firstMarker[0] != recordTypeCommit {
+		t.Fatal("first WAL does not end with a commit marker")
+	}
+	secondRecords := secondWAL[:len(secondWAL)-commitMarkerSize]
+	mixedWAL := append(bytes.Clone(secondRecords), firstMarker...)
+	if err := os.WriteFile(path+"-wal", mixedWAL, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	recovered, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	got, err := recovered.Get([]byte("key"))
+	if err != nil || !bytes.Equal(got, []byte("old")) {
+		t.Fatalf("mismatched commit marker committed another transaction: got %q, err %v", got, err)
+	}
+}
+
+func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.wal.file.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	records, err := db.wal.readRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if records == nil {
+		t.Fatal("committed WAL has no records")
+	}
+
+	clear(db.wal.overlay)
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ingestWalRecords(records); err == nil {
+		t.Fatal("expected WAL replay to fail on the closed main file")
+	}
+	_ = db.closeFiles()
+
+	if _, err := os.Stat(path + "-wal"); err != nil {
+		t.Fatalf("failed recovery removed the committed WAL: %v", err)
 	}
 }

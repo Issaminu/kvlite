@@ -46,6 +46,14 @@ type DB struct {
 	rootNode *Node
 	options  *Options
 	wal      *WAL
+	closed   bool
+}
+
+func (db *DB) ensureOpen() error {
+	if db.closed {
+		return ErrDatabaseNotOpen
+	}
+	return nil
 }
 
 // Open creates and opens a database at the given path.
@@ -77,80 +85,75 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()
+	var mainMetaErr error
 	if isNew {
 		db.meta = NewMeta()
 	} else {
 		db.meta, err = db.readMeta()
 		if err != nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, fmt.Errorf("read db meta: %w", err)
+			return db.failOpen(fmt.Errorf("read db meta: %w", err))
 		}
-		err := db.meta.Validate()
-		if err != nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+		if err := db.meta.Validate(); err != nil {
+			mainMetaErr = fmt.Errorf("db version is unsupported: %w", err)
+			if !errors.Is(err, ErrChecksum) {
+				return db.failOpen(mainMetaErr)
 			}
-			return nil, fmt.Errorf("db version is unsupported: %w", err)
+		}
+		if db.meta.pageSize <= 0 || db.meta.pageSize > MaxValueSize {
+			if mainMetaErr != nil {
+				return db.failOpen(mainMetaErr)
+			}
+			return db.failOpen(fmt.Errorf("invalid database page size %d: %w", db.meta.pageSize, ErrInvalid))
 		}
 	}
 
 	// if there's no WAL, create it. Otherwise, read it
 	wal, records, err := db.readOrCreateWal()
 	if err != nil {
-		if closeErr := db.Close(); closeErr != nil {
-			return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-		}
-		return nil, err
+		return db.failOpen(err)
 	}
 
 	db.wal = wal
+	if mainMetaErr != nil {
+		if records == nil {
+			return db.failOpen(mainMetaErr)
+		}
+		meta, err := metaFromCommittedWAL(*records)
+		if err != nil {
+			return db.failOpen(mainMetaErr)
+		}
+		db.meta = meta
+	}
 
 	if isNew {
 		// A brand-new database writes its meta and empty root straight to the main
 		// file, so there is no WAL record to collect here. Any failure below leaves a
 		// half-written file, so we surface it instead of returning a broken handle.
-		fail := func(err error) (*DB, error) {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, err
-		}
 		if err := db.persistMeta(); err != nil {
-			return fail(fmt.Errorf("init meta: %w", err))
+			return db.failOpen(fmt.Errorf("init meta: %w", err))
 		}
 		db.rootNode = db.newLeafNode(db.meta.pgid)
 		if err := db.persistNode(db.rootNode); err != nil {
-			return fail(fmt.Errorf("init root node: %w", err))
+			return db.failOpen(fmt.Errorf("init root node: %w", err))
 		}
 		if err := db.file.Sync(); err != nil {
-			return fail(fmt.Errorf("sync new database: %w", err))
+			return db.failOpen(fmt.Errorf("sync new database: %w", err))
 		}
 	}
 
 	// If the WAL has records, the previous run crashed before checkpointing.
 	if records != nil {
-		fail := func(err error) (*DB, error) {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, err
-		}
 		if db.options.ReadOnly {
 			// A read-only handle cannot rewrite the main file, so it cannot ingest
 			// the WAL. Instead it serves the committed pages from the in-memory
 			// overlay and adopts the latest committed meta, so reads see the same
 			// state a writable open would recover to (a torn tail stays invisible).
 			if err := db.loadCommittedIntoOverlay(records); err != nil {
-				return fail(err)
+				return db.failOpen(err)
 			}
 		} else {
 			if err := db.ingestWalRecords(records); err != nil {
-				return fail(err)
-			}
-			if err := db.wal.Truncate(); err != nil {
-				return fail(err)
+				return db.failOpen(err)
 			}
 		}
 	}
@@ -161,10 +164,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if !db.options.ReadOnly {
 		db.meta, err = db.readMeta()
 		if err != nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, err
+			return db.failOpen(err)
 		}
 	}
 
@@ -173,21 +173,40 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if db.rootNode == nil {
 		rootNode, err := db.readNode(db.meta.root)
 		if err != nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, err
+			return db.failOpen(err)
 		}
 		if rootNode == nil {
-			if closeErr := db.Close(); closeErr != nil {
-				return nil, errors.Join(fmt.Errorf("read root node: got nil"), fmt.Errorf("failed to close database: %w", closeErr))
-			}
-			return nil, fmt.Errorf("read root node: got nil")
+			return db.failOpen(fmt.Errorf("read root node: got nil"))
 		}
 		db.rootNode = rootNode
 	}
 
+	if records != nil && !db.options.ReadOnly {
+		if err := db.wal.Truncate(); err != nil {
+			return db.failOpen(err)
+		}
+	}
+
 	return db, nil
+}
+
+func (db *DB) closeFiles() error {
+	var walErr error
+	if db.wal != nil && db.wal.file != nil {
+		walErr = db.wal.file.Close()
+	}
+	var dbErr error
+	if db.file != nil {
+		dbErr = db.file.Close()
+	}
+	return errors.Join(walErr, dbErr)
+}
+
+func (db *DB) failOpen(err error) (*DB, error) {
+	if closeErr := db.closeFiles(); closeErr != nil {
+		return nil, errors.Join(err, fmt.Errorf("failed to close database files: %w", closeErr))
+	}
+	return nil, err
 }
 
 // Close releases all database resources.
@@ -200,7 +219,11 @@ func (db *DB) Close() error {
 		if db.wal != nil && db.wal.file != nil {
 			walErr = db.wal.file.Close()
 		}
-		return errors.Join(walErr, db.file.Close())
+		if err := errors.Join(walErr, db.file.Close()); err != nil {
+			return err
+		}
+		db.closed = true
+		return nil
 	}
 
 	if db.wal != nil {
@@ -216,7 +239,11 @@ func (db *DB) Close() error {
 			return err
 		}
 	}
-	return db.file.Close()
+	if err := db.file.Close(); err != nil {
+		return err
+	}
+	db.closed = true
+	return nil
 }
 
 // Path returns the path to the currently open database file.
@@ -225,6 +252,9 @@ func (db *DB) Path() string {
 }
 
 func (db *DB) Put(key []byte, value []byte) error {
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
 	return db.Update(func(tx *Tx) error {
 		return tx.Put(key, value)
 	})
@@ -247,6 +277,11 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 	}
 	if len(value) > MaxValueSize {
 		return nil, ErrValueTooLarge
+	}
+	entry := Entry{key: key, value: value}
+	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
+	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.pageSize) {
+		return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, key, db.meta.pageSize)
 	}
 
 	// When we operate on the database's own tree (rather than a bucket sub-tree),
@@ -371,6 +406,9 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
+	if err := db.ensureOpen(); err != nil {
+		return nil, err
+	}
 	var value []byte
 	err := db.View(func(tx *Tx) error {
 		var err error
@@ -537,7 +575,7 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 
 	records, err := wal.readRecords()
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, errors.Join(err, wal.file.Close())
 	}
 
 	if records != nil {
@@ -552,24 +590,71 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 }
 
 func (db *DB) ingestWalRecords(records *[]Record) error {
-	recordsInCommit := make([]Record, 0)
-	for _, record := range *records {
-		if isRecordCommitMarker(&record) {
-			for _, record := range recordsInCommit {
-				err := db.wal.applyRecordToDatabase(&record, db.meta.pageSize)
-				if err != nil {
-					return err
-				}
-			}
-			//clean out commit Records
-			recordsInCommit = recordsInCommit[:0]
-			continue
+	committed, err := committedWALRecords(*records)
+	if err != nil {
+		return err
+	}
+	for _, record := range committed {
+		if err := db.wal.applyRecordToDatabase(&record, db.meta.pageSize); err != nil {
+			return err
 		}
-		// record is not a commit marker
-		recordsInCommit = append(recordsInCommit, record)
 	}
 
 	return db.file.Sync()
+}
+
+func committedWALRecords(records []Record) ([]Record, error) {
+	committed := make([]Record, 0, len(records))
+	pending := make([]Record, 0)
+
+	for index, record := range records {
+		if !isRecordCommitMarker(&record) {
+			pending = append(pending, record)
+			continue
+		}
+
+		matches := len(pending) > 0
+		for _, candidate := range pending {
+			if candidate.header.txid != record.header.txid {
+				matches = false
+				break
+			}
+		}
+		if !matches {
+			if index == len(records)-1 {
+				return committed, nil
+			}
+			return nil, ErrInvalid
+		}
+
+		committed = append(committed, pending...)
+		pending = pending[:0]
+	}
+
+	return committed, nil
+}
+
+func metaFromCommittedWAL(records []Record) (*Meta, error) {
+	committed, err := committedWALRecords(records)
+	if err != nil {
+		return nil, err
+	}
+	// starting from the last record downwards to get the most recent version of the meta, then early break then
+	for index := len(committed) - 1; index >= 0; index-- {
+		record := committed[index]
+		if record.header.recordType != recordTypeMeta || record.header.pgid != metaPgid {
+			continue
+		}
+		meta, err := readMeta(bytes.NewReader(record.pageContent))
+		if err != nil {
+			return nil, err
+		}
+		if err := meta.Validate(); err != nil {
+			return nil, err
+		}
+		return meta, nil
+	}
+	return nil, ErrInvalid
 }
 
 // loadCommittedIntoOverlay replays a crashed WAL into the in-memory overlay instead
@@ -579,16 +664,12 @@ func (db *DB) ingestWalRecords(records *[]Record) error {
 // the latest page per pgid, and adopts the committed meta (page 0) so reads resolve
 // the recovered root.
 func (db *DB) loadCommittedIntoOverlay(records *[]Record) error {
-	recordsInCommit := make([]Record, 0)
-	for _, record := range *records {
-		if isRecordCommitMarker(&record) {
-			for _, committed := range recordsInCommit {
-				db.wal.overlay[committed.header.pgid] = committed
-			}
-			recordsInCommit = recordsInCommit[:0]
-			continue
-		}
-		recordsInCommit = append(recordsInCommit, record)
+	committed, err := committedWALRecords(*records)
+	if err != nil {
+		return err
+	}
+	for _, record := range committed {
+		db.wal.overlay[record.header.pgid] = record
 	}
 
 	if metaRecord, ok := db.wal.overlay[metaPgid]; ok {
@@ -623,6 +704,9 @@ func (db *DB) applyOptions(options *Options) {
 }
 
 func (db *DB) Update(transaction func(tx *Tx) error) error {
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
 	if db.options.ReadOnly {
 		return ErrDatabaseReadOnly
 	}
@@ -636,31 +720,44 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	records := maps.Clone(db.wal.collectedRecords)
 	overlay := maps.Clone(db.wal.overlay)
 	metaSnapshot := *db.meta
+	hadUnsyncedWrites := db.wal.hasUnsyncedWrites
 	walOffset, err := db.wal.file.Seek(0, io.SeekCurrent)
 	if err != nil {
 		return err
 	}
 	nextTxid := db.wal.nextTxid
+	callbackReturned := false
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			if err := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid); err != nil {
-				panic(errors.Join(fmt.Errorf("transaction panic: %v", recovered), err))
+		if callbackReturned {
+			return
+		}
+
+		panicValue := recover() // nil when there's no panic
+		rollbackErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid, hadUnsyncedWrites)
+		if rollbackErr != nil {
+			if panicValue != nil {
+				panic(errors.Join(fmt.Errorf("transaction panic: %v", panicValue), rollbackErr))
 			}
-			panic(recovered)
+			panic(rollbackErr)
+		}
+		if panicValue != nil {
+			panic(panicValue)
 		}
 	}()
 
-	if err := transaction(tx); err != nil {
+	transactionErr := transaction(tx)
+	callbackReturned = true
+	if transactionErr != nil {
 		// transaction failed, revert back to snapshot
-		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid); rbErr != nil {
-			return errors.Join(err, rbErr)
+		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid, hadUnsyncedWrites); rbErr != nil {
+			return errors.Join(transactionErr, rbErr)
 		}
-		return err
+		return transactionErr
 	}
 
 	// transaction succeeded
 	if err := db.wal.persistCollectedRecords(); err != nil {
-		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid); rbErr != nil {
+		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid, hadUnsyncedWrites); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
@@ -682,7 +779,7 @@ func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]
 	return nil
 }
 
-func (db *DB) rollbackWriteTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, overlay map[Pgid]Record, metaSnapshot *Meta, walOffset int64, nextTxid Txid) error {
+func (db *DB) rollbackWriteTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, overlay map[Pgid]Record, metaSnapshot *Meta, walOffset int64, nextTxid Txid, hadUnsyncedWrites bool) error {
 	memoryErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, metaSnapshot)
 	db.wal.nextTxid = nextTxid
 	if err := db.wal.file.Truncate(walOffset); err != nil {
@@ -691,10 +788,14 @@ func (db *DB) rollbackWriteTransaction(bytesSinceCheckpoint uint32, records map[
 	if _, err := db.wal.file.Seek(walOffset, io.SeekStart); err != nil {
 		return errors.Join(memoryErr, fmt.Errorf("rewind after failed WAL transaction: %w", err))
 	}
+	db.wal.hasUnsyncedWrites = hadUnsyncedWrites
 	return memoryErr
 }
 
 func (db *DB) View(transaction func(tx *Tx) error) error {
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
 	tx := &Tx{db: db, readOnly: true}
 	defer func() { tx.closed = true }()
 	return transaction(tx)

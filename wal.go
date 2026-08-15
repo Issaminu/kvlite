@@ -28,6 +28,8 @@ type WAL struct {
 	collectedRecords         map[Pgid]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
 	overlay                  map[Pgid]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
 	nextTxid                 Txid            // sequence number stamped on the next committed transaction
+	hasUnsyncedWrites        bool            // true when WAL bytes were appended after the last successful sync
+	syncFile                 func() error    // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
 }
 
 // RecordHeader is the fixed-size head of every WAL record.
@@ -101,9 +103,10 @@ func (wal *WAL) readRecords() (*[]Record, error) {
 	for {
 		record, err := decodeRecord(wal.file, wal.db.meta.pageSize)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, ErrChecksum) {
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
+			// if we ever encouner an ErrChecksum, it is returned as an err
 			return nil, err
 		}
 		records = append(records, *record)
@@ -118,6 +121,25 @@ func (wal *WAL) hasRecords() bool {
 		return false
 	}
 	return fi.Size() > 0
+}
+
+func (wal *WAL) sync() error {
+	if !wal.hasUnsyncedWrites {
+		return nil
+	}
+
+	var err error
+	if wal.syncFile != nil {
+		err = wal.syncFile()
+	} else {
+		// Production leaves syncFile nil and syncs the WAL file directly.
+		err = wal.file.Sync()
+	}
+	if err != nil {
+		return err
+	}
+	wal.hasUnsyncedWrites = false
+	return nil
 }
 
 // Truncate the WAL file.
@@ -264,27 +286,28 @@ func (wal *WAL) persistCollectedRecords() error {
 	if err := writeFull(wal.file, largeBuf.Bytes()); err != nil {
 		return fmt.Errorf("persist multiple records: %w", err)
 	}
+	wal.hasUnsyncedWrites = true
 	wal.bytesSinceCheckpoint += walBytes
 
-	// transaction complete, reset collectedRecords
+	needsCheckpoint := wal.reachedCheckpointThreshold()
+	if wal.db.options.synchronous == SYNCHRONOUS_FULL || needsCheckpoint {
+		if err := wal.sync(); err != nil {
+			return err
+		}
+	}
 
+	// The required WAL sync is the commit point. Publish the committed records
+	// only after it succeeds.
 	for key := range wal.collectedRecords {
 		wal.overlay[key] = wal.collectedRecords[key]
 	}
 	clear(wal.collectedRecords)
 
-	// check if it's time to fsync the WAL
-	if wal.db.options.synchronous == SYNCHRONOUS_FULL {
-		err := wal.file.Sync()
-		if err != nil {
-			return err
-		}
-	}
-
-	// check if we should checkpoint into the DB file
-	if wal.reachedCheckpointThreshold() {
+	if needsCheckpoint {
 		if err := wal.checkpoint(); err != nil {
-			return err
+			// The WAL is already durable. Keep the WAL and overlay so the
+			// committed transaction stays readable and recoverable.
+			return nil
 		}
 	}
 	return nil
@@ -340,7 +363,7 @@ func (wal *WAL) checkpoint() error {
 	}
 
 	// make WAL durable
-	if err := wal.file.Sync(); err != nil {
+	if err := wal.sync(); err != nil {
 		return err
 	}
 
