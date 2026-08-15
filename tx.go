@@ -20,8 +20,16 @@ func (tx *Tx) Put(key, value []byte) error {
 		return ErrTxNotWritable
 	}
 	// need to call `_put()` instead of `Put()` so that we can specify that we don't want to commit the changes
-	_, err := tx.db._put(tx.db.rootNode, key, value, 0, false)
-	return err
+	newRoot, err := tx.db._put(tx.db.rootNode, key, value, 0, false)
+	if err != nil {
+		return err
+	}
+	if newRoot == tx.db.rootNode {
+		return nil
+	}
+	tx.db.rootNode = newRoot
+	tx.db.meta.root = newRoot.pgid
+	return nil
 }
 
 func (tx *Tx) Get(key []byte) ([]byte, error) {
@@ -145,13 +153,13 @@ func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
 }
 
 func (bucket *Bucket) Bucket(bucketName []byte) (*Bucket, error) {
-	value, flags, err := bucket.rootNode.get(bucketName)
-	if err != nil && errors.Is(err, ErrKeyNotFound) {
+	value, flags, err := bucket.tx.db._get(bucket.rootNode, bucketName)
+	if err != nil {
+		if errors.Is(err, ErrKeyNotFound) {
+			return nil, nil
+		}
+
 		return nil, err
-	}
-	// if bucket is missing, return nil
-	if value == nil {
-		return nil, nil
 	}
 
 	if flags&BucketLeafFlag == 0 {
@@ -202,7 +210,9 @@ func (bucket *Bucket) Put(key, value []byte) error {
 
 func (bucket *Bucket) Get(key []byte) []byte {
 	value, flags, _ := bucket.tx.db._get(bucket.rootNode, key)
-	if flags == BucketLeafFlag {
+
+	// value is a bucket, we should refuse
+	if flags&BucketLeafFlag != 0 {
 		return nil
 	}
 	return value

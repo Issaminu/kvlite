@@ -7,7 +7,6 @@ import (
 	"hash/fnv"
 	"io"
 	"os"
-	"unsafe"
 )
 
 const version uint32 = 1 // format version, bumps only when making a breaking change to the DB file format itself
@@ -127,7 +126,14 @@ func (m *Meta) Validate() error {
 }
 
 func (m *Meta) GenerateChecksum() uint64 {
+	buf := new(bytes.Buffer)
+	_ = m.encode(buf) // encode writes to a bytes.Buffer, which never fails
+
+	// The checksum is the last field: an 8-byte uint64. we hash everything before it
+	encoded := buf.Bytes()
+	sealed := encoded[:len(encoded)-8]
+
 	hashFunc := fnv.New64a()
-	hashFunc.Write((*[unsafe.Offsetof(Meta{}.checksum)]byte)(unsafe.Pointer(m))[:])
+	hashFunc.Write(sealed)
 	return hashFunc.Sum64()
 }

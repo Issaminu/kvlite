@@ -252,7 +252,9 @@ func (wal *WAL) persistCollectedRecords() error {
 		}
 	}
 
-	wal.insertCommitMarker(largeBuf, txid)
+	if err := wal.insertCommitMarker(largeBuf, txid); err != nil {
+		return err
+	}
 
 	if err := writeFull(wal.file, largeBuf.Bytes()); err != nil {
 		return fmt.Errorf("persist multiple records: %w", err)
@@ -275,7 +277,9 @@ func (wal *WAL) persistCollectedRecords() error {
 
 	// check if we should checkpoint into the DB file
 	if wal.reachedCheckpointThreshold() {
-		wal.checkpoint()
+		if err := wal.checkpoint(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -287,7 +291,9 @@ func (wal *WAL) insertCommitMarker(buf *bytes.Buffer, txid Txid) error {
 		pageContent: nil,
 	}
 
-	encodeRecord(recordBuffer, commitMarker, wal.db.meta.pageSize)
+	if err := encodeRecord(recordBuffer, commitMarker, wal.db.meta.pageSize); err != nil {
+		return fmt.Errorf("encode commit marker: %w", err)
+	}
 
 	_, err := buf.ReadFrom(recordBuffer)
 	if err != nil {

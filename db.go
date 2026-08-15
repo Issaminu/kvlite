@@ -107,12 +107,25 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	db.wal = wal
 
 	if isNew {
-		db.wal.insertMetaRecord(db.meta)
-		db.persistMeta()
+		// A brand-new database writes its meta and empty root straight to the main
+		// file, so there is no WAL record to collect here. Any failure below leaves a
+		// half-written file, so we surface it instead of returning a broken handle.
+		fail := func(err error) (*DB, error) {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
+			return nil, err
+		}
+		if err := db.persistMeta(); err != nil {
+			return fail(fmt.Errorf("init meta: %w", err))
+		}
 		db.rootNode = db.newLeafNode(db.meta.pgid)
-		db.persistNode(db.rootNode)
-
-		db.file.Sync()
+		if err := db.persistNode(db.rootNode); err != nil {
+			return fail(fmt.Errorf("init root node: %w", err))
+		}
+		if err := db.file.Sync(); err != nil {
+			return fail(fmt.Errorf("sync new database: %w", err))
+		}
 	}
 
 	// if the wal has records already, there has been a crash and we must read and parse it's records into our main db file
@@ -162,7 +175,13 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
 	if db.options.ReadOnly {
-		return db.file.Close()
+		// A read-only open may still hold a WAL handle (opened O_RDONLY when a "-wal"
+		// file was present). Close it too, but always close the main file as well.
+		var walErr error
+		if db.wal != nil && db.wal.file != nil {
+			walErr = db.wal.file.Close()
+		}
+		return errors.Join(walErr, db.file.Close())
 	}
 
 	if db.wal != nil {

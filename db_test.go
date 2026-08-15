@@ -1648,6 +1648,96 @@ func TestTx_ViewIsReadOnly(t *testing.T) {
 	}
 }
 
+// TestTx_PutSurvivesRootSplit: a splitting tx.Put on the DEFAULT tree must promote the
+// new branch root, exactly like db.Put does. Tx.Put currently discards _put's returned
+// root, so a root split inside an Update loses every key that moved to the far side of
+// the new root — and persists a stale meta.root. Enough 256B values to split the default
+// tree more than once; every key must read back after the (nil) commit.
+//
+// RED today: Tx.Put is `_, err := tx.db._put(...)`. GREEN once it captures the returned
+// root into db.rootNode / db.meta.root when the root actually moved (as db.Put does).
+func TestTx_PutSurvivesRootSplit(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const n = 200
+	val := bytes.Repeat([]byte("x"), 256)
+	if err := db.Update(func(tx *Tx) error {
+		for i := 0; i < n; i++ {
+			if err := tx.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	// A split must actually have happened — otherwise a pass proves nothing.
+	if db.rootNode.IsLeaf {
+		t.Fatal("test setup: default tree did not split; raise n or the value size")
+	}
+
+	// Every key the Update committed must be readable.
+	for i := 0; i < n; i++ {
+		k := fmt.Appendf(nil, "key-%05d", i)
+		got, err := db.Get(k)
+		if err != nil || !bytes.Equal(got, val) {
+			t.Fatalf("key %q lost after a tx.Put root split (dropped new root): err=%v", k, err)
+		}
+	}
+}
+
+// TestTx_PutErrorLeavesRootIntact: a tx.Put that fails validation must NOT touch the
+// tree. _put returns (nil, err) on its guard paths (empty/oversized key, etc.), so a
+// root-capture that runs unconditionally sets db.rootNode = nil and dereferences a nil
+// node. The failed Put must return the error, leave db.rootNode non-nil, and leave a
+// previously committed key readable.
+//
+// RED if tx.Put writes db.rootNode/meta.root before checking that the root actually
+// moved. GREEN once the capture is guarded (only when _put returns a new, non-nil root).
+func TestTx_PutErrorLeavesRootIntact(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Seed one committed key the failing txn must not disturb.
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Put([]byte("keep"), []byte("me"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A tx.Put with an empty key fails _put's guard -> _put returns (nil, err).
+	got := db.Update(func(tx *Tx) error {
+		return tx.Put(nil, []byte("x")) // empty key -> ErrKeyEmpty from _put
+	})
+	if !errors.Is(got, ErrKeyEmpty) {
+		t.Fatalf("expected ErrKeyEmpty from a bad tx.Put, got %v", got)
+	}
+
+	// The tree must be intact: root still set, seeded key still readable.
+	if db.rootNode == nil {
+		t.Fatal("tx.Put error nilled out db.rootNode")
+	}
+	if v, err := db.Get([]byte("keep")); err != nil || !bytes.Equal(v, []byte("me")) {
+		t.Fatalf("committed key lost after a failed tx.Put: got %q, err %v", v, err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // RUNG 5b — Buckets: many named keyspaces in one file.  <-- BUILD THIS
 //
@@ -1998,6 +2088,92 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 	}
 	defer db.Close()
 	verify(t, db, "after reopen")
+}
+
+// TestBucket_NestedInSplitParent: a nested bucket must resolve even when the PARENT
+// bucket's OWN tree has split (its root became a branch). Bucket.Bucket() and the
+// duplicate check in Bucket.CreateBucket look the child up with bucket.rootNode.get(name)
+// — a single-node lookup that ERRORS on a branch root (ErrNotLeafNode) instead of
+// descending — while Tx.Bucket() correctly uses the descending _get. So a child bucket
+// in a large parent is wrongly reported missing (and CreateBucket's guard then silently
+// overwrites). Here the parent is filled past one page BEFORE the child is created, then
+// the child is read back both in-session and after a reopen.
+//
+// RED today: parent.Bucket("child") returns nil once the parent root is a branch. GREEN
+// once the nested lookup descends the parent's tree (share Tx.Bucket's _get path).
+func TestBucket_NestedInSplitParent(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 200
+	val := bytes.Repeat([]byte("x"), 256) // fills the parent bucket past one page -> it splits
+	if err := db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		for i := 0; i < n; i++ {
+			if err := parent.Put(fmt.Appendf(nil, "pk-%05d", i), val); err != nil {
+				return err
+			}
+		}
+		if parent.rootNode.IsLeaf {
+			t.Fatal("test setup: parent bucket tree did not split")
+		}
+		child, err := parent.CreateBucket([]byte("child"))
+		if err != nil {
+			return fmt.Errorf("create nested child in a split parent: %w", err)
+		}
+		if err := child.Put([]byte("k"), []byte("childval")); err != nil {
+			return err
+		}
+		// read-your-writes: the child must resolve through the branchy parent.
+		c, err := parent.Bucket([]byte("child"))
+		if err != nil {
+			return fmt.Errorf("lookup nested child: %w", err)
+		}
+		if c == nil {
+			t.Fatal("nested child bucket not found through a split parent (non-descending lookup)")
+		}
+		if got := c.Get([]byte("k")); !bytes.Equal(got, []byte("childval")) {
+			t.Fatalf("nested child value wrong in-session: got %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// It must survive a reopen: parent resolves, and the child resolves under it.
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		parent := tx.Bucket([]byte("parent"))
+		if parent == nil {
+			t.Fatal("parent bucket lost across reopen")
+		}
+		c, err := parent.Bucket([]byte("child"))
+		if err != nil || c == nil {
+			t.Fatalf("nested child not resolved after reopen: err=%v", err)
+		}
+		if got := c.Get([]byte("k")); !bytes.Equal(got, []byte("childval")) {
+			t.Fatalf("nested child value lost across reopen: got %q", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestBucket_Nested: a bucket inside a bucket — the recursion the whole flag design
