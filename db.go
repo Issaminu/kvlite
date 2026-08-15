@@ -161,6 +161,9 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if !db.options.ReadOnly {
 		db.meta, err = db.readMeta()
 		if err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
 			return nil, err
 		}
 	}
@@ -170,6 +173,9 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if db.rootNode == nil {
 		rootNode, err := db.readNode(db.meta.root)
 		if err != nil {
+			if closeErr := db.Close(); closeErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("failed to close database: %w", closeErr))
+			}
 			return nil, err
 		}
 		if rootNode == nil {
@@ -296,6 +302,13 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 		rightPgid := db.allocate()
 		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid)
 		if err != nil {
+			if errors.Is(err, ErrNodeNotSaturated) {
+				// split() only fails this way when a single entry (or, for a branch,
+				// too few entries) already overflows a page on its own: there is no
+				// way to divide it into two non-empty halves. Surface a clear error
+				// instead of the internal split-precondition failure.
+				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, key, db.meta.pageSize)
+			}
 			return nil, err
 		}
 
@@ -376,8 +389,14 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
-	value, _, err := db._get(db.rootNode, key)
-	return value, err
+	value, flags, err := db._get(db.rootNode, key)
+	if err != nil {
+		return nil, err
+	}
+	if flags&BucketLeafFlag != 0 {
+		return nil, ErrIncompatibleValue
+	}
+	return value, nil
 }
 
 func (db *DB) _get(rootNode *Node, key []byte) ([]byte, uint32, error) {
@@ -408,11 +427,11 @@ func (db *DB) _get(rootNode *Node, key []byte) ([]byte, uint32, error) {
 		node = childNode
 	}
 
-	value, flags, err := node.get(key)
+	value, flags, found, err := node.get(key)
 	if err != nil {
 		return nil, 0, err
 	}
-	if value == nil {
+	if !found {
 		return nil, 0, ErrKeyNotFound
 	}
 	return value, flags, nil

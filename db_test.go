@@ -1648,6 +1648,47 @@ func TestTx_ViewIsReadOnly(t *testing.T) {
 	}
 }
 
+// TestTx_ViewCannotCreateBucket: CreateBucket is a write. A View txn must reject it
+// with ErrTxNotWritable, exactly like tx.Put does. Before the fix, CreateBucket had no
+// Writable() guard: it bumped meta.pgid, mutated db.rootNode, and left records in
+// wal.collectedRecords. View never flushes and never restores on success, so the leaked
+// records got committed by the NEXT write — a phantom bucket from a read-only path.
+func TestTx_ViewCannotCreateBucket(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// A CreateBucket inside a View must fail and change nothing.
+	err = db.View(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("phantom"))
+		return err
+	})
+	if !errors.Is(err, ErrTxNotWritable) {
+		t.Fatalf("CreateBucket inside View must fail with ErrTxNotWritable, got %v", err)
+	}
+
+	// A later, legitimate write must not carry a leaked phantom bucket with it.
+	if err := db.Update(func(tx *Tx) error {
+		return tx.Put([]byte("real"), []byte("value"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		if b := tx.Bucket([]byte("phantom")); b != nil {
+			t.Fatal("View leaked a bucket: 'phantom' was committed by a later write")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestTx_PutSurvivesRootSplit: a splitting tx.Put on the DEFAULT tree must promote the
 // new branch root, exactly like db.Put does. Tx.Put currently discards _put's returned
 // root, so a root split inside an Update loses every key that moved to the far side of
@@ -1835,10 +1876,12 @@ func TestBucket_IsolatesSameKey(t *testing.T) {
 	}
 
 	if err := db.View(func(tx *Tx) error {
-		if got := tx.Bucket([]byte("A")).Get([]byte("k")); !bytes.Equal(got, []byte("from-A")) {
+		a := tx.Bucket([]byte("A"))
+		if got := a.Get([]byte("k")); !bytes.Equal(got, []byte("from-A")) {
 			t.Fatalf("bucket A leaked/collided: got %q, want from-A", got)
 		}
-		if got := tx.Bucket([]byte("B")).Get([]byte("k")); !bytes.Equal(got, []byte("from-B")) {
+		b := tx.Bucket([]byte("B"))
+		if got := b.Get([]byte("k")); !bytes.Equal(got, []byte("from-B")) {
 			t.Fatalf("bucket B leaked/collided: got %q, want from-B", got)
 		}
 		return nil
@@ -1995,7 +2038,8 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 				t.Fatalf("key %d lost after reopen: the moved bucket root was not written back to its parent entry", i)
 			}
 		}
-		if got := tx.Bucket([]byte("small")).Get([]byte("only")); !bytes.Equal(got, []byte("one")) {
+		small := tx.Bucket([]byte("small"))
+		if got := small.Get([]byte("only")); !bytes.Equal(got, []byte("one")) {
 			t.Fatalf("sibling bucket clobbered by the big bucket's growth: got %q", got)
 		}
 		return nil
@@ -2494,4 +2538,712 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 	}
 	defer db.Close()
 	verify(t, db, "after reopen")
+}
+
+// -----------------------------------------------------------------------------
+// PHASE 1 — spring-cleaning regression tests.
+// -----------------------------------------------------------------------------
+
+// TestWriteBackRoot_AdoptsSplitContainerRoot arms Phase-1 bug #2.
+//
+// writeBackRoot writes a bucket's root pointer into its parent's tree. That write
+// can split the parent. The old code threw away the new root that _put returned, so
+// a split would orphan the parent's right half and lose keys. Today the public API
+// never triggers this, because a pointer update is a fixed 8 bytes and lands in
+// place. This white-box test forces the split directly: it packs a bucket's leaf to
+// the brink, then writes back a child with a large name, so the pointer insert grows
+// the node past a page. After the split, a FRESH handle from the catalog must still
+// see every key. Before the fix, the parent root stays the truncated left half and
+// the right-half keys vanish.
+func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateBucket([]byte("p")); err != nil {
+			return err
+		}
+		p := tx.Bucket([]byte("p"))
+
+		pageSize := int(db.meta.pageSize)
+		childName := bytes.Repeat([]byte("c"), 300) // large name => large writeback entry
+		fillVal := bytes.Repeat([]byte("x"), 200)
+
+		// Pack p's single leaf as full as possible without overflowing it. Each fill
+		// entry is ~220 bytes, so the leftover slack ends up smaller than the ~320-byte
+		// writeback entry below, which guarantees the writeback insert overflows.
+		var fillKeys [][]byte
+		for i := 0; ; i++ {
+			k := fmt.Appendf(nil, "fill-%06d", i)
+			entrySize := 4 + 4 + len(k) + 4 + len(fillVal)
+			if p.rootNode.serializedSize()+entrySize > pageSize {
+				break
+			}
+			if err := p.Put(k, fillVal); err != nil {
+				return err
+			}
+			fillKeys = append(fillKeys, k)
+		}
+		if !p.rootNode.IsLeaf {
+			t.Fatal("setup error: p split during packing; it should still be one leaf")
+		}
+
+		// Build a child bucket by hand and write its pointer back into p. This is the
+		// operation that Bucket.CreateBucket/Put drive; here we aim it at a brimming
+		// parent so the pointer insert splits p's root.
+		newPgid := tx.db.allocate()
+		cRoot := tx.db.newLeafNode(newPgid)
+		tx.db.wal.insertNodeRecord(cRoot)
+		c := &Bucket{tx: tx, name: childName, rootNode: cRoot, parentBucket: p}
+		if err := c.writeBackRoot(); err != nil {
+			return err
+		}
+
+		// The pointer insert overflows p's leaf, so _put splits it and returns a new
+		// branch root. writeBackRoot must adopt that root into p.rootNode. If p.rootNode
+		// is still a leaf here, the returned root was dropped — bug #2.
+		if p.rootNode.IsLeaf {
+			t.Fatal("writeBackRoot dropped the split's new root: p.rootNode is still the old leaf")
+		}
+
+		// A fresh handle read straight from the catalog must resolve p's NEW root and
+		// see every packed key plus the new child. Before the fix, the catalog still
+		// points at the truncated left half and the right-half keys are gone. Use a
+		// second, uncached Tx wrapper over the same db so this genuinely re-decodes
+		// the catalog entry instead of returning tx's own memoized "p" handle.
+		freshTx := &Tx{db: tx.db, readOnly: tx.readOnly}
+		p2 := freshTx.Bucket([]byte("p"))
+		if p2 == nil {
+			t.Fatal("bucket \"p\" lost from catalog after its root split")
+		}
+		for _, k := range fillKeys {
+			if got := p2.Get(k); !bytes.Equal(got, fillVal) {
+				t.Fatalf("key %q lost after parent split: writeBackRoot dropped the new root", k)
+			}
+		}
+		child, err := p2.Bucket(childName)
+		if err != nil {
+			return err
+		}
+		if child == nil {
+			t.Fatal("child bucket pointer lost: it landed in the orphaned right half")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestWAL_BytesSinceCheckpointTracksWALSize arms Phase-1 bug #3.
+//
+// bytesSinceCheckpoint gates the checkpoint. The old code added a record's size on
+// every collectRecord call, but collectedRecords keeps only one image per pgid, so
+// re-writing a page (or the meta page, rewritten on every _put) inflated the
+// counter far above the real pending bytes and checkpointed too early. The counter
+// must equal the bytes actually appended to the WAL since the last checkpoint. A
+// fresh DB starts with an empty WAL, so after one commit the counter must equal the
+// WAL file size on disk.
+func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	// Overwrite ONE key 100 times in a single transaction. Only the leaf page and the
+	// meta page change, so the WAL grows by exactly one commit: two records plus a
+	// commit marker. The old per-call counter would report ~100x that.
+	err = db.Update(func(tx *Tx) error {
+		for i := 0; i < 100; i++ {
+			if err := tx.Put([]byte("k"), []byte("v")); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	walSize := fileSize(t, path+"-wal")
+	if int64(db.wal.bytesSinceCheckpoint) != walSize {
+		t.Fatalf("bytesSinceCheckpoint=%d, want WAL file size %d (counter must track real WAL growth, not collectRecord calls)",
+			db.wal.bytesSinceCheckpoint, walSize)
+	}
+}
+
+// TestBucket_SharedHandleSeesWrites fixes Phase-1 bug #1.
+//
+// tx.Bucket(name) used to build a fresh handle on every call, each caching its own
+// root snapshot, so a write through one handle that split the bucket was invisible
+// to a second handle for the same bucket. Tx and Bucket now cache one handle per
+// name (per transaction, and per parent bucket for nested names), so every call
+// with the same name returns the same *Bucket object.
+func TestBucket_SharedHandleSeesWrites(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateBucket([]byte("b")); err != nil {
+			return err
+		}
+		h1 := tx.Bucket([]byte("b"))
+		h2 := tx.Bucket([]byte("b")) // same cached handle as h1
+
+		val := bytes.Repeat([]byte("x"), 200)
+		for i := 0; i < 500; i++ {
+			if err := h1.Put(fmt.Appendf(nil, "key-%08d", i), val); err != nil {
+				return err
+			}
+		}
+		for i := 0; i < 500; i++ {
+			if got := h2.Get(fmt.Appendf(nil, "key-%08d", i)); got == nil {
+				t.Fatalf("second handle cannot see key %d written through the first handle", i)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Bug 1 — an empty or nil value must round-trip, and must not read back as a
+// missing key. "Missing" is signalled by ErrKeyNotFound, not by a nil value.
+// -----------------------------------------------------------------------------
+
+func TestGet_NilValueIsFoundNotMissing(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), nil); err != nil {
+		t.Fatalf("put nil value: %v", err)
+	}
+	v, err := db.Get([]byte("k"))
+	if errors.Is(err, ErrKeyNotFound) {
+		t.Fatal("key with a nil value read back as ErrKeyNotFound")
+	}
+	if err != nil {
+		t.Fatalf("get nil value: %v", err)
+	}
+	// A found key never yields a nil value; an empty stored value comes back as a
+	// zero-length slice.
+	if v == nil {
+		t.Fatal("found key returned a nil value")
+	}
+	if len(v) != 0 {
+		t.Fatalf("expected zero-length value, got %q", v)
+	}
+}
+
+func TestGet_EmptyValueRoundTrips(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte{}); err != nil {
+		t.Fatalf("put empty value: %v", err)
+	}
+	v, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get empty value: %v", err)
+	}
+	if v == nil || len(v) != 0 {
+		t.Fatalf("expected zero-length non-nil value, got %v", v)
+	}
+}
+
+func TestGet_MissingStillErrKeyNotFound(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, err := db.Get([]byte("absent")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("expected ErrKeyNotFound for an absent key, got %v", err)
+	}
+}
+
+// An empty value must also survive a checkpoint + reopen, not just an in-memory
+// round-trip. This guards the encode/decode path, where a zero-length value could
+// re-emerge as nil.
+func TestGet_EmptyValueSurvivesReopen(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("k"), []byte{}); err != nil {
+		t.Fatalf("put empty value: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db2, err := openDB(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+
+	v, err := db2.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get after reopen: %v", err)
+	}
+	if v == nil || len(v) != 0 {
+		t.Fatalf("expected zero-length non-nil value after reopen, got %v", v)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Bug 2 — raw Get/Put share the catalog tree with buckets. A raw Get must not
+// leak a bucket's internal page id, and a raw Put must not overwrite a bucket
+// entry (which would orphan its sub-tree). The write guard lives in node.insert,
+// so it rides the single _put descent (no extra lookup) and also covers nested
+// buckets. Both paths report ErrIncompatibleValue.
+// -----------------------------------------------------------------------------
+
+func TestDBGet_RefusesBucketEntry(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("b"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Get([]byte("b")); !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("db.Get on a bucket name: expected ErrIncompatibleValue, got %v", err)
+	}
+}
+
+func TestDBPut_RefusesOverwritingBucket(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		b, err := tx.CreateBucket([]byte("b"))
+		if err != nil {
+			return err
+		}
+		return b.Put([]byte("inner"), []byte("value"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The raw Put must be rejected...
+	if err := db.Put([]byte("b"), []byte("raw")); !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("db.Put over a bucket name: expected ErrIncompatibleValue, got %v", err)
+	}
+
+	// ...and the bucket must be intact afterwards.
+	if err := db.View(func(tx *Tx) error {
+		b := tx.Bucket([]byte("b"))
+		if b == nil {
+			t.Fatal("bucket was destroyed by the refused Put")
+		}
+		if got := b.Get([]byte("inner")); !bytes.Equal(got, []byte("value")) {
+			t.Fatalf("bucket data corrupted: got %q want %q", got, "value")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTxPut_RefusesOverwritingBucket(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("b"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A raw Put through a writable transaction hits the same catalog tree, so it
+	// must be refused too.
+	err = db.Update(func(tx *Tx) error {
+		return tx.Put([]byte("b"), []byte("raw"))
+	})
+	if !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("tx.Put over a bucket name: expected ErrIncompatibleValue, got %v", err)
+	}
+
+	// The bucket must still resolve.
+	if err := db.View(func(tx *Tx) error {
+		b := tx.Bucket([]byte("b"))
+		if b == nil {
+			t.Fatal("bucket was destroyed by the refused tx.Put")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The guard lives in node.insert, so it also protects nested buckets: a raw
+// bucket.Put must not overwrite a sub-bucket entry inside a parent bucket.
+func TestBucketPut_RefusesOverwritingNestedBucket(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if _, err := parent.CreateBucket([]byte("child")); err != nil {
+			return err
+		}
+		// Overwriting the sub-bucket "child" with a raw value must be refused.
+		if err := parent.Put([]byte("child"), []byte("raw")); !errors.Is(err, ErrIncompatibleValue) {
+			t.Fatalf("bucket.Put over a nested bucket: expected ErrIncompatibleValue, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The nested bucket must still resolve.
+	if err := db.View(func(tx *Tx) error {
+		parent := tx.Bucket([]byte("parent"))
+		if parent == nil {
+			t.Fatal("parent bucket missing")
+		}
+		child, err := parent.Bucket([]byte("child"))
+		if err != nil {
+			t.Fatalf("resolve nested bucket: %v", err)
+		}
+		if child == nil {
+			t.Fatal("nested bucket was destroyed by the refused Put")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A raw Put on a plain (non-bucket) key must still work and overwrite in place.
+func TestDBPut_RawKeyStillWorks(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put([]byte("k"), []byte("v2")); err != nil {
+		t.Fatalf("overwrite plain key: %v", err)
+	}
+	v, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(v, []byte("v2")) {
+		t.Fatalf("got %q want %q", v, "v2")
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Bug 3 — CreateBucket must not silently turn an existing plain value into a
+// bucket pointer. tx.Bucket used to report "not found" and "found but not a
+// bucket" the same way (nil, no error), so CreateBucket's existence check could
+// not tell them apart, and node.insert only ever updated an overwritten entry's
+// value, never its flags. Together, creating a bucket over an existing key
+// replaced the value with a bucket pgid while leaving the entry unmarked as a
+// bucket — the original value was gone, and nothing pointed at the new page
+// either. Both directions must now be refused with ErrIncompatibleValue and
+// leave the existing entry untouched.
+// -----------------------------------------------------------------------------
+
+func TestCreateBucket_RefusesOverwritingValue(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte("plain-value")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("k"))
+		return err
+	}); !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("CreateBucket over a plain key: expected ErrIncompatibleValue, got %v", err)
+	}
+
+	// The original value must be untouched, and still a plain (non-bucket) value.
+	got, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("value destroyed by the refused CreateBucket: %v", err)
+	}
+	if !bytes.Equal(got, []byte("plain-value")) {
+		t.Fatalf("value corrupted by the refused CreateBucket: got %q", got)
+	}
+}
+
+func TestBucketCreateBucket_RefusesOverwritingNestedValue(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if err := parent.Put([]byte("k"), []byte("plain-value")); err != nil {
+			return err
+		}
+		if _, err := parent.CreateBucket([]byte("k")); !errors.Is(err, ErrIncompatibleValue) {
+			t.Fatalf("nested CreateBucket over a plain key: expected ErrIncompatibleValue, got %v", err)
+		}
+		if got := parent.Get([]byte("k")); !bytes.Equal(got, []byte("plain-value")) {
+			t.Fatalf("value corrupted by the refused nested CreateBucket: got %q", got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Bug 4 — a committed-but-not-yet-checkpointed WAL record must carry the txid it
+// was actually committed under. persistCollectedRecords stamped the txid onto a
+// range-loop copy of each record before encoding it, but copied the ORIGINAL
+// (pre-stamp) record into wal.overlay, so every overlay record carried a stale
+// txid. Nothing reads that field today, but it exists for future crash-recovery
+// ordering, so it must be correct now rather than silently wrong.
+// -----------------------------------------------------------------------------
+
+func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+
+	wantTxid := db.wal.nextTxid - 1 // the txid the commit above was just stamped with
+	if len(db.wal.overlay) == 0 {
+		t.Fatal("expected at least one overlay record after a commit")
+	}
+	for pgid, record := range db.wal.overlay {
+		if record.header.txid != wantTxid {
+			t.Fatalf("overlay record for pgid %d has txid %d, want %d (the committing transaction's txid)",
+				pgid, record.header.txid, wantTxid)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Bug 5 — a single key/value pair that alone overflows a page cannot be split
+// (both halves of a split must be non-empty), so it used to fail with the
+// internal ErrNodeNotSaturated leaking straight out of Put. That error describes
+// a split precondition, not something a caller can act on. It must now surface as
+// a clear, documented error instead.
+// -----------------------------------------------------------------------------
+
+func TestPut_EntryTooLargeForPageReturnsClearError(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	huge := bytes.Repeat([]byte("x"), int(db.meta.pageSize))
+	if err := db.Put([]byte("k"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
+		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Bug 6 — a *Bucket must own a private copy of its name. CreateBucket and Bucket
+// stored the caller's []byte directly, and writeBackRoot reads that field again on
+// every later split (to write the bucket's moved root pgid back into the parent's
+// tree). If the caller reuses or mutates that buffer after getting the handle
+// back, a later split silently writes the pointer update under whatever the
+// buffer now holds instead of the bucket's real name: the real name's catalog
+// entry is left pointing at the stale pre-split root (losing every key that moved
+// to the split's other half), and a phantom entry appears under the mutated name.
+// -----------------------------------------------------------------------------
+
+func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const n = 100
+	val := bytes.Repeat([]byte("x"), 512) // enough to split the bucket's own tree
+
+	name := []byte("aaaa")
+	err = db.Update(func(tx *Tx) error {
+		b, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+
+		// Simulate the caller reusing its name buffer for something else, the way a
+		// scratch key-building buffer would be reused across iterations.
+		copy(name, "bbbb")
+
+		for i := 0; i < n; i++ {
+			if err := b.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		if tx.Bucket([]byte("bbbb")) != nil {
+			t.Fatal("phantom bucket \"bbbb\" created: writeBackRoot used the caller's mutated buffer as the key")
+		}
+		aaaa := tx.Bucket([]byte("aaaa"))
+		if aaaa == nil {
+			t.Fatal("bucket \"aaaa\" lost: writeBackRoot no longer wrote back under the real name")
+		}
+		for i := 0; i < n; i++ {
+			k := fmt.Appendf(nil, "key-%05d", i)
+			if got := aaaa.Get(k); !bytes.Equal(got, val) {
+				t.Fatalf("key %q lost after split: the moved root was written back under the wrong name", k)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const n = 100
+	val := bytes.Repeat([]byte("x"), 512) // enough to split the nested bucket's own tree
+
+	name := []byte("aaaa")
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+
+		copy(name, "bbbb")
+
+		for i := 0; i < n; i++ {
+			if err := child.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		parent := tx.Bucket([]byte("parent"))
+		if parent == nil {
+			t.Fatal("parent bucket missing")
+		}
+		if b, err := parent.Bucket([]byte("bbbb")); err != nil || b != nil {
+			t.Fatalf("phantom nested bucket \"bbbb\" created: writeBackRoot used the caller's mutated buffer as the key (err=%v)", err)
+		}
+		aaaa, err := parent.Bucket([]byte("aaaa"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if aaaa == nil {
+			t.Fatal("nested bucket \"aaaa\" lost: writeBackRoot no longer wrote back under the real name")
+		}
+		for i := 0; i < n; i++ {
+			k := fmt.Appendf(nil, "key-%05d", i)
+			if got := aaaa.Get(k); !bytes.Equal(got, val) {
+				t.Fatalf("key %q lost after split: the moved root was written back under the wrong name", k)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }

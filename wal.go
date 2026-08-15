@@ -90,11 +90,6 @@ func (wal *WAL) insertMetaRecord(meta *Meta) {
 
 func (wal *WAL) collectRecord(record *Record) {
 	wal.collectedRecords[record.header.pgid] = *record
-	wal.bytesSinceCheckpoint += uint32(record.size())
-}
-
-func (record *Record) size() int {
-	return recordHeaderSize + len(record.pageContent) + 8 // 8 bytes for checksum
 }
 
 func (wal *WAL) readRecords() (*[]Record, error) {
@@ -241,7 +236,7 @@ func (wal *WAL) persistCollectedRecords() error {
 	largeBuf := new(bytes.Buffer)
 	recordBuffer := new(bytes.Buffer)
 
-	for _, record := range wal.collectedRecords {
+	for pgid, record := range wal.collectedRecords {
 		record.header.txid = txid
 
 		if err := encodeRecord(recordBuffer, &record, wal.db.meta.pageSize); err != nil {
@@ -253,15 +248,21 @@ func (wal *WAL) persistCollectedRecords() error {
 		if err != nil {
 			return err
 		}
+
+		// Write the stamped copy back into the map
+		wal.collectedRecords[pgid] = record
 	}
 
 	if err := wal.insertCommitMarker(largeBuf, txid); err != nil {
 		return err
 	}
 
+	walBytes := uint32(largeBuf.Len())
+
 	if err := writeFull(wal.file, largeBuf.Bytes()); err != nil {
 		return fmt.Errorf("persist multiple records: %w", err)
 	}
+	wal.bytesSinceCheckpoint += walBytes
 
 	// transaction complete, reset collectedRecords
 

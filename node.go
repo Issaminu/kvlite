@@ -82,23 +82,28 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 	return low, false, nil
 }
 
-func (n *Node) get(key []byte) ([]byte, uint32, error) {
+// get looks a key up in this leaf. The returned found reports whether the key is
+// present; callers must use it rather than a nil value to decide "missing",
+// because a stored value can legitimately be empty. When found is true, the
+// returned value is always non-nil (an empty stored value comes back as a
+// zero-length slice), so a nil value never means "present but empty".
+func (n *Node) get(key []byte) (value []byte, flags uint32, found bool, err error) {
 	if !n.IsLeaf {
-		return nil, 0, ErrNotLeafNode
+		return nil, 0, false, ErrNotLeafNode
 	}
 	idx, found, err := n.findKeyIndex(key)
-
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, false, err
 	}
-
 	if !found {
-		return nil, 0, nil
+		return nil, 0, false, nil
 	}
 
-	flags := n.entries[idx].flags
-	value := slices.Clone(n.entries[idx].value)
-	return value, flags, nil
+	value = slices.Clone(n.entries[idx].value)
+	if value == nil {
+		value = []byte{}
+	}
+	return value, n.entries[idx].flags, true, nil
 }
 
 func (n *Node) insert(key, value []byte, flags uint32) error {
@@ -124,6 +129,12 @@ func (n *Node) insert(key, value []byte, flags uint32) error {
 		return err
 	}
 	if found {
+		existingIsBucket := n.entries[idx].flags&BucketLeafFlag != 0
+		newIsBucket := flags&BucketLeafFlag != 0
+		if existingIsBucket != newIsBucket {
+			return ErrIncompatibleValue
+		}
+		n.entries[idx].flags = flags
 		n.entries[idx].value = valueCopy
 		return nil
 	}
