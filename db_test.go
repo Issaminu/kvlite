@@ -4178,6 +4178,64 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 	}
 }
 
+func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := []byte("k")
+	if err := db.Put(key, []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.pageSize
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Truncate(info.Size() + pageSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+
+	const (
+		leafMarkerBytes    = 1 // A node starts with one byte that identifies a leaf.
+		entryCountBytes    = 4 // The entry count uses one uint32 value.
+		entryFlagsBytes    = 4 // Each entry stores flags in one uint32 value.
+		encodedLengthBytes = 4 // Each key or value length uses one uint32 value.
+	)
+	valueLengthOffset := pageSize + leafMarkerBytes + entryCountBytes + entryFlagsBytes + encodedLengthBytes + int64(len(key))
+	valueLength := make([]byte, encodedLengthBytes)
+	binary.LittleEndian.PutUint32(valueLength, uint32(pageSize))
+	if _, err := file.WriteAt(valueLength, valueLengthOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if !errors.Is(err, ErrInvalid) {
+		if reopened != nil {
+			_ = reopened.Close()
+		}
+		t.Fatalf("Open error: got %v, want ErrInvalid for a node value that crossed its page boundary", err)
+	}
+}
+
 func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)

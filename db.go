@@ -501,12 +501,15 @@ func (db *DB) readNode(pgid Pgid) (*Node, error) {
 		return node, nil
 	}
 
-	// Node not found in-memory, so we have to search in db file
-
+	// Node not found in-memory, so we have to read its full page from the database file.
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return nil, err
 	}
-	node, err := readNode(db.file)
+	page := make([]byte, db.meta.pageSize)
+	if _, err := io.ReadFull(db.file, page); err != nil {
+		return nil, err
+	}
+	node, err := readNode(bytes.NewReader(page))
 	if err != nil {
 		return nil, err
 	}

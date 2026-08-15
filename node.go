@@ -148,7 +148,7 @@ func (n *Node) insert(key, value []byte, flags uint32) error {
 	return nil
 }
 
-func readNode(r io.Reader) (*Node, error) {
+func readNode(r *bytes.Reader) (*Node, error) {
 	node := &Node{}
 	node, err := decodeNode(r)
 
@@ -158,8 +158,8 @@ func readNode(r io.Reader) (*Node, error) {
 	return node, nil
 }
 
-// Decodes an io.Reader (or a type that did implicit interface satisfaction, like *bytes.Buffer) into a *Node
-func decodeNode(r io.Reader) (*Node, error) {
+// Decodes one bounded node buffer into a Node.
+func decodeNode(r *bytes.Reader) (*Node, error) {
 	node := &Node{}
 	var isLeafByte byte
 	if err := binary.Read(r, binary.LittleEndian, &isLeafByte); err != nil {
