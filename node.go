@@ -16,6 +16,7 @@ const (
 type KVLength uint32 // Size of the prefixed length of an Entry's `key` or `Value`
 
 type Entry struct {
+	flags uint32
 	key   []byte
 	value []byte
 }
@@ -69,25 +70,26 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 	return low, false, nil
 }
 
-func (n *Node) get(key []byte) ([]byte, bool, error) {
+func (n *Node) get(key []byte) ([]byte, uint32, error) {
 	if !n.IsLeaf {
-		return nil, false, ErrNotLeafNode
+		return nil, 0, ErrNotLeafNode
 	}
 	idx, found, err := n.findKeyIndex(key)
 
 	if err != nil {
-		return nil, false, err
+		return nil, 0, err
 	}
 
 	if !found {
-		return nil, false, nil
+		return nil, 0, nil
 	}
 
+	flags := n.entries[idx].flags
 	value := slices.Clone(n.entries[idx].value)
-	return value, true, nil
+	return value, flags, nil
 }
 
-func (n *Node) insert(key, value []byte) error {
+func (n *Node) insert(key, value []byte, flags uint32) error {
 	if len(key) == 0 {
 		return ErrKeyEmpty
 	}
@@ -114,7 +116,7 @@ func (n *Node) insert(key, value []byte) error {
 		return nil
 	}
 
-	newEntry := Entry{key: keyCopy, value: valueCopy}
+	newEntry := Entry{flags: flags, key: keyCopy, value: valueCopy}
 
 	n.entries = append(n.entries, Entry{})
 	copy(n.entries[idx+1:], n.entries[idx:])
@@ -149,19 +151,23 @@ func decodeNode(r io.Reader) (*Node, error) {
 
 	// looping through the entries (keys and values) of this node
 	for i := uint32(0); i < count; i++ {
+		var flags uint32
+		if err := binary.Read(r, binary.LittleEndian, &flags); err != nil {
+			return nil, fmt.Errorf("read node flags %d: %w", i, err)
+		}
 		key, err := readLengthPrefixedBytes[KVLength](r)
 		if err != nil {
 			return nil, fmt.Errorf("read node key %d: %w", i, err)
 		}
 		if !node.IsLeaf { // meaning we can only read the key
-			node.entries = append(node.entries, Entry{key: key})
+			node.entries = append(node.entries, Entry{flags: flags, key: key})
 			continue
 		}
 		value, err := readLengthPrefixedBytes[KVLength](r)
 		if err != nil {
 			return nil, fmt.Errorf("read node value %d: %w", i, err)
 		}
-		node.entries = append(node.entries, Entry{key: key, value: value})
+		node.entries = append(node.entries, Entry{flags: flags, key: key, value: value})
 	}
 
 	if !node.IsLeaf {
@@ -215,6 +221,9 @@ func encodeNode(node *Node, buf *bytes.Buffer) error {
 	}
 
 	for _, e := range node.entries {
+		if err := binary.Write(buf, binary.LittleEndian, e.flags); err != nil {
+			return fmt.Errorf("write node flags: %w", err)
+		}
 		if err := writeLengthPrefixedBytes[KVLength](buf, e.key); err != nil {
 			return fmt.Errorf("write node key: %w", err)
 		}

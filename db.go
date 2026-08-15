@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 )
 
@@ -186,32 +187,49 @@ func (db *DB) Path() string {
 }
 
 func (db *DB) Put(key []byte, value []byte) error {
+	node, err := db._put(db.rootNode, key, value, 0, true) // forceCommit is true for single Put() operation
+	if err != nil {
+		return err
+	}
+	if node != nil {
+		db.rootNode = node
+		db.meta.root = node.pgid
+	}
+
+	return nil
+}
+
+// _put() places a key in it's correct place starting from a root *Node.
+// Due to node splitting, it's possible that the the new root (starting from the provided rootNode) is not actually the root of that tree.
+// returns (*NewRootNode, error), since it's possible that the root was split within the process.
+// if `rootNode != NewRootNode`, please assign it as the new root node of the tree.
+func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, forceCommit bool) (*Node, error) {
 	if db.options.ReadOnly {
-		return ErrDatabaseReadOnly
+		return nil, ErrDatabaseReadOnly
 	}
 
 	if len(key) == 0 {
-		return ErrKeyEmpty
+		return nil, ErrKeyEmpty
 	}
 	if len(key) > MaxKeySize {
-		return ErrKeyTooLarge
+		return nil, ErrKeyTooLarge
 	}
 	if len(value) > MaxValueSize {
-		return ErrValueTooLarge
+		return nil, ErrValueTooLarge
 	}
 
-	node := db.rootNode
+	node := rootNode
 	for !node.IsLeaf {
 		childIndex, err := node.findChildIndex(key)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		childNode, err := db.readNode(node.Children[childIndex])
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if childNode == nil {
-			return ErrKeyNotFound
+			return nil, ErrKeyNotFound
 		}
 
 		childNode.parent = node
@@ -220,25 +238,29 @@ func (db *DB) Put(key []byte, value []byte) error {
 		node = childNode
 	}
 
-	if err := node.insert(key, value); err != nil {
-		return err
+	if err := node.insert(key, value, flags); err != nil {
+		return nil, err
 	}
 
 	if !node.needsSplit() {
 		db.wal.insertNodeRecord(node)
 		db.wal.insertMetaRecord(db.meta)
 
-		return db.wal.persistCollectedRecords()
+		if !forceCommit {
+			return rootNode, nil
+		}
+
+		return rootNode, db.wal.persistCollectedRecords()
 	}
 
 	for node.needsSplit() {
 		rightPgid := db.allocate()
 		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid)
 		if err != nil {
-			return err
+			return nil, err
 		}
 
-		if node == db.rootNode {
+		if node == rootNode {
 			var newEntries []Entry
 
 			if node.IsLeaf {
@@ -260,8 +282,7 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 			db.wal.insertNodeRecord(newRoot)
 
-			db.rootNode = newRoot
-			db.meta.root = newRoot.pgid
+			rootNode = newRoot
 		} else { // parent is not a root node
 			parent := node.parent
 			rightNode.parent = parent
@@ -295,29 +316,39 @@ func (db *DB) Put(key []byte, value []byte) error {
 
 	db.wal.insertMetaRecord(db.meta)
 
-	return db.wal.persistCollectedRecords()
+	// forceCommit is true for single Put operations, and false for multi Put operations (transaction)
+	// for transactions, the persistCollectedRecords() happens elsewhere
+	if !forceCommit {
+		return rootNode, nil
+	}
+	return rootNode, db.wal.persistCollectedRecords()
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
+	value, _, err := db._get(db.rootNode, key)
+	return value, err
+}
+
+func (db *DB) _get(rootNode *Node, key []byte) ([]byte, uint32, error) {
 	if len(key) == 0 {
-		return nil, ErrKeyEmpty
+		return nil, 0, ErrKeyEmpty
 	}
 	if len(key) > MaxKeySize {
-		return nil, ErrKeyTooLarge
+		return nil, 0, ErrKeyTooLarge
 	}
 
-	node := db.rootNode
+	node := rootNode
 	for !node.IsLeaf {
 		childIndex, err := node.findChildIndex(key)
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		childNode, err := db.readNode(node.Children[childIndex])
 		if err != nil {
-			return nil, err
+			return nil, 0, err
 		}
 		if childNode == nil {
-			return nil, ErrKeyNotFound
+			return nil, 0, ErrKeyNotFound
 		}
 
 		childNode.parent = node
@@ -326,14 +357,14 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		node = childNode
 	}
 
-	value, found, err := node.get(key)
+	value, flags, err := node.get(key)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	if !found {
-		return nil, ErrKeyNotFound
+	if value == nil {
+		return nil, 0, ErrKeyNotFound
 	}
-	return value, nil
+	return value, flags, nil
 }
 
 func (db *DB) persistNode(node *Node) error {
@@ -509,4 +540,70 @@ func (db *DB) applyOptions(options *Options) {
 	if options.synchronous != SYNCHRONOUS_DEFAULT {
 		db.options.synchronous = options.synchronous
 	}
+}
+
+func (db *DB) Update(transaction func(tx *Tx) error) error {
+	if db.options.ReadOnly {
+		return ErrDatabaseReadOnly
+	}
+
+	tx := &Tx{db: db, readOnly: false}
+
+	// take snapshot
+
+	bytesSinceCheckpoint := db.wal.bytesSinceCheckpoint
+	records := maps.Clone(db.wal.collectedRecords)
+	metaSnapshot := *db.meta
+
+	if err := transaction(tx); err != nil {
+		// transaction failed, revert back to snapshot
+		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, &metaSnapshot); rbErr != nil {
+			return errors.Join(err, rbErr)
+		}
+		return err
+	}
+
+	// transaction succeeded
+	if err := db.wal.persistCollectedRecords(); err != nil {
+		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, &metaSnapshot); rbErr != nil {
+			return errors.Join(err, rbErr)
+		}
+		return err
+	}
+
+	return nil
+}
+
+func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, metaSnapshot *Meta) error {
+	db.wal.bytesSinceCheckpoint = bytesSinceCheckpoint
+	db.wal.collectedRecords = records
+	db.meta = metaSnapshot
+	root, err := db.readNode(metaSnapshot.root)
+	if err != nil {
+		return fmt.Errorf("reload root node: %w", err)
+	}
+	db.rootNode = root
+	return nil
+}
+
+func (db *DB) View(transaction func(tx *Tx) error) error {
+	tx := &Tx{db: db, readOnly: true}
+
+	// take snapshot
+
+	bytesSinceCheckpoint := db.wal.bytesSinceCheckpoint
+	records := maps.Clone(db.wal.collectedRecords)
+	metaSnapshot := *db.meta
+
+	if err := transaction(tx); err != nil {
+		// transaction failed, revert back to snapshot
+		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, &metaSnapshot); rbErr != nil {
+			return errors.Join(err, rbErr)
+		}
+		return err
+	}
+
+	// transaction succeeded
+
+	return nil
 }
