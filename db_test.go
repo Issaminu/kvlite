@@ -2258,3 +2258,240 @@ func TestBucket_Nested(t *testing.T) {
 	defer db.Close()
 	verify(t, db, "after reopen")
 }
+
+// -----------------------------------------------------------------------------
+// Spring-cleaning Phase 1 — bug fixes (TDD: these are RED before the fix).
+// -----------------------------------------------------------------------------
+
+// TestSplit_LargeValuesGetOwnNode: a value whose encoded size reaches half a page
+// must still split cleanly. Node.split cuts at the first entry that reaches
+// pageSize/2, so if the FIRST entry already exceeds that limit the separator index
+// is 0 — the left node becomes EMPTY and the right node keeps the whole (over-page)
+// content. The split loop in _put then advances to the parent and never re-checks
+// that oversized right node. Result: two ~0.6-page values (which fit fine at one
+// entry per node) are rejected with "record page content exceeds page size", or a
+// corrupt empty leaf is wired under a branch separator.
+func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page := int(db.meta.pageSize)
+	// Each value is ~0.6 of a page: one entry per node fits, two never do.
+	vlen := page * 6 / 10
+	const n = 6
+	keys := make([][]byte, n)
+	vals := make([][]byte, n)
+	for i := 0; i < n; i++ {
+		keys[i] = fmt.Appendf(nil, "key-%03d", i)
+		vals[i] = bytes.Repeat([]byte{byte('a' + i)}, vlen)
+		if err := db.Put(keys[i], vals[i]); err != nil {
+			t.Fatalf("put %d (value %d bytes, page %d): %v", i, vlen, page, err)
+		}
+	}
+
+	// Every node must fit one page and hold at least one entry (no empty leaf).
+	walkNodes(t, db, func(nd *Node) {
+		if sz := nd.serializedSize(); sz > page {
+			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
+		}
+		if len(nd.entries) == 0 {
+			t.Fatalf("empty node in the tree (split produced a node with no entries)")
+		}
+	})
+
+	verify := func(t *testing.T, db *DB, when string) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			got, err := db.Get(keys[i])
+			if err != nil {
+				t.Fatalf("%s: get %d: %v", when, i, err)
+			}
+			if !bytes.Equal(got, vals[i]) {
+				t.Fatalf("%s: value %d wrong: got %d bytes want %d", when, i, len(got), len(vals[i]))
+			}
+		}
+	}
+	verify(t, db, "in-session")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	verify(t, db, "after reopen")
+}
+
+// TestBucket_HandleSurvivesCatalogSplit: a live bucket handle held across a catalog
+// (top-level root) split must still write back to the RIGHT place. A Bucket caches
+// its parent as a raw *Node taken at creation time. When later CreateBucket calls
+// split the catalog, db.rootNode becomes a new object and the cached parent goes
+// stale. The bucket name "zzz-bucket" sorts last, so the split moves its catalog
+// entry OFF the original (in-place) left node onto a new right node — the stale
+// cached parent no longer holds it. When the held bucket then splits its own tree,
+// Bucket.Put writes the new root pgid into the stale parent node, not the real
+// catalog entry. The catalog keeps pointing at the pre-split bucket root, so every
+// key added after the bucket split is lost.
+//
+// RED today: the post-split keys vanish. GREEN once the writeback resolves the
+// parent from the current tree instead of a stale cached node.
+func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const nCatalog = 1200 // enough name->pgid entries to split the catalog tree
+	const nBig = 100
+	bigVal := bytes.Repeat([]byte("x"), 512) // grows the held bucket past one page
+
+	if err := db.Update(func(tx *Tx) error {
+		// Create and HOLD the handle while the catalog is still one leaf.
+		// The name sorts last, so a catalog split moves it to a new node.
+		held, err := tx.CreateBucket([]byte("zzz-bucket"))
+		if err != nil {
+			return err
+		}
+		if err := held.Put([]byte("seed"), []byte("seed")); err != nil {
+			return err
+		}
+		// Split the catalog with many smaller-sorting buckets.
+		for i := 0; i < nCatalog; i++ {
+			if _, err := tx.CreateBucket(fmt.Appendf(nil, "bkt-%05d", i)); err != nil {
+				return fmt.Errorf("create catalog bucket %d: %w", i, err)
+			}
+		}
+		// Now split the HELD bucket's own tree via its (now stale) parent handle.
+		for j := 0; j < nBig; j++ {
+			if err := held.Put(fmt.Appendf(nil, "big-%05d", j), bigVal); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+
+	verify := func(t *testing.T, db *DB, when string) {
+		t.Helper()
+		if err := db.View(func(tx *Tx) error {
+			b := tx.Bucket([]byte("zzz-bucket"))
+			if b == nil {
+				t.Fatalf("%s: held bucket lost", when)
+			}
+			for j := 0; j < nBig; j++ {
+				k := fmt.Appendf(nil, "big-%05d", j)
+				if got := b.Get(k); !bytes.Equal(got, bigVal) {
+					t.Fatalf("%s: key %q lost (writeback landed on a stale parent node): got %d bytes", when, k, len(got))
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	verify(t, db, "in-session")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	verify(t, db, "after reopen")
+}
+
+// TestSplit_OneLeafSplitsIntoThree: a single Put can create a node that ONE balanced
+// split still leaves over a page. Fill one leaf with small entries to just under a
+// page, then insert a single medium value (~0.85 page, sorts last). The overflowing
+// node is now ~1.5 pages: cutting it at half a page leaves ~half the small entries
+// PLUS the medium value on the right — still over a page. The split loop must keep
+// splitting that right sibling until every node fits; if it only splits once and
+// climbs, the oversized right node is rejected at persist ("record page content
+// exceeds page size") and the Put fails.
+func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	page := int(db.meta.pageSize)
+	smallVal := bytes.Repeat([]byte("s"), 100)
+	smallEntry := 12 + 6 + len(smallVal) // flags(4)+keylen(4)+key(6)+vallen(4)+val
+	// Fill one leaf to ~0.9 of a page so it stays a single leaf before the big insert.
+	nSmall := (page * 9 / 10) / smallEntry
+	keys := make([][]byte, 0, nSmall+1)
+	for i := 0; i < nSmall; i++ {
+		k := fmt.Appendf(nil, "k%05d", i) // 6 bytes, all sort before the big key
+		if err := db.Put(k, smallVal); err != nil {
+			t.Fatalf("small put %d: %v", i, err)
+		}
+		keys = append(keys, k)
+	}
+	if !db.rootNode.IsLeaf {
+		t.Fatalf("setup: root split before the big insert (nSmall=%d too high)", nSmall)
+	}
+
+	// One medium value, sorts last, ~0.85 page: legal (< one page) but big enough that
+	// half the leaf plus this value still overflows a page after a single split.
+	bigKey := []byte("zzz-big")
+	bigVal := bytes.Repeat([]byte("B"), page*85/100)
+	if err := db.Put(bigKey, bigVal); err != nil {
+		t.Fatalf("big put (the one a single-split loop rejects): %v", err)
+	}
+	keys = append(keys, bigKey)
+
+	// The big insert must have grown the tree to at least three leaves.
+	leaves := 0
+	walkNodes(t, db, func(nd *Node) {
+		if sz := nd.serializedSize(); sz > page {
+			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
+		}
+		if nd.IsLeaf {
+			leaves++
+		}
+	})
+	if leaves < 3 {
+		t.Fatalf("expected >= 3 leaves (one leaf must split into three), got %d", leaves)
+	}
+
+	verify := func(t *testing.T, db *DB, when string) {
+		t.Helper()
+		for _, k := range keys {
+			want := smallVal
+			if bytes.Equal(k, bigKey) {
+				want = bigVal
+			}
+			got, err := db.Get(k)
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("%s: key %q wrong: err=%v got %d bytes want %d", when, k, err, len(got), len(want))
+			}
+		}
+	}
+	verify(t, db, "in-session")
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	verify(t, db, "after reopen")
+}

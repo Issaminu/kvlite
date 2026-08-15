@@ -356,6 +356,12 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32, force
 		db.wal.insertNodeRecord(node)
 		db.wal.insertNodeRecord(rightNode)
 
+		// The right sibling can itself still overflow a page.
+		// So keep splitting it before climbing, so no node is left over a page.
+		if rightNode.needsSplit() {
+			node = rightNode
+			continue
+		}
 		node = node.parent
 	}
 

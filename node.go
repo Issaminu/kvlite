@@ -286,6 +286,24 @@ func (n *Node) split(newPgid Pgid) (*Node, int, []byte, error) { // Returns (new
 		return nil, seperatorIndex, nil, ErrNodeNotSaturated
 	}
 
+	// Keep both sides non-empty. The half-page cut lands on index 0 when the first
+	// entry alone fills half a page; without this clamp the left node would be empty
+	// and the right node would keep the whole over-page content — an invalid split.
+	// A leaf keeps [:sep] on the left and [sep:] on the right, so sep must be in
+	// [1, len-1]. A branch also pushes entries[sep] up, so its right side is
+	// [sep+1:]; sep must be in [1, len-2], which needs at least 3 entries.
+	if n.IsLeaf {
+		if len(n.entries) < 2 {
+			return nil, -1, nil, ErrNodeNotSaturated
+		}
+		seperatorIndex = min(max(seperatorIndex, 1), len(n.entries)-1)
+	} else {
+		if len(n.entries) < 3 {
+			return nil, -1, nil, ErrNodeNotSaturated
+		}
+		seperatorIndex = min(max(seperatorIndex, 1), len(n.entries)-2)
+	}
+
 	rightNode := n.db.newLeafNode(newPgid)
 
 	rightNode.IsLeaf = n.IsLeaf

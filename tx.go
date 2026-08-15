@@ -38,10 +38,21 @@ func (tx *Tx) Get(key []byte) ([]byte, error) {
 }
 
 type Bucket struct {
-	tx       *Tx
-	name     []byte
-	rootNode *Node
-	parent   *Node
+	tx           *Tx
+	name         []byte
+	rootNode     *Node
+	parentBucket *Bucket
+}
+
+// writeBackRoot records this bucket's (possibly moved) root pgid into the entry that points at it
+func (b *Bucket) writeBackRoot() error {
+	db := b.tx.db
+	container := db.rootNode
+	if b.parentBucket != nil {
+		container = b.parentBucket.rootNode
+	}
+	_, err := db._put(container, b.name, encode(b.rootNode.pgid), BucketLeafFlag, false)
+	return err
 }
 
 func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
@@ -58,10 +69,10 @@ func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
 	tx.db.wal.insertNodeRecord(bucketRootNode)
 
 	bucket = &Bucket{
-		tx:       tx,
-		name:     bucketName,
-		rootNode: bucketRootNode,
-		parent:   tx.db.rootNode,
+		tx:           tx,
+		name:         bucketName,
+		rootNode:     bucketRootNode,
+		parentBucket: nil, // top-level: entry lives in the DB catalog
 	}
 
 	newRootNode, err := tx.db._put(tx.db.rootNode, []byte(bucketName), encode(newPgid), BucketLeafFlag, false)
@@ -104,7 +115,7 @@ func (tx *Tx) Bucket(bucketName []byte) *Bucket {
 		return nil
 	}
 
-	return &Bucket{tx: tx, name: bucketName, rootNode: bucketRootNode, parent: tx.db.rootNode}
+	return &Bucket{tx: tx, name: bucketName, rootNode: bucketRootNode, parentBucket: nil}
 }
 
 func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
@@ -124,31 +135,23 @@ func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
 	bucket.tx.db.wal.insertNodeRecord(bucketRootNode)
 
 	newBucket = &Bucket{
-		tx:       bucket.tx,
-		name:     bucketName,
-		rootNode: bucketRootNode,
-		parent:   bucket.rootNode,
+		tx:           bucket.tx,
+		name:         bucketName,
+		rootNode:     bucketRootNode,
+		parentBucket: bucket,
 	}
 
+	// Insert the child's name->root entry into this bucket's own tree. That insert
+	// can split this bucket; if its root moves, write the new root back up the chain.
 	newRoot, err := bucket.tx.db._put(bucket.rootNode, newBucket.name, encode(newBucket.rootNode.pgid), BucketLeafFlag, false)
 	if err != nil {
 		return nil, err
 	}
-	if newRoot == bucket.rootNode {
-		return newBucket, nil
-	}
-
-	bucket.rootNode = newRoot
-	// The parent bucket's root moved, so the child now hangs off the new root.
-	newBucket.parent = bucket.rootNode
-
-	parentRoot, err := bucket.tx.db._put(bucket.parent, bucket.name, encode(bucket.rootNode.pgid), BucketLeafFlag, false)
-	if err != nil {
-		return nil, err
-	}
-	if parentRoot != bucket.parent && bucket.parent == bucket.tx.db.rootNode {
-		bucket.tx.db.rootNode = parentRoot
-		bucket.tx.db.meta.root = parentRoot.pgid
+	if newRoot != bucket.rootNode {
+		bucket.rootNode = newRoot
+		if err := bucket.writeBackRoot(); err != nil {
+			return nil, err
+		}
 	}
 
 	// Return the newly created child bucket, not the parent we just re-wired.
@@ -181,7 +184,7 @@ func (bucket *Bucket) Bucket(bucketName []byte) (*Bucket, error) {
 		return nil, err
 	}
 
-	return &Bucket{tx: bucket.tx, name: bucketName, rootNode: bucketRootNode, parent: bucket.rootNode}, nil
+	return &Bucket{tx: bucket.tx, name: bucketName, rootNode: bucketRootNode, parentBucket: bucket}, nil
 }
 
 func (bucket *Bucket) Put(key, value []byte) error {
@@ -198,17 +201,7 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	}
 
 	bucket.rootNode = newRoot
-
-	parentRoot, err := bucket.tx.db._put(bucket.parent, bucket.name, encode(bucket.rootNode.pgid), BucketLeafFlag, false)
-	if err != nil {
-		return err
-	}
-	if parentRoot != bucket.parent && bucket.parent == bucket.tx.db.rootNode {
-		bucket.tx.db.rootNode = parentRoot
-		bucket.tx.db.meta.root = parentRoot.pgid
-	}
-
-	return nil
+	return bucket.writeBackRoot()
 }
 
 func (bucket *Bucket) Get(key []byte) []byte {
