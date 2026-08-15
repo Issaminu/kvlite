@@ -3247,3 +3247,63 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Bug 7 — a transaction reported as failed must not leave its data readable.
+// persistCollectedRecords moves collectedRecords into wal.overlay (and clears
+// collectedRecords) BEFORE its own trailing fsync/checkpoint step, which can
+// still fail afterward (a checkpoint can fail partway through draining overlay
+// into the main file). Update() treats that as a failed transaction and rolled
+// back meta/rootNode/collectedRecords, but never touched wal.overlay — so
+// readNode kept serving the "failed" transaction's pages from the overlay
+// forever after. Update/View now snapshot wal.overlay too, and restore it on
+// rollback exactly like collectedRecords.
+// -----------------------------------------------------------------------------
+
+func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	// Large default threshold: this first Put must NOT auto-checkpoint, so its
+	// content lives only in wal.overlay (not yet on the main file) — otherwise
+	// this test's own setup would need the main file to be healthy too.
+	db, err := Open(path, 0644, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("k"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.wal.overlay) == 0 {
+		t.Fatal("test setup: expected the first put to sit in wal.overlay, not be checkpointed yet")
+	}
+
+	// Arrange for exactly the NEXT commit's growth to cross the checkpoint
+	// threshold, so it (and only it) attempts a checkpoint.
+	db.wal.checkpointThresholdBytes = db.wal.bytesSinceCheckpoint + 1
+
+	// Simulate the main file failing right when the checkpoint tries to write to
+	// it. wal.file (used for the WAL write itself) stays open, so the write
+	// succeeds and wal.overlay gets updated before the checkpoint step fails.
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.Update(func(tx *Tx) error {
+		return tx.Put([]byte("k"), []byte("new"))
+	})
+	if err == nil {
+		t.Fatal("expected db.Update to fail once the main file is closed (checkpoint write should fail)")
+	}
+
+	v, err := db.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get after failed update: %v", err)
+	}
+	if !bytes.Equal(v, []byte("old")) {
+		t.Fatalf("read after a FAILED transaction returned %q, want the pre-transaction value %q", v, "old")
+	}
+}

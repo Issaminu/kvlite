@@ -652,11 +652,12 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 
 	bytesSinceCheckpoint := db.wal.bytesSinceCheckpoint
 	records := maps.Clone(db.wal.collectedRecords)
+	overlay := maps.Clone(db.wal.overlay)
 	metaSnapshot := *db.meta
 
 	if err := transaction(tx); err != nil {
 		// transaction failed, revert back to snapshot
-		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, &metaSnapshot); rbErr != nil {
+		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
@@ -664,7 +665,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 
 	// transaction succeeded
 	if err := db.wal.persistCollectedRecords(); err != nil {
-		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, &metaSnapshot); rbErr != nil {
+		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
@@ -673,9 +674,10 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	return nil
 }
 
-func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, metaSnapshot *Meta) error {
+func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, overlay map[Pgid]Record, metaSnapshot *Meta) error {
 	db.wal.bytesSinceCheckpoint = bytesSinceCheckpoint
 	db.wal.collectedRecords = records
+	db.wal.overlay = overlay
 	db.meta = metaSnapshot
 	root, err := db.readNode(metaSnapshot.root)
 	if err != nil {
@@ -692,11 +694,12 @@ func (db *DB) View(transaction func(tx *Tx) error) error {
 
 	bytesSinceCheckpoint := db.wal.bytesSinceCheckpoint
 	records := maps.Clone(db.wal.collectedRecords)
+	overlay := maps.Clone(db.wal.overlay)
 	metaSnapshot := *db.meta
 
 	if err := transaction(tx); err != nil {
 		// transaction failed, revert back to snapshot
-		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, &metaSnapshot); rbErr != nil {
+		if rbErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
