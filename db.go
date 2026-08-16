@@ -146,17 +146,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		}
 	}
 
-	// Load the root node from the main file. A freshly created
-	// DB already has its root in memory.
-	if db.rootNode == nil {
-		rootNode, err := db.readNode(db.meta.root)
-		if err != nil {
-			return db.failOpen(err)
-		}
-		if rootNode == nil {
-			return db.failOpen(fmt.Errorf("read root node: got nil"))
-		}
-		db.rootNode = rootNode
+	if err := db.loadRootNode(); err != nil {
+		return db.failOpen(err)
 	}
 
 	if records != nil && !db.options.ReadOnly {
@@ -190,6 +181,21 @@ func (db *DB) replayWAL(records *[]Record) error {
 		return db.loadCommittedIntoOverlay(records)
 	}
 	return db.ingestWalRecords(records)
+}
+
+func (db *DB) loadRootNode() error {
+	if db.rootNode != nil {
+		return nil
+	}
+	rootNode, err := db.readNode(db.meta.root)
+	if err != nil {
+		return err
+	}
+	if rootNode == nil {
+		return fmt.Errorf("read root node: got nil")
+	}
+	db.rootNode = rootNode
+	return nil
 }
 
 func (db *DB) closeFiles() error {
