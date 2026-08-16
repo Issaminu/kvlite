@@ -56,7 +56,7 @@ var DefaultOptions = &Options{
 type DB struct {
 	path     string
 	file     *os.File
-	meta     *Meta
+	meta     *page.Meta
 	rootNode *Node
 	options  *Options
 	wal      *WAL
@@ -104,7 +104,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	isNew := !db.hasMeta()
 	var mainMetaErr error
 	if isNew {
-		db.meta = NewMeta(int64(db.options.PageSize))
+		db.meta = page.NewMeta(int64(db.options.PageSize))
 	} else {
 		db.meta, err = db.readMeta()
 		if err != nil {
@@ -116,11 +116,11 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 				return db.failOpen(mainMetaErr)
 			}
 		}
-		if db.meta.pageSize < metaEncodedSize || db.meta.pageSize > MaxValueSize {
+		if db.meta.PageSize() < page.MetaSize || db.meta.PageSize() > MaxValueSize {
 			if mainMetaErr != nil {
 				return db.failOpen(mainMetaErr)
 			}
-			return db.failOpen(fmt.Errorf("invalid database page size %d: %w", db.meta.pageSize, ErrInvalid))
+			return db.failOpen(fmt.Errorf("invalid database page size %d: %w", db.meta.PageSize(), ErrInvalid))
 		}
 	}
 
@@ -180,7 +180,7 @@ func (db *DB) initializeNewDatabase() error {
 	if err := db.persistMeta(); err != nil {
 		return fmt.Errorf("init meta: %w", err)
 	}
-	db.rootNode = newLeafNode(db.meta.pgid)
+	db.rootNode = newLeafNode(db.meta.Root())
 	if err := db.persistNode(db.rootNode); err != nil {
 		return fmt.Errorf("init root node: %w", err)
 	}
@@ -204,7 +204,7 @@ func (db *DB) loadRootNode() error {
 	if db.rootNode != nil {
 		return nil
 	}
-	rootNode, err := db.readNode(db.meta.root)
+	rootNode, err := db.readNode(db.meta.Root())
 	if err != nil {
 		return err
 	}
@@ -309,8 +309,8 @@ func (db *DB) validateTreeEntry(entry Entry) error {
 		return ErrValueTooLarge
 	}
 	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
-	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.pageSize) {
-		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.pageSize)
+	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.PageSize()) {
+		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.PageSize())
 	}
 	return nil
 }
@@ -335,21 +335,21 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 		return nil, err
 	}
 
-	if !node.needsSplit(db.meta.pageSize) {
+	if !node.needsSplit(db.meta.PageSize()) {
 		db.wal.insertNodeRecord(node)
 		return rootNode, nil
 	}
 
-	for node.needsSplit(db.meta.pageSize) {
+	for node.needsSplit(db.meta.PageSize()) {
 		rightPgid := db.allocate()
-		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid, db.meta.pageSize)
+		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid, db.meta.PageSize())
 		if err != nil {
 			if errors.Is(err, ErrNodeNotSaturated) {
 				// split() only fails this way when a single entry (or, for a branch,
 				// too few entries) already overflows a page on its own: there is no
 				// way to divide it into two non-empty halves. Surface a clear error
 				// instead of the internal split-precondition failure.
-				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.pageSize)
+				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.PageSize())
 			}
 			return nil, err
 		}
@@ -369,7 +369,7 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 
 		// The right sibling can itself still overflow a page.
 		// So keep splitting it before climbing, so no node is left over a page.
-		if rightNode.needsSplit(db.meta.pageSize) {
+		if rightNode.needsSplit(db.meta.PageSize()) {
 			node = rightNode
 			continue
 		}
@@ -405,11 +405,11 @@ func (db *DB) findTreeEntry(rootNode *Node, key []byte) (Entry, bool, error) {
 }
 
 func (db *DB) persistNode(node *Node) error {
-	offset := int64(node.pgid) * db.meta.pageSize
+	offset := int64(node.pgid) * db.meta.PageSize()
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek node: %w", err)
 	}
-	if err := writeNode(db.file, node, db.meta.pageSize, true); err != nil {
+	if err := writeNode(db.file, node, db.meta.PageSize(), true); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	return nil
@@ -443,11 +443,11 @@ func (db *DB) readNode(pgid page.ID) (*Node, error) {
 
 	// Node not found in-memory, so we have to read its full page from the database file.
 
-	offset := int64(pgid) * db.meta.pageSize
+	offset := int64(pgid) * db.meta.PageSize()
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return nil, err
 	}
-	page := make([]byte, db.meta.pageSize)
+	page := make([]byte, db.meta.PageSize())
 	if err := fileio.ReadFull(db.file, page); err != nil {
 		return nil, err
 	}
@@ -460,25 +460,25 @@ func (db *DB) readNode(pgid page.ID) (*Node, error) {
 	return node, nil
 }
 
-func (db *DB) readMeta() (*Meta, error) {
+func (db *DB) readMeta() (*page.Meta, error) {
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	data := make([]byte, metaEncodedSize)
+	data := make([]byte, page.MetaSize)
 	if err := fileio.ReadFull(db.file, data); err != nil {
 		return nil, errors.Join(ErrInvalid, err)
 	}
-	return decodeMeta(data)
+	return page.DecodeMeta(data)
 }
 
 func (db *DB) persistMeta() error {
 	// recompute checksum
-	db.meta.checksum = db.meta.GenerateChecksum()
+	db.meta.RefreshChecksum()
 
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek meta: %w", err)
 	}
-	if err := fileio.WriteFull(db.file, encodeMeta(db.meta)); err != nil {
+	if err := fileio.WriteFull(db.file, page.EncodeMeta(db.meta)); err != nil {
 		return fmt.Errorf("write meta: %w", err)
 	}
 	return nil
@@ -497,8 +497,7 @@ func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *No
 }
 
 func (db *DB) allocate() page.ID {
-	db.meta.pgid++
-	return db.meta.pgid
+	return db.meta.Allocate()
 }
 
 func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
@@ -557,7 +556,7 @@ func (db *DB) ingestWalRecords(records []Record) error {
 		return err
 	}
 	for _, record := range committed {
-		if err := db.wal.applyRecordToDatabase(&record, db.meta.pageSize); err != nil {
+		if err := db.wal.applyRecordToDatabase(&record, db.meta.PageSize()); err != nil {
 			return err
 		}
 	}
@@ -596,7 +595,7 @@ func committedWALRecords(records []Record) ([]Record, error) {
 	return committed, nil
 }
 
-func metaFromCommittedWAL(records []Record) (*Meta, error) {
+func metaFromCommittedWAL(records []Record) (*page.Meta, error) {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return nil, err
@@ -604,10 +603,10 @@ func metaFromCommittedWAL(records []Record) (*Meta, error) {
 	// starting from the last record downwards to get the most recent version of the meta, then early break then
 	for index := len(committed) - 1; index >= 0; index-- {
 		record := committed[index]
-		if record.header.recordType != recordTypeMeta || record.header.pgid != metaPgid {
+		if record.header.recordType != recordTypeMeta || record.header.pgid != page.MetaID {
 			continue
 		}
-		meta, err := decodeMeta(record.pageContent)
+		meta, err := page.DecodeMeta(record.pageContent)
 		if err != nil {
 			return nil, err
 		}
@@ -634,8 +633,8 @@ func (db *DB) loadCommittedIntoOverlay(records []Record) error {
 		db.wal.overlay[record.header.pgid] = record
 	}
 
-	if metaRecord, ok := db.wal.overlay[metaPgid]; ok {
-		meta, err := decodeMeta(metaRecord.pageContent)
+	if metaRecord, ok := db.wal.overlay[page.MetaID]; ok {
+		meta, err := page.DecodeMeta(metaRecord.pageContent)
 		if err != nil {
 			return fmt.Errorf("read committed meta from WAL: %w", err)
 		}
@@ -660,7 +659,7 @@ func resolveOptions(options *Options) (*Options, error) {
 	if resolved.PageSize == 0 {
 		resolved.PageSize = os.Getpagesize()
 	}
-	if resolved.PageSize < metaEncodedSize || resolved.PageSize > MaxValueSize {
+	if resolved.PageSize < page.MetaSize || resolved.PageSize > MaxValueSize {
 		return nil, fmt.Errorf("invalid database page size %d: %w", resolved.PageSize, ErrInvalid)
 	}
 
@@ -753,7 +752,7 @@ func (db *DB) rollbackTransaction(snapshot *writeTransactionSnapshot) error {
 	db.wal.collectedRecords = snapshot.collectedRecords
 	db.wal.overlay = snapshot.overlay
 	db.meta = &snapshot.meta
-	root, err := db.readNode(snapshot.meta.root)
+	root, err := db.readNode(snapshot.meta.Root())
 	if err != nil {
 		return fmt.Errorf("reload root node: %w", err)
 	}

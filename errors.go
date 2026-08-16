@@ -13,8 +13,8 @@ var errNotImplemented = errors.New("kvlite: not implemented")
 var (
 	ErrDatabaseNotOpen      = errors.New("database not open")
 	ErrInvalid              = page.ErrInvalid
-	ErrVersionNotSupported  = errors.New("database version is not supported by current kvlite version")
-	ErrChecksum             = errors.New("checksum error")
+	ErrVersionNotSupported  = page.ErrVersionNotSupported
+	ErrChecksum             = page.ErrChecksum
 	ErrTxNotWritable        = errors.New("tx not writable")
 	ErrTxClosed             = errors.New("tx closed")
 	ErrDatabaseReadOnly     = errors.New("database is in read-only mode")

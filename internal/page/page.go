@@ -6,8 +6,13 @@ import (
 	"fmt"
 )
 
-var ErrInvalid = errors.New("invalid database")
+var (
+	ErrInvalid             = errors.New("invalid database")
+	ErrVersionNotSupported = errors.New("database version is not supported by current kvlite version")
+	ErrChecksum            = errors.New("checksum error")
+)
 
+// Identifier for the page number (Pgid)
 type ID uint64
 
 // IDSize is the encoded size of a page ID. An ID is one uint64 value.

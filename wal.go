@@ -60,12 +60,12 @@ func (wal *WAL) insertNodeRecord(node *Node) {
 	wal.collectRecord(&record)
 }
 
-func (wal *WAL) insertMetaRecord(meta *Meta) {
-	meta.checksum = meta.GenerateChecksum() // meta is mutated each Put so we should refresh it's checksum before encoding
+func (wal *WAL) insertMetaRecord(meta *page.Meta) {
+	meta.RefreshChecksum()
 
 	record := Record{
-		header:      RecordHeader{recordType: recordTypeMeta, pgid: metaPgid},
-		pageContent: encodeMeta(meta),
+		header:      RecordHeader{recordType: recordTypeMeta, pgid: page.MetaID},
+		pageContent: page.EncodeMeta(meta),
 	}
 
 	wal.collectRecord(&record)
@@ -82,7 +82,7 @@ func (wal *WAL) readRecords() ([]Record, error) {
 
 	var records []Record
 	for {
-		record, err := decodeRecord(wal.file, wal.db.meta.pageSize)
+		record, err := decodeRecord(wal.file, wal.db.meta.PageSize())
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
@@ -273,7 +273,7 @@ func (wal *WAL) persistCollectedRecords() error {
 func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 	transactionSize := recordHeaderSize + recordChecksumSize // The commit marker has no page content.
 	for _, record := range wal.collectedRecords {
-		size, err := encodedRecordSize(&record, wal.db.meta.pageSize)
+		size, err := encodedRecordSize(&record, wal.db.meta.PageSize())
 		if err != nil {
 			return nil, err
 		}
@@ -362,7 +362,7 @@ func (wal *WAL) checkpoint() error {
 
 	// drain in-memory wal.overlay to main
 	for _, record := range wal.overlay {
-		if err := wal.applyRecordToDatabase(&record, wal.db.meta.pageSize); err != nil {
+		if err := wal.applyRecordToDatabase(&record, wal.db.meta.PageSize()); err != nil {
 			return err
 		}
 	}

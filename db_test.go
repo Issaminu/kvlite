@@ -38,39 +38,6 @@ func openDB(path string) (*DB, error) {
 	return Open(path, 0600, &Options{Synchronous: SyncNormal})
 }
 
-func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
-	// Distinct field values make the order and width of every field visible.
-	meta := &Meta{magic: 1, version: 2, pageSize: 3, pgid: 4, root: 5, checksum: 6}
-	want := []byte{
-		1, 0, 0, 0,
-		2, 0, 0, 0,
-		3, 0, 0, 0, 0, 0, 0, 0,
-		4, 0, 0, 0, 0, 0, 0, 0,
-		5, 0, 0, 0, 0, 0, 0, 0,
-		6, 0, 0, 0, 0, 0, 0, 0,
-	}
-
-	encoded := encodeMeta(meta)
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode meta: got %x, want %x", encoded, want)
-	}
-
-	decoded, err := decodeMeta(encoded)
-	if err != nil {
-		t.Fatalf("decode meta: %v", err)
-	}
-	if *decoded != *meta {
-		t.Fatalf("decode meta: got %+v, want %+v", decoded, meta)
-	}
-
-	// The six fields above occupy exactly 40 bytes.
-	for _, size := range []int{39, 41} {
-		if _, err := decodeMeta(make([]byte, size)); !errors.Is(err, ErrInvalid) {
-			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
-		}
-	}
-}
-
 func TestNodeCodec_UsesFixedLeafLayout(t *testing.T) {
 	node := &Node{
 		IsLeaf:  true,
@@ -205,18 +172,18 @@ func (w *oneByteWriter) Write(data []byte) (int, error) {
 }
 
 func TestWriteNode_CompletesPartialWrites(t *testing.T) {
-	meta := NewMeta(int64(os.Getpagesize()))
-	node := newLeafNode(meta.root)
+	meta := page.NewMeta(int64(os.Getpagesize()))
+	node := newLeafNode(meta.Root())
 	if err := node.insertEntry(Entry{key: []byte("key"), value: []byte("value")}); err != nil {
 		t.Fatal(err)
 	}
 
 	writer := new(oneByteWriter)
-	if err := writeNode(writer, node, meta.pageSize, true); err != nil {
+	if err := writeNode(writer, node, meta.PageSize(), true); err != nil {
 		t.Fatal(err)
 	}
-	if writer.Len() != int(meta.pageSize) {
-		t.Fatalf("encoded node size: got %d bytes, want one %d-byte page", writer.Len(), meta.pageSize)
+	if writer.Len() != int(meta.PageSize()) {
+		t.Fatalf("encoded node size: got %d bytes, want one %d-byte page", writer.Len(), meta.PageSize())
 	}
 }
 
@@ -375,7 +342,7 @@ func TestFile_SinglePage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	pageBytes := db.meta.pageSize
+	pageBytes := db.meta.PageSize()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +478,7 @@ func TestSplit_RootBecomesBranch(t *testing.T) {
 	}
 	defer db.Close()
 
-	pageBytes := int(db.meta.pageSize)
+	pageBytes := int(db.meta.PageSize())
 	val := bytes.Repeat([]byte("x"), 256)
 	// Size the count off the page size so this forces ~one split on any page size.
 	entryBytes := 4 + len("key-00000") + 4 + len(val)
@@ -557,7 +524,7 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 		}
 	}
 
-	pageBytes := int(db.meta.pageSize)
+	pageBytes := int(db.meta.PageSize())
 	walkNodes(t, db, func(nd *Node) {
 		if sz := nd.serializedSize(); sz > pageBytes {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page — split must keep every node <= a page", sz, pageBytes)
@@ -620,7 +587,7 @@ func TestSplit_Cascades(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pageBytes := int(db.meta.pageSize)
+	pageBytes := int(db.meta.PageSize())
 	keySize := pageBytes / 16 // safely < pageSize/2 (no oversized-entry edge), fat enough to fill branches fast
 	mkKey := func(i int) []byte {
 		k := fmt.Appendf(nil, "key-%08d-", i)
@@ -1479,8 +1446,8 @@ func TestOpen_PageSizeOptionControlsNewDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if db.meta.pageSize != pageSize {
-		t.Fatalf("new database page size: got %d, want %d", db.meta.pageSize, pageSize)
+	if db.meta.PageSize() != pageSize {
+		t.Fatalf("new database page size: got %d, want %d", db.meta.PageSize(), pageSize)
 	}
 	if got := fileSize(t, path); got != 2*pageSize {
 		t.Fatalf("new database file size: got %d, want two %d-byte pages", got, pageSize)
@@ -1496,8 +1463,8 @@ func TestOpen_PageSizeOptionControlsNewDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if reopened.meta.pageSize != pageSize {
-		t.Fatalf("reopened database page size: got %d, want stored size %d", reopened.meta.pageSize, pageSize)
+	if reopened.meta.PageSize() != pageSize {
+		t.Fatalf("reopened database page size: got %d, want stored size %d", reopened.meta.PageSize(), pageSize)
 	}
 }
 
@@ -1517,7 +1484,7 @@ func TestOpen_ZeroPageSizeUsesOperatingSystemPageSize(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if got, want := db.meta.pageSize, int64(os.Getpagesize()); got != want {
+	if got, want := db.meta.PageSize(), int64(os.Getpagesize()); got != want {
 		t.Fatalf("zero page size: got %d, want operating system page size %d", got, want)
 	}
 }
@@ -1528,7 +1495,7 @@ func TestOpen_InvalidPageSizeDoesNotCreateDatabase(t *testing.T) {
 		pageSize int
 	}{
 		{name: "negative", pageSize: -1},
-		{name: "smaller than metadata", pageSize: metaEncodedSize - 1},
+		{name: "smaller than metadata", pageSize: page.MetaSize - 1},
 		{name: "larger than supported value", pageSize: MaxValueSize + 1},
 	}
 
@@ -2413,8 +2380,8 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	defer db.Close()
 
 	originalRoot := db.rootNode
-	originalMetaRoot := db.meta.root
-	value := bytes.Repeat([]byte("v"), int(db.meta.pageSize/2))
+	originalMetaRoot := db.meta.Root()
+	value := bytes.Repeat([]byte("v"), int(db.meta.PageSize()/2))
 
 	root, err := db.putTreeEntry(originalRoot, Entry{key: []byte("a"), value: value})
 	if err != nil {
@@ -2430,10 +2397,10 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	if db.rootNode != originalRoot {
 		t.Fatal("tree engine adopted the replacement root")
 	}
-	if db.meta.root != originalMetaRoot {
-		t.Fatalf("tree engine changed meta root: got %d, want %d", db.meta.root, originalMetaRoot)
+	if db.meta.Root() != originalMetaRoot {
+		t.Fatalf("tree engine changed meta root: got %d, want %d", db.meta.Root(), originalMetaRoot)
 	}
-	if _, ok := db.wal.collectedRecords[metaPgid]; ok {
+	if _, ok := db.wal.collectedRecords[page.MetaID]; ok {
 		t.Fatal("tree engine staged a meta record before its owner adopted the root")
 	}
 }
@@ -3027,7 +2994,7 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := int(db.meta.pageSize)
+	page := int(db.meta.PageSize())
 	// Each value is ~0.6 of a page: one entry per node fits, two never do.
 	vlen := page * 6 / 10
 	const n = 6
@@ -3177,7 +3144,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	page := int(db.meta.pageSize)
+	page := int(db.meta.PageSize())
 	smallVal := bytes.Repeat([]byte("s"), 100)
 	smallEntry := 12 + 6 + len(smallVal) // flags(4)+keylen(4)+key(6)+vallen(4)+val
 	// Fill one leaf to ~0.9 of a page so it stays a single leaf before the big insert.
@@ -3274,7 +3241,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		}
 		p := tx.Bucket([]byte("p"))
 
-		pageSize := int(db.meta.pageSize)
+		pageSize := int(db.meta.PageSize())
 		childName := bytes.Repeat([]byte("c"), 300) // large name => large writeback entry
 		fillVal := bytes.Repeat([]byte("x"), 200)
 
@@ -3850,7 +3817,7 @@ func TestPut_EntryTooLargeForPageReturnsClearError(t *testing.T) {
 	}
 	defer db.Close()
 
-	huge := bytes.Repeat([]byte("x"), int(db.meta.pageSize))
+	huge := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
 	if err := db.Put([]byte("k"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
 		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
 	}
@@ -3867,7 +3834,7 @@ func TestPut_EntryTooLargeForPageDoesNotChangeDatabase(t *testing.T) {
 	}
 	defer db.Close()
 
-	huge := bytes.Repeat([]byte("x"), int(db.meta.pageSize))
+	huge := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
 	if err := db.Put([]byte("large"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
 		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
 	}
@@ -4329,7 +4296,7 @@ func TestAudit_RejectedTxPutDoesNotChangeReadableState(t *testing.T) {
 	}
 	defer db.Close()
 
-	large := bytes.Repeat([]byte("x"), int(db.meta.pageSize))
+	large := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
 	err = db.Update(func(tx *Tx) error {
 		if err := tx.Put([]byte("rejected"), large); !errors.Is(err, ErrEntryTooLargeForPage) {
 			t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
@@ -4710,7 +4677,7 @@ func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
 	if err := db.Put(key, []byte("v")); err != nil {
 		t.Fatal(err)
 	}
-	pageSize := db.meta.pageSize
+	pageSize := db.meta.PageSize()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

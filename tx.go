@@ -21,7 +21,7 @@ type writeTransactionSnapshot struct {
 	bytesSinceCheckpoint int64
 	collectedRecords     map[page.ID]Record
 	overlay              map[page.ID]Record
-	meta                 Meta
+	meta                 page.Meta
 	walOffset            int64
 	nextTxid             Txid
 	hasUnsyncedWrites    bool
@@ -51,7 +51,7 @@ func (tx *Tx) putCatalogEntry(entry Entry) error {
 		return err
 	}
 	tx.db.rootNode = newRoot
-	tx.db.meta.root = newRoot.pgid
+	tx.db.meta.SetRoot(newRoot.pgid)
 	tx.db.wal.insertMetaRecord(tx.db.meta)
 	return nil
 }
