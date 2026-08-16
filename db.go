@@ -126,18 +126,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	if isNew {
-		// A brand-new database writes its meta and empty root straight to the main
-		// file, so there is no WAL record to collect here. Any failure below leaves a
-		// half-written file, so we surface it instead of returning a broken handle.
-		if err := db.persistMeta(); err != nil {
-			return db.failOpen(fmt.Errorf("init meta: %w", err))
-		}
-		db.rootNode = db.newLeafNode(db.meta.pgid)
-		if err := db.persistNode(db.rootNode); err != nil {
-			return db.failOpen(fmt.Errorf("init root node: %w", err))
-		}
-		if err := db.file.Sync(); err != nil {
-			return db.failOpen(fmt.Errorf("sync new database: %w", err))
+		if err := db.initializeNewDatabase(); err != nil {
+			return db.failOpen(err)
 		}
 	}
 
@@ -188,6 +178,20 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	return db, nil
+}
+
+func (db *DB) initializeNewDatabase() error {
+	if err := db.persistMeta(); err != nil {
+		return fmt.Errorf("init meta: %w", err)
+	}
+	db.rootNode = db.newLeafNode(db.meta.pgid)
+	if err := db.persistNode(db.rootNode); err != nil {
+		return fmt.Errorf("init root node: %w", err)
+	}
+	if err := db.file.Sync(); err != nil {
+		return fmt.Errorf("sync new database: %w", err)
+	}
+	return nil
 }
 
 func (db *DB) closeFiles() error {
