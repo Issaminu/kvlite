@@ -357,27 +357,8 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 		}
 
 		if node == rootNode {
-			var newEntries []Entry
-
-			if node.IsLeaf {
-				newEntries = []Entry{{key: rightNode.entries[0].key}}
-			} else {
-				newEntries = []Entry{{key: keyAtSeperatorIndex}}
-			}
-
-			newRoot := &Node{
-				db:       db,
-				IsLeaf:   false,
-				entries:  newEntries,                        // separator: first key of right (copied up)
-				Children: []Pgid{node.pgid, rightNode.pgid}, // left, right
-				pgid:     db.allocate(),
-			}
-
-			node.parent = newRoot
-			rightNode.parent = newRoot
-
+			newRoot := db.newRootAfterSplit(node, rightNode, keyAtSeperatorIndex)
 			db.wal.insertNodeRecord(newRoot)
-
 			rootNode = newRoot
 
 			// Adopt the new root now, so the meta record collected below records it.
@@ -552,6 +533,19 @@ func (db *DB) persistMeta() error {
 
 func (db *DB) newLeafNode(pgid Pgid) *Node {
 	return &Node{db: db, IsLeaf: true, pgid: pgid, Children: []Pgid{}, entries: []Entry{}}
+}
+
+func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *Node {
+	rootNode := &Node{
+		db:       db,
+		IsLeaf:   false,
+		entries:  []Entry{{key: separator}},
+		Children: []Pgid{leftNode.pgid, rightNode.pgid},
+		pgid:     db.allocate(),
+	}
+	leftNode.parent = rootNode
+	rightNode.parent = rootNode
+	return rootNode
 }
 
 func (db *DB) allocate() Pgid {
