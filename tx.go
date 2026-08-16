@@ -2,6 +2,8 @@ package kvlite
 
 import (
 	"slices"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 const (
@@ -17,8 +19,8 @@ type Tx struct {
 
 type writeTransactionSnapshot struct {
 	bytesSinceCheckpoint int64
-	collectedRecords     map[Pgid]Record
-	overlay              map[Pgid]Record
+	collectedRecords     map[page.ID]Record
+	overlay              map[page.ID]Record
 	meta                 Meta
 	walOffset            int64
 	nextTxid             Txid
@@ -107,7 +109,7 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // that points at it. That entry lives in the parent's tree: the DB catalog for a
 // top-level bucket, or the parent bucket's own tree for a nested bucket.
 func (b *Bucket) writeBackRoot() error {
-	entry := Entry{flags: BucketLeafFlag, key: b.name, value: encodePgid(b.rootNode.pgid)}
+	entry := Entry{flags: BucketLeafFlag, key: b.name, value: page.EncodeID(b.rootNode.pgid)}
 	if b.parentBucket == nil {
 		return b.tx.putCatalogEntry(entry)
 	}
@@ -149,9 +151,9 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	if parent == nil {
-		err = tx.putCatalogEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encodePgid(newPgid)})
+		err = tx.putCatalogEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: page.EncodeID(newPgid)})
 	} else {
-		err = parent.putBucketEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encodePgid(newPgid)})
+		err = parent.putBucketEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: page.EncodeID(newPgid)})
 	}
 	if err != nil {
 		return nil, err
@@ -216,7 +218,7 @@ func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bu
 
 	// exists and is actually a bucket
 
-	pgid, err := decodePgid(entry.value)
+	pgid, err := page.DecodeID(entry.value)
 	if err != nil {
 		return nil, err
 	}

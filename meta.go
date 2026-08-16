@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 const version uint32 = 1 // format version, bumps only when making a breaking change to the DB file format itself
@@ -12,14 +14,14 @@ const magic uint32 = 0x7317DC29 // magic string is "KVLT"
 
 // metaPgid is the page id that holds the meta. It is always page 0, the first page
 // of the file; node pages start at pgid 1. WAL meta records use this id too.
-const metaPgid Pgid = 0
+const metaPgid page.ID = 0
 
 type Meta struct {
 	magic    uint32
 	version  uint32
 	pageSize int64
-	pgid     Pgid
-	root     Pgid // pgid of the root node
+	pgid     page.ID
+	root     page.ID // pgid of the root node
 	checksum uint64
 }
 
@@ -52,8 +54,8 @@ func decodeMeta(data []byte) (*Meta, error) {
 		magic:    binary.LittleEndian.Uint32(data[0:4]),
 		version:  binary.LittleEndian.Uint32(data[4:8]),
 		pageSize: int64(binary.LittleEndian.Uint64(data[8:16])),
-		pgid:     Pgid(binary.LittleEndian.Uint64(data[16:24])),
-		root:     Pgid(binary.LittleEndian.Uint64(data[24:32])),
+		pgid:     page.ID(binary.LittleEndian.Uint64(data[16:24])),
+		root:     page.ID(binary.LittleEndian.Uint64(data[24:32])),
 		checksum: binary.LittleEndian.Uint64(data[32:40]),
 	}, nil
 }

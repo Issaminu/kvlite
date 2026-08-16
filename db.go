@@ -6,6 +6,8 @@ import (
 	"io"
 	"maps"
 	"os"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 type Sync uint8
@@ -420,7 +422,7 @@ func (db *DB) hasMeta() bool {
 	return fi.Size() > 0
 }
 
-func (db *DB) readNode(pgid Pgid) (*Node, error) {
+func (db *DB) readNode(pgid page.ID) (*Node, error) {
 	// check if Node exists in current transaction
 
 	record, ok := db.wal.collectedRecords[pgid]
@@ -485,7 +487,7 @@ func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *No
 	rootNode := &Node{
 		IsLeaf:   false,
 		entries:  []Entry{{key: separator}},
-		Children: []Pgid{leftNode.pgid, rightNode.pgid},
+		Children: []page.ID{leftNode.pgid, rightNode.pgid},
 		pgid:     db.allocate(),
 	}
 	leftNode.parent = rootNode
@@ -493,7 +495,7 @@ func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *No
 	return rootNode
 }
 
-func (db *DB) allocate() Pgid {
+func (db *DB) allocate() page.ID {
 	db.meta.pgid++
 	return db.meta.pgid
 }
@@ -525,8 +527,8 @@ func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 		db:                       db,
 		path:                     walPath,
 		file:                     walFile,
-		collectedRecords:         make(map[Pgid]Record),
-		overlay:                  make(map[Pgid]Record),
+		collectedRecords:         make(map[page.ID]Record),
+		overlay:                  make(map[page.ID]Record),
 		nextTxid:                 1,
 		checkpointThresholdBytes: db.options.CheckpointThresholdBytes,
 		bytesSinceCheckpoint:     0,

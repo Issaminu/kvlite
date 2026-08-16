@@ -1,6 +1,10 @@
 package kvlite
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/Issaminu/kvlite/internal/page"
+)
 
 // errNotImplemented is a scaffold placeholder returned by stubs that are not yet
 // built. Remove each usage as its component is implemented.
@@ -8,7 +12,7 @@ var errNotImplemented = errors.New("kvlite: not implemented")
 
 var (
 	ErrDatabaseNotOpen      = errors.New("database not open")
-	ErrInvalid              = errors.New("invalid database")
+	ErrInvalid              = page.ErrInvalid
 	ErrVersionNotSupported  = errors.New("database version is not supported by current kvlite version")
 	ErrChecksum             = errors.New("checksum error")
 	ErrTxNotWritable        = errors.New("tx not writable")

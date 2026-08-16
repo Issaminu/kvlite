@@ -7,6 +7,8 @@ import (
 	"io"
 	"slices"
 	"sort"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 const (
@@ -43,14 +45,14 @@ func (e Entry) encodedSize(isLeaf bool) int {
 type Node struct {
 	IsLeaf   bool
 	entries  []Entry
-	Children []Pgid // for non-leaf nodes: len(Children) == len(entries)+1
-	Index    int    // this node's index within it's parent node's Children array
-	pgid     Pgid
+	Children []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
+	Index    int       // this node's index within it's parent node's Children array
+	pgid     page.ID
 	parent   *Node
 }
 
-func newLeafNode(pgid Pgid) *Node {
-	return &Node{IsLeaf: true, pgid: pgid, Children: []Pgid{}, entries: []Entry{}}
+func newLeafNode(pgid page.ID) *Node {
+	return &Node{IsLeaf: true, pgid: pgid, Children: []page.ID{}, entries: []Entry{}}
 }
 
 // Find the correct child node for this key.
@@ -167,14 +169,14 @@ func decodeNode(data []byte) (*Node, error) {
 
 	if !node.IsLeaf {
 		childCount := uint64(count) + 1
-		childrenSize := childCount * uint64(pgidEncodedSize)
+		childrenSize := childCount * uint64(page.IDSize)
 		if childrenSize > uint64(len(data)) {
 			return nil, fmt.Errorf("read node children: %w", ErrInvalid)
 		}
-		node.Children = make([]Pgid, int(childCount))
+		node.Children = make([]page.ID, int(childCount))
 		for i := range node.Children {
-			node.Children[i] = Pgid(binary.LittleEndian.Uint64(data[:pgidEncodedSize]))
-			data = data[pgidEncodedSize:]
+			node.Children[i] = page.ID(binary.LittleEndian.Uint64(data[:page.IDSize]))
+			data = data[page.IDSize:]
 		}
 	}
 	return node, nil
@@ -289,7 +291,7 @@ func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
 	return min(max(separatorIndex, 1), len(n.entries)-2), nil
 }
 
-func (n *Node) split(newPgid Pgid, pageSize int64) (*Node, int, []byte, error) {
+func (n *Node) split(newPgid page.ID, pageSize int64) (*Node, int, []byte, error) {
 	separatorIndex, err := n.chooseSplitIndex(pageSize)
 	if err != nil {
 		return nil, separatorIndex, nil, err
@@ -297,7 +299,7 @@ func (n *Node) split(newPgid Pgid, pageSize int64) (*Node, int, []byte, error) {
 
 	rightNode := &Node{
 		IsLeaf:   n.IsLeaf,
-		Children: []Pgid{},
+		Children: []page.ID{},
 		Index:    n.Index + 1,
 		pgid:     newPgid,
 	}

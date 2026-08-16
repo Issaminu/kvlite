@@ -7,6 +7,8 @@ import (
 	"hash/fnv"
 	"io"
 	"os"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 const (
@@ -18,8 +20,10 @@ const (
 	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
 	recordContentLengthSize = 4 // A content length uses one uint32 value.
 	recordChecksumSize      = 8 // An FNV-1a checksum uses one uint64 value.
-	recordHeaderSize        = recordTypeSize + txidEncodedSize + recordTransactionIDSize + recordContentLengthSize
+	recordHeaderSize        = recordTypeSize + page.IDSize + recordTransactionIDSize + recordContentLengthSize
 )
+
+type Txid uint64
 
 type WAL struct {
 	db                       *DB
@@ -27,17 +31,17 @@ type WAL struct {
 	file                     *os.File
 	checkpointThresholdBytes int64
 	bytesSinceCheckpoint     int64
-	collectedRecords         map[Pgid]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
-	overlay                  map[Pgid]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
-	nextTxid                 Txid            // sequence number stamped on the next committed transaction
-	hasUnsyncedWrites        bool            // true when WAL bytes were appended after the last successful sync
-	syncFile                 func() error    // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
+	collectedRecords         map[page.ID]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
+	overlay                  map[page.ID]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
+	nextTxid                 Txid               // sequence number stamped on the next committed transaction
+	hasUnsyncedWrites        bool               // true when WAL bytes were appended after the last successful sync
+	syncFile                 func() error       // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
 }
 
 // RecordHeader is the fixed-size head of every WAL record.
 type RecordHeader struct {
 	recordType uint8
-	pgid       Pgid
+	pgid       page.ID
 	txid       Txid
 }
 
@@ -184,8 +188,8 @@ func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
 	record := &Record{}
 	record.header.recordType = data[0]
 	data = data[recordTypeSize:]
-	record.header.pgid = Pgid(binary.LittleEndian.Uint64(data[:pgidEncodedSize]))
-	data = data[pgidEncodedSize:]
+	record.header.pgid = page.ID(binary.LittleEndian.Uint64(data[:page.IDSize]))
+	data = data[page.IDSize:]
 	record.header.txid = Txid(binary.LittleEndian.Uint64(data[:recordTransactionIDSize]))
 	data = data[recordTransactionIDSize:]
 	contentSize := binary.LittleEndian.Uint32(data[:recordContentLengthSize])

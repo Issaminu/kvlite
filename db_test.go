@@ -20,6 +20,8 @@ import (
 	"runtime"
 	"testing"
 	"time"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 // tempfile returns a temporary file path for a database.
@@ -34,32 +36,6 @@ func tempfile() string {
 // per-commit durability uses this.
 func openDB(path string) (*DB, error) {
 	return Open(path, 0600, &Options{Synchronous: SyncNormal})
-}
-
-func TestPgidCodec_UsesExactlyEightLittleEndianBytes(t *testing.T) {
-	// The byte pattern makes the uint64 byte order visible in the assertion.
-	const pgid Pgid = 0x0102030405060708
-	want := []byte{0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}
-
-	encoded := encodePgid(pgid)
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode pgid: got %x, want %x", encoded, want)
-	}
-
-	decoded, err := decodePgid(encoded)
-	if err != nil {
-		t.Fatalf("decode pgid: %v", err)
-	}
-	if decoded != pgid {
-		t.Fatalf("decode pgid: got %x, want %x", decoded, pgid)
-	}
-
-	// A Pgid is a uint64, so its encoding must contain exactly eight bytes.
-	for _, size := range []int{7, 9} {
-		if _, err := decodePgid(make([]byte, size)); !errors.Is(err, ErrInvalid) {
-			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
-		}
-	}
 }
 
 func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
@@ -136,7 +112,7 @@ func TestNodeCodec_UsesFixedLeafLayout(t *testing.T) {
 func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
 	node := &Node{
 		entries:  []Entry{{key: []byte("m")}},
-		Children: []Pgid{2, 3},
+		Children: []page.ID{2, 3},
 	}
 	// Layout: branch marker, one separator, zero flags, one-byte key, and two child page IDs.
 	want := []byte{
@@ -258,10 +234,10 @@ func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 
 func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	const (
-		pageSize  int64 = 64 // Two 33-byte entries exceed this page size.
-		valueSize       = 20 // A leaf entry uses 12 fixed bytes, a one-byte key, and this value.
-		leftPgid  Pgid  = 1  // Page 1 is the first node page after the metadata page.
-		rightPgid Pgid  = 2  // Page 2 is the next page allocated for the split.
+		pageSize  int64   = 64 // Two 33-byte entries exceed this page size.
+		valueSize         = 20 // A leaf entry uses 12 fixed bytes, a one-byte key, and this value.
+		leftPgid  page.ID = 1  // Page 1 is the first node page after the metadata page.
+		rightPgid page.ID = 2  // Page 2 is the next page allocated for the split.
 	)
 
 	node := &Node{
