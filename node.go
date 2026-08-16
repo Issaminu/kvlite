@@ -333,3 +333,15 @@ func (n *Node) split(newPgid Pgid) (*Node, int, []byte, error) { // Returns (new
 
 	return rightNode, seperatorIndex, keyAtSeperatorIndex, nil
 }
+
+func (parent *Node) insertSplitChild(leftNode, rightNode *Node, separator []byte) {
+	rightNode.parent = parent
+
+	parent.entries = append(parent.entries, Entry{})
+	copy(parent.entries[leftNode.Index+1:], parent.entries[leftNode.Index:])
+	parent.entries[leftNode.Index] = Entry{key: separator}
+
+	parent.Children = append(parent.Children, 0)
+	copy(parent.Children[rightNode.Index+1:], parent.Children[rightNode.Index:])
+	parent.Children[rightNode.Index] = rightNode.pgid
+}

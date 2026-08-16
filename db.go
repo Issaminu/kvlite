@@ -368,26 +368,7 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 			}
 		} else { // parent is not a root node
 			parent := node.parent
-			rightNode.parent = parent
-
-			var newEntry Entry
-			if node.IsLeaf {
-				newEntry = Entry{key: rightNode.entries[0].key}
-			} else {
-				newEntry = Entry{key: keyAtSeperatorIndex}
-			}
-
-			// add seperator to the parent's entries
-			parent.entries = append(parent.entries, Entry{})
-			copy(parent.entries[node.Index+1:], parent.entries[node.Index:])
-
-			parent.entries[node.Index] = newEntry
-
-			// add the new right node `pgid` to the parent's Children
-			parent.Children = append(parent.Children, 0)
-			copy(parent.Children[rightNode.Index+1:], parent.Children[rightNode.Index:])
-			parent.Children[rightNode.Index] = rightNode.pgid
-
+			parent.insertSplitChild(node, rightNode, keyAtSeperatorIndex)
 			db.wal.insertNodeRecord(parent)
 		}
 
