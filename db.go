@@ -221,13 +221,7 @@ func (db *DB) failOpen(err error) (*DB, error) {
 // All transactions must be closed before closing the database.
 func (db *DB) Close() error {
 	if db.options.ReadOnly {
-		// A read-only open may still hold a WAL handle (opened O_RDONLY when a "-wal"
-		// file was present). Close it too, but always close the main file as well.
-		var walErr error
-		if db.wal != nil && db.wal.file != nil {
-			walErr = db.wal.file.Close()
-		}
-		if err := errors.Join(walErr, db.file.Close()); err != nil {
+		if err := db.closeFiles(); err != nil {
 			return err
 		}
 		db.closed = true
