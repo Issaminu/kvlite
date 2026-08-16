@@ -132,20 +132,8 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	// If the WAL has records, the previous run crashed before checkpointing.
-	if records != nil {
-		if db.options.ReadOnly {
-			// A read-only handle cannot rewrite the main file, so it cannot ingest
-			// the WAL. Instead it serves the committed pages from the in-memory
-			// overlay and adopts the latest committed meta, so reads see the same
-			// state a writable open would recover to (a torn tail stays invisible).
-			if err := db.loadCommittedIntoOverlay(records); err != nil {
-				return db.failOpen(err)
-			}
-		} else {
-			if err := db.ingestWalRecords(records); err != nil {
-				return db.failOpen(err)
-			}
-		}
+	if err := db.replayWAL(records); err != nil {
+		return db.failOpen(err)
 	}
 
 	// A writable open re-reads meta from the main file. A
@@ -192,6 +180,16 @@ func (db *DB) initializeNewDatabase() error {
 		return fmt.Errorf("sync new database: %w", err)
 	}
 	return nil
+}
+
+func (db *DB) replayWAL(records *[]Record) error {
+	if records == nil {
+		return nil
+	}
+	if db.options.ReadOnly {
+		return db.loadCommittedIntoOverlay(records)
+	}
+	return db.ingestWalRecords(records)
 }
 
 func (db *DB) closeFiles() error {
