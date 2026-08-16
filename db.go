@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -69,7 +68,7 @@ type DB struct {
 	meta     *page.Meta
 	rootNode *Node
 	options  *Options
-	wal      *WAL
+	wal      *wal.WAL
 	closed   bool
 }
 
@@ -227,8 +226,8 @@ func (db *DB) loadRootNode() error {
 
 func (db *DB) closeFiles() error {
 	var walErr error
-	if db.wal != nil && db.wal.file != nil {
-		walErr = db.wal.file.Close()
+	if db.wal != nil {
+		walErr = db.wal.Close()
 	}
 	var dbErr error
 	if db.file != nil {
@@ -259,7 +258,7 @@ func (db *DB) Close() error {
 		if err := db.checkpointWAL(); err != nil {
 			return err
 		}
-		if err := db.wal.delete(); err != nil {
+		if err := db.wal.Delete(); err != nil {
 			return err
 		}
 	} else {
@@ -346,7 +345,7 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 	}
 
 	if !node.NeedsSplit(db.meta.PageSize()) {
-		db.wal.insertNodeRecord(node)
+		db.wal.InsertNodeRecord(node)
 		return rootNode, nil
 	}
 
@@ -366,16 +365,16 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 
 		if node == rootNode {
 			newRoot := db.newRootAfterSplit(node, rightNode, keyAtSeperatorIndex)
-			db.wal.insertNodeRecord(newRoot)
+			db.wal.InsertNodeRecord(newRoot)
 			rootNode = newRoot
 		} else { // parent is not a root node
 			parent := node.Parent()
 			parent.InsertSplitChild(node, rightNode, keyAtSeperatorIndex)
-			db.wal.insertNodeRecord(parent)
+			db.wal.InsertNodeRecord(parent)
 		}
 
-		db.wal.insertNodeRecord(node)
-		db.wal.insertNodeRecord(rightNode)
+		db.wal.InsertNodeRecord(node)
+		db.wal.InsertNodeRecord(rightNode)
 
 		// The right sibling can itself still overflow a page.
 		// So keep splitting it before climbing, so no node is left over a page.
@@ -445,27 +444,7 @@ func (db *DB) applyWALRecord(record *wal.Record) error {
 // checkpointWAL makes the WAL durable, copies its committed pages into the main
 // file, makes the main file durable, and then clears the WAL state.
 func (db *DB) checkpointWAL() error {
-	if len(db.wal.overlay) == 0 {
-		return nil
-	}
-	if err := db.wal.sync(); err != nil {
-		return err
-	}
-	for _, record := range db.wal.overlay {
-		if err := db.applyWALRecord(&record); err != nil {
-			return err
-		}
-	}
-	if err := db.file.Sync(); err != nil {
-		return err
-	}
-	if err := db.wal.Truncate(); err != nil {
-		// The main file is already durable. Keep the overlay so cleanup can be retried.
-		return nil
-	}
-	clear(db.wal.overlay)
-	db.wal.bytesSinceCheckpoint = 0
-	return nil
+	return db.wal.Checkpoint(db.applyWALRecord, db.file.Sync)
 }
 
 func (db *DB) hasMeta() bool {
@@ -479,14 +458,9 @@ func (db *DB) hasMeta() bool {
 func (db *DB) readNode(pgid page.ID) (*Node, error) {
 	// check if Node exists in current transaction
 
-	record, ok := db.wal.collectedRecords[pgid]
-	if !ok {
-		// Node is not in current transaction.
-		// let's check if Node has been commited (in an earlier transaction) but not yet checkpointed
-		record, ok = db.wal.overlay[pgid]
-	}
+	record, ok := db.wal.Lookup(pgid)
 	if ok {
-		node, err := recordToNode(&record)
+		node, err := wal.RecordToNode(&record)
 		if err != nil {
 			return nil, err
 		}
@@ -545,7 +519,7 @@ func (db *DB) allocate() page.ID {
 	return db.meta.Allocate()
 }
 
-func (db *DB) readOrCreateWal() (*WAL, []wal.Record, error) {
+func (db *DB) readOrCreateWal() (*wal.WAL, []wal.Record, error) {
 	walPath := db.path + "-wal"
 	var walFile *os.File
 	var err error
@@ -568,32 +542,20 @@ func (db *DB) readOrCreateWal() (*WAL, []wal.Record, error) {
 		}
 	}
 
-	wal := &WAL{
-		path:                     walPath,
-		file:                     walFile,
-		pageSize:                 db.meta.PageSize(),
-		syncOnCommit:             db.options.Synchronous == SyncFull,
-		collectedRecords:         make(map[page.ID]wal.Record),
-		overlay:                  make(map[page.ID]wal.Record),
-		nextTxid:                 1,
-		checkpointThresholdBytes: db.options.CheckpointThresholdBytes,
-		bytesSinceCheckpoint:     0,
-	}
+	log := wal.New(wal.Config{
+		Path:                     walPath,
+		File:                     walFile,
+		PageSize:                 db.meta.PageSize(),
+		SyncOnCommit:             db.options.Synchronous == SyncFull,
+		CheckpointThresholdBytes: db.options.CheckpointThresholdBytes,
+	})
 
-	records, err := wal.readRecords()
+	records, err := log.ReadRecords()
 	if err != nil {
-		return nil, nil, errors.Join(err, wal.file.Close())
+		return nil, nil, errors.Join(err, log.Close())
 	}
 
-	if len(records) > 0 {
-		for _, record := range records {
-			if record.Header.TxID >= wal.nextTxid {
-				wal.nextTxid = record.Header.TxID + 1
-			}
-		}
-	}
-
-	return wal, records, nil
+	return log, records, nil
 }
 
 func (db *DB) ingestWalRecords(records []wal.Record) error {
@@ -676,10 +638,10 @@ func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
 		return err
 	}
 	for _, record := range committed {
-		db.wal.overlay[record.Header.PageID] = record
+		db.wal.LoadCommittedRecord(record)
 	}
 
-	if metaRecord, ok := db.wal.overlay[page.MetaID]; ok {
+	if metaRecord, ok := db.wal.CommittedRecord(page.MetaID); ok {
 		meta, err := page.DecodeMeta(metaRecord.PageContent)
 		if err != nil {
 			return fmt.Errorf("read committed meta from WAL: %w", err)
@@ -767,7 +729,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	}
 
 	// transaction succeeded
-	needsCheckpoint, err := db.wal.persistCollectedRecords()
+	needsCheckpoint, err := db.wal.PersistCollectedRecords()
 	if err != nil {
 		if rbErr := db.rollbackWriteTransaction(&snapshot); rbErr != nil {
 			return errors.Join(err, rbErr)
@@ -784,45 +746,25 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 }
 
 func (db *DB) snapshotWriteTransaction() (writeTransactionSnapshot, error) {
-	walOffset, err := db.wal.file.Seek(0, io.SeekCurrent)
+	walSnapshot, err := db.wal.Snapshot()
 	if err != nil {
 		return writeTransactionSnapshot{}, err
 	}
 	return writeTransactionSnapshot{
-		bytesSinceCheckpoint: db.wal.bytesSinceCheckpoint,
-		collectedRecords:     maps.Clone(db.wal.collectedRecords),
-		overlay:              maps.Clone(db.wal.overlay),
-		meta:                 *db.meta,
-		walOffset:            walOffset,
-		nextTxid:             db.wal.nextTxid,
-		hasUnsyncedWrites:    db.wal.hasUnsyncedWrites,
+		meta: *db.meta,
+		wal:  walSnapshot,
 	}, nil
 }
 
-func (db *DB) rollbackTransaction(snapshot *writeTransactionSnapshot) error {
-	db.wal.bytesSinceCheckpoint = snapshot.bytesSinceCheckpoint
-	db.wal.collectedRecords = snapshot.collectedRecords
-	db.wal.overlay = snapshot.overlay
+func (db *DB) rollbackWriteTransaction(snapshot *writeTransactionSnapshot) error {
+	walErr := db.wal.Restore(snapshot.wal)
 	db.meta = &snapshot.meta
 	root, err := db.readNode(snapshot.meta.Root())
 	if err != nil {
-		return fmt.Errorf("reload root node: %w", err)
+		return errors.Join(walErr, fmt.Errorf("reload root node: %w", err))
 	}
 	db.rootNode = root
-	return nil
-}
-
-func (db *DB) rollbackWriteTransaction(snapshot *writeTransactionSnapshot) error {
-	memoryErr := db.rollbackTransaction(snapshot)
-	db.wal.nextTxid = snapshot.nextTxid
-	if err := db.wal.file.Truncate(snapshot.walOffset); err != nil {
-		return errors.Join(memoryErr, fmt.Errorf("truncate failed WAL transaction: %w", err))
-	}
-	if _, err := db.wal.file.Seek(snapshot.walOffset, io.SeekStart); err != nil {
-		return errors.Join(memoryErr, fmt.Errorf("rewind after failed WAL transaction: %w", err))
-	}
-	db.wal.hasUnsyncedWrites = snapshot.hasUnsyncedWrites
-	return memoryErr
+	return walErr
 }
 
 func (db *DB) View(transaction func(tx *Tx) error) error {

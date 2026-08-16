@@ -1,4 +1,4 @@
-package kvlite
+package wal
 
 import (
 	"errors"
@@ -9,7 +9,6 @@ import (
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
-	walrecord "github.com/Issaminu/kvlite/internal/wal"
 )
 
 type WAL struct {
@@ -19,45 +18,45 @@ type WAL struct {
 	syncOnCommit             bool
 	checkpointThresholdBytes int64
 	bytesSinceCheckpoint     int64
-	collectedRecords         map[page.ID]walrecord.Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
-	overlay                  map[page.ID]walrecord.Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
-	nextTxid                 walrecord.TxID               // sequence number stamped on the next committed transaction
-	hasUnsyncedWrites        bool                         // true when WAL bytes were appended after the last successful sync
-	syncFile                 func() error                 // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
+	collectedRecords         map[page.ID]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
+	overlay                  map[page.ID]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
+	nextTxid                 TxID               // sequence number stamped on the next committed transaction
+	hasUnsyncedWrites        bool               // true when WAL bytes were appended after the last successful sync
+	syncFile                 func() error       // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
 }
 
-func (wal *WAL) insertNodeRecord(node *Node) {
-	record := walrecord.Record{
-		Header:      walrecord.RecordHeader{Type: walrecord.RecordTypeData, PageID: node.PageID()},
+func (wal *WAL) InsertNodeRecord(node *btree.Node) {
+	record := Record{
+		Header:      RecordHeader{Type: RecordTypeData, PageID: node.PageID()},
 		PageContent: btree.EncodeNode(node),
 	}
 
 	wal.collectRecord(&record)
 }
 
-func (wal *WAL) insertMetaRecord(meta *page.Meta) {
+func (wal *WAL) InsertMetaRecord(meta *page.Meta) {
 	meta.RefreshChecksum()
 
-	record := walrecord.Record{
-		Header:      walrecord.RecordHeader{Type: walrecord.RecordTypeMeta, PageID: page.MetaID},
+	record := Record{
+		Header:      RecordHeader{Type: RecordTypeMeta, PageID: page.MetaID},
 		PageContent: page.EncodeMeta(meta),
 	}
 
 	wal.collectRecord(&record)
 }
 
-func (wal *WAL) collectRecord(record *walrecord.Record) {
+func (wal *WAL) collectRecord(record *Record) {
 	wal.collectedRecords[record.Header.PageID] = *record
 }
 
-func (wal *WAL) readRecords() ([]walrecord.Record, error) {
+func (wal *WAL) ReadRecords() ([]Record, error) {
 	if !wal.hasRecords() {
 		return nil, nil
 	}
 
-	var records []walrecord.Record
+	var records []Record
 	for {
-		record, err := walrecord.DecodeRecord(wal.file, wal.pageSize)
+		record, err := DecodeRecord(wal.file, wal.pageSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
@@ -66,6 +65,9 @@ func (wal *WAL) readRecords() ([]walrecord.Record, error) {
 			return nil, err
 		}
 		records = append(records, *record)
+		if record.Header.TxID >= wal.nextTxid {
+			wal.nextTxid = record.Header.TxID + 1
+		}
 	}
 
 	return records, nil
@@ -79,7 +81,7 @@ func (wal *WAL) hasRecords() bool {
 	return fi.Size() > 0
 }
 
-func (wal *WAL) sync() error {
+func (wal *WAL) Sync() error {
 	if !wal.hasUnsyncedWrites {
 		return nil
 	}
@@ -113,7 +115,7 @@ func (wal *WAL) Truncate() error {
 
 // Delete the WAL file
 // Important: only delete the file when running db.Close()
-func (wal *WAL) delete() error {
+func (wal *WAL) Delete() error {
 	// close the file before deletion
 	err := wal.file.Close()
 	if err != nil {
@@ -124,7 +126,7 @@ func (wal *WAL) delete() error {
 	return err
 }
 
-func (wal *WAL) persistCollectedRecords() (bool, error) {
+func (wal *WAL) PersistCollectedRecords() (bool, error) {
 	if len(wal.collectedRecords) == 0 {
 		return false, nil
 	}
@@ -144,9 +146,9 @@ func (wal *WAL) persistCollectedRecords() (bool, error) {
 }
 
 func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
-	transactionSize := walrecord.HeaderSize + walrecord.ChecksumSize // The commit marker has no page content.
+	transactionSize := HeaderSize + ChecksumSize // The commit marker has no page content.
 	for _, record := range wal.collectedRecords {
-		size, err := walrecord.EncodedRecordSize(&record, wal.pageSize)
+		size, err := EncodedRecordSize(&record, wal.pageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -160,16 +162,16 @@ func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 
 	for pgid, record := range wal.collectedRecords {
 		record.Header.TxID = txid
-		transaction = walrecord.AppendEncodedRecord(transaction, &record)
+		transaction = AppendEncodedRecord(transaction, &record)
 
 		wal.collectedRecords[pgid] = record
 	}
 
-	commitMarker := &walrecord.Record{
-		Header:      walrecord.RecordHeader{Type: walrecord.RecordTypeCommit, PageID: 0, TxID: txid},
+	commitMarker := &Record{
+		Header:      RecordHeader{Type: RecordTypeCommit, PageID: 0, TxID: txid},
 		PageContent: nil,
 	}
-	transaction = walrecord.AppendEncodedRecord(transaction, commitMarker)
+	transaction = AppendEncodedRecord(transaction, commitMarker)
 
 	return transaction, nil
 }
@@ -183,7 +185,7 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 
 	needsCheckpoint := wal.reachedCheckpointThreshold()
 	if wal.syncOnCommit || needsCheckpoint {
-		if err := wal.sync(); err != nil {
+		if err := wal.Sync(); err != nil {
 			return false, err
 		}
 	}
@@ -202,7 +204,7 @@ func (wal *WAL) reachedCheckpointThreshold() bool {
 	return wal.bytesSinceCheckpoint >= wal.checkpointThresholdBytes
 }
 
-func recordToNode(record *walrecord.Record) (*Node, error) {
+func RecordToNode(record *Record) (*btree.Node, error) {
 	if record.PageContent == nil {
 		return nil, fmt.Errorf("record has no page content")
 	}

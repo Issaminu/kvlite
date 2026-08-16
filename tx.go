@@ -20,13 +20,8 @@ type Tx struct {
 }
 
 type writeTransactionSnapshot struct {
-	bytesSinceCheckpoint int64
-	collectedRecords     map[page.ID]wal.Record
-	overlay              map[page.ID]wal.Record
-	meta                 page.Meta
-	walOffset            int64
-	nextTxid             wal.TxID
-	hasUnsyncedWrites    bool
+	meta page.Meta
+	wal  wal.Snapshot
 }
 
 func (tx *Tx) Writable() bool {
@@ -54,7 +49,7 @@ func (tx *Tx) putCatalogEntry(entry Entry) error {
 	}
 	tx.db.rootNode = newRoot
 	tx.db.meta.SetRoot(newRoot.PageID())
-	tx.db.wal.insertMetaRecord(tx.db.meta)
+	tx.db.wal.InsertMetaRecord(tx.db.meta)
 	return nil
 }
 
@@ -143,7 +138,7 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 
 	newPgid := tx.db.allocate()
 	rootNode := btree.NewLeafNode(newPgid)
-	tx.db.wal.insertNodeRecord(rootNode)
+	tx.db.wal.InsertNodeRecord(rootNode)
 
 	bucket := &Bucket{
 		tx:           tx,
@@ -270,7 +265,7 @@ func (bucket *Bucket) putBucketEntry(entry Entry) error {
 		return err
 	}
 	if newRoot == bucket.rootNode {
-		bucket.tx.db.wal.insertMetaRecord(bucket.tx.db.meta)
+		bucket.tx.db.wal.InsertMetaRecord(bucket.tx.db.meta)
 		return nil
 	}
 

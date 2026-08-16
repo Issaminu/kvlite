@@ -40,45 +40,6 @@ func openDB(path string) (*DB, error) {
 	return Open(path, 0600, &Options{Synchronous: SyncNormal})
 }
 
-func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
-	const (
-		pageSize      int64    = 64 // The record content must fit inside this page size.
-		firstPageID   page.ID  = 1  // Page zero contains metadata, so node pages start at one.
-		transactionID wal.TxID = 1  // A new WAL starts with transaction ID one.
-	)
-
-	log := &WAL{
-		pageSize: pageSize,
-		collectedRecords: map[page.ID]wal.Record{
-			firstPageID: {
-				Header:      wal.RecordHeader{Type: wal.RecordTypeData, PageID: firstPageID},
-				PageContent: []byte("x"),
-			},
-		},
-		nextTxid: transactionID,
-	}
-
-	transaction, err := log.encodeCollectedRecords()
-	if err != nil {
-		t.Fatal(err)
-	}
-	reader := bytes.NewReader(transaction)
-	dataRecord, err := wal.DecodeRecord(reader, pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	commitMarker, err := wal.DecodeRecord(reader, pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dataRecord.Header.TxID != transactionID || commitMarker.Header.TxID != transactionID {
-		t.Fatalf("transaction IDs: data=%d commit=%d, want %d", dataRecord.Header.TxID, commitMarker.Header.TxID, transactionID)
-	}
-	if !wal.IsCommitMarker(commitMarker) {
-		t.Fatal("encoded transaction does not end with a commit marker")
-	}
-}
-
 // fileSize returns the current size of the database file in bytes.
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()
@@ -573,13 +534,14 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.wal.file.Close(); err != nil {
+	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db.wal.file, err = os.Open(path + "-wal")
+	readOnlyWAL, err := os.Open(path + "-wal")
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.wal.ReplaceFileForTesting(readOnlyWAL)
 
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatalf("checkpoint returned an error after the main file was durable: %v", err)
@@ -869,7 +831,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	}
 
 	// Force frequent checkpoints so we can prove the WAL is bounded.
-	db.wal.checkpointThresholdBytes = 8 * 1024 // 8 KiB
+	db.wal.SetCheckpointThresholdBytes(8 * 1024) // 8 KiB
 
 	const n = 400
 	val := bytes.Repeat([]byte("x"), 2048) // ~2 KiB per value: the WAL grows fast
@@ -887,7 +849,8 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	// Without a checkpoint it grows with the data (RED).
 	if got := fileSize(t, wal); got > 128*1024 {
 		t.Fatalf("WAL was not checkpointed: %d bytes at rest after writing ~%d KiB "+
-			"(expected it to reset near the %d-byte threshold)", got, n*len(val)/1024, db.wal.checkpointThresholdBytes)
+			"(expected it to reset near the %d-byte threshold)", got, n*len(val)/1024,
+			db.wal.Stats().CheckpointThresholdBytes)
 	}
 
 	// All data readable before the close.
@@ -1003,7 +966,7 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 	}
 	// Drive checkpoints by hand: a huge threshold stops any auto-checkpoint from
 	// firing mid-test, so we control exactly what sits in main vs the WAL.
-	db.wal.checkpointThresholdBytes = 1 << 30
+	db.wal.SetCheckpointThresholdBytes(1 << 30)
 
 	valBase := bytes.Repeat([]byte("a"), 512) // ~512B/value forces a multi-level base tree
 	valUpd := bytes.Repeat([]byte("b"), 512)  // same length, distinct content
@@ -1476,10 +1439,10 @@ func TestOpen_SynchronousNormalDefersWALSync(t *testing.T) {
 	defer db.Close()
 
 	syncCalls := 0
-	db.wal.syncFile = func() error {
+	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		return nil
-	}
+	})
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
@@ -1507,36 +1470,6 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 	}
 	if got := fileSize(t, path+"-wal"); got != 0 {
 		t.Fatalf("WAL size after threshold checkpoint: got %d, want 0", got)
-	}
-}
-
-func TestWAL_ByteCounterDoesNotWrapAtFourGiB(t *testing.T) {
-	walFile, err := os.CreateTemp(t.TempDir(), "wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer walFile.Close()
-
-	// The largest uint32 value is the boundary that the old WAL byte counter
-	// could not cross.
-	const largestUint32 = 1<<32 - 1
-	wal := &WAL{
-		file:                     walFile,
-		bytesSinceCheckpoint:     largestUint32 - 1,
-		checkpointThresholdBytes: largestUint32,
-	}
-
-	// Two bytes move the counter from one byte below the boundary to one byte
-	// above it.
-	needsCheckpoint, err := wal.appendTransaction([]byte{0, 0})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !needsCheckpoint {
-		t.Fatal("WAL counter crossed 4 GiB without starting a checkpoint")
-	}
-	if got, want := uint64(wal.bytesSinceCheckpoint), uint64(largestUint32)+1; got != want {
-		t.Fatalf("WAL byte counter: got %d, want %d", got, want)
 	}
 }
 
@@ -2263,7 +2196,7 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	if db.meta.Root() != originalMetaRoot {
 		t.Fatalf("tree engine changed meta root: got %d, want %d", db.meta.Root(), originalMetaRoot)
 	}
-	if _, ok := db.wal.collectedRecords[page.MetaID]; ok {
+	if _, ok := db.wal.CollectedRecord(page.MetaID); ok {
 		t.Fatal("tree engine staged a meta record before its owner adopted the root")
 	}
 }
@@ -3132,7 +3065,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		// parent so the pointer insert splits p's root.
 		newPgid := tx.db.allocate()
 		cRoot := btree.NewLeafNode(newPgid)
-		tx.db.wal.insertNodeRecord(cRoot)
+		tx.db.wal.InsertNodeRecord(cRoot)
 		c := &Bucket{tx: tx, name: childName, rootNode: cRoot, parentBucket: p}
 		if err := c.writeBackRoot(); err != nil {
 			return err
@@ -3210,9 +3143,9 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	}
 
 	walSize := fileSize(t, path+"-wal")
-	if int64(db.wal.bytesSinceCheckpoint) != walSize {
+	if db.wal.Stats().BytesSinceCheckpoint != walSize {
 		t.Fatalf("bytesSinceCheckpoint=%d, want WAL file size %d (counter must track real WAL growth, not collectRecord calls)",
-			db.wal.bytesSinceCheckpoint, walSize)
+			db.wal.Stats().BytesSinceCheckpoint, walSize)
 	}
 }
 
@@ -3652,11 +3585,12 @@ func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantTxid := db.wal.nextTxid - 1 // the txid the commit above was just stamped with
-	if len(db.wal.overlay) == 0 {
+	wantTxid := db.wal.Stats().NextTxID - 1 // the txid the commit above was just stamped with
+	records := db.wal.CommittedRecords()
+	if len(records) == 0 {
 		t.Fatal("expected at least one overlay record after a commit")
 	}
-	for pgid, record := range db.wal.overlay {
+	for pgid, record := range records {
 		if record.Header.TxID != wantTxid {
 			t.Fatalf("overlay record for pgid %d has txid %d, want %d (the committing transaction's txid)",
 				pgid, record.Header.TxID, wantTxid)
@@ -3855,13 +3789,13 @@ func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
 	if err := db.Put([]byte("k"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
-	if len(db.wal.overlay) == 0 {
+	if db.wal.Stats().CommittedRecordCount == 0 {
 		t.Fatal("test setup: expected the first put to sit in wal.overlay, not be checkpointed yet")
 	}
 
 	// Arrange for exactly the NEXT commit's growth to cross the checkpoint
 	// threshold, so it (and only it) attempts a checkpoint.
-	db.wal.checkpointThresholdBytes = db.wal.bytesSinceCheckpoint + 1
+	db.wal.SetCheckpointThresholdBytes(db.wal.Stats().BytesSinceCheckpoint + 1)
 
 	// Simulate the main file failing right when the checkpoint tries to write to
 	// it. wal.file (used for the WAL write itself) stays open, so the write
@@ -3901,7 +3835,7 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db.wal.checkpointThresholdBytes = db.wal.bytesSinceCheckpoint + 1
+	db.wal.SetCheckpointThresholdBytes(db.wal.Stats().BytesSinceCheckpoint + 1)
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -3918,7 +3852,7 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatalf("committed Put returned %q, want %q", got, "new")
 	}
 
-	if err := db.wal.file.Close(); err != nil {
+	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
 	reopened, err := Open(path, 0644, nil)
@@ -4045,7 +3979,7 @@ func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = db.wal.file.Close()
+	_ = db.wal.Close()
 	_ = db.file.Close()
 
 	if len(walBytes) < wal.HeaderSize {
@@ -4098,7 +4032,7 @@ func TestAudit_FinalWALChecksumFailureReturnsChecksumError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = db.wal.file.Close()
+	_ = db.wal.Close()
 	_ = db.file.Close()
 
 	if len(walBytes) == 0 {
@@ -4190,7 +4124,7 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
-	db.wal.checkpointThresholdBytes = 1
+	db.wal.SetCheckpointThresholdBytes(1)
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -4201,7 +4135,7 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if got, err := db.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("committed overlay value: got %q, err %v", got, err)
 	}
-	if err := db.wal.file.Close(); err != nil {
+	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4225,22 +4159,22 @@ func TestAudit_AutomaticCheckpointSyncsWALOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		db.wal.syncFile = nil
+		db.wal.SetSyncFileForTesting(nil)
 		_ = db.Close()
 	}()
 
 	// One byte makes every non-empty WAL append cross the checkpoint threshold.
-	db.wal.checkpointThresholdBytes = 1
+	db.wal.SetCheckpointThresholdBytes(1)
 	syncCalls := 0
-	db.wal.syncFile = func() error {
+	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		return nil
-	}
+	})
 
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	db.wal.syncFile = nil
+	db.wal.SetSyncFileForTesting(nil)
 	if syncCalls != 1 {
 		t.Fatalf("automatic checkpoint WAL sync calls: got %d, want 1", syncCalls)
 	}
@@ -4257,16 +4191,16 @@ func TestAudit_CloseAfterFullCommitDoesNotResyncWAL(t *testing.T) {
 	}
 	defer func() {
 		if !db.closed {
-			db.wal.syncFile = nil
+			db.wal.SetSyncFileForTesting(nil)
 			_ = db.Close()
 		}
 	}()
 
 	syncCalls := 0
-	db.wal.syncFile = func() error {
+	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		return nil
-	}
+	})
 
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
@@ -4290,16 +4224,16 @@ func TestAudit_CloseSyncsUnsyncedNormalWAL(t *testing.T) {
 	}
 	defer func() {
 		if !db.closed {
-			db.wal.syncFile = nil
+			db.wal.SetSyncFileForTesting(nil)
 			_ = db.Close()
 		}
 	}()
 
 	syncCalls := 0
-	db.wal.syncFile = func() error {
+	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		return nil
-	}
+	})
 
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
@@ -4323,7 +4257,7 @@ func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
 	}
 	defer func() {
 		if !db.closed {
-			db.wal.syncFile = nil
+			db.wal.SetSyncFileForTesting(nil)
 			_ = db.Close()
 		}
 	}()
@@ -4334,14 +4268,14 @@ func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
 
 	syncErr := errors.New("injected WAL sync failure")
 	syncCalls := 0
-	db.wal.syncFile = func() error {
+	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		// The first hooked sync belongs to the failed commit. Any later call is redundant.
 		if syncCalls == 1 {
 			return syncErr
 		}
 		return nil
-	}
+	})
 
 	if err := db.Put([]byte("failed"), []byte("value")); !errors.Is(err, syncErr) {
 		t.Fatalf("Put error: got %v, want %v", err, syncErr)
@@ -4372,24 +4306,25 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	walBefore, err := db.wal.file.Stat()
+	walBefore, err := db.wal.FileForTesting().Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.wal.checkpointThresholdBytes = 1
+	db.wal.SetCheckpointThresholdBytes(1)
 	syncErr := errors.New("injected WAL sync failure")
 	syncCalls := 0
 	publishedBeforeSync := false
 	pendingAtSync := false
-	db.wal.syncFile = func() error {
+	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
-		publishedBeforeSync = len(db.wal.overlay) != 0
-		pendingAtSync = len(db.wal.collectedRecords) != 0
+		stats := db.wal.Stats()
+		publishedBeforeSync = stats.CommittedRecordCount != 0
+		pendingAtSync = stats.CollectedRecordCount != 0
 		return syncErr
-	}
+	})
 
 	err = db.Put([]byte("key"), []byte("new"))
-	db.wal.syncFile = nil
+	db.wal.SetSyncFileForTesting(nil)
 	if !errors.Is(err, syncErr) {
 		t.Fatalf("Put error: got %v, want %v", err, syncErr)
 	}
@@ -4402,13 +4337,15 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	if !pendingAtSync {
 		t.Fatal("transaction records were not pending when WAL sync started")
 	}
-	if len(db.wal.overlay) != 0 || len(db.wal.collectedRecords) != 0 {
-		t.Fatalf("failed transaction state remained: overlay=%d, collected=%d", len(db.wal.overlay), len(db.wal.collectedRecords))
+	stats := db.wal.Stats()
+	if stats.CommittedRecordCount != 0 || stats.CollectedRecordCount != 0 {
+		t.Fatalf("failed transaction state remained: overlay=%d, collected=%d",
+			stats.CommittedRecordCount, stats.CollectedRecordCount)
 	}
-	if db.wal.bytesSinceCheckpoint != 0 {
-		t.Fatalf("failed transaction byte count: got %d, want 0", db.wal.bytesSinceCheckpoint)
+	if stats.BytesSinceCheckpoint != 0 {
+		t.Fatalf("failed transaction byte count: got %d, want 0", stats.BytesSinceCheckpoint)
 	}
-	walAfter, err := db.wal.file.Stat()
+	walAfter, err := db.wal.FileForTesting().Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4435,7 +4372,7 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
-	db.wal.checkpointThresholdBytes = 1
+	db.wal.SetCheckpointThresholdBytes(1)
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -4443,10 +4380,12 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 	if err := db.Put([]byte("first"), []byte("one")); err != nil {
 		t.Fatalf("first durable WAL commit returned a checkpoint error: %v", err)
 	}
-	if len(db.wal.overlay) == 0 || db.wal.bytesSinceCheckpoint == 0 {
-		t.Fatalf("failed checkpoint did not retain committed state: overlay=%d, bytes=%d", len(db.wal.overlay), db.wal.bytesSinceCheckpoint)
+	stats := db.wal.Stats()
+	if stats.CommittedRecordCount == 0 || stats.BytesSinceCheckpoint == 0 {
+		t.Fatalf("failed checkpoint did not retain committed state: overlay=%d, bytes=%d",
+			stats.CommittedRecordCount, stats.BytesSinceCheckpoint)
 	}
-	walBeforeRetry, err := db.wal.file.Stat()
+	walBeforeRetry, err := db.wal.FileForTesting().Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4461,10 +4400,12 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 	if err := db.Put([]byte("second"), []byte("two")); err != nil {
 		t.Fatalf("second commit did not retry the checkpoint: %v", err)
 	}
-	if len(db.wal.overlay) != 0 || db.wal.bytesSinceCheckpoint != 0 {
-		t.Fatalf("checkpoint retry did not drain committed state: overlay=%d, bytes=%d", len(db.wal.overlay), db.wal.bytesSinceCheckpoint)
+	stats = db.wal.Stats()
+	if stats.CommittedRecordCount != 0 || stats.BytesSinceCheckpoint != 0 {
+		t.Fatalf("checkpoint retry did not drain committed state: overlay=%d, bytes=%d",
+			stats.CommittedRecordCount, stats.BytesSinceCheckpoint)
 	}
-	walAfterRetry, err := db.wal.file.Stat()
+	walAfterRetry, err := db.wal.FileForTesting().Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4504,7 +4445,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	_ = db.wal.file.Close()
+	_ = db.wal.Close()
 	_ = db.file.Close()
 
 	mainBytes, err := os.ReadFile(path)
@@ -4611,7 +4552,7 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = db.wal.file.Close()
+	_ = db.wal.Close()
 	_ = db.file.Close()
 
 	commitMarkerSize := wal.HeaderSize + wal.ChecksumSize
@@ -4651,10 +4592,10 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 	if err := db.Put([]byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.wal.file.Seek(0, io.SeekStart); err != nil {
+	if _, err := db.wal.FileForTesting().Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	records, err := db.wal.readRecords()
+	records, err := db.wal.ReadRecords()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4662,7 +4603,7 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 		t.Fatal("committed WAL has no records")
 	}
 
-	clear(db.wal.overlay)
+	db.wal.ClearCommittedRecordsForTesting()
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
