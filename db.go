@@ -114,10 +114,10 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 
 	db.wal = wal
 	if mainMetaErr != nil {
-		if records == nil {
+		if len(records) == 0 {
 			return db.failOpen(mainMetaErr)
 		}
-		meta, err := metaFromCommittedWAL(*records)
+		meta, err := metaFromCommittedWAL(records)
 		if err != nil {
 			return db.failOpen(mainMetaErr)
 		}
@@ -149,7 +149,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		return db.failOpen(err)
 	}
 
-	if records != nil && !db.options.ReadOnly {
+	if len(records) > 0 && !db.options.ReadOnly {
 		if err := db.wal.Truncate(); err != nil {
 			return db.failOpen(err)
 		}
@@ -172,8 +172,8 @@ func (db *DB) initializeNewDatabase() error {
 	return nil
 }
 
-func (db *DB) replayWAL(records *[]Record) error {
-	if records == nil {
+func (db *DB) replayWAL(records []Record) error {
+	if len(records) == 0 {
 		return nil
 	}
 	if db.options.ReadOnly {
@@ -490,7 +490,7 @@ func (db *DB) allocate() Pgid {
 	return db.meta.pgid
 }
 
-func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
+func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 	walPath := db.path + "-wal"
 	var walFile *os.File
 	var err error
@@ -518,8 +518,8 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 		return nil, nil, errors.Join(err, wal.file.Close())
 	}
 
-	if records != nil {
-		for _, record := range *records {
+	if len(records) > 0 {
+		for _, record := range records {
 			if record.header.txid >= wal.nextTxid {
 				wal.nextTxid = record.header.txid + 1
 			}
@@ -529,8 +529,8 @@ func (db *DB) readOrCreateWal() (*WAL, *[]Record, error) {
 	return wal, records, nil
 }
 
-func (db *DB) ingestWalRecords(records *[]Record) error {
-	committed, err := committedWALRecords(*records)
+func (db *DB) ingestWalRecords(records []Record) error {
+	committed, err := committedWALRecords(records)
 	if err != nil {
 		return err
 	}
@@ -603,8 +603,8 @@ func metaFromCommittedWAL(records []Record) (*Meta, error) {
 // It groups records by commit marker (so a torn, uncommitted tail is dropped), keeps
 // the latest page per pgid, and adopts the committed meta (page 0) so reads resolve
 // the recovered root.
-func (db *DB) loadCommittedIntoOverlay(records *[]Record) error {
-	committed, err := committedWALRecords(*records)
+func (db *DB) loadCommittedIntoOverlay(records []Record) error {
+	committed, err := committedWALRecords(records)
 	if err != nil {
 		return err
 	}

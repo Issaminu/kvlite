@@ -70,7 +70,7 @@ func (wal *WAL) collectRecord(record *Record) {
 	wal.collectedRecords[record.header.pgid] = *record
 }
 
-func (wal *WAL) readRecords() (*[]Record, error) {
+func (wal *WAL) readRecords() ([]Record, error) {
 	if !wal.hasRecords() {
 		return nil, nil
 	}
@@ -88,7 +88,7 @@ func (wal *WAL) readRecords() (*[]Record, error) {
 		records = append(records, *record)
 	}
 
-	return &records, nil
+	return records, nil
 }
 
 func (wal *WAL) hasRecords() bool {
