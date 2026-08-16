@@ -13,6 +13,11 @@ var (
 	ErrIncompatibleValue = errors.New("incompatible value")
 	ErrNodeNotSaturated  = errors.New("node entries size hasn't reached a large enough size to split")
 	ErrNodeTooLarge      = errors.New("node is too large to fit page size")
+	ErrKeyNotFound       = errors.New("key not found")
+	ErrKeyTooLarge       = errors.New("key too large")
+	ErrKeyEmpty          = errors.New("key is empty")
+	ErrValueTooLarge     = errors.New("value too large")
+	ErrEntryTooLarge     = errors.New("key/value entry is too large to fit in a single page on its own")
 )
 
 const BucketLeafFlag uint32 = 0x01

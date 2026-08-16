@@ -29,7 +29,35 @@ type DB struct {
 	rootNode *Node
 	options  *Options
 	wal      *wal.WAL
+	tree     *btree.Tree
 	closed   bool
+}
+
+// treeStore connects btree.Tree to this DB. It contains only db because each
+// method below forwards one storage operation to the database. This lets the
+// tree package change the tree while DB keeps control of pages and the WAL.
+type treeStore struct {
+	db *DB
+}
+
+// PageSize reports the page size from the database metadata.
+func (store treeStore) PageSize() int64 {
+	return store.db.meta.PageSize()
+}
+
+// ReadNode uses the database read path, including records staged in the WAL.
+func (store treeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
+	return store.db.readNode(pageID)
+}
+
+// AllocatePage reserves the next database page ID.
+func (store treeStore) AllocatePage() page.ID {
+	return store.db.allocate()
+}
+
+// StageNode places a changed tree node in the current WAL transaction.
+func (store treeStore) StageNode(node *btree.Node) {
+	store.db.wal.InsertNodeRecord(node)
 }
 
 func (db *DB) ensureOpen() error {
@@ -68,6 +96,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		file:    dbFile,
 		options: resolvedOptions,
 	}
+	db.tree = btree.NewTree(treeStore{db: db})
 
 	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()
@@ -235,45 +264,6 @@ func (db *DB) Put(key []byte, value []byte) error {
 	})
 }
 
-func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
-	node := rootNode
-	for !node.IsLeaf {
-		childIndex, err := node.FindChildIndex(key)
-		if err != nil {
-			return nil, err
-		}
-		childNode, err := db.readNode(node.Children[childIndex])
-		if err != nil {
-			return nil, err
-		}
-		if childNode == nil {
-			return nil, ErrKeyNotFound
-		}
-
-		childNode.SetParent(node)
-		childNode.Index = childIndex
-		node = childNode
-	}
-	return node, nil
-}
-
-func (db *DB) validateTreeEntry(entry Entry) error {
-	if len(entry.Key()) == 0 {
-		return ErrKeyEmpty
-	}
-	if len(entry.Key()) > MaxKeySize {
-		return ErrKeyTooLarge
-	}
-	if len(entry.Value()) > MaxValueSize {
-		return ErrValueTooLarge
-	}
-	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
-	if encodedLeafHeaderSize+entry.EncodedSize(true) > int(db.meta.PageSize()) {
-		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.Key(), db.meta.PageSize())
-	}
-	return nil
-}
-
 // putTreeEntry inserts entry into the tree that starts at rootNode. It returns
 // the current root because a split can create a replacement root. The caller
 // owns that root and must adopt it after this function succeeds.
@@ -281,61 +271,7 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 	if db.options.ReadOnly {
 		return nil, ErrDatabaseReadOnly
 	}
-	if err := db.validateTreeEntry(entry); err != nil {
-		return nil, err
-	}
-
-	node, err := db.findLeafNode(rootNode, entry.Key())
-	if err != nil {
-		return nil, err
-	}
-
-	if err := node.InsertEntry(entry); err != nil {
-		return nil, err
-	}
-
-	if !node.NeedsSplit(db.meta.PageSize()) {
-		db.wal.InsertNodeRecord(node)
-		return rootNode, nil
-	}
-
-	for node.NeedsSplit(db.meta.PageSize()) {
-		rightPgid := db.allocate()
-		rightNode, _, keyAtSeperatorIndex, err := node.Split(rightPgid, db.meta.PageSize())
-		if err != nil {
-			if errors.Is(err, ErrNodeNotSaturated) {
-				// split() only fails this way when a single entry (or, for a branch,
-				// too few entries) already overflows a page on its own: there is no
-				// way to divide it into two non-empty halves. Surface a clear error
-				// instead of the internal split-precondition failure.
-				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.Key(), db.meta.PageSize())
-			}
-			return nil, err
-		}
-
-		if node == rootNode {
-			newRoot := db.newRootAfterSplit(node, rightNode, keyAtSeperatorIndex)
-			db.wal.InsertNodeRecord(newRoot)
-			rootNode = newRoot
-		} else { // parent is not a root node
-			parent := node.Parent()
-			parent.InsertSplitChild(node, rightNode, keyAtSeperatorIndex)
-			db.wal.InsertNodeRecord(parent)
-		}
-
-		db.wal.InsertNodeRecord(node)
-		db.wal.InsertNodeRecord(rightNode)
-
-		// The right sibling can itself still overflow a page.
-		// So keep splitting it before climbing, so no node is left over a page.
-		if rightNode.NeedsSplit(db.meta.PageSize()) {
-			node = rightNode
-			continue
-		}
-		node = node.Parent()
-	}
-
-	return rootNode, nil
+	return db.tree.PutEntry(rootNode, entry)
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
@@ -349,18 +285,7 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 }
 
 func (db *DB) findTreeEntry(rootNode *Node, key []byte) (Entry, bool, error) {
-	if len(key) == 0 {
-		return Entry{}, false, ErrKeyEmpty
-	}
-	if len(key) > MaxKeySize {
-		return Entry{}, false, ErrKeyTooLarge
-	}
-
-	node, err := db.findLeafNode(rootNode, key)
-	if err != nil {
-		return Entry{}, false, err
-	}
-	return node.FindEntry(key)
+	return db.tree.FindEntry(rootNode, key)
 }
 
 func (db *DB) persistNode(node *Node) error {
@@ -436,10 +361,6 @@ func (db *DB) persistMeta() error {
 		return fmt.Errorf("write meta: %w", err)
 	}
 	return nil
-}
-
-func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *Node {
-	return btree.NewRootNode(db.allocate(), leftNode, rightNode, separator)
 }
 
 func (db *DB) allocate() page.ID {

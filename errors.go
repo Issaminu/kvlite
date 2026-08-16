@@ -22,16 +22,16 @@ var (
 	ErrBucketNotFound       = errors.New("bucket not found")
 	ErrBucketExists         = errors.New("bucket already exists")
 	ErrBucketNameRequired   = errors.New("bucket name required")
-	ErrKeyNotFound          = errors.New("key not found")
+	ErrKeyNotFound          = btree.ErrKeyNotFound
 	ErrKeyRequired          = errors.New("key required")
-	ErrKeyTooLarge          = errors.New("key too large")
-	ErrKeyEmpty             = errors.New("key is empty")
+	ErrKeyTooLarge          = btree.ErrKeyTooLarge
+	ErrKeyEmpty             = btree.ErrKeyEmpty
 	ErrNotBranchNode        = btree.ErrNotBranchNode
 	ErrNotLeafNode          = btree.ErrNotLeafNode
-	ErrValueTooLarge        = errors.New("value too large")
+	ErrValueTooLarge        = btree.ErrValueTooLarge
 	ErrValueEmpty           = errors.New("value is empty")
 	ErrIncompatibleValue    = btree.ErrIncompatibleValue
 	ErrNodeNotSaturated     = btree.ErrNodeNotSaturated
 	ErrNodeTooLarge         = btree.ErrNodeTooLarge
-	ErrEntryTooLargeForPage = errors.New("key/value entry is too large to fit in a single page on its own")
+	ErrEntryTooLargeForPage = btree.ErrEntryTooLarge
 )

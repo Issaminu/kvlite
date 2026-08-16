@@ -2,6 +2,7 @@ package btree
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"testing"
 
@@ -145,5 +146,72 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	}
 	if !rightNode.IsLeaf || len(rightNode.entries) != 1 || !bytes.Equal(rightNode.entries[0].key, []byte("b")) {
 		t.Fatalf("right entries: got %q, want [b]", rightNode.entries)
+	}
+}
+
+type memoryTreeStore struct {
+	pageSize int64
+	nextID   page.ID
+	nodes    map[page.ID]*Node
+}
+
+func (store *memoryTreeStore) PageSize() int64 {
+	return store.pageSize
+}
+
+func (store *memoryTreeStore) ReadNode(pageID page.ID) (*Node, error) {
+	return store.nodes[pageID], nil
+}
+
+func (store *memoryTreeStore) AllocatePage() page.ID {
+	pageID := store.nextID
+	store.nextID++
+	return pageID
+}
+
+func (store *memoryTreeStore) StageNode(node *Node) {
+	store.nodes[node.PageID()] = node
+}
+
+func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
+	const (
+		pageSize   int64   = 128 // This small page size forces several tree levels.
+		rootPageID page.ID = 1   // Page zero is reserved for metadata.
+		firstNewID page.ID = 2   // New tree pages start after the root page.
+		entryCount         = 100 // This many entries cannot fit in one 128-byte page.
+	)
+
+	store := &memoryTreeStore{
+		pageSize: pageSize,
+		nextID:   firstNewID,
+		nodes:    make(map[page.ID]*Node),
+	}
+	tree := NewTree(store)
+	root := NewLeafNode(rootPageID)
+	store.StageNode(root)
+
+	for index := 0; index < entryCount; index++ {
+		key := fmt.Appendf(nil, "key-%03d", index)
+		value := fmt.Appendf(nil, "value-%03d", index)
+		var err error
+		root, err = tree.PutEntry(root, NewEntry(0, key, value))
+		if err != nil {
+			t.Fatalf("put %q: %v", key, err)
+		}
+	}
+	if root.IsLeaf {
+		t.Fatal("tree did not create a branch root")
+	}
+
+	for index := 0; index < entryCount; index++ {
+		key := fmt.Appendf(nil, "key-%03d", index)
+		want := fmt.Appendf(nil, "value-%03d", index)
+		entry, found, err := tree.FindEntry(root, key)
+		if err != nil {
+			t.Fatalf("find %q: %v", key, err)
+		}
+		if !found || !bytes.Equal(entry.Value(), want) {
+			t.Fatalf("find %q: found=%t value=%q, want %q", key, found, entry.Value(), want)
+		}
 	}
 }
