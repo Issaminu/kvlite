@@ -1,7 +1,6 @@
 package kvlite
 
 import (
-	"errors"
 	"slices"
 )
 
@@ -62,14 +61,17 @@ func (tx *Tx) Get(key []byte) ([]byte, error) {
 		return nil, ErrTxClosed
 	}
 
-	value, flags, err := tx.db._get(tx.db.rootNode, key)
+	entry, found, err := tx.db.findTreeEntry(tx.db.rootNode, key)
 	if err != nil {
 		return nil, err
 	}
-	if flags&BucketLeafFlag != 0 {
+	if !found {
+		return nil, ErrKeyNotFound
+	}
+	if entry.flags&BucketLeafFlag != 0 {
 		return nil, ErrIncompatibleValue
 	}
-	return value, nil
+	return entry.value, nil
 }
 
 // cacheBucket registers b as the one handle for its name within this transaction.
@@ -193,22 +195,22 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 }
 
 func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
-	value, flags, err := tx.db._get(rootNode, bucketName)
+	entry, found, err := tx.db.findTreeEntry(rootNode, bucketName)
 	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) {
-			return nil, nil
-		}
 		return nil, err
 	}
+	if !found {
+		return nil, nil
+	}
 
-	if flags&BucketLeafFlag == 0 {
+	if entry.flags&BucketLeafFlag == 0 {
 		// exists, but it's a regular value
 		return nil, ErrIncompatibleValue
 	}
 
 	// exists and is actually a bucket
 
-	pgid, err := decode[Pgid](value)
+	pgid, err := decode[Pgid](entry.value)
 	if err != nil {
 		return nil, err
 	}
@@ -273,14 +275,14 @@ func (bucket *Bucket) Get(key []byte) []byte {
 	if bucket.tx.closed {
 		return nil
 	}
-	value, flags, err := bucket.tx.db._get(bucket.rootNode, key)
-	if err != nil {
+	entry, found, err := bucket.tx.db.findTreeEntry(bucket.rootNode, key)
+	if err != nil || !found {
 		return nil
 	}
 
 	// value is a bucket, we should refuse
-	if flags&BucketLeafFlag != 0 {
+	if entry.flags&BucketLeafFlag != 0 {
 		return nil
 	}
-	return value
+	return entry.value
 }

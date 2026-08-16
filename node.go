@@ -69,28 +69,27 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 	return index, found, nil
 }
 
-// get looks a key up in this leaf. The returned found reports whether the key is
-// present; callers must use it rather than a nil value to decide "missing",
-// because a stored value can legitimately be empty. When found is true, the
-// returned value is always non-nil (an empty stored value comes back as a
-// zero-length slice), so a nil value never means "present but empty".
-func (n *Node) get(key []byte) (value []byte, flags uint32, found bool, err error) {
+// findEntry looks a key up in this leaf. The returned found reports whether the
+// key is present because a stored value can be empty.
+func (n *Node) findEntry(key []byte) (Entry, bool, error) {
 	if !n.IsLeaf {
-		return nil, 0, false, ErrNotLeafNode
+		return Entry{}, false, ErrNotLeafNode
 	}
 	idx, found, err := n.findKeyIndex(key)
 	if err != nil {
-		return nil, 0, false, err
+		return Entry{}, false, err
 	}
 	if !found {
-		return nil, 0, false, nil
+		return Entry{}, false, nil
 	}
 
-	value = slices.Clone(n.entries[idx].value)
-	if value == nil {
-		value = []byte{}
+	entry := n.entries[idx]
+	entry.key = slices.Clone(entry.key)
+	entry.value = slices.Clone(entry.value)
+	if entry.value == nil {
+		entry.value = []byte{}
 	}
-	return value, n.entries[idx].flags, true, nil
+	return entry, true, nil
 }
 
 func (n *Node) insert(key, value []byte, flags uint32) error {

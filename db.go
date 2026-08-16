@@ -389,27 +389,19 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return value, err
 }
 
-func (db *DB) _get(rootNode *Node, key []byte) ([]byte, uint32, error) {
+func (db *DB) findTreeEntry(rootNode *Node, key []byte) (Entry, bool, error) {
 	if len(key) == 0 {
-		return nil, 0, ErrKeyEmpty
+		return Entry{}, false, ErrKeyEmpty
 	}
 	if len(key) > MaxKeySize {
-		return nil, 0, ErrKeyTooLarge
+		return Entry{}, false, ErrKeyTooLarge
 	}
 
 	node, err := db.findLeafNode(rootNode, key)
 	if err != nil {
-		return nil, 0, err
+		return Entry{}, false, err
 	}
-
-	value, flags, found, err := node.get(key)
-	if err != nil {
-		return nil, 0, err
-	}
-	if !found {
-		return nil, 0, ErrKeyNotFound
-	}
-	return value, flags, nil
+	return node.findEntry(key)
 }
 
 func (db *DB) persistNode(node *Node) error {

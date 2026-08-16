@@ -3050,6 +3050,38 @@ func TestGet_MissingStillErrKeyNotFound(t *testing.T) {
 	}
 }
 
+func TestFindTreeEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("present"), nil); err != nil {
+		t.Fatalf("put empty value: %v", err)
+	}
+
+	entry, found, err := db.findTreeEntry(db.rootNode, []byte("present"))
+	if err != nil {
+		t.Fatalf("find present entry: %v", err)
+	}
+	if !found {
+		t.Fatal("stored entry reported missing")
+	}
+	if entry.value == nil || len(entry.value) != 0 {
+		t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.value)
+	}
+
+	_, found, err = db.findTreeEntry(db.rootNode, []byte("missing"))
+	if err != nil {
+		t.Fatalf("find missing entry: %v", err)
+	}
+	if found {
+		t.Fatal("missing entry reported present")
+	}
+}
+
 // An empty value must also survive a checkpoint + reopen, not just an in-memory
 // round-trip. This guards the encode/decode path, where a zero-length value could
 // re-emerge as nil.
