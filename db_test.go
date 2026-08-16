@@ -75,7 +75,7 @@ func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	meta := NewMeta()
 	db := &DB{meta: meta}
 	node := db.newLeafNode(meta.root)
-	if err := node.insert([]byte("key"), []byte("value"), 0); err != nil {
+	if err := node.insertEntry(Entry{key: []byte("key"), value: []byte("value")}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1990,6 +1990,40 @@ func TestTx_PutSurvivesRootSplit(t *testing.T) {
 		if err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %q lost after a tx.Put root split (dropped new root): err=%v", k, err)
 		}
+	}
+}
+
+func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
+	path := tempfile()
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	originalRoot := db.rootNode
+	originalMetaRoot := db.meta.root
+	value := bytes.Repeat([]byte("v"), int(db.meta.pageSize/2))
+
+	root, err := db.putTreeEntry(originalRoot, Entry{key: []byte("a"), value: value})
+	if err != nil {
+		t.Fatalf("put first entry: %v", err)
+	}
+	root, err = db.putTreeEntry(root, Entry{key: []byte("b"), value: value})
+	if err != nil {
+		t.Fatalf("put second entry: %v", err)
+	}
+	if root == originalRoot {
+		t.Fatal("second entry did not split the root")
+	}
+	if db.rootNode != originalRoot {
+		t.Fatal("tree engine adopted the replacement root")
+	}
+	if db.meta.root != originalMetaRoot {
+		t.Fatalf("tree engine changed meta root: got %d, want %d", db.meta.root, originalMetaRoot)
+	}
+	if _, ok := db.wal.collectedRecords[metaPgid]; ok {
+		t.Fatal("tree engine staged a meta record before its owner adopted the root")
 	}
 }
 

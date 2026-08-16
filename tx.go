@@ -39,13 +39,18 @@ func (tx *Tx) writableError() error {
 	return nil
 }
 
-func (tx *Tx) putEntry(key, value []byte, flags uint32) error {
-	newRoot, err := tx.db._put(tx.db.rootNode, key, value, flags)
+// putCatalogEntry writes entry to the database's top-level tree. putTreeEntry
+// can return a replacement root after a split, but it does not install that
+// root. This method installs it, updates meta.root, and then stages the meta
+// record so recovery uses the root that contains the entry.
+func (tx *Tx) putCatalogEntry(entry Entry) error {
+	newRoot, err := tx.db.putTreeEntry(tx.db.rootNode, entry)
 	if err != nil {
 		return err
 	}
 	tx.db.rootNode = newRoot
 	tx.db.meta.root = newRoot.pgid
+	tx.db.wal.insertMetaRecord(tx.db.meta)
 	return nil
 }
 
@@ -53,7 +58,7 @@ func (tx *Tx) Put(key, value []byte) error {
 	if err := tx.writableError(); err != nil {
 		return err
 	}
-	return tx.putEntry(key, value, 0)
+	return tx.putCatalogEntry(Entry{key: key, value: value})
 }
 
 func (tx *Tx) Get(key []byte) ([]byte, error) {
@@ -102,10 +107,11 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // that points at it. That entry lives in the parent's tree: the DB catalog for a
 // top-level bucket, or the parent bucket's own tree for a nested bucket.
 func (b *Bucket) writeBackRoot() error {
+	entry := Entry{flags: BucketLeafFlag, key: b.name, value: encode(b.rootNode.pgid)}
 	if b.parentBucket == nil {
-		return b.tx.putEntry(b.name, encode(b.rootNode.pgid), BucketLeafFlag)
+		return b.tx.putCatalogEntry(entry)
 	}
-	return b.parentBucket.putEntry(b.name, encode(b.rootNode.pgid), BucketLeafFlag)
+	return b.parentBucket.putBucketEntry(entry)
 }
 
 func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
@@ -143,9 +149,9 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	if parent == nil {
-		err = tx.putEntry(bucket.name, encode(newPgid), BucketLeafFlag)
+		err = tx.putCatalogEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encode(newPgid)})
 	} else {
-		err = parent.putEntry(bucket.name, encode(newPgid), BucketLeafFlag)
+		err = parent.putBucketEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encode(newPgid)})
 	}
 	if err != nil {
 		return nil, err
@@ -251,15 +257,16 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
-	return bucket.putEntry(key, value, 0)
+	return bucket.putBucketEntry(Entry{key: key, value: value})
 }
 
-func (bucket *Bucket) putEntry(key, value []byte, flags uint32) error {
-	newRoot, err := bucket.tx.db._put(bucket.rootNode, key, value, flags)
+func (bucket *Bucket) putBucketEntry(entry Entry) error {
+	newRoot, err := bucket.tx.db.putTreeEntry(bucket.rootNode, entry)
 	if err != nil {
 		return err
 	}
 	if newRoot == bucket.rootNode {
+		bucket.tx.db.wal.insertMetaRecord(bucket.tx.db.meta)
 		return nil
 	}
 

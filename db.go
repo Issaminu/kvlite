@@ -281,55 +281,45 @@ func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
 	return node, nil
 }
 
-func (db *DB) validatePutEntry(key, value []byte) error {
-	if len(key) == 0 {
+func (db *DB) validateTreeEntry(entry Entry) error {
+	if len(entry.key) == 0 {
 		return ErrKeyEmpty
 	}
-	if len(key) > MaxKeySize {
+	if len(entry.key) > MaxKeySize {
 		return ErrKeyTooLarge
 	}
-	if len(value) > MaxValueSize {
+	if len(entry.value) > MaxValueSize {
 		return ErrValueTooLarge
 	}
-	entry := Entry{key: key, value: value}
 	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
 	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.pageSize) {
-		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, key, db.meta.pageSize)
+		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.pageSize)
 	}
 	return nil
 }
 
-// _put() places a key in it's correct place starting from a root *Node.
-// Due to node splitting, it's possible that the the new root (starting from the provided rootNode) is not actually the root of that tree.
-// returns (*NewRootNode, error), since it's possible that the root was split within the process.
-// if `rootNode != NewRootNode`, please assign it as the new root node of the tree.
-func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Node, error) {
+// putTreeEntry inserts entry into the tree that starts at rootNode. It returns
+// the current root because a split can create a replacement root. The caller
+// owns that root and must adopt it after this function succeeds.
+func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 	if db.options.ReadOnly {
 		return nil, ErrDatabaseReadOnly
 	}
-	if err := db.validatePutEntry(key, value); err != nil {
+	if err := db.validateTreeEntry(entry); err != nil {
 		return nil, err
 	}
 
-	// When we operate on the database's own tree (rather than a bucket sub-tree),
-	// a root split must update db.meta.root *before* we collect the meta record
-	// below. Otherwise the record captures the pre-split root, and a commit that
-	// ends on a root split persists a meta pointing at the old root — reopen then
-	// loads a root that holds only the left half of the split.
-	isTopLevel := rootNode == db.rootNode
-
-	node, err := db.findLeafNode(rootNode, key)
+	node, err := db.findLeafNode(rootNode, entry.key)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := node.insert(key, value, flags); err != nil {
+	if err := node.insertEntry(entry); err != nil {
 		return nil, err
 	}
 
 	if !node.needsSplit() {
 		db.wal.insertNodeRecord(node)
-		db.wal.insertMetaRecord(db.meta)
 		return rootNode, nil
 	}
 
@@ -342,7 +332,7 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 				// too few entries) already overflows a page on its own: there is no
 				// way to divide it into two non-empty halves. Surface a clear error
 				// instead of the internal split-precondition failure.
-				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, key, db.meta.pageSize)
+				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.pageSize)
 			}
 			return nil, err
 		}
@@ -351,12 +341,6 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 			newRoot := db.newRootAfterSplit(node, rightNode, keyAtSeperatorIndex)
 			db.wal.insertNodeRecord(newRoot)
 			rootNode = newRoot
-
-			// Adopt the new root now, so the meta record collected below records it.
-			if isTopLevel {
-				db.rootNode = newRoot
-				db.meta.root = newRoot.pgid
-			}
 		} else { // parent is not a root node
 			parent := node.parent
 			parent.insertSplitChild(node, rightNode, keyAtSeperatorIndex)
@@ -375,7 +359,6 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 		node = node.parent
 	}
 
-	db.wal.insertMetaRecord(db.meta)
 	return rootNode, nil
 }
 

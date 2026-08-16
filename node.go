@@ -92,35 +92,32 @@ func (n *Node) findEntry(key []byte) (Entry, bool, error) {
 	return entry, true, nil
 }
 
-func (n *Node) insert(key, value []byte, flags uint32) error {
+func (n *Node) insertEntry(entry Entry) error {
 	if !n.IsLeaf {
 		return ErrNotLeafNode
 	}
 
-	keyCopy := slices.Clone(key)
-	valueCopy := slices.Clone(value)
-
-	idx, found, err := n.findKeyIndex(key)
-
+	idx, found, err := n.findKeyIndex(entry.key)
 	if err != nil {
 		return err
 	}
 	if found {
 		existingIsBucket := n.entries[idx].flags&BucketLeafFlag != 0
-		newIsBucket := flags&BucketLeafFlag != 0
+		newIsBucket := entry.flags&BucketLeafFlag != 0
 		if existingIsBucket != newIsBucket {
 			return ErrIncompatibleValue
 		}
-		n.entries[idx].flags = flags
-		n.entries[idx].value = valueCopy
+		n.entries[idx].flags = entry.flags
+		n.entries[idx].value = slices.Clone(entry.value)
 		return nil
 	}
 
-	newEntry := Entry{flags: flags, key: keyCopy, value: valueCopy}
+	entry.key = slices.Clone(entry.key)
+	entry.value = slices.Clone(entry.value)
 
 	n.entries = append(n.entries, Entry{})
 	copy(n.entries[idx+1:], n.entries[idx:])
-	n.entries[idx] = newEntry
+	n.entries[idx] = entry
 
 	return nil
 }
