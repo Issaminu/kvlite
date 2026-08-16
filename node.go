@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"sort"
 )
 
 const (
@@ -49,16 +50,10 @@ func (n *Node) findChildIndex(key []byte) (int, error) {
 	if n.IsLeaf {
 		return -1, ErrNotBranchNode
 	}
-	low, high := 0, len(n.entries)
-	for low < high {
-		mid := low + (high-low)/2
-		if bytes.Compare(key, n.entries[mid].key) < 0 {
-			high = mid
-		} else {
-			low = mid + 1
-		}
-	}
-	return low, nil
+	index := sort.Search(len(n.entries), func(index int) bool {
+		return bytes.Compare(key, n.entries[index].key) < 0
+	})
+	return index, nil
 }
 
 // Find the index of the key in it's leaf node.
@@ -67,19 +62,11 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 	if !n.IsLeaf {
 		return -1, false, ErrNotLeafNode
 	}
-	low, high := 0, len(n.entries)
-	for low < high {
-		mid := low + (high-low)/2
-		cmp := bytes.Compare(key, n.entries[mid].key)
-		if cmp < 0 {
-			high = mid
-		} else if cmp > 0 {
-			low = mid + 1
-		} else {
-			return mid, true, nil
-		}
-	}
-	return low, false, nil
+	index := sort.Search(len(n.entries), func(index int) bool {
+		return bytes.Compare(n.entries[index].key, key) >= 0
+	})
+	found := index < len(n.entries) && bytes.Equal(n.entries[index].key, key)
+	return index, found, nil
 }
 
 // get looks a key up in this leaf. The returned found reports whether the key is
