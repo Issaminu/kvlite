@@ -445,21 +445,15 @@ func (db *DB) hasMeta() bool {
 }
 
 func (db *DB) readNode(pgid Pgid) (*Node, error) {
-	offset := int64(pgid) * db.meta.pageSize
-
 	// check if Node exists in current transaction
-	if record, ok := db.wal.collectedRecords[pgid]; ok {
-		node, err := record.toNode()
-		if err != nil {
-			return nil, err
-		}
-		node.db = db
-		node.pgid = pgid
-		return node, nil
-	}
 
-	// check if Node has been commited (in an earlier transaction) but not yet checkpointed
-	if record, ok := db.wal.overlay[pgid]; ok {
+	record, ok := db.wal.collectedRecords[pgid]
+	if !ok {
+		// Node is not in current transaction.
+		// let's check if Node has been commited (in an earlier transaction) but not yet checkpointed
+		record, ok = db.wal.overlay[pgid]
+	}
+	if ok {
 		node, err := record.toNode()
 		if err != nil {
 			return nil, err
@@ -470,6 +464,8 @@ func (db *DB) readNode(pgid Pgid) (*Node, error) {
 	}
 
 	// Node not found in-memory, so we have to read its full page from the database file.
+
+	offset := int64(pgid) * db.meta.pageSize
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return nil, err
 	}
