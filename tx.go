@@ -40,20 +40,21 @@ func (tx *Tx) writableError() error {
 	return nil
 }
 
-func (tx *Tx) Put(key, value []byte) error {
-	if err := tx.writableError(); err != nil {
-		return err
-	}
-	newRoot, err := tx.db._put(tx.db.rootNode, key, value, 0)
+func (tx *Tx) putEntry(key, value []byte, flags uint32) error {
+	newRoot, err := tx.db._put(tx.db.rootNode, key, value, flags)
 	if err != nil {
 		return err
-	}
-	if newRoot == tx.db.rootNode {
-		return nil
 	}
 	tx.db.rootNode = newRoot
 	tx.db.meta.root = newRoot.pgid
 	return nil
+}
+
+func (tx *Tx) Put(key, value []byte) error {
+	if err := tx.writableError(); err != nil {
+		return err
+	}
+	return tx.putEntry(key, value, 0)
 }
 
 func (tx *Tx) Get(key []byte) ([]byte, error) {
@@ -99,29 +100,10 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // that points at it. That entry lives in the parent's tree: the DB catalog for a
 // top-level bucket, or the parent bucket's own tree for a nested bucket.
 func (b *Bucket) writeBackRoot() error {
-	db := b.tx.db
-
 	if b.parentBucket == nil {
-		// Top-level bucket. The entry lives in the DB catalog (db.rootNode). When
-		// that root splits, _put updates db.rootNode and db.meta.root itself, so we
-		// only record the pointer here and let _put own the catalog root.
-		_, err := db._put(db.rootNode, b.name, encode(b.rootNode.pgid), BucketLeafFlag)
-		return err
+		return b.tx.putEntry(b.name, encode(b.rootNode.pgid), BucketLeafFlag)
 	}
-
-	// Nested bucket. The entry lives in the parent bucket's own tree. A split moves
-	// the parent's root to a new page, so adopt it and write the parent's pointer one
-	// level further up. This recurses until it reaches the DB catalog.
-	parent := b.parentBucket
-	newParentRoot, err := db._put(parent.rootNode, b.name, encode(b.rootNode.pgid), BucketLeafFlag)
-	if err != nil {
-		return err
-	}
-	if newParentRoot != parent.rootNode {
-		parent.rootNode = newParentRoot
-		return parent.writeBackRoot()
-	}
-	return nil
+	return b.parentBucket.putEntry(b.name, encode(b.rootNode.pgid), BucketLeafFlag)
 }
 
 func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
@@ -133,14 +115,11 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 		return nil, err
 	}
 
-	var parentRoot *Node
 	var existing *Bucket
 	var err error
 	if parent == nil {
-		parentRoot = tx.db.rootNode
 		existing, err = tx.lookupBucket(bucketName)
 	} else {
-		parentRoot = parent.rootNode
 		existing, err = parent.Bucket(bucketName)
 	}
 	if err != nil {
@@ -161,23 +140,18 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 		parentBucket: parent,
 	}
 
-	newParentRoot, err := tx.db._put(parentRoot, bucket.name, encode(newPgid), BucketLeafFlag)
+	if parent == nil {
+		err = tx.putEntry(bucket.name, encode(newPgid), BucketLeafFlag)
+	} else {
+		err = parent.putEntry(bucket.name, encode(newPgid), BucketLeafFlag)
+	}
 	if err != nil {
 		return nil, err
 	}
 
 	if parent == nil {
-		tx.db.rootNode = newParentRoot
-		tx.db.meta.root = newParentRoot.pgid
 		tx.cacheBucket(bucket)
 		return bucket, nil
-	}
-
-	if newParentRoot != parent.rootNode {
-		parent.rootNode = newParentRoot
-		if err := parent.writeBackRoot(); err != nil {
-			return nil, err
-		}
 	}
 
 	parent.cacheChild(bucket)
@@ -275,8 +249,11 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
+	return bucket.putEntry(key, value, 0)
+}
 
-	newRoot, err := bucket.tx.db._put(bucket.rootNode, key, value, 0)
+func (bucket *Bucket) putEntry(key, value []byte, flags uint32) error {
+	newRoot, err := bucket.tx.db._put(bucket.rootNode, key, value, flags)
 	if err != nil {
 		return err
 	}
