@@ -177,7 +177,7 @@ func (db *DB) initializeNewDatabase() error {
 	if err := db.persistMeta(); err != nil {
 		return fmt.Errorf("init meta: %w", err)
 	}
-	db.rootNode = db.newLeafNode(db.meta.pgid)
+	db.rootNode = newLeafNode(db.meta.pgid)
 	if err := db.persistNode(db.rootNode); err != nil {
 		return fmt.Errorf("init root node: %w", err)
 	}
@@ -332,14 +332,14 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 		return nil, err
 	}
 
-	if !node.needsSplit() {
+	if !node.needsSplit(db.meta.pageSize) {
 		db.wal.insertNodeRecord(node)
 		return rootNode, nil
 	}
 
-	for node.needsSplit() {
+	for node.needsSplit(db.meta.pageSize) {
 		rightPgid := db.allocate()
-		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid)
+		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid, db.meta.pageSize)
 		if err != nil {
 			if errors.Is(err, ErrNodeNotSaturated) {
 				// split() only fails this way when a single entry (or, for a branch,
@@ -366,7 +366,7 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 
 		// The right sibling can itself still overflow a page.
 		// So keep splitting it before climbing, so no node is left over a page.
-		if rightNode.needsSplit() {
+		if rightNode.needsSplit(db.meta.pageSize) {
 			node = rightNode
 			continue
 		}
@@ -406,7 +406,7 @@ func (db *DB) persistNode(node *Node) error {
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek node: %w", err)
 	}
-	if err := writeNode(db.file, node, true); err != nil {
+	if err := writeNode(db.file, node, db.meta.pageSize, true); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	return nil
@@ -434,7 +434,6 @@ func (db *DB) readNode(pgid Pgid) (*Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		node.db = db
 		node.pgid = pgid
 		return node, nil
 	}
@@ -454,7 +453,6 @@ func (db *DB) readNode(pgid Pgid) (*Node, error) {
 		return nil, err
 	}
 
-	node.db = db
 	node.pgid = pgid
 	return node, nil
 }
@@ -483,13 +481,8 @@ func (db *DB) persistMeta() error {
 	return nil
 }
 
-func (db *DB) newLeafNode(pgid Pgid) *Node {
-	return &Node{db: db, IsLeaf: true, pgid: pgid, Children: []Pgid{}, entries: []Entry{}}
-}
-
 func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *Node {
 	rootNode := &Node{
-		db:       db,
 		IsLeaf:   false,
 		entries:  []Entry{{key: separator}},
 		Children: []Pgid{leftNode.pgid, rightNode.pgid},

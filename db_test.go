@@ -242,18 +242,55 @@ func TestWriteFull_CompletesPartialWrites(t *testing.T) {
 
 func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	meta := NewMeta(int64(os.Getpagesize()))
-	db := &DB{meta: meta}
-	node := db.newLeafNode(meta.root)
+	node := newLeafNode(meta.root)
 	if err := node.insertEntry(Entry{key: []byte("key"), value: []byte("value")}); err != nil {
 		t.Fatal(err)
 	}
 
 	writer := new(oneByteWriter)
-	if err := writeNode(writer, node, true); err != nil {
+	if err := writeNode(writer, node, meta.pageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	if writer.Len() != int(meta.pageSize) {
 		t.Fatalf("encoded node size: got %d bytes, want one %d-byte page", writer.Len(), meta.pageSize)
+	}
+}
+
+func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
+	const (
+		pageSize  int64 = 64 // Two 33-byte entries exceed this page size.
+		valueSize       = 20 // A leaf entry uses 12 fixed bytes, a one-byte key, and this value.
+		leftPgid  Pgid  = 1  // Page 1 is the first node page after the metadata page.
+		rightPgid Pgid  = 2  // Page 2 is the next page allocated for the split.
+	)
+
+	node := &Node{
+		IsLeaf: true,
+		pgid:   leftPgid,
+		entries: []Entry{
+			{key: []byte("a"), value: make([]byte, valueSize)},
+			{key: []byte("b"), value: make([]byte, valueSize)},
+		},
+	}
+
+	rightNode, splitIndex, separator, err := node.split(rightPgid, pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if splitIndex != 1 {
+		t.Fatalf("split index: got %d, want 1", splitIndex)
+	}
+	if !bytes.Equal(separator, []byte("b")) {
+		t.Fatalf("separator: got %q, want %q", separator, "b")
+	}
+	if len(node.entries) != 1 || !bytes.Equal(node.entries[0].key, []byte("a")) {
+		t.Fatalf("left entries: got %q, want [a]", node.entries)
+	}
+	if rightNode.pgid != rightPgid {
+		t.Fatalf("right page ID: got %d, want %d", rightNode.pgid, rightPgid)
+	}
+	if !rightNode.IsLeaf || len(rightNode.entries) != 1 || !bytes.Equal(rightNode.entries[0].key, []byte("b")) {
+		t.Fatalf("right entries: got %q, want [b]", rightNode.entries)
 	}
 }
 
@@ -3300,7 +3337,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		// operation that Bucket.CreateBucket/Put drive; here we aim it at a brimming
 		// parent so the pointer insert splits p's root.
 		newPgid := tx.db.allocate()
-		cRoot := tx.db.newLeafNode(newPgid)
+		cRoot := newLeafNode(newPgid)
 		tx.db.wal.insertNodeRecord(cRoot)
 		c := &Bucket{tx: tx, name: childName, rootNode: cRoot, parentBucket: p}
 		if err := c.writeBackRoot(); err != nil {

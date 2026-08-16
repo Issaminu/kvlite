@@ -41,13 +41,16 @@ func (e Entry) encodedSize(isLeaf bool) int {
 }
 
 type Node struct {
-	db       *DB
 	IsLeaf   bool
 	entries  []Entry
 	Children []Pgid // for non-leaf nodes: len(Children) == len(entries)+1
 	Index    int    // this node's index within it's parent node's Children array
 	pgid     Pgid
 	parent   *Node
+}
+
+func newLeafNode(pgid Pgid) *Node {
+	return &Node{IsLeaf: true, pgid: pgid, Children: []Pgid{}, entries: []Entry{}}
 }
 
 // Find the correct child node for this key.
@@ -193,20 +196,19 @@ func decodeLengthPrefixedBytes(data []byte) ([]byte, []byte, error) {
 	return value, data[size:], nil
 }
 
-func writeNode(w io.Writer, node *Node, shouldPad bool) error {
-	pageSize := int(node.db.meta.pageSize)
+func writeNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
 	encoded := encodeNode(node)
 	currNodeSize := len(encoded)
 
-	if currNodeSize > pageSize {
+	if int64(currNodeSize) > pageSize {
 		return ErrNodeTooLarge
 	}
 
 	if err := writeFull(w, encoded); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
-	if shouldPad && currNodeSize < pageSize {
-		padding := make([]byte, pageSize-currNodeSize)
+	if shouldPad && int64(currNodeSize) < pageSize {
+		padding := make([]byte, int(pageSize)-currNodeSize)
 		if err := writeFull(w, padding); err != nil {
 			return fmt.Errorf("write node padding: %w", err)
 		}
@@ -241,17 +243,17 @@ func encodeNode(node *Node) []byte {
 	return data
 }
 
-// Node needs to be split since it surpassed the maximum node size
-func (n *Node) needsSplit() bool {
-	return n.serializedSize() > int(n.db.meta.pageSize)
+// Check if Node needs to be split since it surpassed the maximum node size
+func (n *Node) needsSplit(pageSize int64) bool {
+	return int64(n.serializedSize()) > pageSize
 }
 
 func (n *Node) serializedSize() int {
 	return len(encodeNode(n))
 }
 
-func (n *Node) chooseSplitIndex() (int, error) {
-	limit := int(n.db.meta.pageSize / 2)
+func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
+	limit := int(pageSize / 2)
 	currSize := 0
 	separatorIndex := -1
 
@@ -287,16 +289,18 @@ func (n *Node) chooseSplitIndex() (int, error) {
 	return min(max(separatorIndex, 1), len(n.entries)-2), nil
 }
 
-func (n *Node) split(newPgid Pgid) (*Node, int, []byte, error) {
-	separatorIndex, err := n.chooseSplitIndex()
+func (n *Node) split(newPgid Pgid, pageSize int64) (*Node, int, []byte, error) {
+	separatorIndex, err := n.chooseSplitIndex(pageSize)
 	if err != nil {
 		return nil, separatorIndex, nil, err
 	}
 
-	rightNode := n.db.newLeafNode(newPgid)
-
-	rightNode.IsLeaf = n.IsLeaf
-	rightNode.Index = n.Index + 1
+	rightNode := &Node{
+		IsLeaf:   n.IsLeaf,
+		Children: []Pgid{},
+		Index:    n.Index + 1,
+		pgid:     newPgid,
+	}
 
 	keyAtSeparatorIndex := n.entries[separatorIndex].key
 

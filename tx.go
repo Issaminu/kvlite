@@ -138,7 +138,7 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	newPgid := tx.db.allocate()
-	rootNode := tx.db.newLeafNode(newPgid)
+	rootNode := newLeafNode(newPgid)
 	tx.db.wal.insertNodeRecord(rootNode)
 
 	bucket := &Bucket{
