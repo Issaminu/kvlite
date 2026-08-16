@@ -1,7 +1,6 @@
 package kvlite
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -435,7 +434,7 @@ func (db *DB) readNode(pgid Pgid) (*Node, error) {
 	if _, err := io.ReadFull(db.file, page); err != nil {
 		return nil, err
 	}
-	node, err := readNode(bytes.NewReader(page))
+	node, err := decodeNode(page)
 	if err != nil {
 		return nil, err
 	}

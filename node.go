@@ -14,7 +14,13 @@ const (
 	MaxValueSize = (1 << 31) - 2 // ~2 GiB
 )
 
-type KVLength uint32 // Size of the prefixed length of an Entry's `key` or `Value`
+const (
+	// Node scalar fields and key/value lengths use uint32 values, which occupy
+	// four bytes when encoded.
+	encodedUint32Size = 4
+	// A node starts with a one-byte leaf marker and a uint32 entry count.
+	nodeHeaderSize = 1 + encodedUint32Size
+)
 
 type Entry struct {
 	flags uint32
@@ -122,77 +128,81 @@ func (n *Node) insertEntry(entry Entry) error {
 	return nil
 }
 
-func readNode(r *bytes.Reader) (*Node, error) {
-	node := &Node{}
-	node, err := decodeNode(r)
-
-	if err != nil {
-		return nil, err
-	}
-	return node, nil
-}
-
 // Decodes one bounded node buffer into a Node.
-func decodeNode(r *bytes.Reader) (*Node, error) {
-	node := &Node{}
-	var isLeafByte byte
-	if err := binary.Read(r, binary.LittleEndian, &isLeafByte); err != nil {
-		return nil, fmt.Errorf("read node isLeaf: %w", err)
+func decodeNode(data []byte) (*Node, error) {
+	if len(data) < nodeHeaderSize {
+		return nil, fmt.Errorf("read node header: %w", ErrInvalid)
 	}
-	node.IsLeaf = isLeafByte != 0
-
-	var count uint32
-	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
-		return nil, fmt.Errorf("read node key count: %w", err)
-	}
+	node := &Node{IsLeaf: data[0] != 0}
+	count := binary.LittleEndian.Uint32(data[1:nodeHeaderSize])
+	data = data[nodeHeaderSize:]
 
 	// looping through the entries (keys and values) of this node
 	for i := uint32(0); i < count; i++ {
-		var flags uint32
-		if err := binary.Read(r, binary.LittleEndian, &flags); err != nil {
-			return nil, fmt.Errorf("read node flags %d: %w", i, err)
+		if len(data) < encodedUint32Size {
+			return nil, fmt.Errorf("read node flags %d: %w", i, ErrInvalid)
 		}
-		key, err := readLengthPrefixedBytes[KVLength](r)
+		flags := binary.LittleEndian.Uint32(data[:encodedUint32Size])
+		data = data[encodedUint32Size:]
+
+		key, remaining, err := decodeLengthPrefixedBytes(data)
 		if err != nil {
 			return nil, fmt.Errorf("read node key %d: %w", i, err)
 		}
+		data = remaining
 		if !node.IsLeaf { // meaning we can only read the key
 			node.entries = append(node.entries, Entry{flags: flags, key: key})
 			continue
 		}
-		value, err := readLengthPrefixedBytes[KVLength](r)
+		value, remaining, err := decodeLengthPrefixedBytes(data)
 		if err != nil {
 			return nil, fmt.Errorf("read node value %d: %w", i, err)
 		}
+		data = remaining
 		node.entries = append(node.entries, Entry{flags: flags, key: key, value: value})
 	}
 
 	if !node.IsLeaf {
-		node.Children = make([]Pgid, count+1)
+		childCount := uint64(count) + 1
+		childrenSize := childCount * uint64(pgidEncodedSize)
+		if childrenSize > uint64(len(data)) {
+			return nil, fmt.Errorf("read node children: %w", ErrInvalid)
+		}
+		node.Children = make([]Pgid, int(childCount))
 		for i := range node.Children {
-			var pgid uint64
-			if err := binary.Read(r, binary.LittleEndian, &pgid); err != nil {
-				return nil, fmt.Errorf("read node child pgid %d: %w", i, err)
-			}
-			node.Children[i] = Pgid(pgid)
+			node.Children[i] = Pgid(binary.LittleEndian.Uint64(data[:pgidEncodedSize]))
+			data = data[pgidEncodedSize:]
 		}
 	}
 	return node, nil
 }
 
+func decodeLengthPrefixedBytes(data []byte) ([]byte, []byte, error) {
+	if len(data) < encodedUint32Size {
+		return nil, nil, ErrInvalid
+	}
+	length := binary.LittleEndian.Uint32(data[:encodedUint32Size])
+	data = data[encodedUint32Size:]
+	if uint64(length) > uint64(len(data)) {
+		return nil, nil, ErrInvalid
+	}
+
+	size := int(length)
+	value := make([]byte, size)
+	copy(value, data[:size])
+	return value, data[size:], nil
+}
+
 func writeNode(w io.Writer, node *Node, shouldPad bool) error {
-	buf := new(bytes.Buffer)
 	pageSize := int(node.db.meta.pageSize)
-
-	encodeNode(node, buf)
-
-	currNodeSize := buf.Len()
+	encoded := encodeNode(node)
+	currNodeSize := len(encoded)
 
 	if currNodeSize > pageSize {
 		return ErrNodeTooLarge
 	}
 
-	if err := writeFull(w, buf.Bytes()); err != nil {
+	if err := writeFull(w, encoded); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	if shouldPad && currNodeSize < pageSize {
@@ -204,41 +214,31 @@ func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 	return nil
 }
 
-// Encodes a *Node instance into a *bytes.Buffer
-func encodeNode(node *Node, buf *bytes.Buffer) error {
+func encodeNode(node *Node) []byte {
+	data := make([]byte, 0)
 	isLeafByte := byte(0)
 	if node.IsLeaf {
 		isLeafByte = 1
 	}
-	if err := binary.Write(buf, binary.LittleEndian, isLeafByte); err != nil {
-		return fmt.Errorf("write node isLeaf: %w", err)
-	}
-	if err := binary.Write(buf, binary.LittleEndian, uint32(len(node.entries))); err != nil {
-		return fmt.Errorf("write node key count: %w", err)
-	}
+	data = append(data, isLeafByte)
+	data = binary.LittleEndian.AppendUint32(data, uint32(len(node.entries)))
 
 	for _, e := range node.entries {
-		if err := binary.Write(buf, binary.LittleEndian, e.flags); err != nil {
-			return fmt.Errorf("write node flags: %w", err)
-		}
-		if err := writeLengthPrefixedBytes[KVLength](buf, e.key); err != nil {
-			return fmt.Errorf("write node key: %w", err)
-		}
+		data = binary.LittleEndian.AppendUint32(data, e.flags)
+		data = binary.LittleEndian.AppendUint32(data, uint32(len(e.key)))
+		data = append(data, e.key...)
 		if node.IsLeaf {
-			if err := writeLengthPrefixedBytes[KVLength](buf, e.value); err != nil {
-				return fmt.Errorf("write node value: %w", err)
-			}
+			data = binary.LittleEndian.AppendUint32(data, uint32(len(e.value)))
+			data = append(data, e.value...)
 		}
 	}
 
 	if !node.IsLeaf {
 		for _, child := range node.Children {
-			if err := binary.Write(buf, binary.LittleEndian, uint64(child)); err != nil {
-				return fmt.Errorf("write node child pgid: %w", err)
-			}
+			data = binary.LittleEndian.AppendUint64(data, uint64(child))
 		}
 	}
-	return nil
+	return data
 }
 
 // Node needs to be split since it surpassed the maximum node size
@@ -247,9 +247,7 @@ func (n *Node) needsSplit() bool {
 }
 
 func (n *Node) serializedSize() int {
-	buf := new(bytes.Buffer)
-	encodeNode(n, buf)
-	return buf.Len()
+	return len(encodeNode(n))
 }
 
 func (n *Node) chooseSplitIndex() (int, error) {

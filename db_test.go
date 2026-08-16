@@ -95,6 +95,76 @@ func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 	}
 }
 
+func TestNodeCodec_UsesFixedLeafLayout(t *testing.T) {
+	node := &Node{
+		IsLeaf:  true,
+		entries: []Entry{{key: []byte("k"), value: []byte("v")}},
+	}
+	// Layout: leaf marker, one entry, zero flags, one-byte key, and one-byte value.
+	want := []byte{
+		1,
+		1, 0, 0, 0,
+		0, 0, 0, 0,
+		1, 0, 0, 0, 'k',
+		1, 0, 0, 0, 'v',
+	}
+
+	encoded := encodeNode(node)
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encode leaf: got %x, want %x", encoded, want)
+	}
+
+	decoded, err := decodeNode(encoded)
+	if err != nil {
+		t.Fatalf("decode leaf: %v", err)
+	}
+	if !decoded.IsLeaf || len(decoded.entries) != 1 {
+		t.Fatalf("decode leaf shape: %+v", decoded)
+	}
+	entry := decoded.entries[0]
+	if entry.flags != 0 || !bytes.Equal(entry.key, []byte("k")) || !bytes.Equal(entry.value, []byte("v")) {
+		t.Fatalf("decode leaf entry: %+v", entry)
+	}
+
+	for size := 0; size < len(encoded); size++ {
+		if _, err := decodeNode(encoded[:size]); err == nil {
+			t.Errorf("decode %d-byte leaf prefix: expected an error", size)
+		}
+	}
+}
+
+func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
+	node := &Node{
+		entries:  []Entry{{key: []byte("m")}},
+		Children: []Pgid{2, 3},
+	}
+	// Layout: branch marker, one separator, zero flags, one-byte key, and two child page IDs.
+	want := []byte{
+		0,
+		1, 0, 0, 0,
+		0, 0, 0, 0,
+		1, 0, 0, 0, 'm',
+		2, 0, 0, 0, 0, 0, 0, 0,
+		3, 0, 0, 0, 0, 0, 0, 0,
+	}
+
+	encoded := encodeNode(node)
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encode branch: got %x, want %x", encoded, want)
+	}
+
+	decoded, err := decodeNode(encoded)
+	if err != nil {
+		t.Fatalf("decode branch: %v", err)
+	}
+	if decoded.IsLeaf || len(decoded.entries) != 1 || len(decoded.Children) != 2 {
+		t.Fatalf("decode branch shape: %+v", decoded)
+	}
+	if !bytes.Equal(decoded.entries[0].key, []byte("m")) || decoded.Children[0] != 2 || decoded.Children[1] != 3 {
+		t.Fatalf("decode branch data: %+v", decoded)
+	}
+}
+
 // fileSize returns the current size of the database file in bytes.
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()

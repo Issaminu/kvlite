@@ -66,12 +66,9 @@ type Record struct {
 }
 
 func (wal *WAL) insertNodeRecord(node *Node) {
-	buf := new(bytes.Buffer)
-	encodeNode(node, buf)
-
 	record := Record{
 		header:      RecordHeader{recordType: recordTypeData, pgid: node.pgid},
-		pageContent: buf.Bytes(),
+		pageContent: encodeNode(node),
 	}
 
 	wal.collectRecord(&record)
@@ -338,7 +335,7 @@ func (record *Record) toNode() (*Node, error) {
 		return nil, fmt.Errorf("record has no page content")
 	}
 
-	node, err := decodeNode(bytes.NewReader(record.pageContent))
+	node, err := decodeNode(record.pageContent)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize node: %w", err)

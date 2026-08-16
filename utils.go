@@ -1,36 +1,6 @@
 package kvlite
 
-import (
-	"bytes"
-	"encoding/binary"
-	"io"
-)
-
-type UintType interface {
-	~uint8 | ~uint16 | ~uint32 | ~uint64
-}
-
-func readLengthPrefixedBytes[T UintType](r *bytes.Reader) ([]byte, error) {
-	var length T
-	if err := binary.Read(r, binary.LittleEndian, &length); err != nil {
-		return nil, err
-	}
-	if uint64(length) > uint64(r.Len()) {
-		return nil, ErrInvalid
-	}
-	data := make([]byte, length)
-	if _, err := io.ReadFull(r, data); err != nil {
-		return nil, err
-	}
-	return data, nil
-}
-
-func writeLengthPrefixedBytes[T UintType](w io.Writer, data []byte) error {
-	if err := binary.Write(w, binary.LittleEndian, T(len(data))); err != nil {
-		return err
-	}
-	return writeFull(w, data)
-}
+import "io"
 
 func writeFull(writer io.Writer, data []byte) error {
 	for len(data) > 0 {
