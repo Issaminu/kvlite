@@ -107,7 +107,7 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // that points at it. That entry lives in the parent's tree: the DB catalog for a
 // top-level bucket, or the parent bucket's own tree for a nested bucket.
 func (b *Bucket) writeBackRoot() error {
-	entry := Entry{flags: BucketLeafFlag, key: b.name, value: encode(b.rootNode.pgid)}
+	entry := Entry{flags: BucketLeafFlag, key: b.name, value: encodePgid(b.rootNode.pgid)}
 	if b.parentBucket == nil {
 		return b.tx.putCatalogEntry(entry)
 	}
@@ -149,9 +149,9 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	if parent == nil {
-		err = tx.putCatalogEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encode(newPgid)})
+		err = tx.putCatalogEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encodePgid(newPgid)})
 	} else {
-		err = parent.putBucketEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encode(newPgid)})
+		err = parent.putBucketEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: encodePgid(newPgid)})
 	}
 	if err != nil {
 		return nil, err
@@ -216,7 +216,7 @@ func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bu
 
 	// exists and is actually a bucket
 
-	pgid, err := decode[Pgid](entry.value)
+	pgid, err := decodePgid(entry.value)
 	if err != nil {
 		return nil, err
 	}

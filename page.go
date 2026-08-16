@@ -11,18 +11,18 @@ import (
 type Pgid uint64
 type Txid uint64
 
-func encode[T Pgid | Txid](value T) []byte {
-	buf := make([]byte, 8)
-	binary.LittleEndian.PutUint64(buf, uint64(value))
+// A Pgid is a uint64, so every encoded page ID occupies eight bytes.
+const pgidEncodedSize = 8
+
+func encodePgid(pgid Pgid) []byte {
+	buf := make([]byte, pgidEncodedSize)
+	binary.LittleEndian.PutUint64(buf, uint64(pgid))
 	return buf
 }
 
-func decode[T Pgid | Txid](value []byte) (T, error) {
-	if len(value) < 8 {
-		var zero T
-		return zero, fmt.Errorf("insufficient bytes: need 8, got %d", len(value))
+func decodePgid(data []byte) (Pgid, error) {
+	if len(data) != pgidEncodedSize {
+		return 0, fmt.Errorf("decode pgid: got %d bytes, want %d: %w", len(data), pgidEncodedSize, ErrInvalid)
 	}
-
-	data := T(binary.LittleEndian.Uint64(value))
-	return data, nil
+	return Pgid(binary.LittleEndian.Uint64(data)), nil
 }

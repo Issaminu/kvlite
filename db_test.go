@@ -36,6 +36,32 @@ func openDB(path string) (*DB, error) {
 	return Open(path, 0600, &Options{synchronous: SYNCHRONOUS_NORMAL})
 }
 
+func TestPgidCodec_UsesExactlyEightLittleEndianBytes(t *testing.T) {
+	// The byte pattern makes the uint64 byte order visible in the assertion.
+	const pgid Pgid = 0x0102030405060708
+	want := []byte{0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01}
+
+	encoded := encodePgid(pgid)
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encode pgid: got %x, want %x", encoded, want)
+	}
+
+	decoded, err := decodePgid(encoded)
+	if err != nil {
+		t.Fatalf("decode pgid: %v", err)
+	}
+	if decoded != pgid {
+		t.Fatalf("decode pgid: got %x, want %x", decoded, pgid)
+	}
+
+	// A Pgid is a uint64, so its encoding must contain exactly eight bytes.
+	for _, size := range []int{7, 9} {
+		if _, err := decodePgid(make([]byte, size)); !errors.Is(err, ErrInvalid) {
+			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
+		}
+	}
+}
+
 // fileSize returns the current size of the database file in bytes.
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()
