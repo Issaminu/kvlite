@@ -1,31 +1,16 @@
 package kvlite
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"os"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
+	walrecord "github.com/Issaminu/kvlite/internal/wal"
 )
-
-const (
-	recordTypeData   uint8 = 0
-	recordTypeMeta   uint8 = 1
-	recordTypeCommit uint8 = 2 // a commit marker: ends one transaction, no content
-
-	recordTypeSize          = 1 // A record type uses one byte.
-	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
-	recordContentLengthSize = 4 // A content length uses one uint32 value.
-	recordChecksumSize      = 8 // An FNV-1a checksum uses one uint64 value.
-	recordHeaderSize        = recordTypeSize + page.IDSize + recordTransactionIDSize + recordContentLengthSize
-)
-
-type Txid uint64
 
 type WAL struct {
 	db                       *DB
@@ -33,29 +18,17 @@ type WAL struct {
 	file                     *os.File
 	checkpointThresholdBytes int64
 	bytesSinceCheckpoint     int64
-	collectedRecords         map[page.ID]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
-	overlay                  map[page.ID]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
-	nextTxid                 Txid               // sequence number stamped on the next committed transaction
-	hasUnsyncedWrites        bool               // true when WAL bytes were appended after the last successful sync
-	syncFile                 func() error       // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
-}
-
-// RecordHeader is the fixed-size head of every WAL record.
-type RecordHeader struct {
-	recordType uint8
-	pgid       page.ID
-	txid       Txid
-}
-
-type Record struct {
-	header      RecordHeader
-	pageContent []byte
+	collectedRecords         map[page.ID]walrecord.Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
+	overlay                  map[page.ID]walrecord.Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
+	nextTxid                 walrecord.TxID               // sequence number stamped on the next committed transaction
+	hasUnsyncedWrites        bool                         // true when WAL bytes were appended after the last successful sync
+	syncFile                 func() error                 // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
 }
 
 func (wal *WAL) insertNodeRecord(node *Node) {
-	record := Record{
-		header:      RecordHeader{recordType: recordTypeData, pgid: node.PageID()},
-		pageContent: btree.EncodeNode(node),
+	record := walrecord.Record{
+		Header:      walrecord.RecordHeader{Type: walrecord.RecordTypeData, PageID: node.PageID()},
+		PageContent: btree.EncodeNode(node),
 	}
 
 	wal.collectRecord(&record)
@@ -64,26 +37,26 @@ func (wal *WAL) insertNodeRecord(node *Node) {
 func (wal *WAL) insertMetaRecord(meta *page.Meta) {
 	meta.RefreshChecksum()
 
-	record := Record{
-		header:      RecordHeader{recordType: recordTypeMeta, pgid: page.MetaID},
-		pageContent: page.EncodeMeta(meta),
+	record := walrecord.Record{
+		Header:      walrecord.RecordHeader{Type: walrecord.RecordTypeMeta, PageID: page.MetaID},
+		PageContent: page.EncodeMeta(meta),
 	}
 
 	wal.collectRecord(&record)
 }
 
-func (wal *WAL) collectRecord(record *Record) {
-	wal.collectedRecords[record.header.pgid] = *record
+func (wal *WAL) collectRecord(record *walrecord.Record) {
+	wal.collectedRecords[record.Header.PageID] = *record
 }
 
-func (wal *WAL) readRecords() ([]Record, error) {
+func (wal *WAL) readRecords() ([]walrecord.Record, error) {
 	if !wal.hasRecords() {
 		return nil, nil
 	}
 
-	var records []Record
+	var records []walrecord.Record
 	for {
-		record, err := decodeRecord(wal.file, wal.db.meta.PageSize())
+		record, err := walrecord.DecodeRecord(wal.file, wal.db.meta.PageSize())
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
@@ -150,82 +123,13 @@ func (wal *WAL) delete() error {
 	return err
 }
 
-func encodeRecord(record *Record, pageSize int64) ([]byte, error) {
-	size, err := encodedRecordSize(record, pageSize)
-	if err != nil {
-		return nil, err
-	}
-
-	return appendEncodedRecord(make([]byte, 0, size), record), nil
-}
-
-func encodedRecordSize(record *Record, pageSize int64) (int, error) {
-	if int64(len(record.pageContent)) > pageSize {
-		return 0, fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
-	}
-	return recordHeaderSize + len(record.pageContent) + recordChecksumSize, nil
-}
-
-func appendEncodedRecord(data []byte, record *Record) []byte {
-	headerStart := len(data)
-	data = append(data, record.header.recordType)
-	data = binary.LittleEndian.AppendUint64(data, uint64(record.header.pgid))
-	data = binary.LittleEndian.AppendUint64(data, uint64(record.header.txid))
-	data = binary.LittleEndian.AppendUint32(data, uint32(len(record.pageContent)))
-	headerEnd := len(data)
-	data = append(data, record.pageContent...)
-	checksum := computeRecordChecksum(data[headerStart:headerEnd], record.pageContent)
-	data = binary.LittleEndian.AppendUint64(data, checksum)
-
-	return data
-}
-
-func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
-	headerData := make([]byte, recordHeaderSize)
-	if err := fileio.ReadFull(r, headerData); err != nil {
-		return nil, err // io.EOF at a clean boundary; io.ErrUnexpectedEOF on a torn tail
-	}
-
-	data := headerData
-	record := &Record{}
-	record.header.recordType = data[0]
-	data = data[recordTypeSize:]
-	record.header.pgid = page.ID(binary.LittleEndian.Uint64(data[:page.IDSize]))
-	data = data[page.IDSize:]
-	record.header.txid = Txid(binary.LittleEndian.Uint64(data[:recordTransactionIDSize]))
-	data = data[recordTransactionIDSize:]
-	contentSize := binary.LittleEndian.Uint32(data[:recordContentLengthSize])
-	if int64(contentSize) > pageSize {
-		// A torn tail can leave a bogus length prefix. Treat it as an integrity
-		// failure (ErrChecksum) so readRecords stops at this record instead of
-		// failing the whole open. A well-formed record can never exceed a page.
-		return nil, fmt.Errorf("record content_size %d exceeds page size %d: %w", contentSize, pageSize, ErrChecksum)
-	}
-
-	record.pageContent = make([]byte, contentSize)
-	if err := fileio.ReadFull(r, record.pageContent); err != nil {
-		return nil, err
-	}
-
-	var checksumData [recordChecksumSize]byte
-	if err := fileio.ReadFull(r, checksumData[:]); err != nil {
-		return nil, err
-	}
-	checksum := binary.LittleEndian.Uint64(checksumData[:])
-	if computeRecordChecksum(headerData, record.pageContent) != checksum {
-		return nil, ErrChecksum
-	}
-
-	return record, nil
-}
-
-func (wal *WAL) applyRecordToDatabase(record *Record, pageSize int64) error {
-	offset := int64(record.header.pgid) * pageSize
+func (wal *WAL) applyRecordToDatabase(record *walrecord.Record, pageSize int64) error {
+	offset := int64(record.Header.PageID) * pageSize
 	if _, err := wal.db.file.Seek(offset, io.SeekStart); err != nil {
 		return err
 	}
 	// content is stored unpadded in the WAL; pad it to a full page for the main file
-	page := record.pageContent
+	page := record.PageContent
 	if int64(len(page)) < pageSize {
 		padded := make([]byte, pageSize)
 		copy(padded, page)
@@ -235,13 +139,6 @@ func (wal *WAL) applyRecordToDatabase(record *Record, pageSize int64) error {
 		return err
 	}
 	return nil
-}
-
-func computeRecordChecksum(header, content []byte) uint64 {
-	hashFunc := fnv.New64a()
-	hashFunc.Write(header)
-	hashFunc.Write(content)
-	return hashFunc.Sum64()
 }
 
 func (wal *WAL) persistCollectedRecords() error {
@@ -272,9 +169,9 @@ func (wal *WAL) persistCollectedRecords() error {
 }
 
 func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
-	transactionSize := recordHeaderSize + recordChecksumSize // The commit marker has no page content.
+	transactionSize := walrecord.HeaderSize + walrecord.ChecksumSize // The commit marker has no page content.
 	for _, record := range wal.collectedRecords {
-		size, err := encodedRecordSize(&record, wal.db.meta.PageSize())
+		size, err := walrecord.EncodedRecordSize(&record, wal.db.meta.PageSize())
 		if err != nil {
 			return nil, err
 		}
@@ -287,17 +184,17 @@ func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 	transaction := make([]byte, 0, transactionSize)
 
 	for pgid, record := range wal.collectedRecords {
-		record.header.txid = txid
-		transaction = appendEncodedRecord(transaction, &record)
+		record.Header.TxID = txid
+		transaction = walrecord.AppendEncodedRecord(transaction, &record)
 
 		wal.collectedRecords[pgid] = record
 	}
 
-	commitMarker := &Record{
-		header:      RecordHeader{recordType: recordTypeCommit, pgid: 0, txid: txid},
-		pageContent: nil,
+	commitMarker := &walrecord.Record{
+		Header:      walrecord.RecordHeader{Type: walrecord.RecordTypeCommit, PageID: 0, TxID: txid},
+		PageContent: nil,
 	}
-	transaction = appendEncodedRecord(transaction, commitMarker)
+	transaction = walrecord.AppendEncodedRecord(transaction, commitMarker)
 
 	return transaction, nil
 }
@@ -326,20 +223,16 @@ func (wal *WAL) moveCollectedRecordsToOverlay() {
 	clear(wal.collectedRecords)
 }
 
-func isRecordCommitMarker(record *Record) bool {
-	return record.header.recordType == recordTypeCommit
-}
-
 func (wal *WAL) reachedCheckpointThreshold() bool {
 	return wal.bytesSinceCheckpoint >= wal.checkpointThresholdBytes
 }
 
-func (record *Record) toNode() (*Node, error) {
-	if record.pageContent == nil {
+func recordToNode(record *walrecord.Record) (*Node, error) {
+	if record.PageContent == nil {
 		return nil, fmt.Errorf("record has no page content")
 	}
 
-	node, err := btree.DecodeNode(record.pageContent)
+	node, err := btree.DecodeNode(record.PageContent)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize node: %w", err)

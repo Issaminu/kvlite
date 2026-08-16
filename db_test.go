@@ -23,6 +23,7 @@ import (
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
+	"github.com/Issaminu/kvlite/internal/wal"
 )
 
 // tempfile returns a temporary file path for a database.
@@ -37,46 +38,6 @@ func tempfile() string {
 // per-commit durability uses this.
 func openDB(path string) (*DB, error) {
 	return Open(path, 0600, &Options{Synchronous: SyncNormal})
-}
-
-func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
-	record := &Record{
-		header: RecordHeader{
-			recordType: recordTypeData,
-			pgid:       1,
-			txid:       2,
-		},
-		pageContent: []byte("xy"),
-	}
-	// Layout: record type, page ID, transaction ID, content length, content,
-	// and the FNV-1a checksum of all preceding bytes.
-	want := []byte{
-		0,
-		1, 0, 0, 0, 0, 0, 0, 0,
-		2, 0, 0, 0, 0, 0, 0, 0,
-		2, 0, 0, 0,
-		'x', 'y',
-		0xf1, 0x3c, 0x9c, 0xc5, 0x52, 0x74, 0xd3, 0x4f,
-	}
-
-	encoded, err := encodeRecord(record, int64(len(record.pageContent)))
-	if err != nil {
-		t.Fatalf("encode WAL record: %v", err)
-	}
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode WAL record: got %x, want %x", encoded, want)
-	}
-
-	decoded, err := decodeRecord(bytes.NewReader(encoded), int64(len(record.pageContent)))
-	if err != nil {
-		t.Fatalf("decode WAL record: %v", err)
-	}
-	if decoded.header.recordType != recordTypeData || decoded.header.pgid != 1 || decoded.header.txid != 2 {
-		t.Fatalf("decode WAL record header: %+v", decoded.header)
-	}
-	if !bytes.Equal(decoded.pageContent, []byte("xy")) {
-		t.Fatalf("decode WAL record content: got %x, want %x", decoded.pageContent, []byte("xy"))
-	}
 }
 
 // fileSize returns the current size of the database file in bytes.
@@ -3658,9 +3619,9 @@ func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
 		t.Fatal("expected at least one overlay record after a commit")
 	}
 	for pgid, record := range db.wal.overlay {
-		if record.header.txid != wantTxid {
+		if record.Header.TxID != wantTxid {
 			t.Fatalf("overlay record for pgid %d has txid %d, want %d (the committing transaction's txid)",
-				pgid, record.header.txid, wantTxid)
+				pgid, record.Header.TxID, wantTxid)
 		}
 	}
 }
@@ -4049,11 +4010,11 @@ func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
 	_ = db.wal.file.Close()
 	_ = db.file.Close()
 
-	if len(walBytes) < recordHeaderSize {
+	if len(walBytes) < wal.HeaderSize {
 		t.Fatalf("WAL is too small: %d bytes", len(walBytes))
 	}
 	contentSize := int(binary.LittleEndian.Uint32(walBytes[17:21]))
-	checksumOffset := recordHeaderSize + contentSize
+	checksumOffset := wal.HeaderSize + contentSize
 	if checksumOffset >= len(walBytes)-1 {
 		t.Fatalf("first record has no later WAL data: checksum offset %d, WAL size %d", checksumOffset, len(walBytes))
 	}
@@ -4615,12 +4576,12 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	_ = db.wal.file.Close()
 	_ = db.file.Close()
 
-	commitMarkerSize := recordHeaderSize + 8
+	commitMarkerSize := wal.HeaderSize + wal.ChecksumSize
 	if len(firstWAL) <= commitMarkerSize || len(secondWAL) <= commitMarkerSize {
 		t.Fatal("WAL transaction is too small")
 	}
 	firstMarker := firstWAL[len(firstWAL)-commitMarkerSize:]
-	if firstMarker[0] != recordTypeCommit {
+	if firstMarker[0] != byte(wal.RecordTypeCommit) {
 		t.Fatal("first WAL does not end with a commit marker")
 	}
 	secondRecords := secondWAL[:len(secondWAL)-commitMarkerSize]

@@ -5,6 +5,7 @@ import (
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
+	"github.com/Issaminu/kvlite/internal/wal"
 )
 
 const (
@@ -20,11 +21,11 @@ type Tx struct {
 
 type writeTransactionSnapshot struct {
 	bytesSinceCheckpoint int64
-	collectedRecords     map[page.ID]Record
-	overlay              map[page.ID]Record
+	collectedRecords     map[page.ID]wal.Record
+	overlay              map[page.ID]wal.Record
 	meta                 page.Meta
 	walOffset            int64
-	nextTxid             Txid
+	nextTxid             wal.TxID
 	hasUnsyncedWrites    bool
 }
 

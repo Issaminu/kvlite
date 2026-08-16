@@ -10,6 +10,7 @@ import (
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
+	"github.com/Issaminu/kvlite/internal/wal"
 )
 
 type Node = btree.Node
@@ -199,7 +200,7 @@ func (db *DB) initializeNewDatabase() error {
 	return nil
 }
 
-func (db *DB) replayWAL(records []Record) error {
+func (db *DB) replayWAL(records []wal.Record) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -442,7 +443,7 @@ func (db *DB) readNode(pgid page.ID) (*Node, error) {
 		record, ok = db.wal.overlay[pgid]
 	}
 	if ok {
-		node, err := record.toNode()
+		node, err := recordToNode(&record)
 		if err != nil {
 			return nil, err
 		}
@@ -501,7 +502,7 @@ func (db *DB) allocate() page.ID {
 	return db.meta.Allocate()
 }
 
-func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
+func (db *DB) readOrCreateWal() (*WAL, []wal.Record, error) {
 	walPath := db.path + "-wal"
 	var walFile *os.File
 	var err error
@@ -528,8 +529,8 @@ func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 		db:                       db,
 		path:                     walPath,
 		file:                     walFile,
-		collectedRecords:         make(map[page.ID]Record),
-		overlay:                  make(map[page.ID]Record),
+		collectedRecords:         make(map[page.ID]wal.Record),
+		overlay:                  make(map[page.ID]wal.Record),
 		nextTxid:                 1,
 		checkpointThresholdBytes: db.options.CheckpointThresholdBytes,
 		bytesSinceCheckpoint:     0,
@@ -542,8 +543,8 @@ func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 
 	if len(records) > 0 {
 		for _, record := range records {
-			if record.header.txid >= wal.nextTxid {
-				wal.nextTxid = record.header.txid + 1
+			if record.Header.TxID >= wal.nextTxid {
+				wal.nextTxid = record.Header.TxID + 1
 			}
 		}
 	}
@@ -551,7 +552,7 @@ func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 	return wal, records, nil
 }
 
-func (db *DB) ingestWalRecords(records []Record) error {
+func (db *DB) ingestWalRecords(records []wal.Record) error {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return err
@@ -565,19 +566,19 @@ func (db *DB) ingestWalRecords(records []Record) error {
 	return db.file.Sync()
 }
 
-func committedWALRecords(records []Record) ([]Record, error) {
-	committed := make([]Record, 0, len(records))
-	pending := make([]Record, 0)
+func committedWALRecords(records []wal.Record) ([]wal.Record, error) {
+	committed := make([]wal.Record, 0, len(records))
+	pending := make([]wal.Record, 0)
 
 	for index, record := range records {
-		if !isRecordCommitMarker(&record) {
+		if !wal.IsCommitMarker(&record) {
 			pending = append(pending, record)
 			continue
 		}
 
 		matches := len(pending) > 0
 		for _, candidate := range pending {
-			if candidate.header.txid != record.header.txid {
+			if candidate.Header.TxID != record.Header.TxID {
 				matches = false
 				break
 			}
@@ -596,7 +597,7 @@ func committedWALRecords(records []Record) ([]Record, error) {
 	return committed, nil
 }
 
-func metaFromCommittedWAL(records []Record) (*page.Meta, error) {
+func metaFromCommittedWAL(records []wal.Record) (*page.Meta, error) {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return nil, err
@@ -604,10 +605,10 @@ func metaFromCommittedWAL(records []Record) (*page.Meta, error) {
 	// starting from the last record downwards to get the most recent version of the meta, then early break then
 	for index := len(committed) - 1; index >= 0; index-- {
 		record := committed[index]
-		if record.header.recordType != recordTypeMeta || record.header.pgid != page.MetaID {
+		if record.Header.Type != wal.RecordTypeMeta || record.Header.PageID != page.MetaID {
 			continue
 		}
-		meta, err := page.DecodeMeta(record.pageContent)
+		meta, err := page.DecodeMeta(record.PageContent)
 		if err != nil {
 			return nil, err
 		}
@@ -625,17 +626,17 @@ func metaFromCommittedWAL(records []Record) (*page.Meta, error) {
 // It groups records by commit marker (so a torn, uncommitted tail is dropped), keeps
 // the latest page per pgid, and adopts the committed meta (page 0) so reads resolve
 // the recovered root.
-func (db *DB) loadCommittedIntoOverlay(records []Record) error {
+func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return err
 	}
 	for _, record := range committed {
-		db.wal.overlay[record.header.pgid] = record
+		db.wal.overlay[record.Header.PageID] = record
 	}
 
 	if metaRecord, ok := db.wal.overlay[page.MetaID]; ok {
-		meta, err := page.DecodeMeta(metaRecord.pageContent)
+		meta, err := page.DecodeMeta(metaRecord.PageContent)
 		if err != nil {
 			return fmt.Errorf("read committed meta from WAL: %w", err)
 		}
