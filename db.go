@@ -256,7 +256,7 @@ func (db *DB) Close() error {
 	}
 
 	if db.wal != nil {
-		if err := db.wal.checkpoint(); err != nil { // implicitely also fsyncs db.file
+		if err := db.checkpointWAL(); err != nil {
 			return err
 		}
 		if err := db.wal.delete(); err != nil {
@@ -425,6 +425,49 @@ func (db *DB) persistNode(node *Node) error {
 	return nil
 }
 
+func (db *DB) applyWALRecord(record *wal.Record) error {
+	pageSize := db.meta.PageSize()
+	offset := int64(record.Header.PageID) * pageSize
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		return err
+	}
+
+	// WAL records omit page padding. The main file stores every page at its full size.
+	data := record.PageContent
+	if int64(len(data)) < pageSize {
+		padded := make([]byte, pageSize)
+		copy(padded, data)
+		data = padded
+	}
+	return fileio.WriteFull(db.file, data)
+}
+
+// checkpointWAL makes the WAL durable, copies its committed pages into the main
+// file, makes the main file durable, and then clears the WAL state.
+func (db *DB) checkpointWAL() error {
+	if len(db.wal.overlay) == 0 {
+		return nil
+	}
+	if err := db.wal.sync(); err != nil {
+		return err
+	}
+	for _, record := range db.wal.overlay {
+		if err := db.applyWALRecord(&record); err != nil {
+			return err
+		}
+	}
+	if err := db.file.Sync(); err != nil {
+		return err
+	}
+	if err := db.wal.Truncate(); err != nil {
+		// The main file is already durable. Keep the overlay so cleanup can be retried.
+		return nil
+	}
+	clear(db.wal.overlay)
+	db.wal.bytesSinceCheckpoint = 0
+	return nil
+}
+
 func (db *DB) hasMeta() bool {
 	fi, err := db.file.Stat()
 	if err != nil {
@@ -526,9 +569,10 @@ func (db *DB) readOrCreateWal() (*WAL, []wal.Record, error) {
 	}
 
 	wal := &WAL{
-		db:                       db,
 		path:                     walPath,
 		file:                     walFile,
+		pageSize:                 db.meta.PageSize(),
+		syncOnCommit:             db.options.Synchronous == SyncFull,
 		collectedRecords:         make(map[page.ID]wal.Record),
 		overlay:                  make(map[page.ID]wal.Record),
 		nextTxid:                 1,
@@ -558,7 +602,7 @@ func (db *DB) ingestWalRecords(records []wal.Record) error {
 		return err
 	}
 	for _, record := range committed {
-		if err := db.wal.applyRecordToDatabase(&record, db.meta.PageSize()); err != nil {
+		if err := db.applyWALRecord(&record); err != nil {
 			return err
 		}
 	}
@@ -723,11 +767,17 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	}
 
 	// transaction succeeded
-	if err := db.wal.persistCollectedRecords(); err != nil {
+	needsCheckpoint, err := db.wal.persistCollectedRecords()
+	if err != nil {
 		if rbErr := db.rollbackWriteTransaction(&snapshot); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
+	}
+	if needsCheckpoint {
+		// The WAL is already durable. A checkpoint failure must not turn this
+		// committed transaction into a reported failure.
+		_ = db.checkpointWAL()
 	}
 
 	return nil

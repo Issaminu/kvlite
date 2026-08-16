@@ -13,9 +13,10 @@ import (
 )
 
 type WAL struct {
-	db                       *DB
 	path                     string
 	file                     *os.File
+	pageSize                 int64
+	syncOnCommit             bool
 	checkpointThresholdBytes int64
 	bytesSinceCheckpoint     int64
 	collectedRecords         map[page.ID]walrecord.Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
@@ -56,7 +57,7 @@ func (wal *WAL) readRecords() ([]walrecord.Record, error) {
 
 	var records []walrecord.Record
 	for {
-		record, err := walrecord.DecodeRecord(wal.file, wal.db.meta.PageSize())
+		record, err := walrecord.DecodeRecord(wal.file, wal.pageSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
@@ -123,55 +124,29 @@ func (wal *WAL) delete() error {
 	return err
 }
 
-func (wal *WAL) applyRecordToDatabase(record *walrecord.Record, pageSize int64) error {
-	offset := int64(record.Header.PageID) * pageSize
-	if _, err := wal.db.file.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-	// content is stored unpadded in the WAL; pad it to a full page for the main file
-	page := record.PageContent
-	if int64(len(page)) < pageSize {
-		padded := make([]byte, pageSize)
-		copy(padded, page)
-		page = padded
-	}
-	if err := fileio.WriteFull(wal.db.file, page); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (wal *WAL) persistCollectedRecords() error {
+func (wal *WAL) persistCollectedRecords() (bool, error) {
 	if len(wal.collectedRecords) == 0 {
-		return nil
+		return false, nil
 	}
 
 	transaction, err := wal.encodeCollectedRecords()
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	needsCheckpoint, err := wal.appendTransaction(transaction)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	wal.moveCollectedRecordsToOverlay()
-
-	if needsCheckpoint {
-		if err := wal.checkpoint(); err != nil {
-			// The WAL is already durable. Keep the WAL and overlay so the
-			// committed transaction stays readable and recoverable.
-			return nil
-		}
-	}
-	return nil
+	return needsCheckpoint, nil
 }
 
 func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 	transactionSize := walrecord.HeaderSize + walrecord.ChecksumSize // The commit marker has no page content.
 	for _, record := range wal.collectedRecords {
-		size, err := walrecord.EncodedRecordSize(&record, wal.db.meta.PageSize())
+		size, err := walrecord.EncodedRecordSize(&record, wal.pageSize)
 		if err != nil {
 			return nil, err
 		}
@@ -207,7 +182,7 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	wal.bytesSinceCheckpoint += int64(len(transaction))
 
 	needsCheckpoint := wal.reachedCheckpointThreshold()
-	if wal.db.options.Synchronous == SyncFull || needsCheckpoint {
+	if wal.syncOnCommit || needsCheckpoint {
 		if err := wal.sync(); err != nil {
 			return false, err
 		}
@@ -239,40 +214,4 @@ func recordToNode(record *walrecord.Record) (*Node, error) {
 	}
 
 	return node, nil
-}
-
-// checkpoint() flushes the WAL overlay to the main database file and resets the WAL state.
-// It ensures durability by syncing both the WAL and database files, then truncates the WAL
-// and clears the in-memory overlay to prepare for new transactions.
-func (wal *WAL) checkpoint() error {
-	if len(wal.overlay) == 0 {
-		return nil
-	}
-
-	// make WAL durable
-	if err := wal.sync(); err != nil {
-		return err
-	}
-
-	// drain in-memory wal.overlay to main
-	for _, record := range wal.overlay {
-		if err := wal.applyRecordToDatabase(&record, wal.db.meta.PageSize()); err != nil {
-			return err
-		}
-	}
-
-	// fsync main db file after applying the records to it
-	if err := wal.db.file.Sync(); err != nil {
-		return err
-	}
-
-	//reset WAL
-	if err := wal.Truncate(); err != nil {
-		// The main file is already durable, so the transaction is committed.
-		// Keep the WAL and overlay intact so cleanup can be retried safely.
-		return nil
-	}
-	clear(wal.overlay)
-	wal.bytesSinceCheckpoint = 0
-	return nil
 }
