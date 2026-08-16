@@ -420,7 +420,6 @@ func (db *DB) persistNode(node *Node) error {
 	if err := writeNode(db.file, node, true); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
-	// return db.file.Sync()
 	return nil
 }
 
@@ -492,7 +491,6 @@ func (db *DB) persistMeta() error {
 	if err := writeMeta(db.file, db.meta); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
-	// return db.file.Sync()
 	return nil
 }
 
