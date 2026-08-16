@@ -3,6 +3,7 @@ package kvlite
 import (
 	"errors"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -25,12 +26,12 @@ var (
 	ErrKeyRequired          = errors.New("key required")
 	ErrKeyTooLarge          = errors.New("key too large")
 	ErrKeyEmpty             = errors.New("key is empty")
-	ErrNotBranchNode        = errors.New("node is a leaf node, which is not allowed here")
-	ErrNotLeafNode          = errors.New("node is a branch node, which is not allowed here")
+	ErrNotBranchNode        = btree.ErrNotBranchNode
+	ErrNotLeafNode          = btree.ErrNotLeafNode
 	ErrValueTooLarge        = errors.New("value too large")
 	ErrValueEmpty           = errors.New("value is empty")
-	ErrIncompatibleValue    = errors.New("incompatible value")
-	ErrNodeNotSaturated     = errors.New("node entries size hasn't reached a large enough size to split")
-	ErrNodeTooLarge         = errors.New("node is too large to fit page size")
+	ErrIncompatibleValue    = btree.ErrIncompatibleValue
+	ErrNodeNotSaturated     = btree.ErrNodeNotSaturated
+	ErrNodeTooLarge         = btree.ErrNodeTooLarge
 	ErrEntryTooLargeForPage = errors.New("key/value entry is too large to fit in a single page on its own")
 )

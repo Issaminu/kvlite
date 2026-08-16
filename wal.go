@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -53,8 +54,8 @@ type Record struct {
 
 func (wal *WAL) insertNodeRecord(node *Node) {
 	record := Record{
-		header:      RecordHeader{recordType: recordTypeData, pgid: node.pgid},
-		pageContent: encodeNode(node),
+		header:      RecordHeader{recordType: recordTypeData, pgid: node.PageID()},
+		pageContent: btree.EncodeNode(node),
 	}
 
 	wal.collectRecord(&record)
@@ -338,7 +339,7 @@ func (record *Record) toNode() (*Node, error) {
 		return nil, fmt.Errorf("record has no page content")
 	}
 
-	node, err := decodeNode(record.pageContent)
+	node, err := btree.DecodeNode(record.pageContent)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize node: %w", err)

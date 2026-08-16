@@ -1,4 +1,4 @@
-package kvlite
+package btree
 
 import (
 	"bytes"
@@ -31,11 +31,27 @@ type Entry struct {
 	value []byte
 }
 
-// encodedSize reports how many bytes this entry occupies inside an encoded node.
-// It must stay in lockstep with encodeNode: flags(4) + a length-prefixed key
+func NewEntry(flags uint32, key, value []byte) Entry {
+	return Entry{flags: flags, key: key, value: value}
+}
+
+func (e Entry) Flags() uint32 {
+	return e.flags
+}
+
+func (e Entry) Key() []byte {
+	return e.key
+}
+
+func (e Entry) Value() []byte {
+	return e.value
+}
+
+// EncodedSize reports how many bytes this entry occupies inside an encoded node.
+// It must stay in lockstep with EncodeNode: flags(4) + a length-prefixed key
 // (4 + len(key)), plus a length-prefixed value (4 + len(value)) for leaf entries.
 // Branch entries hold only a separator key, so they carry no value.
-func (e Entry) encodedSize(isLeaf bool) int {
+func (e Entry) EncodedSize(isLeaf bool) int {
 	size := 4 + 4 + len(e.key)
 	if isLeaf {
 		size += 4 + len(e.value)
@@ -52,13 +68,44 @@ type Node struct {
 	parent   *Node
 }
 
-func newLeafNode(pgid page.ID) *Node {
+func NewLeafNode(pgid page.ID) *Node {
 	return &Node{IsLeaf: true, pgid: pgid, Children: []page.ID{}, entries: []Entry{}}
+}
+
+func NewRootNode(pgid page.ID, leftNode, rightNode *Node, separator []byte) *Node {
+	rootNode := &Node{
+		entries:  []Entry{{key: separator}},
+		Children: []page.ID{leftNode.pgid, rightNode.pgid},
+		pgid:     pgid,
+	}
+	leftNode.parent = rootNode
+	rightNode.parent = rootNode
+	return rootNode
+}
+
+func (n *Node) PageID() page.ID {
+	return n.pgid
+}
+
+func (n *Node) SetPageID(pgid page.ID) {
+	n.pgid = pgid
+}
+
+func (n *Node) Parent() *Node {
+	return n.parent
+}
+
+func (n *Node) SetParent(parent *Node) {
+	n.parent = parent
+}
+
+func (n *Node) EntryCount() int {
+	return len(n.entries)
 }
 
 // Find the correct child node for this key.
 // It only returns the correct child for this node, if you actually want to reach the leaf node that has the key, then this function should be called in a loop.
-func (n *Node) findChildIndex(key []byte) (int, error) {
+func (n *Node) FindChildIndex(key []byte) (int, error) {
 	if n.IsLeaf {
 		return -1, ErrNotBranchNode
 	}
@@ -81,9 +128,9 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 	return index, found, nil
 }
 
-// findEntry looks a key up in this leaf. The returned found reports whether the
+// FindEntry looks a key up in this leaf. The returned found reports whether the
 // key is present because a stored value can be empty.
-func (n *Node) findEntry(key []byte) (Entry, bool, error) {
+func (n *Node) FindEntry(key []byte) (Entry, bool, error) {
 	if !n.IsLeaf {
 		return Entry{}, false, ErrNotLeafNode
 	}
@@ -104,7 +151,7 @@ func (n *Node) findEntry(key []byte) (Entry, bool, error) {
 	return entry, true, nil
 }
 
-func (n *Node) insertEntry(entry Entry) error {
+func (n *Node) InsertEntry(entry Entry) error {
 	if !n.IsLeaf {
 		return ErrNotLeafNode
 	}
@@ -135,7 +182,7 @@ func (n *Node) insertEntry(entry Entry) error {
 }
 
 // Decodes one bounded node buffer into a Node.
-func decodeNode(data []byte) (*Node, error) {
+func DecodeNode(data []byte) (*Node, error) {
 	if len(data) < nodeHeaderSize {
 		return nil, fmt.Errorf("read node header: %w", ErrInvalid)
 	}
@@ -199,8 +246,8 @@ func decodeLengthPrefixedBytes(data []byte) ([]byte, []byte, error) {
 	return value, data[size:], nil
 }
 
-func writeNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
-	encoded := encodeNode(node)
+func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
+	encoded := EncodeNode(node)
 	currNodeSize := len(encoded)
 
 	if int64(currNodeSize) > pageSize {
@@ -219,7 +266,7 @@ func writeNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
 	return nil
 }
 
-func encodeNode(node *Node) []byte {
+func EncodeNode(node *Node) []byte {
 	data := make([]byte, 0)
 	isLeafByte := byte(0)
 	if node.IsLeaf {
@@ -247,12 +294,12 @@ func encodeNode(node *Node) []byte {
 }
 
 // Check if Node needs to be split since it surpassed the maximum node size
-func (n *Node) needsSplit(pageSize int64) bool {
-	return int64(n.serializedSize()) > pageSize
+func (n *Node) NeedsSplit(pageSize int64) bool {
+	return int64(n.EncodedSize()) > pageSize
 }
 
-func (n *Node) serializedSize() int {
-	return len(encodeNode(n))
+func (n *Node) EncodedSize() int {
+	return len(EncodeNode(n))
 }
 
 func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
@@ -261,7 +308,7 @@ func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
 	separatorIndex := -1
 
 	for i, entry := range n.entries {
-		currSize += entry.encodedSize(n.IsLeaf)
+		currSize += entry.EncodedSize(n.IsLeaf)
 
 		if currSize >= limit {
 			separatorIndex = i
@@ -292,7 +339,7 @@ func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
 	return min(max(separatorIndex, 1), len(n.entries)-2), nil
 }
 
-func (n *Node) split(newPgid page.ID, pageSize int64) (*Node, int, []byte, error) {
+func (n *Node) Split(newPgid page.ID, pageSize int64) (*Node, int, []byte, error) {
 	separatorIndex, err := n.chooseSplitIndex(pageSize)
 	if err != nil {
 		return nil, separatorIndex, nil, err
@@ -327,7 +374,7 @@ func (n *Node) split(newPgid page.ID, pageSize int64) (*Node, int, []byte, error
 	return rightNode, separatorIndex, keyAtSeparatorIndex, nil
 }
 
-func (parent *Node) insertSplitChild(leftNode, rightNode *Node, separator []byte) {
+func (parent *Node) InsertSplitChild(leftNode, rightNode *Node, separator []byte) {
 	rightNode.parent = parent
 
 	parent.entries = append(parent.entries, Entry{})

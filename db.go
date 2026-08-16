@@ -7,8 +7,17 @@ import (
 	"maps"
 	"os"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
+)
+
+type Node = btree.Node
+type Entry = btree.Entry
+
+const (
+	MaxKeySize   = btree.MaxKeySize
+	MaxValueSize = btree.MaxValueSize
 )
 
 type Sync uint8
@@ -180,7 +189,7 @@ func (db *DB) initializeNewDatabase() error {
 	if err := db.persistMeta(); err != nil {
 		return fmt.Errorf("init meta: %w", err)
 	}
-	db.rootNode = newLeafNode(db.meta.Root())
+	db.rootNode = btree.NewLeafNode(db.meta.Root())
 	if err := db.persistNode(db.rootNode); err != nil {
 		return fmt.Errorf("init root node: %w", err)
 	}
@@ -279,7 +288,7 @@ func (db *DB) Put(key []byte, value []byte) error {
 func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
 	node := rootNode
 	for !node.IsLeaf {
-		childIndex, err := node.findChildIndex(key)
+		childIndex, err := node.FindChildIndex(key)
 		if err != nil {
 			return nil, err
 		}
@@ -291,7 +300,7 @@ func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
 			return nil, ErrKeyNotFound
 		}
 
-		childNode.parent = node
+		childNode.SetParent(node)
 		childNode.Index = childIndex
 		node = childNode
 	}
@@ -299,18 +308,18 @@ func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
 }
 
 func (db *DB) validateTreeEntry(entry Entry) error {
-	if len(entry.key) == 0 {
+	if len(entry.Key()) == 0 {
 		return ErrKeyEmpty
 	}
-	if len(entry.key) > MaxKeySize {
+	if len(entry.Key()) > MaxKeySize {
 		return ErrKeyTooLarge
 	}
-	if len(entry.value) > MaxValueSize {
+	if len(entry.Value()) > MaxValueSize {
 		return ErrValueTooLarge
 	}
 	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
-	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.PageSize()) {
-		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.PageSize())
+	if encodedLeafHeaderSize+entry.EncodedSize(true) > int(db.meta.PageSize()) {
+		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.Key(), db.meta.PageSize())
 	}
 	return nil
 }
@@ -326,30 +335,30 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 		return nil, err
 	}
 
-	node, err := db.findLeafNode(rootNode, entry.key)
+	node, err := db.findLeafNode(rootNode, entry.Key())
 	if err != nil {
 		return nil, err
 	}
 
-	if err := node.insertEntry(entry); err != nil {
+	if err := node.InsertEntry(entry); err != nil {
 		return nil, err
 	}
 
-	if !node.needsSplit(db.meta.PageSize()) {
+	if !node.NeedsSplit(db.meta.PageSize()) {
 		db.wal.insertNodeRecord(node)
 		return rootNode, nil
 	}
 
-	for node.needsSplit(db.meta.PageSize()) {
+	for node.NeedsSplit(db.meta.PageSize()) {
 		rightPgid := db.allocate()
-		rightNode, _, keyAtSeperatorIndex, err := node.split(rightPgid, db.meta.PageSize())
+		rightNode, _, keyAtSeperatorIndex, err := node.Split(rightPgid, db.meta.PageSize())
 		if err != nil {
 			if errors.Is(err, ErrNodeNotSaturated) {
 				// split() only fails this way when a single entry (or, for a branch,
 				// too few entries) already overflows a page on its own: there is no
 				// way to divide it into two non-empty halves. Surface a clear error
 				// instead of the internal split-precondition failure.
-				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.key, db.meta.PageSize())
+				return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, entry.Key(), db.meta.PageSize())
 			}
 			return nil, err
 		}
@@ -359,8 +368,8 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 			db.wal.insertNodeRecord(newRoot)
 			rootNode = newRoot
 		} else { // parent is not a root node
-			parent := node.parent
-			parent.insertSplitChild(node, rightNode, keyAtSeperatorIndex)
+			parent := node.Parent()
+			parent.InsertSplitChild(node, rightNode, keyAtSeperatorIndex)
 			db.wal.insertNodeRecord(parent)
 		}
 
@@ -369,11 +378,11 @@ func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
 
 		// The right sibling can itself still overflow a page.
 		// So keep splitting it before climbing, so no node is left over a page.
-		if rightNode.needsSplit(db.meta.PageSize()) {
+		if rightNode.NeedsSplit(db.meta.PageSize()) {
 			node = rightNode
 			continue
 		}
-		node = node.parent
+		node = node.Parent()
 	}
 
 	return rootNode, nil
@@ -401,15 +410,15 @@ func (db *DB) findTreeEntry(rootNode *Node, key []byte) (Entry, bool, error) {
 	if err != nil {
 		return Entry{}, false, err
 	}
-	return node.findEntry(key)
+	return node.FindEntry(key)
 }
 
 func (db *DB) persistNode(node *Node) error {
-	offset := int64(node.pgid) * db.meta.PageSize()
+	offset := int64(node.PageID()) * db.meta.PageSize()
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek node: %w", err)
 	}
-	if err := writeNode(db.file, node, db.meta.PageSize(), true); err != nil {
+	if err := btree.WriteNode(db.file, node, db.meta.PageSize(), true); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	return nil
@@ -437,7 +446,7 @@ func (db *DB) readNode(pgid page.ID) (*Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		node.pgid = pgid
+		node.SetPageID(pgid)
 		return node, nil
 	}
 
@@ -451,12 +460,12 @@ func (db *DB) readNode(pgid page.ID) (*Node, error) {
 	if err := fileio.ReadFull(db.file, page); err != nil {
 		return nil, err
 	}
-	node, err := decodeNode(page)
+	node, err := btree.DecodeNode(page)
 	if err != nil {
 		return nil, err
 	}
 
-	node.pgid = pgid
+	node.SetPageID(pgid)
 	return node, nil
 }
 
@@ -485,15 +494,7 @@ func (db *DB) persistMeta() error {
 }
 
 func (db *DB) newRootAfterSplit(leftNode, rightNode *Node, separator []byte) *Node {
-	rootNode := &Node{
-		IsLeaf:   false,
-		entries:  []Entry{{key: separator}},
-		Children: []page.ID{leftNode.pgid, rightNode.pgid},
-		pgid:     db.allocate(),
-	}
-	leftNode.parent = rootNode
-	rightNode.parent = rootNode
-	return rootNode
+	return btree.NewRootNode(db.allocate(), leftNode, rightNode, separator)
 }
 
 func (db *DB) allocate() page.ID {

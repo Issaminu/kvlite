@@ -3,11 +3,12 @@ package kvlite
 import (
 	"slices"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
 const (
-	BucketLeafFlag = 0x01
+	BucketLeafFlag = btree.BucketLeafFlag
 )
 
 type Tx struct {
@@ -51,7 +52,7 @@ func (tx *Tx) putCatalogEntry(entry Entry) error {
 		return err
 	}
 	tx.db.rootNode = newRoot
-	tx.db.meta.SetRoot(newRoot.pgid)
+	tx.db.meta.SetRoot(newRoot.PageID())
 	tx.db.wal.insertMetaRecord(tx.db.meta)
 	return nil
 }
@@ -60,7 +61,7 @@ func (tx *Tx) Put(key, value []byte) error {
 	if err := tx.writableError(); err != nil {
 		return err
 	}
-	return tx.putCatalogEntry(Entry{key: key, value: value})
+	return tx.putCatalogEntry(btree.NewEntry(0, key, value))
 }
 
 func (tx *Tx) Get(key []byte) ([]byte, error) {
@@ -75,10 +76,10 @@ func (tx *Tx) Get(key []byte) ([]byte, error) {
 	if !found {
 		return nil, ErrKeyNotFound
 	}
-	if entry.flags&BucketLeafFlag != 0 {
+	if entry.Flags()&BucketLeafFlag != 0 {
 		return nil, ErrIncompatibleValue
 	}
-	return entry.value, nil
+	return entry.Value(), nil
 }
 
 // cacheBucket registers b as the one handle for its name within this transaction.
@@ -109,7 +110,7 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // that points at it. That entry lives in the parent's tree: the DB catalog for a
 // top-level bucket, or the parent bucket's own tree for a nested bucket.
 func (b *Bucket) writeBackRoot() error {
-	entry := Entry{flags: BucketLeafFlag, key: b.name, value: page.EncodeID(b.rootNode.pgid)}
+	entry := btree.NewEntry(BucketLeafFlag, b.name, page.EncodeID(b.rootNode.PageID()))
 	if b.parentBucket == nil {
 		return b.tx.putCatalogEntry(entry)
 	}
@@ -140,7 +141,7 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	newPgid := tx.db.allocate()
-	rootNode := newLeafNode(newPgid)
+	rootNode := btree.NewLeafNode(newPgid)
 	tx.db.wal.insertNodeRecord(rootNode)
 
 	bucket := &Bucket{
@@ -151,9 +152,9 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	if parent == nil {
-		err = tx.putCatalogEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: page.EncodeID(newPgid)})
+		err = tx.putCatalogEntry(btree.NewEntry(BucketLeafFlag, bucket.name, page.EncodeID(newPgid)))
 	} else {
-		err = parent.putBucketEntry(Entry{flags: BucketLeafFlag, key: bucket.name, value: page.EncodeID(newPgid)})
+		err = parent.putBucketEntry(btree.NewEntry(BucketLeafFlag, bucket.name, page.EncodeID(newPgid)))
 	}
 	if err != nil {
 		return nil, err
@@ -211,14 +212,14 @@ func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bu
 		return nil, nil
 	}
 
-	if entry.flags&BucketLeafFlag == 0 {
+	if entry.Flags()&BucketLeafFlag == 0 {
 		// exists, but it's a regular value
 		return nil, ErrIncompatibleValue
 	}
 
 	// exists and is actually a bucket
 
-	pgid, err := page.DecodeID(entry.value)
+	pgid, err := page.DecodeID(entry.Value())
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +260,7 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
-	return bucket.putBucketEntry(Entry{key: key, value: value})
+	return bucket.putBucketEntry(btree.NewEntry(0, key, value))
 }
 
 func (bucket *Bucket) putBucketEntry(entry Entry) error {
@@ -290,8 +291,8 @@ func (bucket *Bucket) Get(key []byte) []byte {
 	}
 
 	// value is a bucket, we should refuse
-	if entry.flags&BucketLeafFlag != 0 {
+	if entry.Flags()&BucketLeafFlag != 0 {
 		return nil
 	}
-	return entry.value
+	return entry.Value()
 }

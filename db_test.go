@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -36,76 +37,6 @@ func tempfile() string {
 // per-commit durability uses this.
 func openDB(path string) (*DB, error) {
 	return Open(path, 0600, &Options{Synchronous: SyncNormal})
-}
-
-func TestNodeCodec_UsesFixedLeafLayout(t *testing.T) {
-	node := &Node{
-		IsLeaf:  true,
-		entries: []Entry{{key: []byte("k"), value: []byte("v")}},
-	}
-	// Layout: leaf marker, one entry, zero flags, one-byte key, and one-byte value.
-	want := []byte{
-		1,
-		1, 0, 0, 0,
-		0, 0, 0, 0,
-		1, 0, 0, 0, 'k',
-		1, 0, 0, 0, 'v',
-	}
-
-	encoded := encodeNode(node)
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode leaf: got %x, want %x", encoded, want)
-	}
-
-	decoded, err := decodeNode(encoded)
-	if err != nil {
-		t.Fatalf("decode leaf: %v", err)
-	}
-	if !decoded.IsLeaf || len(decoded.entries) != 1 {
-		t.Fatalf("decode leaf shape: %+v", decoded)
-	}
-	entry := decoded.entries[0]
-	if entry.flags != 0 || !bytes.Equal(entry.key, []byte("k")) || !bytes.Equal(entry.value, []byte("v")) {
-		t.Fatalf("decode leaf entry: %+v", entry)
-	}
-
-	for size := 0; size < len(encoded); size++ {
-		if _, err := decodeNode(encoded[:size]); err == nil {
-			t.Errorf("decode %d-byte leaf prefix: expected an error", size)
-		}
-	}
-}
-
-func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
-	node := &Node{
-		entries:  []Entry{{key: []byte("m")}},
-		Children: []page.ID{2, 3},
-	}
-	// Layout: branch marker, one separator, zero flags, one-byte key, and two child page IDs.
-	want := []byte{
-		0,
-		1, 0, 0, 0,
-		0, 0, 0, 0,
-		1, 0, 0, 0, 'm',
-		2, 0, 0, 0, 0, 0, 0, 0,
-		3, 0, 0, 0, 0, 0, 0, 0,
-	}
-
-	encoded := encodeNode(node)
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode branch: got %x, want %x", encoded, want)
-	}
-
-	decoded, err := decodeNode(encoded)
-	if err != nil {
-		t.Fatalf("decode branch: %v", err)
-	}
-	if decoded.IsLeaf || len(decoded.entries) != 1 || len(decoded.Children) != 2 {
-		t.Fatalf("decode branch shape: %+v", decoded)
-	}
-	if !bytes.Equal(decoded.entries[0].key, []byte("m")) || decoded.Children[0] != 2 || decoded.Children[1] != 3 {
-		t.Fatalf("decode branch data: %+v", decoded)
-	}
 }
 
 func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
@@ -156,73 +87,6 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return fi.Size()
-}
-
-// oneByteWriter accepts one byte from each Write call without returning an
-// error. It verifies that code using io.Writer handles valid partial writes.
-type oneByteWriter struct {
-	bytes.Buffer
-}
-
-func (w *oneByteWriter) Write(data []byte) (int, error) {
-	if len(data) > 1 {
-		data = data[:1]
-	}
-	return w.Buffer.Write(data)
-}
-
-func TestWriteNode_CompletesPartialWrites(t *testing.T) {
-	meta := page.NewMeta(int64(os.Getpagesize()))
-	node := newLeafNode(meta.Root())
-	if err := node.insertEntry(Entry{key: []byte("key"), value: []byte("value")}); err != nil {
-		t.Fatal(err)
-	}
-
-	writer := new(oneByteWriter)
-	if err := writeNode(writer, node, meta.PageSize(), true); err != nil {
-		t.Fatal(err)
-	}
-	if writer.Len() != int(meta.PageSize()) {
-		t.Fatalf("encoded node size: got %d bytes, want one %d-byte page", writer.Len(), meta.PageSize())
-	}
-}
-
-func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
-	const (
-		pageSize  int64   = 64 // Two 33-byte entries exceed this page size.
-		valueSize         = 20 // A leaf entry uses 12 fixed bytes, a one-byte key, and this value.
-		leftPgid  page.ID = 1  // Page 1 is the first node page after the metadata page.
-		rightPgid page.ID = 2  // Page 2 is the next page allocated for the split.
-	)
-
-	node := &Node{
-		IsLeaf: true,
-		pgid:   leftPgid,
-		entries: []Entry{
-			{key: []byte("a"), value: make([]byte, valueSize)},
-			{key: []byte("b"), value: make([]byte, valueSize)},
-		},
-	}
-
-	rightNode, splitIndex, separator, err := node.split(rightPgid, pageSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if splitIndex != 1 {
-		t.Fatalf("split index: got %d, want 1", splitIndex)
-	}
-	if !bytes.Equal(separator, []byte("b")) {
-		t.Fatalf("separator: got %q, want %q", separator, "b")
-	}
-	if len(node.entries) != 1 || !bytes.Equal(node.entries[0].key, []byte("a")) {
-		t.Fatalf("left entries: got %q, want [a]", node.entries)
-	}
-	if rightNode.pgid != rightPgid {
-		t.Fatalf("right page ID: got %d, want %d", rightNode.pgid, rightPgid)
-	}
-	if !rightNode.IsLeaf || len(rightNode.entries) != 1 || !bytes.Equal(rightNode.entries[0].key, []byte("b")) {
-		t.Fatalf("right entries: got %q, want [b]", rightNode.entries)
-	}
 }
 
 // -----------------------------------------------------------------------------
@@ -526,7 +390,7 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 
 	pageBytes := int(db.meta.PageSize())
 	walkNodes(t, db, func(nd *Node) {
-		if sz := nd.serializedSize(); sz > pageBytes {
+		if sz := nd.EncodedSize(); sz > pageBytes {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page — split must keep every node <= a page", sz, pageBytes)
 		}
 	})
@@ -2383,11 +2247,11 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	originalMetaRoot := db.meta.Root()
 	value := bytes.Repeat([]byte("v"), int(db.meta.PageSize()/2))
 
-	root, err := db.putTreeEntry(originalRoot, Entry{key: []byte("a"), value: value})
+	root, err := db.putTreeEntry(originalRoot, btree.NewEntry(0, []byte("a"), value))
 	if err != nil {
 		t.Fatalf("put first entry: %v", err)
 	}
-	root, err = db.putTreeEntry(root, Entry{key: []byte("b"), value: value})
+	root, err = db.putTreeEntry(root, btree.NewEntry(0, []byte("b"), value))
 	if err != nil {
 		t.Fatalf("put second entry: %v", err)
 	}
@@ -3010,10 +2874,10 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 
 	// Every node must fit one page and hold at least one entry (no empty leaf).
 	walkNodes(t, db, func(nd *Node) {
-		if sz := nd.serializedSize(); sz > page {
+		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
-		if len(nd.entries) == 0 {
+		if nd.EntryCount() == 0 {
 			t.Fatalf("empty node in the tree (split produced a node with no entries)")
 		}
 	})
@@ -3173,7 +3037,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 	// The big insert must have grown the tree to at least three leaves.
 	leaves := 0
 	walkNodes(t, db, func(nd *Node) {
-		if sz := nd.serializedSize(); sz > page {
+		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
 		if nd.IsLeaf {
@@ -3252,7 +3116,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		for i := 0; ; i++ {
 			k := fmt.Appendf(nil, "fill-%06d", i)
 			entrySize := 4 + 4 + len(k) + 4 + len(fillVal)
-			if p.rootNode.serializedSize()+entrySize > pageSize {
+			if p.rootNode.EncodedSize()+entrySize > pageSize {
 				break
 			}
 			if err := p.Put(k, fillVal); err != nil {
@@ -3268,7 +3132,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		// operation that Bucket.CreateBucket/Put drive; here we aim it at a brimming
 		// parent so the pointer insert splits p's root.
 		newPgid := tx.db.allocate()
-		cRoot := newLeafNode(newPgid)
+		cRoot := btree.NewLeafNode(newPgid)
 		tx.db.wal.insertNodeRecord(cRoot)
 		c := &Bucket{tx: tx, name: childName, rootNode: cRoot, parentBucket: p}
 		if err := c.writeBackRoot(); err != nil {
@@ -3481,8 +3345,8 @@ func TestFindTreeEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 	if !found {
 		t.Fatal("stored entry reported missing")
 	}
-	if entry.value == nil || len(entry.value) != 0 {
-		t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.value)
+	if entry.Value() == nil || len(entry.Value()) != 0 {
+		t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
 	}
 
 	_, found, err = db.findTreeEntry(db.rootNode, []byte("missing"))
