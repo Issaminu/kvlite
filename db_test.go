@@ -204,18 +204,6 @@ func (w *oneByteWriter) Write(data []byte) (int, error) {
 	return w.Buffer.Write(data)
 }
 
-func TestWriteFull_CompletesPartialWrites(t *testing.T) {
-	writer := new(oneByteWriter)
-	data := encodeMeta(NewMeta(int64(os.Getpagesize())))
-	if err := writeFull(writer, data); err != nil {
-		t.Fatal(err)
-	}
-
-	if writer.Len() != len(data) {
-		t.Fatalf("wrote %d bytes, want %d", writer.Len(), len(data))
-	}
-}
-
 func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	meta := NewMeta(int64(os.Getpagesize()))
 	node := newLeafNode(meta.root)

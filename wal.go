@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -180,7 +181,7 @@ func appendEncodedRecord(data []byte, record *Record) []byte {
 
 func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
 	headerData := make([]byte, recordHeaderSize)
-	if _, err := io.ReadFull(r, headerData); err != nil {
+	if err := fileio.ReadFull(r, headerData); err != nil {
 		return nil, err // io.EOF at a clean boundary; io.ErrUnexpectedEOF on a torn tail
 	}
 
@@ -201,12 +202,12 @@ func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
 	}
 
 	record.pageContent = make([]byte, contentSize)
-	if _, err := io.ReadFull(r, record.pageContent); err != nil {
+	if err := fileio.ReadFull(r, record.pageContent); err != nil {
 		return nil, err
 	}
 
 	var checksumData [recordChecksumSize]byte
-	if _, err := io.ReadFull(r, checksumData[:]); err != nil {
+	if err := fileio.ReadFull(r, checksumData[:]); err != nil {
 		return nil, err
 	}
 	checksum := binary.LittleEndian.Uint64(checksumData[:])
@@ -229,7 +230,7 @@ func (wal *WAL) applyRecordToDatabase(record *Record, pageSize int64) error {
 		copy(padded, page)
 		page = padded
 	}
-	if err := writeFull(wal.db.file, page); err != nil {
+	if err := fileio.WriteFull(wal.db.file, page); err != nil {
 		return err
 	}
 	return nil
@@ -301,7 +302,7 @@ func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 }
 
 func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
-	if err := writeFull(wal.file, transaction); err != nil {
+	if err := fileio.WriteFull(wal.file, transaction); err != nil {
 		return false, fmt.Errorf("persist multiple records: %w", err)
 	}
 	wal.hasUnsyncedWrites = true

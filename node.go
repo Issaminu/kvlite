@@ -8,6 +8,7 @@ import (
 	"slices"
 	"sort"
 
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -206,12 +207,12 @@ func writeNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
 		return ErrNodeTooLarge
 	}
 
-	if err := writeFull(w, encoded); err != nil {
+	if err := fileio.WriteFull(w, encoded); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	if shouldPad && int64(currNodeSize) < pageSize {
 		padding := make([]byte, int(pageSize)-currNodeSize)
-		if err := writeFull(w, padding); err != nil {
+		if err := fileio.WriteFull(w, padding); err != nil {
 			return fmt.Errorf("write node padding: %w", err)
 		}
 	}

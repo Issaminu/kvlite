@@ -7,6 +7,7 @@ import (
 	"maps"
 	"os"
 
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -447,7 +448,7 @@ func (db *DB) readNode(pgid page.ID) (*Node, error) {
 		return nil, err
 	}
 	page := make([]byte, db.meta.pageSize)
-	if _, err := io.ReadFull(db.file, page); err != nil {
+	if err := fileio.ReadFull(db.file, page); err != nil {
 		return nil, err
 	}
 	node, err := decodeNode(page)
@@ -464,7 +465,7 @@ func (db *DB) readMeta() (*Meta, error) {
 		return nil, err
 	}
 	data := make([]byte, metaEncodedSize)
-	if _, err := io.ReadFull(db.file, data); err != nil {
+	if err := fileio.ReadFull(db.file, data); err != nil {
 		return nil, errors.Join(ErrInvalid, err)
 	}
 	return decodeMeta(data)
@@ -477,7 +478,7 @@ func (db *DB) persistMeta() error {
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
 		return fmt.Errorf("seek meta: %w", err)
 	}
-	if err := writeFull(db.file, encodeMeta(db.meta)); err != nil {
+	if err := fileio.WriteFull(db.file, encodeMeta(db.meta)); err != nil {
 		return fmt.Errorf("write meta: %w", err)
 	}
 	return nil
