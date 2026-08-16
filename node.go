@@ -107,15 +107,6 @@ func (n *Node) get(key []byte) (value []byte, flags uint32, found bool, err erro
 }
 
 func (n *Node) insert(key, value []byte, flags uint32) error {
-	if len(key) == 0 {
-		return ErrKeyEmpty
-	}
-	if len(key) > MaxKeySize {
-		return ErrKeyTooLarge
-	}
-	if len(value) > MaxValueSize {
-		return ErrValueTooLarge
-	}
 	if !n.IsLeaf {
 		return ErrNotLeafNode
 	}

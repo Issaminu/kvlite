@@ -290,6 +290,24 @@ func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
 	return node, nil
 }
 
+func (db *DB) validatePutEntry(key, value []byte) error {
+	if len(key) == 0 {
+		return ErrKeyEmpty
+	}
+	if len(key) > MaxKeySize {
+		return ErrKeyTooLarge
+	}
+	if len(value) > MaxValueSize {
+		return ErrValueTooLarge
+	}
+	entry := Entry{key: key, value: value}
+	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
+	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.pageSize) {
+		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, key, db.meta.pageSize)
+	}
+	return nil
+}
+
 // _put() places a key in it's correct place starting from a root *Node.
 // Due to node splitting, it's possible that the the new root (starting from the provided rootNode) is not actually the root of that tree.
 // returns (*NewRootNode, error), since it's possible that the root was split within the process.
@@ -298,20 +316,8 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 	if db.options.ReadOnly {
 		return nil, ErrDatabaseReadOnly
 	}
-
-	if len(key) == 0 {
-		return nil, ErrKeyEmpty
-	}
-	if len(key) > MaxKeySize {
-		return nil, ErrKeyTooLarge
-	}
-	if len(value) > MaxValueSize {
-		return nil, ErrValueTooLarge
-	}
-	entry := Entry{key: key, value: value}
-	const encodedLeafHeaderSize = 1 + 4 // IsLeaf byte + uint32 entry count.
-	if encodedLeafHeaderSize+entry.encodedSize(true) > int(db.meta.pageSize) {
-		return nil, fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLargeForPage, key, db.meta.pageSize)
+	if err := db.validatePutEntry(key, value); err != nil {
+		return nil, err
 	}
 
 	// When we operate on the database's own tree (rather than a bucket sub-tree),
