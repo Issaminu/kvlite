@@ -194,8 +194,16 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if b, ok := tx.buckets[string(bucketName)]; ok {
 		return b, nil
 	}
+	bucket, err := tx.loadBucket(tx.db.rootNode, bucketName, nil)
+	if err != nil || bucket == nil {
+		return bucket, err
+	}
+	tx.cacheBucket(bucket)
+	return bucket, nil
+}
 
-	value, flags, err := tx.db._get(tx.db.rootNode, bucketName)
+func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
+	value, flags, err := tx.db._get(rootNode, bucketName)
 	if err != nil {
 		if errors.Is(err, ErrKeyNotFound) {
 			return nil, nil
@@ -220,9 +228,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 		return nil, err
 	}
 
-	bucket := &Bucket{tx: tx, name: slices.Clone(bucketName), rootNode: bucketRootNode, parentBucket: nil}
-	tx.cacheBucket(bucket)
-	return bucket, nil
+	return &Bucket{tx: tx, name: slices.Clone(bucketName), rootNode: bucketRootNode, parentBucket: parent}, nil
 }
 
 func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
@@ -282,33 +288,10 @@ func (bucket *Bucket) Bucket(bucketName []byte) (*Bucket, error) {
 	if b, ok := bucket.children[string(bucketName)]; ok {
 		return b, nil
 	}
-
-	value, flags, err := bucket.tx.db._get(bucket.rootNode, bucketName)
-	if err != nil {
-		if errors.Is(err, ErrKeyNotFound) {
-			return nil, nil
-		}
-
-		return nil, err
+	child, err := bucket.tx.loadBucket(bucket.rootNode, bucketName, bucket)
+	if err != nil || child == nil {
+		return child, err
 	}
-
-	if flags&BucketLeafFlag == 0 {
-		// exists, but it's a regular value
-		return nil, ErrIncompatibleValue
-	}
-
-	// exists and is actually a bucket
-	pgid, err := decode[Pgid](value)
-	if err != nil {
-		return nil, err
-	}
-
-	bucketRootNode, err := bucket.tx.db.readNode(pgid)
-	if err != nil {
-		return nil, err
-	}
-
-	child := &Bucket{tx: bucket.tx, name: slices.Clone(bucketName), rootNode: bucketRootNode, parentBucket: bucket}
 	bucket.cacheChild(child)
 	return child, nil
 }
