@@ -254,9 +254,6 @@ func (db *DB) Path() string {
 }
 
 func (db *DB) Put(key []byte, value []byte) error {
-	if err := db.ensureOpen(); err != nil {
-		return err
-	}
 	return db.Update(func(tx *Tx) error {
 		return tx.Put(key, value)
 	})
@@ -383,9 +380,6 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 }
 
 func (db *DB) Get(key []byte) ([]byte, error) {
-	if err := db.ensureOpen(); err != nil {
-		return nil, err
-	}
 	var value []byte
 	err := db.View(func(tx *Tx) error {
 		var err error
