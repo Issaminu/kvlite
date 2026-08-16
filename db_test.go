@@ -165,6 +165,46 @@ func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
 	}
 }
 
+func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
+	record := &Record{
+		header: RecordHeader{
+			recordType: recordTypeData,
+			pgid:       1,
+			txid:       2,
+		},
+		pageContent: []byte("xy"),
+	}
+	// Layout: record type, page ID, transaction ID, content length, content,
+	// and the FNV-1a checksum of all preceding bytes.
+	want := []byte{
+		0,
+		1, 0, 0, 0, 0, 0, 0, 0,
+		2, 0, 0, 0, 0, 0, 0, 0,
+		2, 0, 0, 0,
+		'x', 'y',
+		0xf1, 0x3c, 0x9c, 0xc5, 0x52, 0x74, 0xd3, 0x4f,
+	}
+
+	encoded, err := encodeRecord(record, int64(len(record.pageContent)))
+	if err != nil {
+		t.Fatalf("encode WAL record: %v", err)
+	}
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encode WAL record: got %x, want %x", encoded, want)
+	}
+
+	decoded, err := decodeRecord(bytes.NewReader(encoded), int64(len(record.pageContent)))
+	if err != nil {
+		t.Fatalf("decode WAL record: %v", err)
+	}
+	if decoded.header.recordType != recordTypeData || decoded.header.pgid != 1 || decoded.header.txid != 2 {
+		t.Fatalf("decode WAL record header: %+v", decoded.header)
+	}
+	if !bytes.Equal(decoded.pageContent, []byte("xy")) {
+		t.Fatalf("decode WAL record content: got %x, want %x", decoded.pageContent, []byte("xy"))
+	}
+}
+
 // fileSize returns the current size of the database file in bytes.
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()

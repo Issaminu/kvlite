@@ -13,6 +13,7 @@ type Txid uint64
 
 // A Pgid is a uint64, so every encoded page ID occupies eight bytes.
 const pgidEncodedSize = 8
+const txidEncodedSize = pgidEncodedSize
 
 func encodePgid(pgid Pgid) []byte {
 	buf := make([]byte, pgidEncodedSize)

@@ -1,7 +1,6 @@
 package kvlite
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -14,10 +13,13 @@ const (
 	recordTypeData   uint8 = 0
 	recordTypeMeta   uint8 = 1
 	recordTypeCommit uint8 = 2 // a commit marker: ends one transaction, no content
-)
 
-// recordHeaderSize is the fixed header size: type(1) + pgid(8) + txid(8) + content_size(4)
-const recordHeaderSize = 1 + 8 + 8 + 4
+	recordTypeSize          = 1 // A record type uses one byte.
+	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
+	recordContentLengthSize = 4 // A content length uses one uint32 value.
+	recordChecksumSize      = 8 // An FNV-1a checksum uses one uint64 value.
+	recordHeaderSize        = recordTypeSize + txidEncodedSize + recordTransactionIDSize + recordContentLengthSize
+)
 
 type WAL struct {
 	db                       *DB
@@ -34,35 +36,14 @@ type WAL struct {
 
 // RecordHeader is the fixed-size head of every WAL record.
 type RecordHeader struct {
-	recordType  uint8
-	pgid        Pgid
-	txid        Txid
-	contentSize uint32 // length of `Record.pageContent`. In the WAL file, it acts as pageContent's prefixed length
-}
-
-func (h RecordHeader) encode() []byte {
-	b := make([]byte, 0, recordHeaderSize)
-	b = append(b, h.recordType)
-	b = binary.LittleEndian.AppendUint64(b, uint64(h.pgid))
-	b = binary.LittleEndian.AppendUint64(b, uint64(h.txid))
-	b = binary.LittleEndian.AppendUint32(b, h.contentSize)
-	return b
-}
-
-// decodeRecordHeader parses a header from its raw bytes.
-func decodeRecordHeader(raw []byte) RecordHeader {
-	return RecordHeader{
-		recordType:  raw[0],
-		pgid:        Pgid(binary.LittleEndian.Uint64(raw[1:9])),
-		txid:        Txid(binary.LittleEndian.Uint64(raw[9:17])),
-		contentSize: binary.LittleEndian.Uint32(raw[17:21]),
-	}
+	recordType uint8
+	pgid       Pgid
+	txid       Txid
 }
 
 type Record struct {
 	header      RecordHeader
-	pageContent []byte // actual content of the `Record`. We can identify it's length by a prefixed attribute `header.contentSize`
-	checksum    uint64
+	pageContent []byte
 }
 
 func (wal *WAL) insertNodeRecord(node *Node) {
@@ -163,56 +144,69 @@ func (wal *WAL) delete() error {
 	return err
 }
 
-// Encodes a *Record instance into an io.Writer
-func encodeRecord(w io.Writer, record *Record, pageSize int64) error {
-	if int64(len(record.pageContent)) > pageSize {
-		return fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
+func encodeRecord(record *Record, pageSize int64) ([]byte, error) {
+	size, err := encodedRecordSize(record, pageSize)
+	if err != nil {
+		return nil, err
 	}
 
-	record.header.contentSize = uint32(len(record.pageContent))
-	header := record.header.encode()
-
-	checksum := computeRecordChecksum(header, record.pageContent)
-
-	if err := writeFull(w, header); err != nil {
-		return fmt.Errorf("write record header: %w", err)
-	}
-	// no need to use `writeLengthPrefixedBytes` here since it's implicitely happening:
-	// the 4 bytes that sit before pageContent is it's prefixed length (`RecordHeader.contentSize`)
-	if err := writeFull(w, record.pageContent); err != nil {
-		return fmt.Errorf("write record pageContent: %w", err)
-	}
-	if err := binary.Write(w, binary.LittleEndian, checksum); err != nil {
-		return fmt.Errorf("write record checksum: %w", err)
-	}
-
-	return nil
+	return appendEncodedRecord(make([]byte, 0, size), record), nil
 }
 
-// Decodes a *Record instance from an io.Reader
+func encodedRecordSize(record *Record, pageSize int64) (int, error) {
+	if int64(len(record.pageContent)) > pageSize {
+		return 0, fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.pageContent), pageSize)
+	}
+	return recordHeaderSize + len(record.pageContent) + recordChecksumSize, nil
+}
+
+func appendEncodedRecord(data []byte, record *Record) []byte {
+	headerStart := len(data)
+	data = append(data, record.header.recordType)
+	data = binary.LittleEndian.AppendUint64(data, uint64(record.header.pgid))
+	data = binary.LittleEndian.AppendUint64(data, uint64(record.header.txid))
+	data = binary.LittleEndian.AppendUint32(data, uint32(len(record.pageContent)))
+	headerEnd := len(data)
+	data = append(data, record.pageContent...)
+	checksum := computeRecordChecksum(data[headerStart:headerEnd], record.pageContent)
+	data = binary.LittleEndian.AppendUint64(data, checksum)
+
+	return data
+}
+
 func decodeRecord(r io.Reader, pageSize int64) (*Record, error) {
-	header := make([]byte, recordHeaderSize)
-	if _, err := io.ReadFull(r, header); err != nil {
+	headerData := make([]byte, recordHeaderSize)
+	if _, err := io.ReadFull(r, headerData); err != nil {
 		return nil, err // io.EOF at a clean boundary; io.ErrUnexpectedEOF on a torn tail
 	}
 
-	record := &Record{header: decodeRecordHeader(header)}
-	if int64(record.header.contentSize) > pageSize {
+	data := headerData
+	record := &Record{}
+	record.header.recordType = data[0]
+	data = data[recordTypeSize:]
+	record.header.pgid = Pgid(binary.LittleEndian.Uint64(data[:pgidEncodedSize]))
+	data = data[pgidEncodedSize:]
+	record.header.txid = Txid(binary.LittleEndian.Uint64(data[:recordTransactionIDSize]))
+	data = data[recordTransactionIDSize:]
+	contentSize := binary.LittleEndian.Uint32(data[:recordContentLengthSize])
+	if int64(contentSize) > pageSize {
 		// A torn tail can leave a bogus length prefix. Treat it as an integrity
 		// failure (ErrChecksum) so readRecords stops at this record instead of
 		// failing the whole open. A well-formed record can never exceed a page.
-		return nil, fmt.Errorf("record content_size %d exceeds page size %d: %w", record.header.contentSize, pageSize, ErrChecksum)
+		return nil, fmt.Errorf("record content_size %d exceeds page size %d: %w", contentSize, pageSize, ErrChecksum)
 	}
 
-	record.pageContent = make([]byte, record.header.contentSize)
+	record.pageContent = make([]byte, contentSize)
 	if _, err := io.ReadFull(r, record.pageContent); err != nil {
 		return nil, err
 	}
 
-	if err := binary.Read(r, binary.LittleEndian, &record.checksum); err != nil {
+	var checksumData [recordChecksumSize]byte
+	if _, err := io.ReadFull(r, checksumData[:]); err != nil {
 		return nil, err
 	}
-	if computeRecordChecksum(header, record.pageContent) != record.checksum {
+	checksum := binary.LittleEndian.Uint64(checksumData[:])
+	if computeRecordChecksum(headerData, record.pageContent) != checksum {
 		return nil, ErrChecksum
 	}
 
@@ -272,17 +266,23 @@ func (wal *WAL) persistCollectedRecords() error {
 }
 
 func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
+	transactionSize := recordHeaderSize + recordChecksumSize // The commit marker has no page content.
+	for _, record := range wal.collectedRecords {
+		size, err := encodedRecordSize(&record, wal.db.meta.pageSize)
+		if err != nil {
+			return nil, err
+		}
+		transactionSize += size
+	}
+
 	txid := wal.nextTxid
 	wal.nextTxid++
 
-	buf := new(bytes.Buffer)
+	transaction := make([]byte, 0, transactionSize)
 
 	for pgid, record := range wal.collectedRecords {
 		record.header.txid = txid
-
-		if err := encodeRecord(buf, &record, wal.db.meta.pageSize); err != nil {
-			return nil, err
-		}
+		transaction = appendEncodedRecord(transaction, &record)
 
 		wal.collectedRecords[pgid] = record
 	}
@@ -291,11 +291,9 @@ func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 		header:      RecordHeader{recordType: recordTypeCommit, pgid: 0, txid: txid},
 		pageContent: nil,
 	}
-	if err := encodeRecord(buf, commitMarker, wal.db.meta.pageSize); err != nil {
-		return nil, fmt.Errorf("encode commit marker: %w", err)
-	}
+	transaction = appendEncodedRecord(transaction, commitMarker)
 
-	return buf.Bytes(), nil
+	return transaction, nil
 }
 
 func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
