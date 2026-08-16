@@ -4,7 +4,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
-	"os"
 )
 
 const version uint32 = 1 // format version, bumps only when making a breaking change to the DB file format itself
@@ -59,11 +58,11 @@ func decodeMeta(data []byte) (*Meta, error) {
 	}, nil
 }
 
-func NewMeta() *Meta {
+func NewMeta(pageSize int64) *Meta {
 	meta := &Meta{
 		magic:    magic,
 		version:  version,
-		pageSize: int64(os.Getpagesize()),
+		pageSize: pageSize,
 		pgid:     1, // Nodes start at pgid 1 (the pgid 0 is occupied by the meta)
 		root:     1, // needs to stay in sync with `pgid` field above
 	}

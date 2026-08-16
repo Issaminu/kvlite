@@ -33,7 +33,7 @@ func tempfile() string {
 // fsync to the checkpoint — so every test that does not specifically assert
 // per-commit durability uses this.
 func openDB(path string) (*DB, error) {
-	return Open(path, 0600, &Options{synchronous: SYNCHRONOUS_NORMAL})
+	return Open(path, 0600, &Options{Synchronous: SyncNormal})
 }
 
 func TestPgidCodec_UsesExactlyEightLittleEndianBytes(t *testing.T) {
@@ -230,7 +230,7 @@ func (w *oneByteWriter) Write(data []byte) (int, error) {
 
 func TestWriteFull_CompletesPartialWrites(t *testing.T) {
 	writer := new(oneByteWriter)
-	data := encodeMeta(NewMeta())
+	data := encodeMeta(NewMeta(int64(os.Getpagesize())))
 	if err := writeFull(writer, data); err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestWriteFull_CompletesPartialWrites(t *testing.T) {
 }
 
 func TestWriteNode_CompletesPartialWrites(t *testing.T) {
-	meta := NewMeta()
+	meta := NewMeta(int64(os.Getpagesize()))
 	db := &DB{meta: meta}
 	node := db.newLeafNode(meta.root)
 	if err := node.insertEntry(Entry{key: []byte("key"), value: []byte("value")}); err != nil {
@@ -1465,6 +1465,247 @@ func TestOpen_Reopen(t *testing.T) {
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestOpen_PageSizeOptionControlsNewDatabase(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	const pageSize = 8 * 1024 // Use an 8 KiB page so the expected file layout is explicit.
+	db, err := Open(path, 0600, &Options{PageSize: pageSize, Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.meta.pageSize != pageSize {
+		t.Fatalf("new database page size: got %d, want %d", db.meta.pageSize, pageSize)
+	}
+	if got := fileSize(t, path); got != 2*pageSize {
+		t.Fatalf("new database file size: got %d, want two %d-byte pages", got, pageSize)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An existing database owns its page size. A later option must not reinterpret
+	// its pages with a different size.
+	reopened, err := Open(path, 0600, &Options{PageSize: pageSize / 2, Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if reopened.meta.pageSize != pageSize {
+		t.Fatalf("reopened database page size: got %d, want stored size %d", reopened.meta.pageSize, pageSize)
+	}
+}
+
+func TestOpen_ZeroPageSizeUsesOperatingSystemPageSize(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	originalDefaults := DefaultOptions
+	customDefaults := *DefaultOptions
+	customDefaults.PageSize = os.Getpagesize() * 2
+	DefaultOptions = &customDefaults
+	defer func() { DefaultOptions = originalDefaults }()
+
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got, want := db.meta.pageSize, int64(os.Getpagesize()); got != want {
+		t.Fatalf("zero page size: got %d, want operating system page size %d", got, want)
+	}
+}
+
+func TestOpen_InvalidPageSizeDoesNotCreateDatabase(t *testing.T) {
+	testCases := []struct {
+		name     string
+		pageSize int
+	}{
+		{name: "negative", pageSize: -1},
+		{name: "smaller than metadata", pageSize: metaEncodedSize - 1},
+		{name: "larger than supported value", pageSize: MaxValueSize + 1},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := tempfile()
+			defer os.RemoveAll(path)
+			defer os.RemoveAll(path + "-wal")
+
+			db, err := Open(path, 0600, &Options{PageSize: testCase.pageSize})
+			if db != nil {
+				_ = db.Close()
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Open error: got %v, want ErrInvalid", err)
+			}
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("invalid page size created the database, stat error %v", statErr)
+			}
+		})
+	}
+}
+
+func TestOpen_InvalidWALOptionsDoNotCreateDatabase(t *testing.T) {
+	testCases := []struct {
+		name    string
+		options Options
+	}{
+		{name: "unknown synchronous mode", options: Options{Synchronous: SyncNormal + 1}},
+		{name: "negative checkpoint threshold", options: Options{CheckpointThresholdBytes: -1}},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			path := tempfile()
+			defer os.RemoveAll(path)
+			defer os.RemoveAll(path + "-wal")
+
+			db, err := Open(path, 0600, &testCase.options)
+			if db != nil {
+				_ = db.Close()
+			}
+			if !errors.Is(err, ErrInvalid) {
+				t.Fatalf("Open error: got %v, want ErrInvalid", err)
+			}
+			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+				t.Fatalf("invalid WAL option created the database, stat error %v", statErr)
+			}
+		})
+	}
+}
+
+func TestOpen_UsesModeForDatabaseAndWAL(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	const mode os.FileMode = 0600
+	db, err := Open(path, mode, &Options{Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, filePath := range []string{path, path + "-wal"} {
+		info, err := os.Stat(filePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != mode {
+			t.Errorf("mode for %s: got %04o, want %04o", filePath, got, mode)
+		}
+	}
+}
+
+func TestOpen_NilOptionsApplyDefaultReadOnlyBeforeFileCreation(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	originalDefaults := DefaultOptions
+	readOnlyDefaults := *DefaultOptions
+	readOnlyDefaults.ReadOnly = true
+	DefaultOptions = &readOnlyDefaults
+	defer func() { DefaultOptions = originalDefaults }()
+
+	db, err := Open(path, 0600, nil)
+	if db != nil {
+		_ = db.Close()
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Open error: got %v, want os.ErrNotExist", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("read-only defaults created the database, stat error %v", statErr)
+	}
+}
+
+func TestOpen_SynchronousNormalDefersWALSync(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	// The threshold is larger than this test transaction, so NORMAL mode must
+	// leave the WAL unsynced until a later checkpoint or close.
+	const checkpointBeyondTestWrite int64 = 1 << 30
+	db, err := Open(path, 0600, &Options{
+		Synchronous:              SyncNormal,
+		CheckpointThresholdBytes: checkpointBeyondTestWrite,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	syncCalls := 0
+	db.wal.syncFile = func() error {
+		syncCalls++
+		return nil
+	}
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls != 0 {
+		t.Fatalf("NORMAL commit sync calls: got %d, want 0", syncCalls)
+	}
+}
+
+func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, &Options{
+		Synchronous:              SyncNormal,
+		CheckpointThresholdBytes: 1, // Every WAL transaction is larger than one byte.
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if got := fileSize(t, path+"-wal"); got != 0 {
+		t.Fatalf("WAL size after threshold checkpoint: got %d, want 0", got)
+	}
+}
+
+func TestWAL_ByteCounterDoesNotWrapAtFourGiB(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	// The largest uint32 value is the boundary that the old WAL byte counter
+	// could not cross.
+	const largestUint32 = 1<<32 - 1
+	wal := &WAL{
+		db:                       &DB{options: &Options{Synchronous: SyncNormal}},
+		file:                     walFile,
+		bytesSinceCheckpoint:     largestUint32 - 1,
+		checkpointThresholdBytes: largestUint32,
+	}
+
+	// Two bytes move the counter from one byte below the boundary to one byte
+	// above it.
+	needsCheckpoint, err := wal.appendTransaction([]byte{0, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsCheckpoint {
+		t.Fatal("WAL counter crossed 4 GiB without starting a checkpoint")
+	}
+	if got, want := uint64(wal.bytesSinceCheckpoint), uint64(largestUint32)+1; got != want {
+		t.Fatalf("WAL byte counter: got %d, want %d", got, want)
 	}
 }
 

@@ -16,7 +16,7 @@ type Tx struct {
 }
 
 type writeTransactionSnapshot struct {
-	bytesSinceCheckpoint uint32
+	bytesSinceCheckpoint int64
 	collectedRecords     map[Pgid]Record
 	overlay              map[Pgid]Record
 	meta                 Meta

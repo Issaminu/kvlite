@@ -11,9 +11,13 @@ import (
 type Sync uint8
 
 const (
-	SYNCHRONOUS_DEFAULT Sync = 0 // Default value when `synchronous` is not defined. It uses `DefaultOptions.synchronous`
-	SYNCHRONOUS_FULL    Sync = 1 // Always sync every commit to disk
-	SYNCHRONOUS_NORMAL  Sync = 2 // Sync to disk only once we reach checkpointThresholdBytes
+	SyncDefault Sync = iota
+	SyncFull
+	SyncNormal
+
+	// SQLite checkpoints its WAL after 1,000 pages by default. KVLite uses the
+	// same page count to calculate its default byte threshold.
+	defaultCheckpointPageCount = 1000
 )
 
 // Options represents the options that can be set when opening a database.
@@ -21,19 +25,27 @@ type Options struct {
 	// ReadOnly opens the database in read-only mode.
 	ReadOnly bool
 
-	// syncMode defines when we do fsync, every commit (SYNCRONOUS_FULL) vs at checkpoint (SYNCRONOUS_NORMAL)
-	synchronous Sync
+	// PageSize sets the page size for a new database. A zero value uses the
+	// operating system page size. An existing database always uses its stored page
+	PageSize int
 
-	// checkpointThresholdBytes defines the threshold for applying the in-memory changes to disk.
-	// It controls how often the WAL is checkpointed into the main file, in both sync modes; larger = fewer checkpoints, bigger WAL, longer recovery.
-	checkpointThresholdBytes uint32
+	// Synchronous controls when KVLite syncs the WAL.
+	// SyncFull syncs every commit.
+	// SyncNormal syncs at a checkpoint or close.
+	// SyncDefault uses the value from DefaultOptions.
+	Synchronous Sync
+
+	// CheckpointThresholdBytes sets the WAL size that starts a checkpoint.
+	// A zero value uses the value from DefaultOptions.
+	CheckpointThresholdBytes int64
 }
 
 // DefaultOptions is used when nil options are passed to Open.
 var DefaultOptions = &Options{
 	ReadOnly:                 false,
-	synchronous:              SYNCHRONOUS_FULL,
-	checkpointThresholdBytes: 1000 * uint32(os.Getpagesize()), // same as SQLite
+	PageSize:                 0,
+	Synchronous:              SyncFull,
+	CheckpointThresholdBytes: defaultCheckpointPageCount * int64(os.Getpagesize()),
 }
 
 // DB represents a collection of buckets persisted to a single file on disk.
@@ -62,13 +74,17 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		return nil, errors.New("path required")
 	}
 
-	var dbFile *os.File
-	var err error
+	resolvedOptions, err := resolveOptions(options)
+	if err != nil {
+		return nil, err
+	}
 
-	if options != nil && options.ReadOnly {
-		dbFile, err = os.OpenFile(path, os.O_RDONLY, 0444)
+	var dbFile *os.File
+
+	if resolvedOptions.ReadOnly {
+		dbFile, err = os.OpenFile(path, os.O_RDONLY, mode)
 	} else {
-		dbFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
+		dbFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, mode)
 	}
 
 	if err != nil {
@@ -76,17 +92,16 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		path: path,
-		file: dbFile,
+		path:    path,
+		file:    dbFile,
+		options: resolvedOptions,
 	}
-
-	db.applyOptions(options)
 
 	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()
 	var mainMetaErr error
 	if isNew {
-		db.meta = NewMeta()
+		db.meta = NewMeta(int64(db.options.PageSize))
 	} else {
 		db.meta, err = db.readMeta()
 		if err != nil {
@@ -98,7 +113,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 				return db.failOpen(mainMetaErr)
 			}
 		}
-		if db.meta.pageSize <= 0 || db.meta.pageSize > MaxValueSize {
+		if db.meta.pageSize < metaEncodedSize || db.meta.pageSize > MaxValueSize {
 			if mainMetaErr != nil {
 				return db.failOpen(mainMetaErr)
 			}
@@ -495,10 +510,14 @@ func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 	var walFile *os.File
 	var err error
 
-	if db.options != nil && db.options.ReadOnly {
-		walFile, err = os.OpenFile(walPath, os.O_RDONLY, 0444)
+	if db.options.ReadOnly {
+		walFile, err = os.OpenFile(walPath, os.O_RDONLY, 0)
 	} else {
-		walFile, err = os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, 0644)
+		info, statErr := db.file.Stat()
+		if statErr != nil {
+			return nil, nil, statErr
+		}
+		walFile, err = os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, info.Mode().Perm())
 	}
 
 	if err != nil {
@@ -510,7 +529,14 @@ func (db *DB) readOrCreateWal() (*WAL, []Record, error) {
 	}
 
 	wal := &WAL{
-		db: db, path: walPath, file: walFile, collectedRecords: make(map[Pgid]Record), overlay: make(map[Pgid]Record), nextTxid: 1, checkpointThresholdBytes: db.options.checkpointThresholdBytes, bytesSinceCheckpoint: 0,
+		db:                       db,
+		path:                     walPath,
+		file:                     walFile,
+		collectedRecords:         make(map[Pgid]Record),
+		overlay:                  make(map[Pgid]Record),
+		nextTxid:                 1,
+		checkpointThresholdBytes: db.options.CheckpointThresholdBytes,
+		bytesSinceCheckpoint:     0,
 	}
 
 	records, err := wal.readRecords()
@@ -622,25 +648,37 @@ func (db *DB) loadCommittedIntoOverlay(records []Record) error {
 	return nil
 }
 
-func (db *DB) applyOptions(options *Options) {
-	// starting with default options
-	opts := *DefaultOptions
-	db.options = &opts
-
-	if options == nil {
-		return
+func resolveOptions(options *Options) (*Options, error) {
+	resolved := *DefaultOptions
+	if options != nil {
+		resolved.ReadOnly = options.ReadOnly
+		resolved.PageSize = options.PageSize
+		if options.Synchronous != SyncDefault {
+			resolved.Synchronous = options.Synchronous
+		}
+		if options.CheckpointThresholdBytes != 0 {
+			resolved.CheckpointThresholdBytes = options.CheckpointThresholdBytes
+		}
 	}
 
-	// then overriding with any explicitely provided options
-
-	db.options.ReadOnly = options.ReadOnly
-
-	if options.checkpointThresholdBytes > 0 {
-		db.options.checkpointThresholdBytes = options.checkpointThresholdBytes
+	if resolved.PageSize == 0 {
+		resolved.PageSize = os.Getpagesize()
 	}
-	if options.synchronous != SYNCHRONOUS_DEFAULT {
-		db.options.synchronous = options.synchronous
+	if resolved.PageSize < metaEncodedSize || resolved.PageSize > MaxValueSize {
+		return nil, fmt.Errorf("invalid database page size %d: %w", resolved.PageSize, ErrInvalid)
 	}
+
+	if resolved.Synchronous == SyncDefault {
+		resolved.Synchronous = SyncFull
+	}
+	if resolved.Synchronous != SyncFull && resolved.Synchronous != SyncNormal {
+		return nil, fmt.Errorf("invalid synchronous mode %d: %w", resolved.Synchronous, ErrInvalid)
+	}
+	if resolved.CheckpointThresholdBytes <= 0 {
+		return nil, fmt.Errorf("invalid checkpoint threshold %d: %w", resolved.CheckpointThresholdBytes, ErrInvalid)
+	}
+
+	return &resolved, nil
 }
 
 func (db *DB) Update(transaction func(tx *Tx) error) error {
