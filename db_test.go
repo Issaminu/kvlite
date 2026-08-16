@@ -46,6 +46,48 @@ func fileSize(t *testing.T, path string) int64 {
 	return fi.Size()
 }
 
+// oneByteWriter accepts one byte from each Write call without returning an
+// error. It verifies that code using io.Writer handles valid partial writes.
+type oneByteWriter struct {
+	bytes.Buffer
+}
+
+func (w *oneByteWriter) Write(data []byte) (int, error) {
+	if len(data) > 1 {
+		data = data[:1]
+	}
+	return w.Buffer.Write(data)
+}
+
+func TestWriteMeta_CompletesPartialWrites(t *testing.T) {
+	writer := new(oneByteWriter)
+	if err := writeMeta(writer, NewMeta()); err != nil {
+		t.Fatal(err)
+	}
+
+	const encodedMetaSize = 4 + 4 + 8 + 8 + 8 + 8 // magic, version, page size, pgid, root, and checksum.
+	if writer.Len() != encodedMetaSize {
+		t.Fatalf("encoded metadata size: got %d bytes, want %d", writer.Len(), encodedMetaSize)
+	}
+}
+
+func TestWriteNode_CompletesPartialWrites(t *testing.T) {
+	meta := NewMeta()
+	db := &DB{meta: meta}
+	node := db.newLeafNode(meta.root)
+	if err := node.insert([]byte("key"), []byte("value"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	writer := new(oneByteWriter)
+	if err := writeNode(writer, node, true); err != nil {
+		t.Fatal(err)
+	}
+	if writer.Len() != int(meta.pageSize) {
+		t.Fatalf("encoded node size: got %d bytes, want one %d-byte page", writer.Len(), meta.pageSize)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // RUNG 2 — Efficient lookup + no forever-growth: a single sorted node.  <-- NEXT
 //

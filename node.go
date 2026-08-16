@@ -196,12 +196,12 @@ func writeNode(w io.Writer, node *Node, shouldPad bool) error {
 		return ErrNodeTooLarge
 	}
 
-	if _, err := w.Write(buf.Bytes()); err != nil {
+	if err := writeFull(w, buf.Bytes()); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	if shouldPad && currNodeSize < pageSize {
 		padding := make([]byte, pageSize-currNodeSize)
-		if _, err := w.Write(padding); err != nil {
+		if err := writeFull(w, padding); err != nil {
 			return fmt.Errorf("write node padding: %w", err)
 		}
 	}

@@ -79,7 +79,7 @@ func writeMeta(w io.Writer, meta *Meta) error {
 	buf := new(bytes.Buffer)
 	meta.encode(buf)
 
-	if _, err := w.Write(buf.Bytes()); err != nil {
+	if err := writeFull(w, buf.Bytes()); err != nil {
 		return fmt.Errorf("write meta: %w", err)
 	}
 

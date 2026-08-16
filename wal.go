@@ -236,7 +236,7 @@ func (wal *WAL) applyRecordToDatabase(record *Record, pageSize int64) error {
 		copy(padded, page)
 		page = padded
 	}
-	if _, err := wal.db.file.Write(page); err != nil {
+	if err := writeFull(wal.db.file, page); err != nil {
 		return err
 	}
 	return nil
