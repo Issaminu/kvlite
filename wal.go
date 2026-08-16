@@ -259,25 +259,12 @@ func (wal *WAL) persistCollectedRecords() error {
 		return err
 	}
 
-	if err := writeFull(wal.file, transaction); err != nil {
-		return fmt.Errorf("persist multiple records: %w", err)
-	}
-	wal.hasUnsyncedWrites = true
-	wal.bytesSinceCheckpoint += uint32(len(transaction))
-
-	needsCheckpoint := wal.reachedCheckpointThreshold()
-	if wal.db.options.synchronous == SYNCHRONOUS_FULL || needsCheckpoint {
-		if err := wal.sync(); err != nil {
-			return err
-		}
+	needsCheckpoint, err := wal.appendTransaction(transaction)
+	if err != nil {
+		return err
 	}
 
-	// The required WAL sync is the commit point. Publish the committed records
-	// only after it succeeds.
-	for key := range wal.collectedRecords {
-		wal.overlay[key] = wal.collectedRecords[key]
-	}
-	clear(wal.collectedRecords)
+	wal.moveCollectedRecordsToOverlay()
 
 	if needsCheckpoint {
 		if err := wal.checkpoint(); err != nil {
@@ -314,6 +301,30 @@ func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
+}
+
+func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
+	if err := writeFull(wal.file, transaction); err != nil {
+		return false, fmt.Errorf("persist multiple records: %w", err)
+	}
+	wal.hasUnsyncedWrites = true
+	wal.bytesSinceCheckpoint += uint32(len(transaction))
+
+	needsCheckpoint := wal.reachedCheckpointThreshold()
+	if wal.db.options.synchronous == SYNCHRONOUS_FULL || needsCheckpoint {
+		if err := wal.sync(); err != nil {
+			return false, err
+		}
+	}
+
+	return needsCheckpoint, nil
+}
+
+func (wal *WAL) moveCollectedRecordsToOverlay() {
+	for key := range wal.collectedRecords {
+		wal.overlay[key] = wal.collectedRecords[key]
+	}
+	clear(wal.collectedRecords)
 }
 
 func isRecordCommitMarker(record *Record) bool {
