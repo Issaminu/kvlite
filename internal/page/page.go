@@ -7,9 +7,9 @@ import (
 )
 
 var (
-	ErrInvalid             = errors.New("invalid database")
-	ErrVersionNotSupported = errors.New("database version is not supported by current kvlite version")
-	ErrChecksum            = errors.New("checksum error")
+	ErrInvalid         = errors.New("invalid database")
+	ErrVersionMismatch = errors.New("version mismatch")
+	ErrChecksum        = errors.New("checksum error")
 )
 
 // Identifier for the page number (Pgid)

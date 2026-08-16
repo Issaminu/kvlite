@@ -270,10 +270,10 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 // walkNodes visits every node of the on-disk tree rooted at db.rootNode, reading
 // each child by its pgid. It doubles as a reachability check: a bad child pgid
 // (mis-wired separator/split) makes readNode fail and the walk t.Fatal.
-func walkNodes(t *testing.T, db *DB, visit func(n *Node)) {
+func walkNodes(t *testing.T, db *DB, visit func(n *btree.Node)) {
 	t.Helper()
-	var rec func(n *Node)
-	rec = func(n *Node) {
+	var rec func(n *btree.Node)
+	rec = func(n *btree.Node) {
 		visit(n)
 		if n.IsLeaf {
 			return
@@ -350,7 +350,7 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 	}
 
 	pageBytes := int(db.meta.PageSize())
-	walkNodes(t, db, func(nd *Node) {
+	walkNodes(t, db, func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > pageBytes {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page — split must keep every node <= a page", sz, pageBytes)
 		}
@@ -383,7 +383,7 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 		t.Fatal("root must be a branch after 400 entries")
 	}
 	leaves := 0
-	walkNodes(t, db, func(nd *Node) {
+	walkNodes(t, db, func(nd *btree.Node) {
 		if nd.IsLeaf {
 			leaves++
 		}
@@ -1557,8 +1557,8 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := openDB(path); !errors.Is(err, ErrVersionNotSupported) {
-		t.Fatalf("expected ErrVersionNotSupported, got: %v", err)
+	if _, err := openDB(path); !errors.Is(err, ErrVersionMismatch) {
+		t.Fatalf("expected ErrVersionMismatch, got: %v", err)
 	}
 }
 
@@ -2030,7 +2030,7 @@ func TestBucketReadsAfterViewStopAtClosedTransaction(t *testing.T) {
 	if value := savedBucket.Get([]byte("key")); value != nil {
 		t.Fatalf("closed bucket returned %q", value)
 	}
-	if child, err := savedBucket.Bucket([]byte("child")); child != nil || !errors.Is(err, ErrTxClosed) {
+	if child, err := savedBucket.LookupBucket([]byte("child")); child != nil || !errors.Is(err, ErrTxClosed) {
 		t.Fatalf("closed bucket lookup: expected ErrTxClosed, got bucket %v and error %v", child, err)
 	}
 }
@@ -2229,10 +2229,10 @@ func TestTx_PutErrorLeavesRootIntact(t *testing.T) {
 
 	// A tx.Put with an empty key fails _put's guard -> _put returns (nil, err).
 	got := db.Update(func(tx *Tx) error {
-		return tx.Put(nil, []byte("x")) // empty key -> ErrKeyEmpty from _put
+		return tx.Put(nil, []byte("x"))
 	})
-	if !errors.Is(got, ErrKeyEmpty) {
-		t.Fatalf("expected ErrKeyEmpty from a bad tx.Put, got %v", got)
+	if !errors.Is(got, ErrKeyRequired) {
+		t.Fatalf("expected ErrKeyRequired from a bad tx.Put, got %v", got)
 	}
 
 	// The tree must be intact: root still set, seeded key still readable.
@@ -2241,6 +2241,119 @@ func TestTx_PutErrorLeavesRootIntact(t *testing.T) {
 	}
 	if v, err := db.Get([]byte("keep")); err != nil || !bytes.Equal(v, []byte("me")) {
 		t.Fatalf("committed key lost after a failed tx.Put: got %q, err %v", v, err)
+	}
+}
+
+func TestEmptyKeysReturnErrKeyRequired(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put(nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
+		t.Fatalf("DB.Put: expected ErrKeyRequired, got %v", err)
+	}
+	if _, err := db.Get(nil); !errors.Is(err, ErrKeyRequired) {
+		t.Fatalf("DB.Get: expected ErrKeyRequired, got %v", err)
+	}
+
+	err = db.Update(func(tx *Tx) error {
+		if err := tx.Put(nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
+			t.Fatalf("Tx.Put: expected ErrKeyRequired, got %v", err)
+		}
+		if _, err := tx.Get(nil); !errors.Is(err, ErrKeyRequired) {
+			t.Fatalf("Tx.Get: expected ErrKeyRequired, got %v", err)
+		}
+
+		bucket, err := tx.CreateBucket([]byte("bucket"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put(nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
+			t.Fatalf("Bucket.Put: expected ErrKeyRequired, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCreateBucketRequiresName(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		if _, err := tx.CreateBucket(nil); !errors.Is(err, ErrBucketNameRequired) {
+			t.Fatalf("Tx.CreateBucket: expected ErrBucketNameRequired, got %v", err)
+		}
+
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if _, err := parent.LookupBucket(nil); !errors.Is(err, ErrBucketNameRequired) {
+			t.Fatalf("Bucket.LookupBucket: expected ErrBucketNameRequired, got %v", err)
+		}
+		if _, err := parent.CreateBucket(nil); !errors.Is(err, ErrBucketNameRequired) {
+			t.Fatalf("Bucket.CreateBucket: expected ErrBucketNameRequired, got %v", err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNestedBucketLookupContracts(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.CreateBucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		if err := parent.Put([]byte("value"), []byte("plain")); err != nil {
+			return err
+		}
+
+		if got := parent.Bucket([]byte("child")); got != child {
+			t.Fatal("Bucket did not return the cached child")
+		}
+		if got := parent.Bucket([]byte("missing")); got != nil {
+			t.Fatal("Bucket returned a missing child")
+		}
+		if got, err := parent.LookupBucket([]byte("value")); got != nil || !errors.Is(err, ErrIncompatibleValue) {
+			t.Fatalf("LookupBucket: expected ErrIncompatibleValue, got bucket %v and error %v", got, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -2643,10 +2756,7 @@ func TestBucket_NestedInSplitParent(t *testing.T) {
 			return err
 		}
 		// read-your-writes: the child must resolve through the branchy parent.
-		c, err := parent.Bucket([]byte("child"))
-		if err != nil {
-			return fmt.Errorf("lookup nested child: %w", err)
-		}
+		c := parent.Bucket([]byte("child"))
 		if c == nil {
 			t.Fatal("nested child bucket not found through a split parent (non-descending lookup)")
 		}
@@ -2672,9 +2782,9 @@ func TestBucket_NestedInSplitParent(t *testing.T) {
 		if parent == nil {
 			t.Fatal("parent bucket lost across reopen")
 		}
-		c, err := parent.Bucket([]byte("child"))
-		if err != nil || c == nil {
-			t.Fatalf("nested child not resolved after reopen: err=%v", err)
+		c := parent.Bucket([]byte("child"))
+		if c == nil {
+			t.Fatal("nested child not resolved after reopen")
 		}
 		if got := c.Get([]byte("k")); !bytes.Equal(got, []byte("childval")) {
 			t.Fatalf("nested child value lost across reopen: got %q", got)
@@ -2734,9 +2844,9 @@ func TestBucket_Nested(t *testing.T) {
 			if got := p.Get([]byte("pk")); !bytes.Equal(got, []byte("pv")) {
 				t.Fatalf("%s: parent's plain key lost: got %q", when, got)
 			}
-			c, err := p.Bucket([]byte("child"))
-			if err != nil || c == nil {
-				t.Fatalf("%s: child bucket not resolved: err %v", when, err)
+			c := p.Bucket([]byte("child"))
+			if c == nil {
+				t.Fatalf("%s: child bucket not resolved", when)
 			}
 			if got := c.Get([]byte("k")); !bytes.Equal(got, []byte("childval")) {
 				t.Fatalf("%s: nested value lost: got %q", when, got)
@@ -2805,7 +2915,7 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	}
 
 	// Every node must fit one page and hold at least one entry (no empty leaf).
-	walkNodes(t, db, func(nd *Node) {
+	walkNodes(t, db, func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
@@ -2968,7 +3078,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 
 	// The big insert must have grown the tree to at least three leaves.
 	leaves := 0
-	walkNodes(t, db, func(nd *Node) {
+	walkNodes(t, db, func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
@@ -3093,10 +3203,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 				t.Fatalf("key %q lost after parent split: writeBackRoot dropped the new root", k)
 			}
 		}
-		child, err := p2.Bucket(childName)
-		if err != nil {
-			return err
-		}
+		child := p2.Bucket(childName)
 		if child == nil {
 			t.Fatal("child bucket pointer lost: it landed in the orphaned right half")
 		}
@@ -3457,10 +3564,7 @@ func TestBucketPut_RefusesOverwritingNestedBucket(t *testing.T) {
 		if parent == nil {
 			t.Fatal("parent bucket missing")
 		}
-		child, err := parent.Bucket([]byte("child"))
-		if err != nil {
-			t.Fatalf("resolve nested bucket: %v", err)
-		}
+		child := parent.Bucket([]byte("child"))
 		if child == nil {
 			t.Fatal("nested bucket was destroyed by the refused Put")
 		}
@@ -3745,13 +3849,10 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		if parent == nil {
 			t.Fatal("parent bucket missing")
 		}
-		if b, err := parent.Bucket([]byte("bbbb")); err != nil || b != nil {
-			t.Fatalf("phantom nested bucket \"bbbb\" created: writeBackRoot used the caller's mutated buffer as the key (err=%v)", err)
+		if b := parent.Bucket([]byte("bbbb")); b != nil {
+			t.Fatal("phantom nested bucket \"bbbb\" created: writeBackRoot used the caller's mutated buffer as the key")
 		}
-		aaaa, err := parent.Bucket([]byte("aaaa"))
-		if err != nil {
-			t.Fatal(err)
-		}
+		aaaa := parent.Bucket([]byte("aaaa"))
 		if aaaa == nil {
 			t.Fatal("nested bucket \"aaaa\" lost: writeBackRoot no longer wrote back under the real name")
 		}

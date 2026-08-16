@@ -131,7 +131,7 @@ func (tx *Tx) writableError() error {
 // can return a replacement root after a split, but it does not install that
 // root. This method installs it, updates meta.root, and then stages the meta
 // record so recovery uses the root that contains the entry.
-func (tx *Tx) putCatalogEntry(entry Entry) error {
+func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
 	newRoot, err := tx.db.putTreeEntry(tx.db.rootNode, entry)
 	if err != nil {
 		return err
@@ -161,7 +161,7 @@ func (tx *Tx) Get(key []byte) ([]byte, error) {
 	if !found {
 		return nil, ErrKeyNotFound
 	}
-	if entry.Flags()&BucketLeafFlag != 0 {
+	if entry.Flags()&btree.BucketLeafFlag != 0 {
 		return nil, ErrIncompatibleValue
 	}
 	return entry.Value(), nil

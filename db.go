@@ -12,9 +12,6 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-type Node = btree.Node
-type Entry = btree.Entry
-
 const (
 	MaxKeySize   = btree.MaxKeySize
 	MaxValueSize = btree.MaxValueSize
@@ -26,7 +23,7 @@ type DB struct {
 	path     string
 	file     *os.File
 	meta     *page.Meta
-	rootNode *Node
+	rootNode *btree.Node
 	options  *Options
 	wal      *wal.WAL
 	tree     *btree.Tree
@@ -267,7 +264,7 @@ func (db *DB) Put(key []byte, value []byte) error {
 // putTreeEntry inserts entry into the tree that starts at rootNode. It returns
 // the current root because a split can create a replacement root. The caller
 // owns that root and must adopt it after this function succeeds.
-func (db *DB) putTreeEntry(rootNode *Node, entry Entry) (*Node, error) {
+func (db *DB) putTreeEntry(rootNode *btree.Node, entry btree.Entry) (*btree.Node, error) {
 	if db.options.ReadOnly {
 		return nil, ErrDatabaseReadOnly
 	}
@@ -284,11 +281,11 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	return value, err
 }
 
-func (db *DB) findTreeEntry(rootNode *Node, key []byte) (Entry, bool, error) {
+func (db *DB) findTreeEntry(rootNode *btree.Node, key []byte) (btree.Entry, bool, error) {
 	return db.tree.FindEntry(rootNode, key)
 }
 
-func (db *DB) persistNode(node *Node) error {
+func (db *DB) persistNode(node *btree.Node) error {
 	offset := int64(node.PageID()) * db.meta.PageSize()
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		return fmt.Errorf("seek node: %w", err)
@@ -307,7 +304,7 @@ func (db *DB) hasMeta() bool {
 	return fi.Size() > 0
 }
 
-func (db *DB) readNode(pgid page.ID) (*Node, error) {
+func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	// check if Node exists in current transaction
 
 	record, ok := db.wal.Lookup(pgid)

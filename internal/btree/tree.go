@@ -53,7 +53,7 @@ func (tree *Tree) findLeafNode(root *Node, key []byte) (*Node, error) {
 
 func (tree *Tree) validateEntry(entry Entry) error {
 	if len(entry.Key()) == 0 {
-		return ErrKeyEmpty
+		return ErrKeyRequired
 	}
 	if len(entry.Key()) > MaxKeySize {
 		return ErrKeyTooLarge
@@ -127,7 +127,7 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 
 func (tree *Tree) FindEntry(root *Node, key []byte) (Entry, bool, error) {
 	if len(key) == 0 {
-		return Entry{}, false, ErrKeyEmpty
+		return Entry{}, false, ErrKeyRequired
 	}
 	if len(key) > MaxKeySize {
 		return Entry{}, false, ErrKeyTooLarge

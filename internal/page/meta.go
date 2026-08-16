@@ -95,7 +95,7 @@ func (m *Meta) Validate() error {
 		return ErrInvalid
 	}
 	if m.version != version {
-		return ErrVersionNotSupported
+		return ErrVersionMismatch
 	}
 	if m.checksum != m.generateChecksum() {
 		return ErrChecksum

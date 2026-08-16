@@ -7,10 +7,6 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-const (
-	BucketLeafFlag = btree.BucketLeafFlag
-)
-
 // cacheBucket registers b as the one handle for its name within this transaction.
 func (tx *Tx) cacheBucket(b *Bucket) {
 	if tx.buckets == nil {
@@ -22,7 +18,7 @@ func (tx *Tx) cacheBucket(b *Bucket) {
 type Bucket struct {
 	tx           *Tx
 	name         []byte
-	rootNode     *Node
+	rootNode     *btree.Node
 	parentBucket *Bucket
 	children     map[string]*Bucket // per-parent cache: one *Bucket handle per nested name
 }
@@ -39,7 +35,7 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // that points at it. That entry lives in the parent's tree: the DB catalog for a
 // top-level bucket, or the parent bucket's own tree for a nested bucket.
 func (b *Bucket) writeBackRoot() error {
-	entry := btree.NewEntry(BucketLeafFlag, b.name, page.EncodeID(b.rootNode.PageID()))
+	entry := btree.NewEntry(btree.BucketLeafFlag, b.name, page.EncodeID(b.rootNode.PageID()))
 	if b.parentBucket == nil {
 		return b.tx.putCatalogEntry(entry)
 	}
@@ -54,13 +50,16 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	if err := tx.writableError(); err != nil {
 		return nil, err
 	}
+	if len(bucketName) == 0 {
+		return nil, ErrBucketNameRequired
+	}
 
 	var existing *Bucket
 	var err error
 	if parent == nil {
 		existing, err = tx.lookupBucket(bucketName)
 	} else {
-		existing, err = parent.Bucket(bucketName)
+		existing, err = parent.LookupBucket(bucketName)
 	}
 	if err != nil {
 		return nil, err
@@ -81,9 +80,9 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	if parent == nil {
-		err = tx.putCatalogEntry(btree.NewEntry(BucketLeafFlag, bucket.name, page.EncodeID(newPgid)))
+		err = tx.putCatalogEntry(btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(newPgid)))
 	} else {
-		err = parent.putBucketEntry(btree.NewEntry(BucketLeafFlag, bucket.name, page.EncodeID(newPgid)))
+		err = parent.putBucketEntry(btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(newPgid)))
 	}
 	if err != nil {
 		return nil, err
@@ -132,7 +131,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	return bucket, nil
 }
 
-func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
+func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
 	entry, found, err := tx.db.findTreeEntry(rootNode, bucketName)
 	if err != nil {
 		return nil, err
@@ -141,7 +140,7 @@ func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bu
 		return nil, nil
 	}
 
-	if entry.Flags()&BucketLeafFlag == 0 {
+	if entry.Flags()&btree.BucketLeafFlag == 0 {
 		// exists, but it's a regular value
 		return nil, ErrIncompatibleValue
 	}
@@ -165,14 +164,26 @@ func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
 	return bucket.tx.createBucket(bucket, bucketName)
 }
 
-// Bucket looks up a nested bucket by name. It returns (nil, nil) if no entry
-// exists under that name, (nil, ErrIncompatibleValue) if the name holds a plain
-// value instead of a bucket, and otherwise the same *Bucket handle on every call
-// for the same parent and name, so writes through one handle are visible through
-// any other handle for the same nested bucket.
-func (bucket *Bucket) Bucket(bucketName []byte) (*Bucket, error) {
+// Bucket returns the nested bucket with the given name. It returns nil if the
+// bucket does not exist or if the lookup fails. Repeated calls within one
+// transaction return the same bucket handle.
+func (bucket *Bucket) Bucket(bucketName []byte) *Bucket {
+	child, err := bucket.LookupBucket(bucketName)
+	if err != nil {
+		return nil
+	}
+	return child
+}
+
+// LookupBucket returns the nested bucket with the given name and reports lookup
+// errors. It returns (nil, nil) when the bucket does not exist. It returns
+// ErrIncompatibleValue when the name belongs to a plain value.
+func (bucket *Bucket) LookupBucket(bucketName []byte) (*Bucket, error) {
 	if bucket.tx.closed {
 		return nil, ErrTxClosed
+	}
+	if len(bucketName) == 0 {
+		return nil, ErrBucketNameRequired
 	}
 	if b, ok := bucket.children[string(bucketName)]; ok {
 		return b, nil
@@ -192,7 +203,7 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	return bucket.putBucketEntry(btree.NewEntry(0, key, value))
 }
 
-func (bucket *Bucket) putBucketEntry(entry Entry) error {
+func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 	newRoot, err := bucket.tx.db.putTreeEntry(bucket.rootNode, entry)
 	if err != nil {
 		return err
@@ -220,7 +231,7 @@ func (bucket *Bucket) Get(key []byte) []byte {
 	}
 
 	// value is a bucket, we should refuse
-	if entry.Flags()&BucketLeafFlag != 0 {
+	if entry.Flags()&btree.BucketLeafFlag != 0 {
 		return nil
 	}
 	return entry.Value()
