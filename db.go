@@ -260,6 +260,28 @@ func (db *DB) Put(key []byte, value []byte) error {
 	})
 }
 
+func (db *DB) findLeafNode(rootNode *Node, key []byte) (*Node, error) {
+	node := rootNode
+	for !node.IsLeaf {
+		childIndex, err := node.findChildIndex(key)
+		if err != nil {
+			return nil, err
+		}
+		childNode, err := db.readNode(node.Children[childIndex])
+		if err != nil {
+			return nil, err
+		}
+		if childNode == nil {
+			return nil, ErrKeyNotFound
+		}
+
+		childNode.parent = node
+		childNode.Index = childIndex
+		node = childNode
+	}
+	return node, nil
+}
+
 // _put() places a key in it's correct place starting from a root *Node.
 // Due to node splitting, it's possible that the the new root (starting from the provided rootNode) is not actually the root of that tree.
 // returns (*NewRootNode, error), since it's possible that the root was split within the process.
@@ -291,24 +313,9 @@ func (db *DB) _put(rootNode *Node, key []byte, value []byte, flags uint32) (*Nod
 	// loads a root that holds only the left half of the split.
 	isTopLevel := rootNode == db.rootNode
 
-	node := rootNode
-	for !node.IsLeaf {
-		childIndex, err := node.findChildIndex(key)
-		if err != nil {
-			return nil, err
-		}
-		childNode, err := db.readNode(node.Children[childIndex])
-		if err != nil {
-			return nil, err
-		}
-		if childNode == nil {
-			return nil, ErrKeyNotFound
-		}
-
-		childNode.parent = node
-		childNode.Index = childIndex
-
-		node = childNode
+	node, err := db.findLeafNode(rootNode, key)
+	if err != nil {
+		return nil, err
 	}
 
 	if err := node.insert(key, value, flags); err != nil {
@@ -426,24 +433,9 @@ func (db *DB) _get(rootNode *Node, key []byte) ([]byte, uint32, error) {
 		return nil, 0, ErrKeyTooLarge
 	}
 
-	node := rootNode
-	for !node.IsLeaf {
-		childIndex, err := node.findChildIndex(key)
-		if err != nil {
-			return nil, 0, err
-		}
-		childNode, err := db.readNode(node.Children[childIndex])
-		if err != nil {
-			return nil, 0, err
-		}
-		if childNode == nil {
-			return nil, 0, ErrKeyNotFound
-		}
-
-		childNode.parent = node
-		childNode.Index = childIndex
-
-		node = childNode
+	node, err := db.findLeafNode(rootNode, key)
+	if err != nil {
+		return nil, 0, err
 	}
 
 	value, flags, found, err := node.get(key)
@@ -717,18 +709,10 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	tx := &Tx{db: db, readOnly: false}
 	defer func() { tx.closed = true }()
 
-	// take snapshot
-
-	bytesSinceCheckpoint := db.wal.bytesSinceCheckpoint
-	records := maps.Clone(db.wal.collectedRecords)
-	overlay := maps.Clone(db.wal.overlay)
-	metaSnapshot := *db.meta
-	hadUnsyncedWrites := db.wal.hasUnsyncedWrites
-	walOffset, err := db.wal.file.Seek(0, io.SeekCurrent)
+	snapshot, err := db.snapshotWriteTransaction()
 	if err != nil {
 		return err
 	}
-	nextTxid := db.wal.nextTxid
 	callbackReturned := false
 	defer func() {
 		if callbackReturned {
@@ -736,7 +720,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 		}
 
 		panicValue := recover() // nil when there's no panic
-		rollbackErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid, hadUnsyncedWrites)
+		rollbackErr := db.rollbackWriteTransaction(&snapshot)
 		if rollbackErr != nil {
 			if panicValue != nil {
 				panic(errors.Join(fmt.Errorf("transaction panic: %v", panicValue), rollbackErr))
@@ -752,7 +736,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	callbackReturned = true
 	if transactionErr != nil {
 		// transaction failed, revert back to snapshot
-		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid, hadUnsyncedWrites); rbErr != nil {
+		if rbErr := db.rollbackWriteTransaction(&snapshot); rbErr != nil {
 			return errors.Join(transactionErr, rbErr)
 		}
 		return transactionErr
@@ -760,7 +744,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 
 	// transaction succeeded
 	if err := db.wal.persistCollectedRecords(); err != nil {
-		if rbErr := db.rollbackWriteTransaction(bytesSinceCheckpoint, records, overlay, &metaSnapshot, walOffset, nextTxid, hadUnsyncedWrites); rbErr != nil {
+		if rbErr := db.rollbackWriteTransaction(&snapshot); rbErr != nil {
 			return errors.Join(err, rbErr)
 		}
 		return err
@@ -769,12 +753,28 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	return nil
 }
 
-func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, overlay map[Pgid]Record, metaSnapshot *Meta) error {
-	db.wal.bytesSinceCheckpoint = bytesSinceCheckpoint
-	db.wal.collectedRecords = records
-	db.wal.overlay = overlay
-	db.meta = metaSnapshot
-	root, err := db.readNode(metaSnapshot.root)
+func (db *DB) snapshotWriteTransaction() (writeTransactionSnapshot, error) {
+	walOffset, err := db.wal.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return writeTransactionSnapshot{}, err
+	}
+	return writeTransactionSnapshot{
+		bytesSinceCheckpoint: db.wal.bytesSinceCheckpoint,
+		collectedRecords:     maps.Clone(db.wal.collectedRecords),
+		overlay:              maps.Clone(db.wal.overlay),
+		meta:                 *db.meta,
+		walOffset:            walOffset,
+		nextTxid:             db.wal.nextTxid,
+		hasUnsyncedWrites:    db.wal.hasUnsyncedWrites,
+	}, nil
+}
+
+func (db *DB) rollbackTransaction(snapshot *writeTransactionSnapshot) error {
+	db.wal.bytesSinceCheckpoint = snapshot.bytesSinceCheckpoint
+	db.wal.collectedRecords = snapshot.collectedRecords
+	db.wal.overlay = snapshot.overlay
+	db.meta = &snapshot.meta
+	root, err := db.readNode(snapshot.meta.root)
 	if err != nil {
 		return fmt.Errorf("reload root node: %w", err)
 	}
@@ -782,16 +782,16 @@ func (db *DB) rollbackTransaction(bytesSinceCheckpoint uint32, records map[Pgid]
 	return nil
 }
 
-func (db *DB) rollbackWriteTransaction(bytesSinceCheckpoint uint32, records map[Pgid]Record, overlay map[Pgid]Record, metaSnapshot *Meta, walOffset int64, nextTxid Txid, hadUnsyncedWrites bool) error {
-	memoryErr := db.rollbackTransaction(bytesSinceCheckpoint, records, overlay, metaSnapshot)
-	db.wal.nextTxid = nextTxid
-	if err := db.wal.file.Truncate(walOffset); err != nil {
+func (db *DB) rollbackWriteTransaction(snapshot *writeTransactionSnapshot) error {
+	memoryErr := db.rollbackTransaction(snapshot)
+	db.wal.nextTxid = snapshot.nextTxid
+	if err := db.wal.file.Truncate(snapshot.walOffset); err != nil {
 		return errors.Join(memoryErr, fmt.Errorf("truncate failed WAL transaction: %w", err))
 	}
-	if _, err := db.wal.file.Seek(walOffset, io.SeekStart); err != nil {
+	if _, err := db.wal.file.Seek(snapshot.walOffset, io.SeekStart); err != nil {
 		return errors.Join(memoryErr, fmt.Errorf("rewind after failed WAL transaction: %w", err))
 	}
-	db.wal.hasUnsyncedWrites = hadUnsyncedWrites
+	db.wal.hasUnsyncedWrites = snapshot.hasUnsyncedWrites
 	return memoryErr
 }
 

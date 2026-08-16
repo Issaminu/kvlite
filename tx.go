@@ -16,6 +16,16 @@ type Tx struct {
 	buckets  map[string]*Bucket // per-tx cache: one *Bucket handle per top-level name, so every caller in this tx observes the same in-memory state
 }
 
+type writeTransactionSnapshot struct {
+	bytesSinceCheckpoint uint32
+	collectedRecords     map[Pgid]Record
+	overlay              map[Pgid]Record
+	meta                 Meta
+	walOffset            int64
+	nextTxid             Txid
+	hasUnsyncedWrites    bool
+}
+
 func (tx *Tx) Writable() bool {
 	return !tx.readOnly && !tx.closed
 }
