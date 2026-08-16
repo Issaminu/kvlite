@@ -254,40 +254,16 @@ func (wal *WAL) persistCollectedRecords() error {
 		return nil
 	}
 
-	txid := wal.nextTxid
-	wal.nextTxid++
-
-	largeBuf := new(bytes.Buffer)
-	recordBuffer := new(bytes.Buffer)
-
-	for pgid, record := range wal.collectedRecords {
-		record.header.txid = txid
-
-		if err := encodeRecord(recordBuffer, &record, wal.db.meta.pageSize); err != nil {
-			return err
-		}
-
-		// append to `largeBuf`
-		_, err := largeBuf.ReadFrom(recordBuffer)
-		if err != nil {
-			return err
-		}
-
-		// Write the stamped copy back into the map
-		wal.collectedRecords[pgid] = record
-	}
-
-	if err := wal.insertCommitMarker(largeBuf, txid); err != nil {
+	transaction, err := wal.encodeCollectedRecords()
+	if err != nil {
 		return err
 	}
 
-	walBytes := uint32(largeBuf.Len())
-
-	if err := writeFull(wal.file, largeBuf.Bytes()); err != nil {
+	if err := writeFull(wal.file, transaction); err != nil {
 		return fmt.Errorf("persist multiple records: %w", err)
 	}
 	wal.hasUnsyncedWrites = true
-	wal.bytesSinceCheckpoint += walBytes
+	wal.bytesSinceCheckpoint += uint32(len(transaction))
 
 	needsCheckpoint := wal.reachedCheckpointThreshold()
 	if wal.db.options.synchronous == SYNCHRONOUS_FULL || needsCheckpoint {
@@ -313,23 +289,31 @@ func (wal *WAL) persistCollectedRecords() error {
 	return nil
 }
 
-func (wal *WAL) insertCommitMarker(buf *bytes.Buffer, txid Txid) error {
-	recordBuffer := new(bytes.Buffer)
+func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
+	txid := wal.nextTxid
+	wal.nextTxid++
+
+	buf := new(bytes.Buffer)
+
+	for pgid, record := range wal.collectedRecords {
+		record.header.txid = txid
+
+		if err := encodeRecord(buf, &record, wal.db.meta.pageSize); err != nil {
+			return nil, err
+		}
+
+		wal.collectedRecords[pgid] = record
+	}
+
 	commitMarker := &Record{
 		header:      RecordHeader{recordType: recordTypeCommit, pgid: 0, txid: txid},
 		pageContent: nil,
 	}
-
-	if err := encodeRecord(recordBuffer, commitMarker, wal.db.meta.pageSize); err != nil {
-		return fmt.Errorf("encode commit marker: %w", err)
+	if err := encodeRecord(buf, commitMarker, wal.db.meta.pageSize); err != nil {
+		return nil, fmt.Errorf("encode commit marker: %w", err)
 	}
 
-	_, err := buf.ReadFrom(recordBuffer)
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return buf.Bytes(), nil
 }
 
 func isRecordCommitMarker(record *Record) bool {
