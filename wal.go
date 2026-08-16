@@ -79,12 +79,10 @@ func (wal *WAL) insertNodeRecord(node *Node) {
 
 func (wal *WAL) insertMetaRecord(meta *Meta) {
 	meta.checksum = meta.GenerateChecksum() // meta is mutated each Put so we should refresh it's checksum before encoding
-	buf := new(bytes.Buffer)
-	meta.encode(buf)
 
 	record := Record{
 		header:      RecordHeader{recordType: recordTypeMeta, pgid: metaPgid},
-		pageContent: buf.Bytes(),
+		pageContent: encodeMeta(meta),
 	}
 
 	wal.collectRecord(&record)

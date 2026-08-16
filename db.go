@@ -449,11 +449,11 @@ func (db *DB) readMeta() (*Meta, error) {
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
 		return nil, err
 	}
-	meta, err := readMeta(db.file)
-	if err != nil {
-		return nil, err
+	data := make([]byte, metaEncodedSize)
+	if _, err := io.ReadFull(db.file, data); err != nil {
+		return nil, errors.Join(ErrInvalid, err)
 	}
-	return meta, nil
+	return decodeMeta(data)
 }
 
 func (db *DB) persistMeta() error {
@@ -461,10 +461,10 @@ func (db *DB) persistMeta() error {
 	db.meta.checksum = db.meta.GenerateChecksum()
 
 	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek node: %w", err)
+		return fmt.Errorf("seek meta: %w", err)
 	}
-	if err := writeMeta(db.file, db.meta); err != nil {
-		return fmt.Errorf("write node: %w", err)
+	if err := writeFull(db.file, encodeMeta(db.meta)); err != nil {
+		return fmt.Errorf("write meta: %w", err)
 	}
 	return nil
 }
@@ -586,7 +586,7 @@ func metaFromCommittedWAL(records []Record) (*Meta, error) {
 		if record.header.recordType != recordTypeMeta || record.header.pgid != metaPgid {
 			continue
 		}
-		meta, err := readMeta(bytes.NewReader(record.pageContent))
+		meta, err := decodeMeta(record.pageContent)
 		if err != nil {
 			return nil, err
 		}
@@ -614,7 +614,7 @@ func (db *DB) loadCommittedIntoOverlay(records *[]Record) error {
 	}
 
 	if metaRecord, ok := db.wal.overlay[metaPgid]; ok {
-		meta, err := readMeta(bytes.NewReader(metaRecord.pageContent))
+		meta, err := decodeMeta(metaRecord.pageContent)
 		if err != nil {
 			return fmt.Errorf("read committed meta from WAL: %w", err)
 		}

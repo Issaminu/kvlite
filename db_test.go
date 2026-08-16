@@ -62,6 +62,39 @@ func TestPgidCodec_UsesExactlyEightLittleEndianBytes(t *testing.T) {
 	}
 }
 
+func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
+	// Distinct field values make the order and width of every field visible.
+	meta := &Meta{magic: 1, version: 2, pageSize: 3, pgid: 4, root: 5, checksum: 6}
+	want := []byte{
+		1, 0, 0, 0,
+		2, 0, 0, 0,
+		3, 0, 0, 0, 0, 0, 0, 0,
+		4, 0, 0, 0, 0, 0, 0, 0,
+		5, 0, 0, 0, 0, 0, 0, 0,
+		6, 0, 0, 0, 0, 0, 0, 0,
+	}
+
+	encoded := encodeMeta(meta)
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("encode meta: got %x, want %x", encoded, want)
+	}
+
+	decoded, err := decodeMeta(encoded)
+	if err != nil {
+		t.Fatalf("decode meta: %v", err)
+	}
+	if *decoded != *meta {
+		t.Fatalf("decode meta: got %+v, want %+v", decoded, meta)
+	}
+
+	// The six fields above occupy exactly 40 bytes.
+	for _, size := range []int{39, 41} {
+		if _, err := decodeMeta(make([]byte, size)); !errors.Is(err, ErrInvalid) {
+			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
+		}
+	}
+}
+
 // fileSize returns the current size of the database file in bytes.
 func fileSize(t *testing.T, path string) int64 {
 	t.Helper()
@@ -85,15 +118,15 @@ func (w *oneByteWriter) Write(data []byte) (int, error) {
 	return w.Buffer.Write(data)
 }
 
-func TestWriteMeta_CompletesPartialWrites(t *testing.T) {
+func TestWriteFull_CompletesPartialWrites(t *testing.T) {
 	writer := new(oneByteWriter)
-	if err := writeMeta(writer, NewMeta()); err != nil {
+	data := encodeMeta(NewMeta())
+	if err := writeFull(writer, data); err != nil {
 		t.Fatal(err)
 	}
 
-	const encodedMetaSize = 4 + 4 + 8 + 8 + 8 + 8 // magic, version, page size, pgid, root, and checksum.
-	if writer.Len() != encodedMetaSize {
-		t.Fatalf("encoded metadata size: got %d bytes, want %d", writer.Len(), encodedMetaSize)
+	if writer.Len() != len(data) {
+		t.Fatalf("wrote %d bytes, want %d", writer.Len(), len(data))
 	}
 }
 

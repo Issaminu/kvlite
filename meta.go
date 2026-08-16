@@ -1,11 +1,9 @@
 package kvlite
 
 import (
-	"bytes"
 	"encoding/binary"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"os"
 )
 
@@ -26,6 +24,41 @@ type Meta struct {
 	checksum uint64
 }
 
+const (
+	// Metadata contains two uint32 fields and four uint64 fields. Its encoded
+	// form therefore occupies 40 bytes.
+	metaEncodedSize = 40
+	// The final metadata field is a uint64 checksum, which occupies eight bytes.
+	metaChecksumSize = 8
+)
+
+func encodeMeta(meta *Meta) []byte {
+	data := make([]byte, 0, metaEncodedSize)
+	data = binary.LittleEndian.AppendUint32(data, meta.magic)
+	data = binary.LittleEndian.AppendUint32(data, meta.version)
+	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pageSize))
+	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pgid))
+	data = binary.LittleEndian.AppendUint64(data, uint64(meta.root))
+	data = binary.LittleEndian.AppendUint64(data, meta.checksum)
+	return data
+}
+
+func decodeMeta(data []byte) (*Meta, error) {
+	if len(data) != metaEncodedSize {
+		return nil, fmt.Errorf("decode meta: got %d bytes, want %d: %w", len(data), metaEncodedSize, ErrInvalid)
+	}
+
+	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], and checksum[32:40].
+	return &Meta{
+		magic:    binary.LittleEndian.Uint32(data[0:4]),
+		version:  binary.LittleEndian.Uint32(data[4:8]),
+		pageSize: int64(binary.LittleEndian.Uint64(data[8:16])),
+		pgid:     Pgid(binary.LittleEndian.Uint64(data[16:24])),
+		root:     Pgid(binary.LittleEndian.Uint64(data[24:32])),
+		checksum: binary.LittleEndian.Uint64(data[32:40]),
+	}, nil
+}
+
 func NewMeta() *Meta {
 	meta := &Meta{
 		magic:    magic,
@@ -36,82 +69,6 @@ func NewMeta() *Meta {
 	}
 	meta.checksum = meta.GenerateChecksum()
 	return meta
-}
-
-func readMeta(r io.Reader) (*Meta, error) {
-	var magic uint32
-	if err := binary.Read(r, binary.LittleEndian, &magic); err != nil {
-		return nil, ErrInvalid
-	}
-
-	var version uint32
-	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
-		return nil, ErrInvalid
-	}
-
-	var pageSize int64
-	if err := binary.Read(r, binary.LittleEndian, &pageSize); err != nil {
-		return nil, ErrInvalid
-	}
-
-	var pgid Pgid
-	if err := binary.Read(r, binary.LittleEndian, &pgid); err != nil {
-		return nil, ErrInvalid
-	}
-
-	var root Pgid
-	if err := binary.Read(r, binary.LittleEndian, &root); err != nil {
-		return nil, ErrInvalid
-	}
-
-	var checksum uint64
-	if err := binary.Read(r, binary.LittleEndian, &checksum); err != nil {
-		return nil, ErrInvalid
-	}
-
-	meta := &Meta{
-		magic, version, pageSize, pgid, root, checksum,
-	}
-	return meta, nil
-}
-
-func writeMeta(w io.Writer, meta *Meta) error {
-	buf := new(bytes.Buffer)
-	meta.encode(buf)
-
-	if err := writeFull(w, buf.Bytes()); err != nil {
-		return fmt.Errorf("write meta: %w", err)
-	}
-
-	return nil
-}
-
-func (meta *Meta) encode(buf *bytes.Buffer) error {
-	if err := binary.Write(buf, binary.LittleEndian, meta.magic); err != nil {
-		return fmt.Errorf("write meta magic: %w", err)
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, meta.version); err != nil {
-		return fmt.Errorf("write meta version: %w", err)
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, meta.pageSize); err != nil {
-		return fmt.Errorf("write meta pageSize: %w", err)
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, meta.pgid); err != nil {
-		return fmt.Errorf("write meta pgid: %w", err)
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, meta.root); err != nil {
-		return fmt.Errorf("write meta root: %w", err)
-	}
-
-	if err := binary.Write(buf, binary.LittleEndian, meta.checksum); err != nil {
-		return fmt.Errorf("write meta checksum: %w", err)
-	}
-
-	return nil
 }
 
 func (m *Meta) Validate() error {
@@ -130,12 +87,8 @@ func (m *Meta) Validate() error {
 }
 
 func (m *Meta) GenerateChecksum() uint64 {
-	buf := new(bytes.Buffer)
-	_ = m.encode(buf) // encode writes to a bytes.Buffer, which never fails
-
-	// The checksum is the last field: an 8-byte uint64. we hash everything before it
-	encoded := buf.Bytes()
-	sealed := encoded[:len(encoded)-8]
+	encoded := encodeMeta(m)
+	sealed := encoded[:metaEncodedSize-metaChecksumSize]
 
 	hashFunc := fnv.New64a()
 	hashFunc.Write(sealed)
