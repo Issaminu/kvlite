@@ -125,16 +125,24 @@ func (b *Bucket) writeBackRoot() error {
 }
 
 func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
+	return tx.createBucket(nil, bucketName)
+}
+
+func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	if err := tx.writableError(); err != nil {
 		return nil, err
 	}
-	// Check whether the name is already taken, by a bucket or by a plain value.
-	// This goes through lookupBucket rather than the public Bucket() method,
-	// because Bucket() (like bbolt's) collapses "wrong type" and "not found" into
-	// the same nil result. CreateBucket needs to tell them apart: ErrBucketExists
-	// for an existing bucket, ErrIncompatibleValue (from lookupBucket) for an
-	// existing plain value.
-	existing, err := tx.lookupBucket(bucketName)
+
+	var parentRoot *Node
+	var existing *Bucket
+	var err error
+	if parent == nil {
+		parentRoot = tx.db.rootNode
+		existing, err = tx.lookupBucket(bucketName)
+	} else {
+		parentRoot = parent.rootNode
+		existing, err = parent.Bucket(bucketName)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -142,29 +150,37 @@ func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
 		return nil, ErrBucketExists
 	}
 
-	// create the bucket
 	newPgid := tx.db.allocate()
-
-	bucketRootNode := tx.db.newLeafNode(newPgid)
-	tx.db.wal.insertNodeRecord(bucketRootNode)
+	rootNode := tx.db.newLeafNode(newPgid)
+	tx.db.wal.insertNodeRecord(rootNode)
 
 	bucket := &Bucket{
 		tx:           tx,
-		name:         slices.Clone(bucketName), // own the name: writeBackRoot reads it again on every later split
-		rootNode:     bucketRootNode,
-		parentBucket: nil, // top-level: entry lives in the DB catalog
+		name:         slices.Clone(bucketName),
+		rootNode:     rootNode,
+		parentBucket: parent,
 	}
 
-	newRootNode, err := tx.db._put(tx.db.rootNode, bucketName, encode(newPgid), BucketLeafFlag)
+	newParentRoot, err := tx.db._put(parentRoot, bucket.name, encode(newPgid), BucketLeafFlag)
 	if err != nil {
 		return nil, err
 	}
-	if newRootNode != nil {
-		tx.db.rootNode = newRootNode
-		tx.db.meta.root = newRootNode.pgid
+
+	if parent == nil {
+		tx.db.rootNode = newParentRoot
+		tx.db.meta.root = newParentRoot.pgid
+		tx.cacheBucket(bucket)
+		return bucket, nil
 	}
 
-	tx.cacheBucket(bucket)
+	if newParentRoot != parent.rootNode {
+		parent.rootNode = newParentRoot
+		if err := parent.writeBackRoot(); err != nil {
+			return nil, err
+		}
+	}
+
+	parent.cacheChild(bucket)
 	return bucket, nil
 }
 
@@ -232,48 +248,7 @@ func (tx *Tx) loadBucket(rootNode *Node, bucketName []byte, parent *Bucket) (*Bu
 }
 
 func (bucket *Bucket) CreateBucket(bucketName []byte) (*Bucket, error) {
-	if err := bucket.tx.writableError(); err != nil {
-		return nil, err
-	}
-
-	// check if the bucket exists already
-	existing, err := bucket.Bucket(bucketName)
-	if err != nil {
-		return nil, err
-	}
-	if existing != nil {
-		return nil, ErrBucketExists
-	}
-
-	// create the bucket
-	newPgid := bucket.tx.db.allocate()
-
-	bucketRootNode := bucket.tx.db.newLeafNode(newPgid)
-	bucket.tx.db.wal.insertNodeRecord(bucketRootNode)
-
-	newBucket := &Bucket{
-		tx:           bucket.tx,
-		name:         slices.Clone(bucketName), // own the name: writeBackRoot reads it again on every later split
-		rootNode:     bucketRootNode,
-		parentBucket: bucket,
-	}
-
-	// Insert the child's name->root entry into this bucket's own tree. That insert
-	// can split this bucket; if its root moves, write the new root back up the chain.
-	newRoot, err := bucket.tx.db._put(bucket.rootNode, newBucket.name, encode(newBucket.rootNode.pgid), BucketLeafFlag)
-	if err != nil {
-		return nil, err
-	}
-	if newRoot != bucket.rootNode {
-		bucket.rootNode = newRoot
-		if err := bucket.writeBackRoot(); err != nil {
-			return nil, err
-		}
-	}
-
-	// Return the newly created child bucket, not the parent we just re-wired.
-	bucket.cacheChild(newBucket)
-	return newBucket, nil
+	return bucket.tx.createBucket(bucket, bucketName)
 }
 
 // Bucket looks up a nested bucket by name. It returns (nil, nil) if no entry
