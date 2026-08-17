@@ -16,8 +16,8 @@ type WAL struct {
 	file                     *os.File
 	pageSize                 int64
 	syncOnCommit             bool
-	checkpointThresholdBytes int64
-	bytesSinceCheckpoint     int64
+	checkpointThresholdBytes uint64
+	bytesSinceCheckpoint     uint64
 	collectedRecords         map[page.ID]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
 	overlay                  map[page.ID]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
 	nextTxid                 TxID               // sequence number stamped on the next committed transaction
@@ -181,7 +181,7 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 		return false, fmt.Errorf("persist multiple records: %w", err)
 	}
 	wal.hasUnsyncedWrites = true
-	wal.bytesSinceCheckpoint += int64(len(transaction))
+	wal.bytesSinceCheckpoint += uint64(len(transaction))
 
 	needsCheckpoint := wal.reachedCheckpointThreshold()
 	if wal.syncOnCommit || needsCheckpoint {

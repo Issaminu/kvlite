@@ -14,7 +14,7 @@ type Config struct {
 	File                     *os.File
 	PageSize                 int64
 	SyncOnCommit             bool
-	CheckpointThresholdBytes int64
+	CheckpointThresholdBytes uint64
 }
 
 func New(config Config) *WAL {
@@ -31,7 +31,7 @@ func New(config Config) *WAL {
 }
 
 type Snapshot struct {
-	bytesSinceCheckpoint int64
+	bytesSinceCheckpoint uint64
 	collectedRecords     map[page.ID]Record
 	overlay              map[page.ID]Record
 	fileOffset           int64
@@ -116,8 +116,8 @@ func (wal *WAL) CollectedRecord(pageID page.ID) (Record, bool) {
 }
 
 type Stats struct {
-	CheckpointThresholdBytes int64
-	BytesSinceCheckpoint     int64
+	CheckpointThresholdBytes uint64
+	BytesSinceCheckpoint     uint64
 	CollectedRecordCount     int
 	CommittedRecordCount     int
 	NextTxID                 TxID
@@ -137,7 +137,7 @@ func (wal *WAL) CommittedRecords() map[page.ID]Record {
 	return maps.Clone(wal.overlay)
 }
 
-func (wal *WAL) SetCheckpointThresholdBytes(threshold int64) {
+func (wal *WAL) SetCheckpointThresholdBytes(threshold uint64) {
 	wal.checkpointThresholdBytes = threshold
 }
 

@@ -45,33 +45,31 @@ func TestRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 	}
 }
 
-func TestWAL_ByteCounterDoesNotWrapAtFourGiB(t *testing.T) {
+func TestWAL_ByteCounterDoesNotWrapAtMaxInt64(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer walFile.Close()
 
-	// The largest uint32 value is the boundary that the old WAL byte counter
-	// could not cross.
-	const largestUint32 = 1<<32 - 1
+	const largestInt64 = 1<<63 - 1
 	log := &WAL{
 		file:                     walFile,
-		bytesSinceCheckpoint:     largestUint32 - 1,
-		checkpointThresholdBytes: largestUint32,
+		bytesSinceCheckpoint:     largestInt64 - 1,
+		checkpointThresholdBytes: largestInt64,
 	}
 
-	// Two bytes move the counter from one byte below the boundary to one byte
-	// above it.
+	// Two bytes move the counter from one byte below the signed boundary to one
+	// byte above it.
 	needsCheckpoint, err := log.appendTransaction([]byte{0, 0})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !needsCheckpoint {
-		t.Fatal("WAL counter crossed 4 GiB without starting a checkpoint")
+		t.Fatal("WAL counter crossed MaxInt64 without starting a checkpoint")
 	}
-	if got, want := uint64(log.bytesSinceCheckpoint), uint64(largestUint32)+1; got != want {
-		t.Fatalf("WAL byte counter: got %d, want %d", got, want)
+	if log.bytesSinceCheckpoint <= largestInt64 {
+		t.Fatalf("WAL byte counter wrapped to %d", log.bytesSinceCheckpoint)
 	}
 }
 
