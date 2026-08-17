@@ -9,6 +9,7 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+// Tx is a managed transaction passed to a [DB.Update] or [DB.View] callback. It is valid only while that callback runs, so callers must not retain it or any [Bucket] obtained from it. Transactions must not be nested, and a Tx must not be copied or used concurrently.
 type Tx struct {
 	db       *DB
 	readOnly bool
@@ -21,6 +22,11 @@ type writeTransactionSnapshot struct {
 	wal  wal.Snapshot
 }
 
+// Update runs transaction as one managed read-write transaction. Writes made inside the callback are visible to later reads in the same callback, but other database operations can observe them only after Update commits.
+//
+// If transaction returns an error, Update rolls back every change and returns that error. If it panics, Update rolls back before the panic continues to the caller. When transaction returns nil, Update writes the transaction to the write-ahead log and returns any error that prevents that commit. If both the original operation and rollback fail, the returned error contains both errors and supports [errors.Is].
+//
+// An automatic checkpoint can run after the write-ahead log commit. If that checkpoint fails, the transaction remains committed, Update returns nil, and KVLite keeps the log data so a later write or [DB.Close] can retry the checkpoint.
 func (db *DB) Update(transaction func(tx *Tx) error) error {
 	if err := db.ensureOpen(); err != nil {
 		return err
@@ -104,6 +110,7 @@ func (db *DB) rollbackWriteTransaction(snapshot *writeTransactionSnapshot) error
 	return walErr
 }
 
+// View runs transaction as one managed read-only transaction and returns its error. Writes through the Tx or its buckets return [ErrTxNotWritable], while reads remain available until the callback returns. If the callback panics, View closes the transaction before the panic continues to the caller.
 func (db *DB) View(transaction func(tx *Tx) error) error {
 	if err := db.ensureOpen(); err != nil {
 		return err
@@ -113,6 +120,7 @@ func (db *DB) View(transaction func(tx *Tx) error) error {
 	return transaction(tx)
 }
 
+// Writable reports whether tx accepts writes. It returns true only inside an active [DB.Update] callback, and returns false for a [DB.View] transaction or after either callback has returned.
 func (tx *Tx) Writable() bool {
 	return !tx.readOnly && !tx.closed
 }
@@ -142,6 +150,9 @@ func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
 	return nil
 }
 
+// Put stores value under key in the top-level key space. The write is visible to later reads in the same transaction, but Put does not commit it; [DB.Update] commits or rolls back all transaction changes together.
+//
+// Put copies key and value before it returns, and it treats a nil value as empty. It returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the transaction callback returns. An empty key returns [ErrKeyRequired], while oversized data returns [ErrKeyTooLarge], [ErrValueTooLarge], or [ErrEntryTooLargeForPage]. If key names a bucket, Put returns [ErrIncompatibleValue] instead of replacing it.
 func (tx *Tx) Put(key, value []byte) error {
 	if err := tx.writableError(); err != nil {
 		return err
@@ -149,6 +160,9 @@ func (tx *Tx) Put(key, value []byte) error {
 	return tx.putCatalogEntry(btree.NewEntry(0, key, value))
 }
 
+// Get returns the top-level value stored under key, including a value written earlier in the same transaction. It returns [ErrKeyNotFound] when the key is absent and [ErrIncompatibleValue] when the key names a bucket. An empty key returns [ErrKeyRequired], an oversized key returns [ErrKeyTooLarge], and a call after the callback returns fails with [ErrTxClosed].
+//
+// Get returns a new slice that the caller can retain and modify. A stored empty value returns a non-nil slice with length zero.
 func (tx *Tx) Get(key []byte) ([]byte, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
