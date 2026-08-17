@@ -1,12 +1,12 @@
 // Package kvlite provides an embedded key/value database with B+tree storage.
 //
-// A database stores values in its top-level key space or in named, nested buckets. Open a database with [Open], use [DB.Update] for atomic writes, and use [DB.View] for read-only access. [DB.Put] and [DB.Get] are convenience methods for one value in the top-level key space.
+// A database stores values in its top-level key space or in named, nested buckets. After opening one with [Open], callers can use [DB.Update] for atomic writes and [DB.View] for read-only access. For one value in the top-level key space, [DB.Put] and [DB.Get] provide a simpler form of those transactions.
 //
-// Update and View create managed transactions. A [Tx] and every [Bucket] obtained from it are valid only while the transaction callback runs. Update commits only when the callback returns nil. It rolls back when the callback returns an error.
+// Update and View manage each transaction from start to finish, so a [Tx] and every [Bucket] obtained from it are valid only while the callback runs. If an Update callback returns an error, KVLite rolls back its changes instead of committing them.
 //
-// KVLite copies the keys and values that it stores. Each successful lookup also returns a new value slice. Callers can reuse or change their byte slices after a call returns.
+// KVLite copies the keys and values that it stores, so callers can reuse or change those byte slices after a write returns. A successful lookup returns a new value slice for the same reason.
 //
-// A [DB] is not safe for concurrent use. The caller must serialize all operations, including [DB.Close]. KVLite does not lock database files, so an application must not open the same path more than once at the same time.
+// A [DB] is not safe for concurrent use, so the caller must serialize all operations, including [DB.Close]. KVLite also does not lock database files, which means an application must not open the same path more than once at the same time.
 //
-// Writes first go to a write-ahead log beside the database file. Close checkpoints committed data into the database file and removes the log. Callers must check the error from Close.
+// Writes first go to a write-ahead log beside the database file. When Close succeeds, it checkpoints committed data into the database file and removes the log, so callers must check its error.
 package kvlite

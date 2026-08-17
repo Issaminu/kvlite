@@ -1263,6 +1263,24 @@ func TestOpen_Reopen(t *testing.T) {
 	}
 }
 
+func TestDefaultOptionsAreIndependent(t *testing.T) {
+	first := defaultOptions()
+	first.ReadOnly = true
+	first.Synchronous = SyncNormal
+	first.CheckpointThresholdBytes = 1
+
+	second := defaultOptions()
+	if second.ReadOnly {
+		t.Fatal("changing one default options value changed a later value")
+	}
+	if second.Synchronous != SyncFull {
+		t.Fatalf("default synchronous mode: got %v, want SyncFull", second.Synchronous)
+	}
+	if second.CheckpointThresholdBytes != defaultCheckpointPageCount*uint64(os.Getpagesize()) {
+		t.Fatalf("default checkpoint threshold: got %d", second.CheckpointThresholdBytes)
+	}
+}
+
 func TestOpen_PageSizeOptionControlsNewDatabase(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1299,12 +1317,6 @@ func TestOpen_ZeroPageSizeUsesOperatingSystemPageSize(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
-
-	originalDefaults := DefaultOptions
-	customDefaults := *DefaultOptions
-	customDefaults.PageSize = os.Getpagesize() * 2
-	DefaultOptions = &customDefaults
-	defer func() { DefaultOptions = originalDefaults }()
 
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
@@ -1346,32 +1358,20 @@ func TestOpen_InvalidPageSizeDoesNotCreateDatabase(t *testing.T) {
 	}
 }
 
-func TestOpen_InvalidWALOptionsDoNotCreateDatabase(t *testing.T) {
-	testCases := []struct {
-		name    string
-		options Options
-	}{
-		{name: "unknown synchronous mode", options: Options{Synchronous: SyncNormal + 1}},
-		{name: "negative checkpoint threshold", options: Options{CheckpointThresholdBytes: -1}},
+func TestOpen_InvalidSynchronousModeDoesNotCreateDatabase(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal + 1})
+	if db != nil {
+		_ = db.Close()
 	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			path := tempfile()
-			defer os.RemoveAll(path)
-			defer os.RemoveAll(path + "-wal")
-
-			db, err := Open(path, 0600, &testCase.options)
-			if db != nil {
-				_ = db.Close()
-			}
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("Open error: got %v, want ErrInvalid", err)
-			}
-			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-				t.Fatalf("invalid WAL option created the database, stat error %v", statErr)
-			}
-		})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Open error: got %v, want ErrInvalid", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("invalid synchronous mode created the database, stat error %v", statErr)
 	}
 }
 
@@ -1398,26 +1398,19 @@ func TestOpen_UsesModeForDatabaseAndWAL(t *testing.T) {
 	}
 }
 
-func TestOpen_NilOptionsApplyDefaultReadOnlyBeforeFileCreation(t *testing.T) {
+func TestOpen_NilOptionsCreatesWritableDatabase(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	originalDefaults := DefaultOptions
-	readOnlyDefaults := *DefaultOptions
-	readOnlyDefaults.ReadOnly = true
-	DefaultOptions = &readOnlyDefaults
-	defer func() { DefaultOptions = originalDefaults }()
-
 	db, err := Open(path, 0600, nil)
-	if db != nil {
-		_ = db.Close()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("Open error: got %v, want os.ErrNotExist", err)
-	}
-	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-		t.Fatalf("read-only defaults created the database, stat error %v", statErr)
+	defer db.Close()
+
+	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+		t.Fatalf("database opened with nil options is not writable: %v", err)
 	}
 }
 
@@ -1428,7 +1421,7 @@ func TestOpen_SynchronousNormalDefersWALSync(t *testing.T) {
 
 	// The threshold is larger than this test transaction, so NORMAL mode must
 	// leave the WAL unsynced until a later checkpoint or close.
-	const checkpointBeyondTestWrite int64 = 1 << 30
+	const checkpointBeyondTestWrite uint64 = 1 << 30
 	db, err := Open(path, 0600, &Options{
 		Synchronous:              SyncNormal,
 		CheckpointThresholdBytes: checkpointBeyondTestWrite,
@@ -3250,7 +3243,7 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	}
 
 	walSize := fileSize(t, path+"-wal")
-	if db.wal.Stats().BytesSinceCheckpoint != walSize {
+	if db.wal.Stats().BytesSinceCheckpoint != uint64(walSize) {
 		t.Fatalf("bytesSinceCheckpoint=%d, want WAL file size %d (counter must track real WAL growth, not collectRecord calls)",
 			db.wal.Stats().BytesSinceCheckpoint, walSize)
 	}
