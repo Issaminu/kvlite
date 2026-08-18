@@ -26,6 +26,8 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+var testBucketName = []byte("test-data")
+
 // tempfile returns a temporary file path for a database.
 func tempfile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("kvlite-%d.db", time.Now().UnixNano()))
@@ -37,7 +39,31 @@ func tempfile() string {
 // fsync to the checkpoint — so every test that does not specifically assert
 // per-commit durability uses this.
 func openDB(path string) (*DB, error) {
-	return Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	if err != nil {
+		return nil, err
+	}
+
+	err = db.View(func(tx *Tx) error {
+		_, err := tx.Bucket(testBucketName)
+		return err
+	})
+	if err == nil {
+		return db, nil
+	}
+	if !errors.Is(err, ErrBucketNotFound) {
+		_ = db.Close()
+		return nil, err
+	}
+
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket(testBucketName)
+		return err
+	}); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 // fileSize returns the current size of the database file in bytes.
@@ -48,6 +74,16 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return fi.Size()
+}
+
+func createBucket(tb testing.TB, db *DB, name []byte) {
+	tb.Helper()
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket(name)
+		return err
+	}); err != nil {
+		tb.Fatal(err)
+	}
 }
 
 func mustBucket(t *testing.T, tx *Tx, name []byte) *Bucket {
@@ -77,6 +113,22 @@ func mustBucketValue(t *testing.T, bucket *Bucket, key []byte) []byte {
 	return value
 }
 
+func mustBucketRoot(t *testing.T, db *DB, name []byte) *btree.Node {
+	t.Helper()
+	var root *btree.Node
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(name)
+		if err != nil {
+			return err
+		}
+		root = bucket.rootNode
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
 // -----------------------------------------------------------------------------
 // RUNG 2 — Efficient lookup + no forever-growth: a single sorted node.  <-- NEXT
 //
@@ -97,13 +149,13 @@ func TestPut_Overwrite_BoundedGrowth(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("a"), []byte("first")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("first")); err != nil {
 		t.Fatal(err)
 	}
 	small := fileSize(t, path)
 
 	for i := 0; i < 1000; i++ {
-		if err := db.Put([]byte("a"), []byte("value")); err != nil {
+		if err := db.Put(testBucketName, []byte("a"), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -135,7 +187,7 @@ func TestPutGet_Stress(t *testing.T) {
 	for i := n - 1; i >= 0; i-- {
 		k := fmt.Sprintf("key-%04d", i)
 		v := fmt.Sprintf("val-%d", i)
-		if err := db.Put([]byte(k), []byte(v)); err != nil {
+		if err := db.Put(testBucketName, []byte(k), []byte(v)); err != nil {
 			t.Fatal(err)
 		}
 		want[k] = v
@@ -144,7 +196,7 @@ func TestPutGet_Stress(t *testing.T) {
 	for i := 0; i < n; i += 2 {
 		k := fmt.Sprintf("key-%04d", i)
 		v := fmt.Sprintf("val-%d-updated", i)
-		if err := db.Put([]byte(k), []byte(v)); err != nil {
+		if err := db.Put(testBucketName, []byte(k), []byte(v)); err != nil {
 			t.Fatal(err)
 		}
 		want[k] = v
@@ -160,7 +212,7 @@ func TestPutGet_Stress(t *testing.T) {
 	defer db.Close()
 
 	for k, wantV := range want {
-		got, err := db.Get([]byte(k))
+		got, err := db.Get(testBucketName, []byte(k))
 		if err != nil {
 			t.Fatalf("get %q: %v", k, err)
 		}
@@ -178,9 +230,7 @@ func TestPutGet_Stress(t *testing.T) {
 // so they stay <= a page is Rung 3b.)
 // -----------------------------------------------------------------------------
 
-// TestFile_SinglePage: a small database (fits in one node) is stored as exactly one
-// padded page. RED against variable-length writes; GREEN once nodes are padded to
-// NODE_SIZE.
+// TestFile_SinglePage: a small bucket uses one catalog leaf and one data leaf.
 func TestFile_SinglePage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -190,7 +240,7 @@ func TestFile_SinglePage(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, kv := range [][2]string{{"a", "1"}, {"b", "2"}, {"c", "3"}} {
-		if err := db.Put([]byte(kv[0]), []byte(kv[1])); err != nil {
+		if err := db.Put(testBucketName, []byte(kv[0]), []byte(kv[1])); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -199,9 +249,9 @@ func TestFile_SinglePage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Decision B: page 0 is the meta page and the single leaf is page 1 -> two pages.
-	if size := fileSize(t, path); size != 2*pageBytes {
-		t.Fatalf("a small DB should occupy exactly two %d-byte pages (meta + one leaf), got %d bytes "+
+	// Page 0 is metadata, page 1 is the bucket catalog, and page 2 is the data leaf.
+	if size := fileSize(t, path); size != 3*pageBytes {
+		t.Fatalf("a small bucket should occupy exactly three %d-byte pages (meta + catalog + data leaf), got %d bytes "+
 			"(nodes must be padded to page boundaries)", pageBytes, size)
 	}
 }
@@ -229,16 +279,16 @@ func TestSplit_TreeGrows(t *testing.T) {
 	// 150 x 256B ≈ 38 KB — blows past one page at any OS page size (4 KB or 16 KB).
 	val := bytes.Repeat([]byte("x"), 256)
 	for i := 0; i < 150; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	if db.rootNode.IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf {
 		t.Fatal("root is still a single leaf after ~38 KB of entries — a full node must " +
 			"split and grow a branch root (Rung 3b)")
 	}
-	if got, err := db.Get([]byte("key-00042")); err != nil || !bytes.Equal(got, val) {
+	if got, err := db.Get(testBucketName, []byte("key-00042")); err != nil || !bytes.Equal(got, val) {
 		t.Fatalf("key-00042 unreadable after split: err=%v", err)
 	}
 }
@@ -257,7 +307,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 	const n = 150
 	val := bytes.Repeat([]byte("y"), 256)
 	for i := 0; i < n; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -272,7 +322,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 	defer db.Close()
 
 	for i := 0; i < n; i++ {
-		got, err := db.Get(fmt.Appendf(nil, "key-%05d", i))
+		got, err := db.Get(testBucketName, fmt.Appendf(nil, "key-%05d", i))
 		if err != nil {
 			t.Fatalf("key-%05d after reopen: %v", i, err)
 		}
@@ -294,10 +344,10 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 //   4. TestSplit_TreeGrows / _SurvivesReopen (above) then carry you home.
 // -----------------------------------------------------------------------------
 
-// walkNodes visits every node of the on-disk tree rooted at db.rootNode, reading
+// walkNodes visits every node of the on-disk tree rooted at root, reading
 // each child by its pgid. It doubles as a reachability check: a bad child pgid
 // (mis-wired separator/split) makes readNode fail and the walk t.Fatal.
-func walkNodes(t *testing.T, db *DB, visit func(n *btree.Node)) {
+func walkNodes(t *testing.T, db *DB, root *btree.Node, visit func(n *btree.Node)) {
 	t.Helper()
 	var rec func(n *btree.Node)
 	rec = func(n *btree.Node) {
@@ -313,7 +363,7 @@ func walkNodes(t *testing.T, db *DB, visit func(n *btree.Node)) {
 			rec(child)
 		}
 	}
-	rec(db.rootNode)
+	rec(root)
 }
 
 // TestSplit_RootBecomesBranch: the first milestone. Insert ~1.5 pages of data so a
@@ -337,20 +387,21 @@ func TestSplit_RootBecomesBranch(t *testing.T) {
 	n := pageBytes/entryBytes + pageBytes/entryBytes/2 // ~1.5 pages
 
 	for i := 0; i < n; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
 
-	if db.rootNode.IsLeaf {
+	root := mustBucketRoot(t, db, testBucketName)
+	if root.IsLeaf {
 		t.Fatal("root is still a leaf after overflowing a page — it must split into a branch root")
 	}
-	if len(db.rootNode.Children) < 2 {
-		t.Fatalf("branch root must point at >= 2 children, got %d", len(db.rootNode.Children))
+	if len(root.Children) < 2 {
+		t.Fatalf("branch root must point at >= 2 children, got %d", len(root.Children))
 	}
 	for _, i := range []int{0, n - 1} { // first and last: neither half may be lost
 		k := fmt.Appendf(nil, "key-%05d", i)
-		if got, err := db.Get(k); err != nil || !bytes.Equal(got, val) {
+		if got, err := db.Get(testBucketName, k); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %q lost across split: err=%v", k, err)
 		}
 	}
@@ -371,17 +422,18 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 
 	val := bytes.Repeat([]byte("z"), 256)
 	for i := 0; i < 300; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
 
 	pageBytes := int(db.meta.PageSize())
-	walkNodes(t, db, func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > pageBytes {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page — split must keep every node <= a page", sz, pageBytes)
 		}
 	})
+
 }
 
 // TestSplit_PropagatesToParent: forces enough leaf splits that at least one happens
@@ -401,26 +453,27 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 	const n = 400
 	val := bytes.Repeat([]byte("w"), 256)
 	for i := 0; i < n; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
 
-	if db.rootNode.IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf {
 		t.Fatal("root must be a branch after 400 entries")
 	}
 	leaves := 0
-	walkNodes(t, db, func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
 		if nd.IsLeaf {
 			leaves++
 		}
 	})
+
 	if leaves < 3 {
 		t.Fatalf("expected >= 3 leaves (a child-leaf split must add one, propagating a separator up), got %d", leaves)
 	}
 	for i := 0; i < n; i++ {
 		k := fmt.Appendf(nil, "key-%05d", i)
-		if got, err := db.Get(k); err != nil || !bytes.Equal(got, val) {
+		if got, err := db.Get(testBucketName, k); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %q unreadable after propagating splits: err=%v", k, err)
 		}
 	}
@@ -452,17 +505,18 @@ func TestSplit_Cascades(t *testing.T) {
 	const n = 400
 	val := []byte("v")
 	for i := 0; i < n; i++ {
-		if err := db.Put(mkKey(i), val); err != nil {
+		if err := db.Put(testBucketName, mkKey(i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
 
 	// Depth >= 3: root is a branch AND at least one of its children is ALSO a branch
 	// (which only happens once the root branch itself has split).
-	if db.rootNode.IsLeaf {
+	root := mustBucketRoot(t, db, testBucketName)
+	if root.IsLeaf {
 		t.Fatal("root must be a branch")
 	}
-	child, err := db.readNode(db.rootNode.Children[0])
+	child, err := db.readNode(root.Children[0])
 	if err != nil || child == nil {
 		t.Fatalf("could not read root's first child: %v", err)
 	}
@@ -472,7 +526,7 @@ func TestSplit_Cascades(t *testing.T) {
 
 	// Every key must still route correctly through the branch-split tree.
 	for i := 0; i < n; i++ {
-		if got, err := db.Get(mkKey(i)); err != nil || !bytes.Equal(got, val) {
+		if got, err := db.Get(testBucketName, mkKey(i)); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %d unreadable after a branch split (mis-wired separator?): err=%v", i, err)
 		}
 	}
@@ -487,7 +541,7 @@ func TestSplit_Cascades(t *testing.T) {
 	}
 	defer db.Close()
 	for i := 0; i < n; i++ {
-		if got, err := db.Get(mkKey(i)); err != nil || !bytes.Equal(got, val) {
+		if got, err := db.Get(testBucketName, mkKey(i)); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %d unreadable after reopen: err=%v", i, err)
 		}
 	}
@@ -514,7 +568,7 @@ func TestWAL_WrittenThenCheckpointed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -537,7 +591,7 @@ func TestWAL_WrittenThenCheckpointed(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if v, err := db.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+	if v, err := db.Get(testBucketName, []byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
 		t.Fatalf("key a lost after checkpoint+reopen: got %q, err %v", v, err)
 	}
 }
@@ -553,7 +607,7 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("k"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	walBefore, err := os.ReadFile(path + "-wal")
@@ -580,7 +634,7 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	if !bytes.Equal(walAfter, walBefore) {
 		t.Fatal("failed WAL cleanup changed the committed WAL")
 	}
-	if got, err := db.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("value")) {
+	if got, err := db.Get(testBucketName, []byte("k")); err != nil || !bytes.Equal(got, []byte("value")) {
 		t.Fatalf("committed value missing after WAL cleanup failure: got %q, err %v", got, err)
 	}
 }
@@ -613,7 +667,7 @@ func TestWAL_RecoversAfterCrash(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
 	walBytes, err := os.ReadFile(wal)
@@ -640,7 +694,7 @@ func TestWAL_RecoversAfterCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer rec.Close()
-	if v, err := rec.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+	if v, err := rec.Get(testBucketName, []byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
 		t.Fatalf("committed key not recovered from WAL after crash: got %q, err %v", v, err)
 	}
 }
@@ -677,11 +731,11 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	const n = 100
 	val := bytes.Repeat([]byte("x"), 512) // 100 * ~525B ≈ 50 KB, well past any page
 	for i := 0; i < n; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
-	if db.rootNode.IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf {
 		t.Fatal("test setup: expected a split — root should be a branch")
 	}
 	walBytes, err := os.ReadFile(wal)
@@ -708,12 +762,12 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 		t.Fatalf("open crashed db: %v", err)
 	}
 	defer rec.Close()
-	if rec.rootNode.IsLeaf {
+	if mustBucketRoot(t, rec, testBucketName).IsLeaf {
 		t.Fatal("recovered root is a leaf — the moved root pointer was not replayed")
 	}
 	for i := 0; i < n; i++ {
 		k := fmt.Appendf(nil, "key-%05d", i)
-		if got, err := rec.Get(k); err != nil || !bytes.Equal(got, val) {
+		if got, err := rec.Get(testBucketName, k); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %d not recovered after split-crash: err=%v", i, err)
 		}
 	}
@@ -761,14 +815,14 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
 	walAfterT1, err := os.ReadFile(wal)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("b"), []byte("2")); err != nil {
+	if err := db.Put(testBucketName, []byte("b"), []byte("2")); err != nil {
 		t.Fatal(err)
 	}
 	walAfterT2, err := os.ReadFile(wal)
@@ -805,10 +859,10 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 			t.Fatalf("open: %v", err)
 		}
 		defer rec.Close()
-		if v, err := rec.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+		if v, err := rec.Get(testBucketName, []byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
 			t.Fatalf("a: got %q err %v, want \"1\"", v, err)
 		}
-		if v, err := rec.Get([]byte("b")); err != nil || !bytes.Equal(v, []byte("2")) {
+		if v, err := rec.Get(testBucketName, []byte("b")); err != nil || !bytes.Equal(v, []byte("2")) {
 			t.Fatalf("b: got %q err %v, want \"2\"", v, err)
 		}
 	})
@@ -823,10 +877,10 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 				t.Fatalf("open must succeed on a torn tail, got: %v", err)
 			}
 			defer rec.Close()
-			if v, err := rec.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+			if v, err := rec.Get(testBucketName, []byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
 				t.Fatalf("committed T1 lost: a = %q, err %v", v, err)
 			}
-			if _, err := rec.Get([]byte("b")); !errors.Is(err, ErrKeyNotFound) {
+			if _, err := rec.Get(testBucketName, []byte("b")); !errors.Is(err, ErrKeyNotFound) {
 				t.Fatalf("uncommitted T2 leaked into recovery: b should be absent, got err %v", err)
 			}
 		})
@@ -865,7 +919,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	want := make(map[string]string, n)
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("key-%05d", i)
-		if err := db.Put([]byte(k), val); err != nil {
+		if err := db.Put(testBucketName, []byte(k), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
 		want[k] = string(val)
@@ -882,7 +936,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 
 	// All data readable before the close.
 	for k, wantV := range want {
-		if got, err := db.Get([]byte(k)); err != nil || string(got) != wantV {
+		if got, err := db.Get(testBucketName, []byte(k)); err != nil || string(got) != wantV {
 			t.Fatalf("get %q before close: got %q, err %v", k, got, err)
 		}
 	}
@@ -899,7 +953,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	}
 	defer db.Close()
 	for k, wantV := range want {
-		if got, err := db.Get([]byte(k)); err != nil || string(got) != wantV {
+		if got, err := db.Get(testBucketName, []byte(k)); err != nil || string(got) != wantV {
 			t.Fatalf("get %q after reopen: got %q, err %v", k, got, err)
 		}
 	}
@@ -926,7 +980,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 	}
 
 	// A commit under the checkpoint threshold must NOT touch the main file.
-	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("v")); err != nil {
 		t.Fatal(err)
 	}
 	mainAfterPut, err := os.ReadFile(path)
@@ -938,7 +992,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 	}
 
 	// Yet the value is readable, served from the overlay, not from main.
-	if got, err := db.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
+	if got, err := db.Get(testBucketName, []byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
 		t.Fatalf("committed key not readable before checkpoint: got %q, err %v", got, err)
 	}
 
@@ -960,7 +1014,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if got, err := db.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
+	if got, err := db.Get(testBucketName, []byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
 		t.Fatalf("committed key lost after checkpoint + reopen: got %q, err %v", got, err)
 	}
 }
@@ -1000,7 +1054,7 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 
 	// Batch 1: keys 0..99, then a manual checkpoint drains them into the main file.
 	for i := 0; i < 100; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
 			t.Fatalf("base put %d: %v", i, err)
 		}
 	}
@@ -1009,19 +1063,19 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 	}
 	// After the checkpoint the base lives in main and the WAL is reset. If the base
 	// never split, the "non-empty base" is trivial — make sure the seam is real.
-	if db.rootNode.IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf {
 		t.Fatal("test setup: base tree did not split; the checkpointed base must be multi-level")
 	}
 
 	// Batch 2 (WAL/overlay only — main keeps the checkpointed base):
 	//   overwrite keys 0..9 to valUpd, and add fresh keys 100..149 as valBase.
 	for i := 0; i < 10; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), valUpd); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), valUpd); err != nil {
 			t.Fatalf("overwrite put %d: %v", i, err)
 		}
 	}
 	for i := 100; i < 150; i++ {
-		if err := db.Put(fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
 			t.Fatalf("post-checkpoint put %d: %v", i, err)
 		}
 	}
@@ -1063,7 +1117,7 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 		if i < 10 {
 			want = valUpd // overwritten in the WAL delta — replay must win over main
 		}
-		got, err := rec.Get(k)
+		got, err := rec.Get(testBucketName, k)
 		if err != nil {
 			t.Fatalf("key %d missing after checkpoint+crash recovery: %v", i, err)
 		}
@@ -1078,17 +1132,10 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// RUNG 1 — Walking skeleton: a file-backed KV that survives reopen.  <-- BUILD THIS
+// Basic persistence behavior.
 //
-// The dumbest thing that is a real database. []byte API (db.Put/db.Get) — no
-// buckets, no transactions, no pages, no tree. This API is deliberately throwaway
-// and will evolve toward bbolt's later. The whole goal: a value written before
-// Close is still there after reopening the same file.
-//
-// These won't compile until you add `Put` and `Get` to *DB — that undefined-method
-// error IS your rung-1 to-do list:
-//   func (db *DB) Put(key, value []byte) error
-//   func (db *DB) Get(key []byte) ([]byte, error)   // missing key -> an error
+// DB.Put and DB.Get access values through an existing named bucket. These tests
+// check basic reads, writes, replacement, and persistence after reopen.
 // -----------------------------------------------------------------------------
 
 // TestPutGet: a value can be written and read back within one session.
@@ -1102,10 +1149,10 @@ func TestPutGet(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
-	v, err := db.Get([]byte("a"))
+	v, err := db.Get(testBucketName, []byte("a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1123,7 +1170,7 @@ func TestPutGet_Persists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -1136,7 +1183,7 @@ func TestPutGet_Persists(t *testing.T) {
 	}
 	defer db.Close()
 
-	v, err := db.Get([]byte("a"))
+	v, err := db.Get(testBucketName, []byte("a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1156,13 +1203,13 @@ func TestPut_Overwrite(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("2")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("2")); err != nil {
 		t.Fatal(err)
 	}
-	v, err := db.Get([]byte("a"))
+	v, err := db.Get(testBucketName, []byte("a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1182,7 +1229,7 @@ func TestGet_Missing(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Get([]byte("nope")); err == nil {
+	if _, err := db.Get(testBucketName, []byte("nope")); err == nil {
 		t.Fatal("expected an error for a missing key")
 	}
 }
@@ -1199,7 +1246,7 @@ func TestPutGet_MultipleKeys(t *testing.T) {
 		t.Fatal(err)
 	}
 	for k, v := range pairs {
-		if err := db.Put([]byte(k), []byte(v)); err != nil {
+		if err := db.Put(testBucketName, []byte(k), []byte(v)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1214,7 +1261,7 @@ func TestPutGet_MultipleKeys(t *testing.T) {
 	defer db.Close()
 
 	for k, want := range pairs {
-		got, err := db.Get([]byte(k))
+		got, err := db.Get(testBucketName, []byte(k))
 		if err != nil {
 			t.Fatalf("get %q: %v", k, err)
 		}
@@ -1435,8 +1482,9 @@ func TestOpen_NilOptionsCreatesWritableDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	createBucket(t, db, testBucketName)
 
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatalf("database opened with nil options is not writable: %v", err)
 	}
 }
@@ -1457,13 +1505,14 @@ func TestOpen_SynchronousNormalDefersWALSync(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	createBucket(t, db, testBucketName)
 
 	syncCalls := 0
 	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		return nil
 	})
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if syncCalls != 0 {
@@ -1484,8 +1533,9 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	createBucket(t, db, testBucketName)
 
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if got := fileSize(t, path+"-wal"); got != 0 {
@@ -1592,7 +1642,7 @@ func TestOpen_ErrChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -1647,7 +1697,7 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("a"), []byte("1")); err != nil {
+	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -1665,12 +1715,12 @@ func TestDB_Open_ReadOnly(t *testing.T) {
 	}
 
 	// Reads work.
-	if v, err := rdb.Get([]byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
+	if v, err := rdb.Get(testBucketName, []byte("a")); err != nil || !bytes.Equal(v, []byte("1")) {
 		t.Fatalf("read-only Get: got %q, err %v", v, err)
 	}
 
 	// Writes are rejected up front, with the read-only error.
-	if err := rdb.Put([]byte("b"), []byte("2")); !errors.Is(err, ErrDatabaseReadOnly) {
+	if err := rdb.Put(testBucketName, []byte("b"), []byte("2")); !errors.Is(err, ErrDatabaseReadOnly) {
 		t.Fatalf("read-only Put: expected ErrDatabaseReadOnly, got %v", err)
 	}
 
@@ -1747,15 +1797,15 @@ func BenchmarkPut_Sequential(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		key := fmt.Appendf(nil, "key-%08d", i)
-		if err := db.Put(key, value); err != nil {
+		if err := db.Put(testBucketName, key, value); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkPut_SingleKeyOverwrite: repeated Put on ONE key — no splits, isolates
-// the per-Put sync cost from split-induced extra writes.
-func BenchmarkPut_SingleKeyOverwrite(b *testing.B) {
+// BenchmarkPut_OneOperationBucket measures the DB convenience path. Each Put
+// opens one transaction and resolves the named bucket.
+func BenchmarkPut_OneOperationBucket(b *testing.B) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -1771,36 +1821,119 @@ func BenchmarkPut_SingleKeyOverwrite(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := db.Put(key, value); err != nil {
+		if err := db.Put(testBucketName, key, value); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
+// BenchmarkPut_ReusedBucket measures writes after one bucket lookup in one
+// transaction.
+func BenchmarkPut_ReusedBucket(b *testing.B) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("the-one-key")
+	value := []byte("some-benchmark-value-thats-a-realistic-size")
+
+	b.ResetTimer()
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < b.N; i++ {
+			if err := bucket.Put(key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+}
+
+// BenchmarkGet_OneOperationBucket measures the DB convenience path. Each Get
+// opens one transaction and resolves the named bucket.
+func BenchmarkGet_OneOperationBucket(b *testing.B) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("the-one-key")
+	value := []byte("some-benchmark-value-thats-a-realistic-size")
+	if err := db.Put(testBucketName, key, value); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := db.Get(testBucketName, key); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkGet_ReusedBucket measures reads after one bucket lookup in one
+// transaction.
+func BenchmarkGet_ReusedBucket(b *testing.B) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("the-one-key")
+	value := []byte("some-benchmark-value-thats-a-realistic-size")
+	if err := db.Put(testBucketName, key, value); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < b.N; i++ {
+			if _, err := bucket.Get(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+}
+
 // -----------------------------------------------------------------------------
-// RUNG 5a — Transactions: db.Update / db.View closures.  <-- BUILD THIS
+// Managed transaction behavior.
 //
-// bbolt's transactional core, minus buckets for now (5b adds those). A write txn
-// is a closure: db.Update(fn). Its writes commit as ONE atomic unit iff fn returns
-// nil; if fn returns an error (or would panic), the WHOLE txn rolls back and NONE
-// of its writes survive. db.View is the read-only twin: it never commits, and a
-// write inside it fails with ErrTxNotWritable.
-//
-// This is the payoff of the WAL you already built: `collectedRecords` is the txn's
-// write buffer, `persistCollectedRecords` (frames + commit marker) IS Commit, and
-// `readNode` already consults `collectedRecords` first (read-your-writes). The work:
-//   - a *Tx type; db.Update/db.View(fn func(*Tx) error) error
-//   - (*Tx).Put/Get/Writable — the ops the closure calls (throwaway single-tree
-//     surface; 5b re-homes them onto *Bucket)
-//   - MOVE the WAL flush out of db.Put (one-txn-per-Put) UP into tx.Commit, so many
-//     Puts commit as one unit. db.Put becomes a one-shot db.Update wrapper.
-//   - Rollback: discard the txn's buffered records AND undo its in-memory tree
-//     mutations (the trap — db.Put mutates db.rootNode in place today, so "don't
-//     persist" is not enough; the in-memory tree is already dirty).
+// DB.Update and DB.View expose bucket handles for atomic writes and read-only
+// access. Update commits all bucket changes only when its callback returns nil.
 // -----------------------------------------------------------------------------
 
-// TestTx_UpdateCommitsAtomically: many Puts in one Update land together on a nil
-// return, and are read-your-writes visible INSIDE the same txn before commit.
+// TestTx_UpdateCommitsAtomically checks that one Update commits all bucket
+// writes together and makes them visible inside the same transaction.
 func TestTx_UpdateCommitsAtomically(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1816,11 +1949,11 @@ func TestTx_UpdateCommitsAtomically(t *testing.T) {
 
 	if err := db.Update(func(tx *Tx) error {
 		for k, v := range pairs {
-			if err := tx.Put([]byte(k), []byte(v)); err != nil {
+			if err := mustBucket(t, tx, testBucketName).Put([]byte(k), []byte(v)); err != nil {
 				return err
 			}
 			// read-your-writes: a value written earlier in THIS txn is visible now.
-			if got, err := tx.Get([]byte(k)); err != nil || !bytes.Equal(got, []byte(v)) {
+			if got, err := mustBucket(t, tx, testBucketName).Get([]byte(k)); err != nil || !bytes.Equal(got, []byte(v)) {
 				t.Fatalf("read-your-writes failed for %q: got %q, err %v", k, got, err)
 			}
 		}
@@ -1832,7 +1965,7 @@ func TestTx_UpdateCommitsAtomically(t *testing.T) {
 	// After commit, a separate read txn sees every key.
 	if err := db.View(func(tx *Tx) error {
 		for k, want := range pairs {
-			got, err := tx.Get([]byte(k))
+			got, err := mustBucket(t, tx, testBucketName).Get([]byte(k))
 			if err != nil || !bytes.Equal(got, []byte(want)) {
 				t.Fatalf("committed key %q not visible after Update: got %q, err %v", k, got, err)
 			}
@@ -1861,17 +1994,17 @@ func TestTx_UpdateRollsBackOnError(t *testing.T) {
 
 	// A prior committed txn that rollback must NOT touch.
 	if err := db.Update(func(tx *Tx) error {
-		return tx.Put([]byte("keep"), []byte("me"))
+		return mustBucket(t, tx, testBucketName).Put([]byte("keep"), []byte("me"))
 	}); err != nil {
 		t.Fatal(err)
 	}
 
 	errBoom := errors.New("boom")
 	got := db.Update(func(tx *Tx) error {
-		if err := tx.Put([]byte("doomed-a"), []byte("x")); err != nil {
+		if err := mustBucket(t, tx, testBucketName).Put([]byte("doomed-a"), []byte("x")); err != nil {
 			return err
 		}
-		if err := tx.Put([]byte("doomed-b"), []byte("y")); err != nil {
+		if err := mustBucket(t, tx, testBucketName).Put([]byte("doomed-b"), []byte("y")); err != nil {
 			return err
 		}
 		return errBoom // abort AFTER writing -> everything above must vanish
@@ -1882,11 +2015,11 @@ func TestTx_UpdateRollsBackOnError(t *testing.T) {
 
 	if err := db.View(func(tx *Tx) error {
 		for _, k := range []string{"doomed-a", "doomed-b"} {
-			if _, err := tx.Get([]byte(k)); !errors.Is(err, ErrKeyNotFound) {
+			if _, err := mustBucket(t, tx, testBucketName).Get([]byte(k)); !errors.Is(err, ErrKeyNotFound) {
 				t.Fatalf("rolled-back key %q leaked (in-memory tree left dirty?): err %v", k, err)
 			}
 		}
-		if v, err := tx.Get([]byte("keep")); err != nil || !bytes.Equal(v, []byte("me")) {
+		if v, err := mustBucket(t, tx, testBucketName).Get([]byte("keep")); err != nil || !bytes.Equal(v, []byte("me")) {
 			t.Fatalf("rollback clobbered a previously committed key: got %q, err %v", v, err)
 		}
 		return nil
@@ -1908,15 +2041,15 @@ func TestTx_UpdateRollsBackOnPanic(t *testing.T) {
 
 	panicValue := "boom"
 	var recovered any
-	var panickedTx *Tx
+	var panickedBucket *Bucket
 	func() {
 		defer func() {
 			recovered = recover()
 		}()
 
 		_ = db.Update(func(tx *Tx) error {
-			panickedTx = tx
-			if err := tx.Put([]byte("doomed"), []byte("value")); err != nil {
+			panickedBucket = mustBucket(t, tx, testBucketName)
+			if err := panickedBucket.Put([]byte("doomed"), []byte("value")); err != nil {
 				t.Fatal(err)
 			}
 			panic(panicValue)
@@ -1926,10 +2059,10 @@ func TestTx_UpdateRollsBackOnPanic(t *testing.T) {
 	if recovered != panicValue {
 		t.Fatalf("Update did not propagate the callback panic: got %v", recovered)
 	}
-	if err := panickedTx.Put([]byte("late"), []byte("value")); !errors.Is(err, ErrTxClosed) {
+	if err := panickedBucket.Put([]byte("late"), []byte("value")); !errors.Is(err, ErrTxClosed) {
 		t.Fatalf("Put through panicked transaction: expected ErrTxClosed, got %v", err)
 	}
-	if _, err := db.Get([]byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := db.Get(testBucketName, []byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("panicked Update changed the database: expected ErrKeyNotFound, got %v", err)
 	}
 }
@@ -1951,7 +2084,7 @@ func TestTx_ViewIsReadOnly(t *testing.T) {
 		if tx.Writable() {
 			t.Fatal("a View txn must not be writable")
 		}
-		return tx.Put([]byte("nope"), []byte("nope"))
+		return mustBucket(t, tx, testBucketName).Put([]byte("nope"), []byte("nope"))
 	})
 	if !errors.Is(err, ErrTxNotWritable) {
 		t.Fatalf("a write inside View must fail with ErrTxNotWritable, got %v", err)
@@ -1959,7 +2092,7 @@ func TestTx_ViewIsReadOnly(t *testing.T) {
 
 	// Nothing was written.
 	if err := db.View(func(tx *Tx) error {
-		if _, err := tx.Get([]byte("nope")); !errors.Is(err, ErrKeyNotFound) {
+		if _, err := mustBucket(t, tx, testBucketName).Get([]byte("nope")); !errors.Is(err, ErrKeyNotFound) {
 			t.Fatalf("View leaked a write: err %v", err)
 		}
 		return nil
@@ -1979,14 +2112,14 @@ func TestTx_GetAfterViewReturnsTxClosed(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 
-	var savedTx *Tx
+	var savedBucket *Bucket
 	if err := db.View(func(tx *Tx) error {
-		savedTx = tx
-		value, err := tx.Get([]byte("key"))
+		savedBucket = mustBucket(t, tx, testBucketName)
+		value, err := savedBucket.Get([]byte("key"))
 		if err != nil {
 			return err
 		}
@@ -1998,7 +2131,7 @@ func TestTx_GetAfterViewReturnsTxClosed(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := savedTx.Get([]byte("key")); !errors.Is(err, ErrTxClosed) {
+	if _, err := savedBucket.Get([]byte("key")); !errors.Is(err, ErrTxClosed) {
 		t.Fatalf("Get through closed transaction: expected ErrTxClosed, got %v", err)
 	}
 }
@@ -2083,7 +2216,7 @@ func TestTx_ViewCannotCreateBucket(t *testing.T) {
 
 	// A later, legitimate write must not carry a leaked phantom bucket with it.
 	if err := db.Update(func(tx *Tx) error {
-		return tx.Put([]byte("real"), []byte("value"))
+		return mustBucket(t, tx, testBucketName).Put([]byte("real"), []byte("value"))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2122,7 +2255,7 @@ func TestBucketPutAfterUpdateReturnsTxClosed(t *testing.T) {
 	}
 
 	if err := db.Update(func(tx *Tx) error {
-		return tx.Put([]byte("trigger"), []byte("value"))
+		return mustBucket(t, tx, testBucketName).Put([]byte("trigger"), []byte("value"))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -2135,53 +2268,6 @@ func TestBucketPutAfterUpdateReturnsTxClosed(t *testing.T) {
 		return nil
 	}); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// TestTx_PutSurvivesRootSplit: a splitting tx.Put on the DEFAULT tree must promote the
-// new branch root, exactly like db.Put does. Tx.Put currently discards _put's returned
-// root, so a root split inside an Update loses every key that moved to the far side of
-// the new root — and persists a stale meta.root. Enough 256B values to split the default
-// tree more than once; every key must read back after the (nil) commit.
-//
-// RED today: Tx.Put is `_, err := tx.db._put(...)`. GREEN once it captures the returned
-// root into db.rootNode / db.meta.root when the root actually moved (as db.Put does).
-func TestTx_PutSurvivesRootSplit(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-	defer os.RemoveAll(path + "-wal")
-
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	const n = 200
-	val := bytes.Repeat([]byte("x"), 256)
-	if err := db.Update(func(tx *Tx) error {
-		for i := 0; i < n; i++ {
-			if err := tx.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
-				return err
-			}
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("update: %v", err)
-	}
-
-	// A split must actually have happened — otherwise a pass proves nothing.
-	if db.rootNode.IsLeaf {
-		t.Fatal("test setup: default tree did not split; raise n or the value size")
-	}
-
-	// Every key the Update committed must be readable.
-	for i := 0; i < n; i++ {
-		k := fmt.Appendf(nil, "key-%05d", i)
-		got, err := db.Get(k)
-		if err != nil || !bytes.Equal(got, val) {
-			t.Fatalf("key %q lost after a tx.Put root split (dropped new root): err=%v", k, err)
-		}
 	}
 }
 
@@ -2219,15 +2305,9 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	}
 }
 
-// TestTx_PutErrorLeavesRootIntact: a tx.Put that fails validation must NOT touch the
-// tree. _put returns (nil, err) on its guard paths (empty/oversized key, etc.), so a
-// root-capture that runs unconditionally sets db.rootNode = nil and dereferences a nil
-// node. The failed Put must return the error, leave db.rootNode non-nil, and leave a
-// previously committed key readable.
-//
-// RED if tx.Put writes db.rootNode/meta.root before checking that the root actually
-// moved. GREEN once the capture is guarded (only when _put returns a new, non-nil root).
-func TestTx_PutErrorLeavesRootIntact(t *testing.T) {
+// TestBucketPutErrorLeavesDataIntact verifies that a rejected bucket write does
+// not damage data committed before it.
+func TestBucketPutErrorLeavesDataIntact(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -2238,27 +2318,21 @@ func TestTx_PutErrorLeavesRootIntact(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Seed one committed key the failing txn must not disturb.
 	if err := db.Update(func(tx *Tx) error {
-		return tx.Put([]byte("keep"), []byte("me"))
+		return mustBucket(t, tx, testBucketName).Put([]byte("keep"), []byte("me"))
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	// A tx.Put with an empty key fails _put's guard -> _put returns (nil, err).
 	got := db.Update(func(tx *Tx) error {
-		return tx.Put(nil, []byte("x"))
+		return mustBucket(t, tx, testBucketName).Put(nil, []byte("x"))
 	})
 	if !errors.Is(got, ErrKeyRequired) {
-		t.Fatalf("expected ErrKeyRequired from a bad tx.Put, got %v", got)
+		t.Fatalf("expected ErrKeyRequired from a bad bucket Put, got %v", got)
 	}
 
-	// The tree must be intact: root still set, seeded key still readable.
-	if db.rootNode == nil {
-		t.Fatal("tx.Put error nilled out db.rootNode")
-	}
-	if v, err := db.Get([]byte("keep")); err != nil || !bytes.Equal(v, []byte("me")) {
-		t.Fatalf("committed key lost after a failed tx.Put: got %q, err %v", v, err)
+	if v, err := db.Get(testBucketName, []byte("keep")); err != nil || !bytes.Equal(v, []byte("me")) {
+		t.Fatalf("committed key lost after a failed bucket Put: got %q, err %v", v, err)
 	}
 }
 
@@ -2273,19 +2347,19 @@ func TestEmptyKeysReturnErrKeyRequired(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put(nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
+	if err := db.Put(testBucketName, nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
 		t.Fatalf("DB.Put: expected ErrKeyRequired, got %v", err)
 	}
-	if _, err := db.Get(nil); !errors.Is(err, ErrKeyRequired) {
+	if _, err := db.Get(testBucketName, nil); !errors.Is(err, ErrKeyRequired) {
 		t.Fatalf("DB.Get: expected ErrKeyRequired, got %v", err)
 	}
 
 	err = db.Update(func(tx *Tx) error {
-		if err := tx.Put(nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
-			t.Fatalf("Tx.Put: expected ErrKeyRequired, got %v", err)
+		if err := mustBucket(t, tx, testBucketName).Put(nil, []byte("value")); !errors.Is(err, ErrKeyRequired) {
+			t.Fatalf("Bucket.Put: expected ErrKeyRequired, got %v", err)
 		}
-		if _, err := tx.Get(nil); !errors.Is(err, ErrKeyRequired) {
-			t.Fatalf("Tx.Get: expected ErrKeyRequired, got %v", err)
+		if _, err := mustBucket(t, tx, testBucketName).Get(nil); !errors.Is(err, ErrKeyRequired) {
+			t.Fatalf("Bucket.Get: expected ErrKeyRequired, got %v", err)
 		}
 
 		bucket, err := tx.CreateBucket([]byte("bucket"))
@@ -2361,10 +2435,6 @@ func TestNestedBucketLookupContracts(t *testing.T) {
 		if err := parent.Put([]byte("value"), []byte("plain")); err != nil {
 			return err
 		}
-		if err := tx.Put([]byte("top-value"), []byte("plain")); err != nil {
-			return err
-		}
-
 		if got, err := parent.Bucket([]byte("child")); err != nil || got != child {
 			t.Fatalf("Bucket did not return the cached child: %v", err)
 		}
@@ -2376,9 +2446,6 @@ func TestNestedBucketLookupContracts(t *testing.T) {
 		}
 		if got, err := tx.Bucket([]byte("missing")); got != nil || !errors.Is(err, ErrBucketNotFound) {
 			t.Fatalf("Tx.Bucket: expected ErrBucketNotFound, got bucket %v and error %v", got, err)
-		}
-		if got, err := tx.Bucket([]byte("top-value")); got != nil || !errors.Is(err, ErrIncompatibleValue) {
-			t.Fatalf("Tx.Bucket: expected ErrIncompatibleValue, got bucket %v and error %v", got, err)
 		}
 		return nil
 	})
@@ -2968,13 +3035,13 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	for i := 0; i < n; i++ {
 		keys[i] = fmt.Appendf(nil, "key-%03d", i)
 		vals[i] = bytes.Repeat([]byte{byte('a' + i)}, vlen)
-		if err := db.Put(keys[i], vals[i]); err != nil {
+		if err := db.Put(testBucketName, keys[i], vals[i]); err != nil {
 			t.Fatalf("put %d (value %d bytes, page %d): %v", i, vlen, page, err)
 		}
 	}
 
 	// Every node must fit one page and hold at least one entry (no empty leaf).
-	walkNodes(t, db, func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
@@ -2986,7 +3053,7 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	verify := func(t *testing.T, db *DB, when string) {
 		t.Helper()
 		for i := 0; i < n; i++ {
-			got, err := db.Get(keys[i])
+			got, err := db.Get(testBucketName, keys[i])
 			if err != nil {
 				t.Fatalf("%s: get %d: %v", when, i, err)
 			}
@@ -3117,12 +3184,12 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 	keys := make([][]byte, 0, nSmall+1)
 	for i := 0; i < nSmall; i++ {
 		k := fmt.Appendf(nil, "k%05d", i) // 6 bytes, all sort before the big key
-		if err := db.Put(k, smallVal); err != nil {
+		if err := db.Put(testBucketName, k, smallVal); err != nil {
 			t.Fatalf("small put %d: %v", i, err)
 		}
 		keys = append(keys, k)
 	}
-	if !db.rootNode.IsLeaf {
+	if !mustBucketRoot(t, db, testBucketName).IsLeaf {
 		t.Fatalf("setup: root split before the big insert (nSmall=%d too high)", nSmall)
 	}
 
@@ -3130,14 +3197,14 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 	// half the leaf plus this value still overflows a page after a single split.
 	bigKey := []byte("zzz-big")
 	bigVal := bytes.Repeat([]byte("B"), page*85/100)
-	if err := db.Put(bigKey, bigVal); err != nil {
+	if err := db.Put(testBucketName, bigKey, bigVal); err != nil {
 		t.Fatalf("big put (the one a single-split loop rejects): %v", err)
 	}
 	keys = append(keys, bigKey)
 
 	// The big insert must have grown the tree to at least three leaves.
 	leaves := 0
-	walkNodes(t, db, func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
@@ -3145,6 +3212,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 			leaves++
 		}
 	})
+
 	if leaves < 3 {
 		t.Fatalf("expected >= 3 leaves (one leaf must split into three), got %d", leaves)
 	}
@@ -3156,7 +3224,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 			if bytes.Equal(k, bigKey) {
 				want = bigVal
 			}
-			got, err := db.Get(k)
+			got, err := db.Get(testBucketName, k)
 			if err != nil || !bytes.Equal(got, want) {
 				t.Fatalf("%s: key %q wrong: err=%v got %d bytes want %d", when, k, err, len(got), len(want))
 			}
@@ -3298,7 +3366,7 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	// commit marker. The old per-call counter would report ~100x that.
 	err = db.Update(func(tx *Tx) error {
 		for i := 0; i < 100; i++ {
-			if err := tx.Put([]byte("k"), []byte("v")); err != nil {
+			if err := mustBucket(t, tx, testBucketName).Put([]byte("k"), []byte("v")); err != nil {
 				return err
 			}
 		}
@@ -3371,10 +3439,10 @@ func TestGet_NilValueIsFoundNotMissing(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("k"), nil); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), nil); err != nil {
 		t.Fatalf("put nil value: %v", err)
 	}
-	v, err := db.Get([]byte("k"))
+	v, err := db.Get(testBucketName, []byte("k"))
 	if errors.Is(err, ErrKeyNotFound) {
 		t.Fatal("key with a nil value read back as ErrKeyNotFound")
 	}
@@ -3399,10 +3467,10 @@ func TestGet_EmptyValueRoundTrips(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("k"), []byte{}); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte{}); err != nil {
 		t.Fatalf("put empty value: %v", err)
 	}
-	v, err := db.Get([]byte("k"))
+	v, err := db.Get(testBucketName, []byte("k"))
 	if err != nil {
 		t.Fatalf("get empty value: %v", err)
 	}
@@ -3419,7 +3487,7 @@ func TestGet_MissingStillErrKeyNotFound(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.Get([]byte("absent")); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := db.Get(testBucketName, []byte("absent")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("expected ErrKeyNotFound for an absent key, got %v", err)
 	}
 }
@@ -3432,11 +3500,12 @@ func TestFindTreeEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("present"), nil); err != nil {
+	if err := db.Put(testBucketName, []byte("present"), nil); err != nil {
 		t.Fatalf("put empty value: %v", err)
 	}
 
-	entry, found, err := db.findTreeEntry(db.rootNode, []byte("present"))
+	root := mustBucketRoot(t, db, testBucketName)
+	entry, found, err := db.findTreeEntry(root, []byte("present"))
 	if err != nil {
 		t.Fatalf("find present entry: %v", err)
 	}
@@ -3447,7 +3516,7 @@ func TestFindTreeEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 		t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
 	}
 
-	_, found, err = db.findTreeEntry(db.rootNode, []byte("missing"))
+	_, found, err = db.findTreeEntry(root, []byte("missing"))
 	if err != nil {
 		t.Fatalf("find missing entry: %v", err)
 	}
@@ -3465,7 +3534,7 @@ func TestGet_EmptyValueSurvivesReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("k"), []byte{}); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte{}); err != nil {
 		t.Fatalf("put empty value: %v", err)
 	}
 	if err := db.Close(); err != nil {
@@ -3478,7 +3547,7 @@ func TestGet_EmptyValueSurvivesReopen(t *testing.T) {
 	}
 	defer db2.Close()
 
-	v, err := db2.Get([]byte("k"))
+	v, err := db2.Get(testBucketName, []byte("k"))
 	if err != nil {
 		t.Fatalf("get after reopen: %v", err)
 	}
@@ -3487,110 +3556,7 @@ func TestGet_EmptyValueSurvivesReopen(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Bug 2 — raw Get/Put share the catalog tree with buckets. A raw Get must not
-// leak a bucket's internal page id, and a raw Put must not overwrite a bucket
-// entry (which would orphan its sub-tree). The write guard lives in node.insert,
-// so it rides the single _put descent (no extra lookup) and also covers nested
-// buckets. Both paths report ErrIncompatibleValue.
-// -----------------------------------------------------------------------------
-
-func TestDBGet_RefusesBucketEntry(t *testing.T) {
-	path := tempfile()
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Update(func(tx *Tx) error {
-		_, err := tx.CreateBucket([]byte("b"))
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := db.Get([]byte("b")); !errors.Is(err, ErrIncompatibleValue) {
-		t.Fatalf("db.Get on a bucket name: expected ErrIncompatibleValue, got %v", err)
-	}
-}
-
-func TestDBPut_RefusesOverwritingBucket(t *testing.T) {
-	path := tempfile()
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Update(func(tx *Tx) error {
-		b, err := tx.CreateBucket([]byte("b"))
-		if err != nil {
-			return err
-		}
-		return b.Put([]byte("inner"), []byte("value"))
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// The raw Put must be rejected...
-	if err := db.Put([]byte("b"), []byte("raw")); !errors.Is(err, ErrIncompatibleValue) {
-		t.Fatalf("db.Put over a bucket name: expected ErrIncompatibleValue, got %v", err)
-	}
-
-	// ...and the bucket must be intact afterwards.
-	if err := db.View(func(tx *Tx) error {
-		b := mustBucket(t, tx, []byte("b"))
-		if b == nil {
-			t.Fatal("bucket was destroyed by the refused Put")
-		}
-		if got := mustBucketValue(t, b, []byte("inner")); !bytes.Equal(got, []byte("value")) {
-			t.Fatalf("bucket data corrupted: got %q want %q", got, "value")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestTxPut_RefusesOverwritingBucket(t *testing.T) {
-	path := tempfile()
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Update(func(tx *Tx) error {
-		_, err := tx.CreateBucket([]byte("b"))
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	// A raw Put through a writable transaction hits the same catalog tree, so it
-	// must be refused too.
-	err = db.Update(func(tx *Tx) error {
-		return tx.Put([]byte("b"), []byte("raw"))
-	})
-	if !errors.Is(err, ErrIncompatibleValue) {
-		t.Fatalf("tx.Put over a bucket name: expected ErrIncompatibleValue, got %v", err)
-	}
-
-	// The bucket must still resolve.
-	if err := db.View(func(tx *Tx) error {
-		b := mustBucket(t, tx, []byte("b"))
-		if b == nil {
-			t.Fatal("bucket was destroyed by the refused tx.Put")
-		}
-		return nil
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// The guard lives in node.insert, so it also protects nested buckets: a raw
-// bucket.Put must not overwrite a sub-bucket entry inside a parent bucket.
+// A bucket Put must not overwrite a nested bucket entry inside its parent.
 func TestBucketPut_RefusesOverwritingNestedBucket(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
@@ -3633,8 +3599,7 @@ func TestBucketPut_RefusesOverwritingNestedBucket(t *testing.T) {
 	}
 }
 
-// A raw Put on a plain (non-bucket) key must still work and overwrite in place.
-func TestDBPut_RawKeyStillWorks(t *testing.T) {
+func TestDBPut_OverwritesBucketValue(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
 	if err != nil {
@@ -3642,59 +3607,18 @@ func TestDBPut_RawKeyStillWorks(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("k"), []byte("v1")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("v1")); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("k"), []byte("v2")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("v2")); err != nil {
 		t.Fatalf("overwrite plain key: %v", err)
 	}
-	v, err := db.Get([]byte("k"))
+	v, err := db.Get(testBucketName, []byte("k"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(v, []byte("v2")) {
 		t.Fatalf("got %q want %q", v, "v2")
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Bug 3 — CreateBucket must not silently turn an existing plain value into a
-// bucket pointer. tx.Bucket used to report "not found" and "found but not a
-// bucket" the same way (nil, no error), so CreateBucket's existence check could
-// not tell them apart, and node.insert only ever updated an overwritten entry's
-// value, never its flags. Together, creating a bucket over an existing key
-// replaced the value with a bucket pgid while leaving the entry unmarked as a
-// bucket — the original value was gone, and nothing pointed at the new page
-// either. Both directions must now be refused with ErrIncompatibleValue and
-// leave the existing entry untouched.
-// -----------------------------------------------------------------------------
-
-func TestCreateBucket_RefusesOverwritingValue(t *testing.T) {
-	path := tempfile()
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	if err := db.Put([]byte("k"), []byte("plain-value")); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.Update(func(tx *Tx) error {
-		_, err := tx.CreateBucket([]byte("k"))
-		return err
-	}); !errors.Is(err, ErrIncompatibleValue) {
-		t.Fatalf("CreateBucket over a plain key: expected ErrIncompatibleValue, got %v", err)
-	}
-
-	// The original value must be untouched, and still a plain (non-bucket) value.
-	got, err := db.Get([]byte("k"))
-	if err != nil {
-		t.Fatalf("value destroyed by the refused CreateBucket: %v", err)
-	}
-	if !bytes.Equal(got, []byte("plain-value")) {
-		t.Fatalf("value corrupted by the refused CreateBucket: got %q", got)
 	}
 }
 
@@ -3743,8 +3667,11 @@ func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
 
-	if err := db.Put([]byte("k"), []byte("v")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("v")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3778,7 +3705,7 @@ func TestPut_EntryTooLargeForPageReturnsClearError(t *testing.T) {
 	defer db.Close()
 
 	huge := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
-	if err := db.Put([]byte("k"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
+	if err := db.Put(testBucketName, []byte("k"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
 		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
 	}
 }
@@ -3795,11 +3722,11 @@ func TestPut_EntryTooLargeForPageDoesNotChangeDatabase(t *testing.T) {
 	defer db.Close()
 
 	huge := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
-	if err := db.Put([]byte("large"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
+	if err := db.Put(testBucketName, []byte("large"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
 		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
 	}
 
-	if _, err := db.Get([]byte("large")); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := db.Get(testBucketName, []byte("large")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("failed Put changed the database: expected ErrKeyNotFound, got %v", err)
 	}
 }
@@ -3945,8 +3872,9 @@ func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	createBucket(t, db, testBucketName)
 
-	if err := db.Put([]byte("k"), []byte("old")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	if db.wal.Stats().CommittedRecordCount == 0 {
@@ -3965,13 +3893,13 @@ func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
 	}
 
 	err = db.Update(func(tx *Tx) error {
-		return tx.Put([]byte("k"), []byte("new"))
+		return mustBucket(t, tx, testBucketName).Put([]byte("k"), []byte("new"))
 	})
 	if err != nil {
 		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
 	}
 
-	v, err := db.Get([]byte("k"))
+	v, err := db.Get(testBucketName, []byte("k"))
 	if err != nil {
 		t.Fatalf("get after committed update: %v", err)
 	}
@@ -3990,8 +3918,9 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	createBucket(t, db, testBucketName)
 
-	if err := db.Put([]byte("k"), []byte("old")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4000,11 +3929,11 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Put([]byte("k"), []byte("new")); err != nil {
+	if err := db.Put(testBucketName, []byte("k"), []byte("new")); err != nil {
 		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
 	}
 
-	got, err := db.Get([]byte("k"))
+	got, err := db.Get(testBucketName, []byte("k"))
 	if err != nil {
 		t.Fatalf("get after committed Put: %v", err)
 	}
@@ -4021,7 +3950,7 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 	}
 	defer reopened.Close()
 
-	got, err = reopened.Get([]byte("k"))
+	got, err = reopened.Get(testBucketName, []byte("k"))
 	if err != nil {
 		t.Fatalf("get after reopen: %v", err)
 	}
@@ -4046,10 +3975,10 @@ func TestAudit_TwoWritableHandlesDoNotLoseCommittedData(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := first.Put([]byte("first"), []byte("one")); err != nil {
+	if err := first.Put(testBucketName, []byte("first"), []byte("one")); err != nil {
 		t.Fatal(err)
 	}
-	if err := second.Put([]byte("second"), []byte("two")); err != nil {
+	if err := second.Put(testBucketName, []byte("second"), []byte("two")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4066,7 +3995,7 @@ func TestAudit_TwoWritableHandlesDoNotLoseCommittedData(t *testing.T) {
 	defer reopened.Close()
 
 	for key, want := range map[string]string{"first": "one", "second": "two"} {
-		got, err := reopened.Get([]byte(key))
+		got, err := reopened.Get(testBucketName, []byte(key))
 		if err != nil || !bytes.Equal(got, []byte(want)) {
 			t.Fatalf("committed key %q was lost: got %q, err %v", key, got, err)
 		}
@@ -4087,7 +4016,7 @@ func TestAudit_GoexitRollsBackUpdate(t *testing.T) {
 	go func() {
 		defer close(done)
 		_ = db.Update(func(tx *Tx) error {
-			if err := tx.Put([]byte("doomed"), []byte("value")); err != nil {
+			if err := mustBucket(t, tx, testBucketName).Put([]byte("doomed"), []byte("value")); err != nil {
 				panic(err)
 			}
 			runtime.Goexit()
@@ -4096,10 +4025,10 @@ func TestAudit_GoexitRollsBackUpdate(t *testing.T) {
 	}()
 	<-done
 
-	if _, err := db.Get([]byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := db.Get(testBucketName, []byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
 		t.Errorf("unfinished Update changed the database: expected ErrKeyNotFound, got %v", err)
 	}
-	if err := db.Put([]byte("keep"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("keep"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -4111,7 +4040,7 @@ func TestAudit_GoexitRollsBackUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if _, err := reopened.Get([]byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := reopened.Get(testBucketName, []byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("unfinished Update was persisted: expected ErrKeyNotFound, got %v", err)
 	}
 }
@@ -4129,10 +4058,10 @@ func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("first"), []byte("one")); err != nil {
+	if err := db.Put(testBucketName, []byte("first"), []byte("one")); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("second"), []byte("two")); err != nil {
+	if err := db.Put(testBucketName, []byte("second"), []byte("two")); err != nil {
 		t.Fatal(err)
 	}
 	walBytes, err := os.ReadFile(path + "-wal")
@@ -4185,7 +4114,7 @@ func TestAudit_FinalWALChecksumFailureReturnsChecksumError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	walBytes, err := os.ReadFile(path + "-wal")
@@ -4230,14 +4159,14 @@ func TestAudit_GetAfterCloseReturnsDatabaseNotOpen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := db.Get([]byte("key")); !errors.Is(err, ErrDatabaseNotOpen) {
+	if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrDatabaseNotOpen) {
 		t.Fatalf("Get after Close: expected ErrDatabaseNotOpen, got %v", err)
 	}
 }
@@ -4255,7 +4184,7 @@ func TestAudit_RejectedTxPutDoesNotChangeReadableState(t *testing.T) {
 
 	large := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
 	err = db.Update(func(tx *Tx) error {
-		if err := tx.Put([]byte("rejected"), large); !errors.Is(err, ErrEntryTooLargeForPage) {
+		if err := mustBucket(t, tx, testBucketName).Put([]byte("rejected"), large); !errors.Is(err, ErrEntryTooLargeForPage) {
 			t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
 		}
 		return nil
@@ -4264,7 +4193,7 @@ func TestAudit_RejectedTxPutDoesNotChangeReadableState(t *testing.T) {
 		t.Fatalf("callback returned nil, but Update returned %v", err)
 	}
 
-	if _, err := db.Get([]byte("rejected")); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := db.Get(testBucketName, []byte("rejected")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("rejected Put changed readable state: expected ErrKeyNotFound, got %v", err)
 	}
 }
@@ -4278,21 +4207,27 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("old")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
 	db.wal.SetCheckpointThresholdBytes(1)
-	if err := db.file.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.Put([]byte("key"), []byte("new")); err != nil {
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if err := db.file.Close(); err != nil {
+			return err
+		}
+		return bucket.Put([]byte("key"), []byte("new"))
+	})
+	if err != nil {
 		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
 	}
-	if got, err := db.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
+	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("committed overlay value: got %q, err %v", got, err)
 	}
 	if err := db.wal.Close(); err != nil {
@@ -4304,7 +4239,7 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer reopened.Close()
-	if got, err := reopened.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
+	if got, err := reopened.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("recovered committed value: got %q, err %v", got, err)
 	}
 }
@@ -4331,7 +4266,7 @@ func TestAudit_AutomaticCheckpointSyncsWALOnce(t *testing.T) {
 		return nil
 	})
 
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	db.wal.SetSyncFileForTesting(nil)
@@ -4355,6 +4290,7 @@ func TestAudit_CloseAfterFullCommitDoesNotResyncWAL(t *testing.T) {
 			_ = db.Close()
 		}
 	}()
+	createBucket(t, db, testBucketName)
 
 	syncCalls := 0
 	db.wal.SetSyncFileForTesting(func() error {
@@ -4362,7 +4298,7 @@ func TestAudit_CloseAfterFullCommitDoesNotResyncWAL(t *testing.T) {
 		return nil
 	})
 
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -4395,7 +4331,7 @@ func TestAudit_CloseSyncsUnsyncedNormalWAL(t *testing.T) {
 		return nil
 	})
 
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {
@@ -4421,8 +4357,9 @@ func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
 			_ = db.Close()
 		}
 	}()
+	createBucket(t, db, testBucketName)
 
-	if err := db.Put([]byte("stable"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("stable"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 
@@ -4437,7 +4374,7 @@ func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
 		return nil
 	})
 
-	if err := db.Put([]byte("failed"), []byte("value")); !errors.Is(err, syncErr) {
+	if err := db.Put(testBucketName, []byte("failed"), []byte("value")); !errors.Is(err, syncErr) {
 		t.Fatalf("Put error: got %v, want %v", err, syncErr)
 	}
 	if err := db.Close(); err != nil {
@@ -4459,7 +4396,7 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	}
 	defer db.Close()
 
-	if err := db.Put([]byte("key"), []byte("old")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.checkpointWAL(); err != nil {
@@ -4483,7 +4420,7 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 		return syncErr
 	})
 
-	err = db.Put([]byte("key"), []byte("new"))
+	err = db.Put(testBucketName, []byte("key"), []byte("new"))
 	db.wal.SetSyncFileForTesting(nil)
 	if !errors.Is(err, syncErr) {
 		t.Fatalf("Put error: got %v, want %v", err, syncErr)
@@ -4512,7 +4449,7 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	if walAfter.Size() != walBefore.Size() {
 		t.Fatalf("failed transaction WAL size: got %d, want %d", walAfter.Size(), walBefore.Size())
 	}
-	if got, err := db.Get([]byte("key")); err != nil || !bytes.Equal(got, []byte("old")) {
+	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("old")) {
 		t.Fatalf("value after WAL sync failure: got %q, err %v", got, err)
 	}
 }
@@ -4526,18 +4463,24 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("baseline"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("baseline"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
 	db.wal.SetCheckpointThresholdBytes(1)
-	if err := db.file.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := db.Put([]byte("first"), []byte("one")); err != nil {
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if err := db.file.Close(); err != nil {
+			return err
+		}
+		return bucket.Put([]byte("first"), []byte("one"))
+	})
+	if err != nil {
 		t.Fatalf("first durable WAL commit returned a checkpoint error: %v", err)
 	}
 	stats := db.wal.Stats()
@@ -4557,7 +4500,7 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("second"), []byte("two")); err != nil {
+	if err := db.Put(testBucketName, []byte("second"), []byte("two")); err != nil {
 		t.Fatalf("second commit did not retry the checkpoint: %v", err)
 	}
 	stats = db.wal.Stats()
@@ -4573,7 +4516,7 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 		t.Fatalf("checkpoint retry did not truncate WAL: size=%d", walAfterRetry.Size())
 	}
 	for key, want := range map[string]string{"first": "one", "second": "two"} {
-		if got, err := db.Get([]byte(key)); err != nil || !bytes.Equal(got, []byte(want)) {
+		if got, err := db.Get(testBucketName, []byte(key)); err != nil || !bytes.Equal(got, []byte(want)) {
 			t.Fatalf("value %q after checkpoint retry: got %q, err %v", key, got, err)
 		}
 	}
@@ -4587,7 +4530,7 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 	}
 	defer reopened.Close()
 	for key, want := range map[string]string{"first": "one", "second": "two"} {
-		if got, err := reopened.Get([]byte(key)); err != nil || !bytes.Equal(got, []byte(want)) {
+		if got, err := reopened.Get(testBucketName, []byte(key)); err != nil || !bytes.Equal(got, []byte(want)) {
 			t.Fatalf("reopened value %q after checkpoint retry: got %q, err %v", key, got, err)
 		}
 	}
@@ -4602,7 +4545,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	_ = db.wal.Close()
@@ -4622,7 +4565,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 		t.Fatalf("valid WAL did not recover damaged main metadata: %v", err)
 	}
 	defer recovered.Close()
-	got, err := recovered.Get([]byte("key"))
+	got, err := recovered.Get(testBucketName, []byte("key"))
 	if err != nil || !bytes.Equal(got, []byte("value")) {
 		t.Fatalf("recovered value: got %q, err %v", got, err)
 	}
@@ -4638,10 +4581,11 @@ func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := []byte("k")
-	if err := db.Put(key, []byte("v")); err != nil {
+	if err := db.Put(testBucketName, key, []byte("v")); err != nil {
 		t.Fatal(err)
 	}
 	pageSize := db.meta.PageSize()
+	bucketPageID := mustBucketRoot(t, db, testBucketName).PageID()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -4666,7 +4610,7 @@ func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
 		entryFlagsBytes    = 4 // Each entry stores flags in one uint32 value.
 		encodedLengthBytes = 4 // Each key or value length uses one uint32 value.
 	)
-	valueLengthOffset := pageSize + leafMarkerBytes + entryCountBytes + entryFlagsBytes + encodedLengthBytes + int64(len(key))
+	valueLengthOffset := int64(bucketPageID)*pageSize + leafMarkerBytes + entryCountBytes + entryFlagsBytes + encodedLengthBytes + int64(len(key))
 	valueLength := make([]byte, encodedLengthBytes)
 	binary.LittleEndian.PutUint32(valueLength, uint32(pageSize))
 	if _, err := file.WriteAt(valueLength, valueLengthOffset); err != nil {
@@ -4695,7 +4639,7 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("old")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
 		t.Fatal(err)
 	}
 	firstWAL, err := os.ReadFile(path + "-wal")
@@ -4705,7 +4649,7 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("new")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("new")); err != nil {
 		t.Fatal(err)
 	}
 	secondWAL, err := os.ReadFile(path + "-wal")
@@ -4734,7 +4678,7 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer recovered.Close()
-	got, err := recovered.Get([]byte("key"))
+	got, err := recovered.Get(testBucketName, []byte("key"))
 	if err != nil || !bytes.Equal(got, []byte("old")) {
 		t.Fatalf("mismatched commit marker committed another transaction: got %q, err %v", got, err)
 	}
@@ -4749,7 +4693,7 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Put([]byte("key"), []byte("value")); err != nil {
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.wal.FileForTesting().Seek(0, io.SeekStart); err != nil {

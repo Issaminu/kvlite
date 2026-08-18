@@ -17,7 +17,7 @@ const (
 	MaxValueSize = btree.MaxValueSize
 )
 
-// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied or used concurrently. Callers access its top-level key space and buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
+// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied or used concurrently. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
 type DB struct {
 	path     string
 	file     *os.File
@@ -258,12 +258,23 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// Put stores value under key in the top-level key space. It is equivalent to calling [Tx.Put] inside [DB.Update], so it replaces an existing value atomically and returns any write or commit error.
+// Put stores value under key in the top-level bucket named bucketName.
+// It is equivalent to resolving the bucket and calling [Bucket.Put] inside
+// [DB.Update], so it replaces an existing value atomically and returns any
+// lookup, write, or commit error.
 //
-// Put copies key and value before it returns, which lets the caller reuse either slice. A nil value is stored as an empty value. If key names a bucket, Put returns [ErrIncompatibleValue] instead of replacing the bucket.
-func (db *DB) Put(key []byte, value []byte) error {
+// The bucket must already exist. An empty bucket name returns
+// [ErrBucketNameRequired], and a missing bucket returns [ErrBucketNotFound].
+// Put copies key and value before it returns, and a nil value is stored as an
+// empty value. If key names a nested bucket, Put returns
+// [ErrIncompatibleValue] instead of replacing the bucket.
+func (db *DB) Put(bucketName, key, value []byte) error {
 	return db.Update(func(tx *Tx) error {
-		return tx.Put(key, value)
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(key, value)
 	})
 }
 
@@ -277,14 +288,23 @@ func (db *DB) putTreeEntry(rootNode *btree.Node, entry btree.Entry) (*btree.Node
 	return db.tree.PutEntry(rootNode, entry)
 }
 
-// Get returns the value stored under key in the top-level key space. It performs the lookup in its own read-only transaction and returns [ErrKeyNotFound] when the key is absent. If key names a bucket, Get returns [ErrIncompatibleValue].
+// Get returns the value stored under key in the top-level bucket named
+// bucketName. It performs the lookup in its own read-only transaction.
 //
-// Get returns a new slice that the caller can retain and modify. A stored empty value returns a non-nil slice with length zero, which distinguishes it from a missing key.
-func (db *DB) Get(key []byte) ([]byte, error) {
+// The bucket must already exist. An empty bucket name returns
+// [ErrBucketNameRequired], and a missing bucket returns [ErrBucketNotFound].
+// Get returns [ErrKeyNotFound] when the key is absent and
+// [ErrIncompatibleValue] when the key names a nested bucket. It returns a new
+// slice that the caller can retain and modify. A stored empty value returns a
+// non-nil slice with length zero.
+func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 	var value []byte
 	err := db.View(func(tx *Tx) error {
-		var err error
-		value, err = tx.Get(key)
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		value, err = bucket.Get(key)
 		return err
 	})
 	return value, err

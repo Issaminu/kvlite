@@ -149,34 +149,3 @@ func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
 	tx.db.wal.InsertMetaRecord(tx.db.meta)
 	return nil
 }
-
-// Put stores value under key in the top-level key space. The write is visible to later reads in the same transaction, but Put does not commit it; [DB.Update] commits or rolls back all transaction changes together.
-//
-// Put copies key and value before it returns, and it treats a nil value as empty. It returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the transaction callback returns. An empty key returns [ErrKeyRequired], while oversized data returns [ErrKeyTooLarge], [ErrValueTooLarge], or [ErrEntryTooLargeForPage]. If key names a bucket, Put returns [ErrIncompatibleValue] instead of replacing it.
-func (tx *Tx) Put(key, value []byte) error {
-	if err := tx.writableError(); err != nil {
-		return err
-	}
-	return tx.putCatalogEntry(btree.NewEntry(0, key, value))
-}
-
-// Get returns the top-level value stored under key, including a value written earlier in the same transaction. It returns [ErrKeyNotFound] when the key is absent and [ErrIncompatibleValue] when the key names a bucket. An empty key returns [ErrKeyRequired], an oversized key returns [ErrKeyTooLarge], and a call after the callback returns fails with [ErrTxClosed].
-//
-// Get returns a new slice that the caller can retain and modify. A stored empty value returns a non-nil slice with length zero.
-func (tx *Tx) Get(key []byte) ([]byte, error) {
-	if tx.closed {
-		return nil, ErrTxClosed
-	}
-
-	entry, found, err := tx.db.findTreeEntry(tx.db.rootNode, key)
-	if err != nil {
-		return nil, err
-	}
-	if !found {
-		return nil, ErrKeyNotFound
-	}
-	if entry.Flags()&btree.BucketLeafFlag != 0 {
-		return nil, ErrIncompatibleValue
-	}
-	return entry.Value(), nil
-}
