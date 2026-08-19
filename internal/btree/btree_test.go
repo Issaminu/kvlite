@@ -82,6 +82,72 @@ func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
 	}
 }
 
+func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
+	nodes := []*Node{
+		{
+			IsLeaf: true,
+			entries: []Entry{
+				{key: []byte("alpha"), value: []byte("one")},
+				{key: []byte("beta"), value: []byte{}},
+			},
+		},
+		{
+			entries: []Entry{
+				{key: []byte("middle")},
+			},
+			Children: []page.ID{2, 3},
+		},
+	}
+
+	for index, node := range nodes {
+		if got, want := node.EncodedSize(), len(EncodeNode(node)); got != want {
+			t.Fatalf("node %d encoded size: got %d, want %d", index, got, want)
+		}
+		if got := testing.AllocsPerRun(100, func() { _ = node.EncodedSize() }); got != 0 {
+			t.Fatalf("node %d encoded size allocations: got %v, want 0", index, got)
+		}
+	}
+}
+
+func TestNodeFindEntryRef_ReturnsStoredValue(t *testing.T) {
+	node := NewLeafNode(1)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, found, err := node.FindEntryRef([]byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("key not found")
+	}
+
+	entry.Value()[0] = 'V'
+	if got := node.entries[0].value; !bytes.Equal(got, []byte("Value")) {
+		t.Fatalf("stored value after reference change: got %q, want %q", got, "Value")
+	}
+}
+
+func TestNodeClone_DoesNotShareEntriesOrChildren(t *testing.T) {
+	original := &Node{
+		entries:  []Entry{{key: []byte("middle")}},
+		Children: []page.ID{2, 3},
+		pgid:     1,
+	}
+
+	clone := original.Clone()
+	clone.entries[0].key[0] = 'M'
+	clone.Children[0] = 20
+
+	if got := original.entries[0].key; !bytes.Equal(got, []byte("middle")) {
+		t.Fatalf("original key changed through clone: got %q", got)
+	}
+	if got := original.Children[0]; got != 2 {
+		t.Fatalf("original child changed through clone: got %d, want 2", got)
+	}
+}
+
 // oneByteWriter accepts one byte from each Write call without returning an
 // error. It verifies that code using io.Writer handles valid partial writes.
 type oneByteWriter struct {
@@ -213,5 +279,22 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 		if !found || !bytes.Equal(entry.Value(), want) {
 			t.Fatalf("find %q: found=%t value=%q, want %q", key, found, entry.Value(), want)
 		}
+	}
+}
+
+func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
+	store := &memoryTreeStore{pageSize: 128, nextID: 2, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	root := NewLeafNode(1)
+	if err := root.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+
+	entry, found, err := tree.FindEntryRef(root, []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !bytes.Equal(entry.Value(), []byte("value")) {
+		t.Fatalf("find reference: found=%t value=%q", found, entry.Value())
 	}
 }

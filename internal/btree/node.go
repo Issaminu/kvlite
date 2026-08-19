@@ -91,6 +91,25 @@ func (n *Node) EntryCount() int {
 	return len(n.entries)
 }
 
+// Clone returns an independent copy of n without a parent link.
+func (n *Node) Clone() *Node {
+	clone := &Node{
+		IsLeaf:   n.IsLeaf,
+		entries:  make([]Entry, len(n.entries)),
+		Children: slices.Clone(n.Children),
+		Index:    n.Index,
+		pgid:     n.pgid,
+	}
+	for index, entry := range n.entries {
+		clone.entries[index] = Entry{
+			flags: entry.flags,
+			key:   slices.Clone(entry.key),
+			value: slices.Clone(entry.value),
+		}
+	}
+	return clone
+}
+
 // Find the correct child node for this key.
 // It only returns the correct child for this node, if you actually want to reach the leaf node that has the key, then this function should be called in a loop.
 func (n *Node) FindChildIndex(key []byte) (int, error) {
@@ -139,6 +158,31 @@ func (n *Node) FindEntry(key []byte) (Entry, bool, error) {
 	return entry, true, nil
 }
 
+// FindEntryRef looks a key up in this leaf without copying its key or value.
+// The returned entry refers to storage owned by the node.
+func (n *Node) FindEntryRef(key []byte) (Entry, bool, error) {
+	if !n.IsLeaf {
+		return Entry{}, false, ErrNotLeafNode
+	}
+	idx, found, err := n.findKeyIndex(key)
+	if err != nil || !found {
+		return Entry{}, found, err
+	}
+
+	if n.entries[idx].value == nil {
+		n.entries[idx].value = []byte{}
+	}
+	return n.entries[idx], true, nil
+}
+
+func cloneValue(value []byte) []byte {
+	value = slices.Clone(value)
+	if value == nil {
+		return []byte{}
+	}
+	return value
+}
+
 func (n *Node) InsertEntry(entry Entry) error {
 	if !n.IsLeaf {
 		return ErrNotLeafNode
@@ -155,12 +199,12 @@ func (n *Node) InsertEntry(entry Entry) error {
 			return ErrIncompatibleValue
 		}
 		n.entries[idx].flags = entry.flags
-		n.entries[idx].value = slices.Clone(entry.value)
+		n.entries[idx].value = cloneValue(entry.value)
 		return nil
 	}
 
 	entry.key = slices.Clone(entry.key)
-	entry.value = slices.Clone(entry.value)
+	entry.value = cloneValue(entry.value)
 
 	n.entries = append(n.entries, Entry{})
 	copy(n.entries[idx+1:], n.entries[idx:])

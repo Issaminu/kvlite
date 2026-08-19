@@ -140,13 +140,37 @@ func (tree *Tree) FindEntry(root *Node, key []byte) (Entry, bool, error) {
 	return node.FindEntry(key)
 }
 
+// FindEntryRef looks a key up without copying the stored key or value.
+// The returned entry refers to storage owned by the leaf node.
+func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
+	if len(key) == 0 {
+		return Entry{}, false, ErrKeyRequired
+	}
+	if len(key) > MaxKeySize {
+		return Entry{}, false, ErrKeyTooLarge
+	}
+
+	node, err := tree.findLeafNode(root, key)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	return node.FindEntryRef(key)
+}
+
 // NeedsSplit reports whether the encoded node is larger than one page.
 func (n *Node) NeedsSplit(pageSize int64) bool {
 	return int64(n.EncodedSize()) > pageSize
 }
 
 func (n *Node) EncodedSize() int {
-	return len(EncodeNode(n))
+	size := nodeHeaderSize
+	for _, entry := range n.entries {
+		size += entry.EncodedSize(n.IsLeaf)
+	}
+	if !n.IsLeaf {
+		size += len(n.Children) * page.IDSize
+	}
+	return size
 }
 
 func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
