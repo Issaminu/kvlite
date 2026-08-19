@@ -18,35 +18,76 @@ type WAL struct {
 	syncOnCommit             bool
 	checkpointThresholdBytes uint64
 	bytesSinceCheckpoint     uint64
-	collectedRecords         map[page.ID]Record // Mapping Page ID to it's corresponding record. Only used temporarily within the current transaction to aggregate records that happen within a write operation, then flush at once
-	overlay                  map[page.ID]Record // Mapping that committed-but-not-yet-checkpointed pages, it's content comes from collectedRecords. This mapping lives beyond a single transaction
+	overlay                  map[page.ID]Record // Committed pages that are not yet checkpointed.
 	nextTxid                 TxID               // sequence number stamped on the next committed transaction
 	hasUnsyncedWrites        bool               // true when WAL bytes were appended after the last successful sync
 	syncFile                 func() error       // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
 }
 
-func (wal *WAL) InsertNodeRecord(node *btree.Node) {
-	record := Record{
-		Header:      RecordHeader{Type: RecordTypeData, PageID: node.PageID()},
-		PageContent: btree.EncodeNode(node),
+// Commit appends one transaction and publishes each changed page to the committed overlay.
+// It returns whether the committed WAL size reached the checkpoint threshold.
+//
+// On failure, Commit truncates the failed append and restores the pre-append byte
+// and synchronization state.
+func (wal *WAL) Commit(records []Record) (bool, error) {
+	if len(records) == 0 {
+		return false, nil
 	}
 
-	wal.collectRecord(&record)
-}
+	transaction, err := wal.encodeRecords(records, wal.nextTxid)
+	if err != nil {
+		return false, err
+	}
+	startOffset, err := wal.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		return false, err
+	}
+	bytesBefore := wal.bytesSinceCheckpoint
+	unsyncedBefore := wal.hasUnsyncedWrites
 
-func (wal *WAL) InsertMetaRecord(meta *page.Meta) {
-	meta.RefreshChecksum()
-
-	record := Record{
-		Header:      RecordHeader{Type: RecordTypeMeta, PageID: page.MetaID},
-		PageContent: page.EncodeMeta(meta),
+	needsCheckpoint, err := wal.appendTransaction(transaction)
+	if err != nil {
+		rollbackErr := wal.rollbackAppend(startOffset, bytesBefore, unsyncedBefore)
+		return false, errors.Join(err, rollbackErr)
 	}
 
-	wal.collectRecord(&record)
+	for _, record := range records {
+		wal.overlay[record.Header.PageID] = record
+	}
+	wal.nextTxid++
+	return needsCheckpoint, nil
 }
 
-func (wal *WAL) collectRecord(record *Record) {
-	wal.collectedRecords[record.Header.PageID] = *record
+func (wal *WAL) encodeRecords(records []Record, txid TxID) ([]byte, error) {
+	transactionSize := HeaderSize + ChecksumSize
+	for index := range records {
+		records[index].Header.TxID = txid
+		size, err := EncodedRecordSize(&records[index], wal.pageSize)
+		if err != nil {
+			return nil, err
+		}
+		transactionSize += size
+	}
+
+	transaction := make([]byte, 0, transactionSize)
+	for index := range records {
+		transaction = AppendEncodedRecord(transaction, &records[index])
+	}
+	commitMarker := Record{Header: RecordHeader{Type: RecordTypeCommit, TxID: txid}}
+	return AppendEncodedRecord(transaction, &commitMarker), nil
+}
+
+// rollbackAppend removes bytes from a failed commit and restores the counters that describe the retained WAL prefix.
+func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUnsyncedWrites bool) error {
+	wal.bytesSinceCheckpoint = bytesSinceCheckpoint
+	wal.hasUnsyncedWrites = hasUnsyncedWrites
+	if err := wal.file.Truncate(offset); err != nil {
+		return fmt.Errorf("truncate failed WAL transaction: %w", err)
+	}
+	if _, err := wal.file.Seek(offset, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind after failed WAL transaction: %w", err)
+	}
+	return nil
 }
 
 func (wal *WAL) ReadRecords() ([]Record, error) {
@@ -126,56 +167,6 @@ func (wal *WAL) Delete() error {
 	return err
 }
 
-func (wal *WAL) PersistCollectedRecords() (bool, error) {
-	if len(wal.collectedRecords) == 0 {
-		return false, nil
-	}
-
-	transaction, err := wal.encodeCollectedRecords()
-	if err != nil {
-		return false, err
-	}
-
-	needsCheckpoint, err := wal.appendTransaction(transaction)
-	if err != nil {
-		return false, err
-	}
-
-	wal.moveCollectedRecordsToOverlay()
-	return needsCheckpoint, nil
-}
-
-func (wal *WAL) encodeCollectedRecords() ([]byte, error) {
-	transactionSize := HeaderSize + ChecksumSize // The commit marker has no page content.
-	for _, record := range wal.collectedRecords {
-		size, err := EncodedRecordSize(&record, wal.pageSize)
-		if err != nil {
-			return nil, err
-		}
-		transactionSize += size
-	}
-
-	txid := wal.nextTxid
-	wal.nextTxid++
-
-	transaction := make([]byte, 0, transactionSize)
-
-	for pgid, record := range wal.collectedRecords {
-		record.Header.TxID = txid
-		transaction = AppendEncodedRecord(transaction, &record)
-
-		wal.collectedRecords[pgid] = record
-	}
-
-	commitMarker := &Record{
-		Header:      RecordHeader{Type: RecordTypeCommit, PageID: 0, TxID: txid},
-		PageContent: nil,
-	}
-	transaction = AppendEncodedRecord(transaction, commitMarker)
-
-	return transaction, nil
-}
-
 func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	if err := fileio.WriteFull(wal.file, transaction); err != nil {
 		return false, fmt.Errorf("persist multiple records: %w", err)
@@ -191,13 +182,6 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	}
 
 	return needsCheckpoint, nil
-}
-
-func (wal *WAL) moveCollectedRecordsToOverlay() {
-	for key := range wal.collectedRecords {
-		wal.overlay[key] = wal.collectedRecords[key]
-	}
-	clear(wal.collectedRecords)
 }
 
 func (wal *WAL) reachedCheckpointThreshold() bool {

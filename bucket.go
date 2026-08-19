@@ -72,9 +72,9 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 		return nil, ErrBucketExists
 	}
 
-	newPgid := tx.db.allocate()
+	newPgid := tx.store.AllocatePage()
 	rootNode := btree.NewLeafNode(newPgid)
-	tx.db.wal.InsertNodeRecord(rootNode)
+	tx.store.StageNode(rootNode)
 
 	bucket := &Bucket{
 		tx:           tx,
@@ -129,7 +129,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if b, ok := tx.buckets[string(bucketName)]; ok {
 		return b, nil
 	}
-	bucket, err := tx.loadBucket(tx.db.rootNode, bucketName, nil)
+	bucket, err := tx.loadBucket(tx.rootNode, bucketName, nil)
 	if err != nil || bucket == nil {
 		return bucket, err
 	}
@@ -139,7 +139,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 
 // loadBucket reads a bucket entry and opens the tree that it names. It returns (nil, nil) when no entry exists and [ErrIncompatibleValue] when the name belongs to a plain value.
 func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
-	entry, found, err := tx.db.findTreeEntry(rootNode, bucketName)
+	entry, found, err := tx.findTreeEntry(rootNode, bucketName)
 	if err != nil {
 		return nil, err
 	}
@@ -159,7 +159,7 @@ func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket
 		return nil, err
 	}
 
-	bucketRootNode, err := tx.db.readNode(pgid)
+	bucketRootNode, err := tx.store.ReadNode(pgid)
 	if err != nil {
 		return nil, err
 	}
@@ -217,12 +217,11 @@ func (bucket *Bucket) Put(key, value []byte) error {
 }
 
 func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
-	newRoot, err := bucket.tx.db.putTreeEntry(bucket.rootNode, entry)
+	newRoot, err := bucket.tx.putTreeEntry(bucket.rootNode, entry)
 	if err != nil {
 		return err
 	}
 	if newRoot == bucket.rootNode {
-		bucket.tx.db.wal.InsertMetaRecord(bucket.tx.db.meta)
 		return nil
 	}
 
@@ -232,12 +231,12 @@ func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 
 // Get returns the value stored under key in bucket, including a value written earlier in the same transaction. It returns [ErrKeyNotFound] when the key is absent and [ErrIncompatibleValue] when the key names a nested bucket. An empty key returns [ErrKeyRequired], an oversized key returns [ErrKeyTooLarge], and a call after the transaction callback returns fails with [ErrTxClosed].
 //
-// Get returns a new slice that the caller can retain and modify. A stored empty value returns a non-nil slice with length zero.
+// Get returns a read-only slice that is valid only until the transaction callback returns. The caller must not modify or retain it. A stored empty value returns a non-nil slice with length zero.
 func (bucket *Bucket) Get(key []byte) ([]byte, error) {
 	if bucket.tx.closed {
 		return nil, ErrTxClosed
 	}
-	entry, found, err := bucket.tx.db.findTreeEntry(bucket.rootNode, key)
+	entry, found, err := bucket.tx.findTreeEntryRef(bucket.rootNode, key)
 	if err != nil {
 		return nil, err
 	}

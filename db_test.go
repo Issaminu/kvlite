@@ -27,6 +27,7 @@ import (
 )
 
 var testBucketName = []byte("test-data")
+var errDiscardTx = errors.New("discard transaction")
 
 // tempfile returns a temporary file path for a database.
 func tempfile() string {
@@ -127,6 +128,45 @@ func mustBucketRoot(t *testing.T, db *DB, name []byte) *btree.Node {
 		t.Fatal(err)
 	}
 	return root
+}
+
+func TestBucketGet_CachedLeafDoesNotAllocate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	key := []byte("key")
+	if err := db.Put(testBucketName, key, []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if _, err := bucket.Get(key); err != nil {
+			return err
+		}
+
+		var getErr error
+		allocations := testing.AllocsPerRun(100, func() {
+			_, getErr = bucket.Get(key)
+		})
+		if getErr != nil {
+			return getErr
+		}
+		if allocations != 0 {
+			t.Fatalf("cached Bucket.Get allocations: got %v, want 0", allocations)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1932,6 +1972,213 @@ func BenchmarkGet_ReusedBucket(b *testing.B) {
 // access. Update commits all bucket changes only when its callback returns nil.
 // -----------------------------------------------------------------------------
 
+func TestUpdate_DoesNotStageWALBeforeCallbackReturns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("key"), []byte("value")); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("committed value: got %q, err %v", got, err)
+	}
+}
+
+func TestView_CachesDecodedPagesWithinTransaction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.View(func(tx *Tx) error {
+		first, err := tx.store.ReadNode(tx.meta.Root())
+		if err != nil {
+			return err
+		}
+		second, err := tx.store.ReadNode(tx.meta.Root())
+		if err != nil {
+			return err
+		}
+		if first != second {
+			t.Fatal("the transaction decoded one page more than once")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdate_OverwriteDoesNotCommitUnchangedMetadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+
+	stats := db.wal.Stats()
+	if stats.CommittedRecordCount != 1 {
+		t.Fatalf("overwrite committed records: got %d, want one data record", stats.CommittedRecordCount)
+	}
+	if _, ok := db.wal.CommittedRecord(page.MetaID); ok {
+		t.Fatal("overwrite committed unchanged metadata")
+	}
+}
+
+func TestReadNode_DoesNotChangeMainFileOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	const offset int64 = 7
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.readNode(db.meta.Root()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != offset {
+		t.Fatalf("main file offset after node read: got %d, want %d", got, offset)
+	}
+}
+
+func TestReadMeta_DoesNotChangeMainFileOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const offset int64 = 7
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.readMeta(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != offset {
+		t.Fatalf("main file offset after metadata read: got %d, want %d", got, offset)
+	}
+}
+
+func TestPersistNode_DoesNotChangeMainFileOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const offset int64 = 7
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.persistNode(db.rootNode); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != offset {
+		t.Fatalf("main file offset after node write: got %d, want %d", got, offset)
+	}
+}
+
+func TestPersistMeta_DoesNotChangeMainFileOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const offset int64 = 7
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.persistMeta(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != offset {
+		t.Fatalf("main file offset after metadata write: got %d, want %d", got, offset)
+	}
+}
+
+func TestCheckpoint_DoesNotChangeMainFileOffset(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	const offset int64 = 7
+	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.file.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != offset {
+		t.Fatalf("main file offset after checkpoint: got %d, want %d", got, offset)
+	}
+}
+
 // TestTx_UpdateCommitsAtomically checks that one Update commits all bucket
 // writes together and makes them visible inside the same transaction.
 func TestTx_UpdateCommitsAtomically(t *testing.T) {
@@ -2189,11 +2436,10 @@ func TestBucketReadsAfterViewStopAtClosedTransaction(t *testing.T) {
 	}
 }
 
-// TestTx_ViewCannotCreateBucket: CreateBucket is a write. A View txn must reject it
-// with ErrTxNotWritable, exactly like tx.Put does. Before the fix, CreateBucket had no
-// Writable() guard: it bumped meta.pgid, mutated db.rootNode, and left records in
-// wal.collectedRecords. View never flushes and never restores on success, so the leaked
-// records got committed by the NEXT write — a phantom bucket from a read-only path.
+// TestTx_ViewCannotCreateBucket: CreateBucket is a write. A View transaction must
+// reject it with ErrTxNotWritable, exactly like Bucket.Put does. Before the fix,
+// CreateBucket changed shared metadata and pending WAL state. The next write could
+// then commit a bucket that came from a read-only transaction.
 func TestTx_ViewCannotCreateBucket(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -2273,7 +2519,10 @@ func TestBucketPutAfterUpdateReturnsTxClosed(t *testing.T) {
 
 func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	path := tempfile()
-	db, err := openDB(path)
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2282,26 +2531,44 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 	originalRoot := db.rootNode
 	originalMetaRoot := db.meta.Root()
 	value := bytes.Repeat([]byte("v"), int(db.meta.PageSize()/2))
+	committedBefore := db.wal.Stats().CommittedRecordCount
 
-	root, err := db.putTreeEntry(originalRoot, btree.NewEntry(0, []byte("a"), value))
-	if err != nil {
-		t.Fatalf("put first entry: %v", err)
-	}
-	root, err = db.putTreeEntry(root, btree.NewEntry(0, []byte("b"), value))
-	if err != nil {
-		t.Fatalf("put second entry: %v", err)
-	}
-	if root == originalRoot {
-		t.Fatal("second entry did not split the root")
+	err = db.Update(func(tx *Tx) error {
+		root := tx.rootNode
+		newRoot, err := tx.putTreeEntry(root, btree.NewEntry(0, []byte("a"), value))
+		if err != nil {
+			return err
+		}
+		newRoot, err = tx.putTreeEntry(newRoot, btree.NewEntry(0, []byte("b"), value))
+		if err != nil {
+			return err
+		}
+		if newRoot == root {
+			t.Fatal("second entry did not split the root")
+		}
+		if tx.rootNode != root {
+			t.Fatal("tree engine adopted the replacement root")
+		}
+		if db.rootNode != originalRoot {
+			t.Fatal("transaction changed the shared database root before commit")
+		}
+		if db.meta.Root() != originalMetaRoot {
+			t.Fatalf("transaction changed meta root before commit: got %d, want %d", db.meta.Root(), originalMetaRoot)
+		}
+		if stats := db.wal.Stats(); stats.CommittedRecordCount != committedBefore {
+			t.Fatalf("WAL records published before commit: got %d, want %d",
+				stats.CommittedRecordCount, committedBefore)
+		}
+		return errDiscardTx
+	})
+	if !errors.Is(err, errDiscardTx) {
+		t.Fatalf("Update: got %v, want %v", err, errDiscardTx)
 	}
 	if db.rootNode != originalRoot {
-		t.Fatal("tree engine adopted the replacement root")
+		t.Fatal("discarded transaction changed the database root")
 	}
 	if db.meta.Root() != originalMetaRoot {
-		t.Fatalf("tree engine changed meta root: got %d, want %d", db.meta.Root(), originalMetaRoot)
-	}
-	if _, ok := db.wal.CollectedRecord(page.MetaID); ok {
-		t.Fatal("tree engine staged a meta record before its owner adopted the root")
+		t.Fatalf("discarded transaction changed meta root: got %d, want %d", db.meta.Root(), originalMetaRoot)
 	}
 }
 
@@ -3300,9 +3567,9 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		// Build a child bucket by hand and write its pointer back into p. This is the
 		// operation that Bucket.CreateBucket/Put drive; here we aim it at a brimming
 		// parent so the pointer insert splits p's root.
-		newPgid := tx.db.allocate()
+		newPgid := tx.store.AllocatePage()
 		cRoot := btree.NewLeafNode(newPgid)
-		tx.db.wal.InsertNodeRecord(cRoot)
+		tx.store.StageNode(cRoot)
 		c := &Bucket{tx: tx, name: childName, rootNode: cRoot, parentBucket: p}
 		if err := c.writeBackRoot(); err != nil {
 			return err
@@ -3318,10 +3585,12 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		// A fresh handle read straight from the catalog must resolve p's NEW root and
 		// see every packed key plus the new child. Before the fix, the catalog still
 		// points at the truncated left half and the right-half keys are gone. Use a
-		// second, uncached Tx wrapper over the same db so this genuinely re-decodes
-		// the catalog entry instead of returning tx's own memoized "p" handle.
-		freshTx := &Tx{db: tx.db, readOnly: tx.readOnly}
-		p2 := mustBucket(t, freshTx, []byte("p"))
+		// direct load through the same transaction so this bypasses the memoized
+		// "p" handle and resolves the catalog entry again.
+		p2, err := tx.loadBucket(tx.rootNode, []byte("p"), nil)
+		if err != nil {
+			return err
+		}
 		if p2 == nil {
 			t.Fatal("bucket \"p\" lost from catalog after its root split")
 		}
@@ -3343,13 +3612,11 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 
 // TestWAL_BytesSinceCheckpointTracksWALSize arms Phase-1 bug #3.
 //
-// bytesSinceCheckpoint gates the checkpoint. The old code added a record's size on
-// every collectRecord call, but collectedRecords keeps only one image per pgid, so
-// re-writing a page (or the meta page, rewritten on every _put) inflated the
-// counter far above the real pending bytes and checkpointed too early. The counter
-// must equal the bytes actually appended to the WAL since the last checkpoint. A
-// fresh DB starts with an empty WAL, so after one commit the counter must equal the
-// WAL file size on disk.
+// bytesSinceCheckpoint gates the checkpoint. The old code added a record's size
+// every time it staged a page. Rewriting one page many times inflated the counter
+// and started checkpoints too early. The counter must equal the bytes actually
+// appended to the WAL since the last checkpoint. A fresh DB starts with an empty
+// WAL, so after one commit the counter must equal the WAL file size on disk.
 func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3361,9 +3628,8 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Overwrite ONE key 100 times in a single transaction. Only the leaf page and the
-	// meta page change, so the WAL grows by exactly one commit: two records plus a
-	// commit marker. The old per-call counter would report ~100x that.
+	// Overwrite one key 100 times in a single transaction. Only the final leaf page
+	// enters the WAL. The old per-call counter would report about 100 times that.
 	err = db.Update(func(tx *Tx) error {
 		for i := 0; i < 100; i++ {
 			if err := mustBucket(t, tx, testBucketName).Put([]byte("k"), []byte("v")); err != nil {
@@ -3504,24 +3770,34 @@ func TestFindTreeEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 		t.Fatalf("put empty value: %v", err)
 	}
 
-	root := mustBucketRoot(t, db, testBucketName)
-	entry, found, err := db.findTreeEntry(root, []byte("present"))
-	if err != nil {
-		t.Fatalf("find present entry: %v", err)
-	}
-	if !found {
-		t.Fatal("stored entry reported missing")
-	}
-	if entry.Value() == nil || len(entry.Value()) != 0 {
-		t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
-	}
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		root := bucket.rootNode
+		entry, found, err := tx.findTreeEntry(root, []byte("present"))
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("stored entry reported missing")
+		}
+		if entry.Value() == nil || len(entry.Value()) != 0 {
+			t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
+		}
 
-	_, found, err = db.findTreeEntry(root, []byte("missing"))
+		_, found, err = tx.findTreeEntry(root, []byte("missing"))
+		if err != nil {
+			return err
+		}
+		if found {
+			t.Fatal("missing entry reported present")
+		}
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("find missing entry: %v", err)
-	}
-	if found {
-		t.Fatal("missing entry reported present")
+		t.Fatalf("find tree entry: %v", err)
 	}
 }
 
@@ -4411,12 +4687,10 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	syncErr := errors.New("injected WAL sync failure")
 	syncCalls := 0
 	publishedBeforeSync := false
-	pendingAtSync := false
 	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
 		stats := db.wal.Stats()
 		publishedBeforeSync = stats.CommittedRecordCount != 0
-		pendingAtSync = stats.CollectedRecordCount != 0
 		return syncErr
 	})
 
@@ -4431,13 +4705,10 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	if publishedBeforeSync {
 		t.Fatal("transaction was published to the overlay before WAL sync succeeded")
 	}
-	if !pendingAtSync {
-		t.Fatal("transaction records were not pending when WAL sync started")
-	}
 	stats := db.wal.Stats()
-	if stats.CommittedRecordCount != 0 || stats.CollectedRecordCount != 0 {
-		t.Fatalf("failed transaction state remained: overlay=%d, collected=%d",
-			stats.CommittedRecordCount, stats.CollectedRecordCount)
+	if stats.CommittedRecordCount != 0 {
+		t.Fatalf("failed transaction was published: committed records=%d",
+			stats.CommittedRecordCount)
 	}
 	if stats.BytesSinceCheckpoint != 0 {
 		t.Fatalf("failed transaction byte count: got %d, want 0", stats.BytesSinceCheckpoint)

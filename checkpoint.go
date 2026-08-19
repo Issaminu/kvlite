@@ -7,25 +7,24 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+// applyWALRecord writes one WAL page image to the main file without changing the file's shared offset.
+// Startup recovery calls this for committed records and synchronizes the main file after all records are applied.
 func (db *DB) applyWALRecord(record *wal.Record) error {
-	pageSize := db.meta.PageSize()
-	offset := int64(record.Header.PageID) * pageSize
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
-		return err
-	}
-
-	// WAL records omit page padding. The main file stores every page at its full size.
-	data := record.PageContent
-	if int64(len(data)) < pageSize {
-		padded := make([]byte, pageSize)
-		copy(padded, data)
-		data = padded
-	}
-	return fileio.WriteFull(db.file, data)
+	pageBuffer := make([]byte, db.meta.PageSize())
+	return db.applyWALRecordWithBuffer(record, pageBuffer)
 }
 
-// checkpointWAL makes the WAL durable, copies its committed pages into the main
-// file, makes the main file durable, and then clears the WAL state.
+func (db *DB) applyWALRecordWithBuffer(record *wal.Record, pageBuffer []byte) error {
+	pageSize := db.meta.PageSize()
+	// WAL records omit page padding. The main file stores every page at its full size.
+	clear(pageBuffer)
+	copy(pageBuffer, record.PageContent)
+	offset := int64(record.Header.PageID) * pageSize
+	return fileio.WriteFull(io.NewOffsetWriter(db.file, offset), pageBuffer)
+}
+
+// checkpointWAL makes the WAL durable, copies its committed pages into the main file, and then makes the main file durable.
+// The WAL removes its committed state only after those steps succeed, so a failed write or main-file sync can be retried.
 func (db *DB) checkpointWAL() error {
-	return db.wal.Checkpoint(db.applyWALRecord, db.file.Sync)
+	return db.wal.Checkpoint(db.file)
 }

@@ -8,6 +8,76 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+func TestWALCommit_PublishesOneRecordForEachChangedPage(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	log := New(Config{
+		File:                     walFile,
+		PageSize:                 64,
+		CheckpointThresholdBytes: 1 << 20,
+	})
+	records := []Record{
+		{Header: RecordHeader{Type: RecordTypeData, PageID: 2}, PageContent: []byte("second")},
+		{Header: RecordHeader{Type: RecordTypeData, PageID: 1}, PageContent: []byte("first")},
+	}
+
+	needsCheckpoint, err := log.Commit(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if needsCheckpoint {
+		t.Fatal("small transaction reached the checkpoint threshold")
+	}
+	if got := log.Stats().CommittedRecordCount; got != 2 {
+		t.Fatalf("committed record count: got %d, want 2", got)
+	}
+	record, ok := log.CommittedRecord(2)
+	if !ok || !bytes.Equal(record.PageContent, []byte("second")) {
+		t.Fatalf("page 2 record: found=%t content=%q", ok, record.PageContent)
+	}
+}
+
+func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+	mainFile, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mainFile.Close()
+
+	log := New(Config{File: walFile, PageSize: 64})
+	for index := range 32 {
+		pageID := page.ID(32 - index)
+		log.LoadCommittedRecord(Record{
+			Header:      RecordHeader{Type: RecordTypeData, PageID: pageID},
+			PageContent: []byte{byte(pageID)},
+		})
+	}
+
+	if err := log.Checkpoint(mainFile); err != nil {
+		t.Fatal(err)
+	}
+	for pageID := page.ID(1); pageID <= 32; pageID++ {
+		pageContent := make([]byte, 64)
+		if _, err := mainFile.ReadAt(pageContent, int64(pageID)*64); err != nil {
+			t.Fatal(err)
+		}
+		want := make([]byte, 64)
+		want[0] = byte(pageID)
+		if !bytes.Equal(pageContent, want) {
+			t.Fatalf("checkpoint page %d: got %v, want %v", pageID, pageContent, want)
+		}
+	}
+}
+
 func TestRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 	record := &Record{
 		Header: RecordHeader{
@@ -82,16 +152,16 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 
 	log := &WAL{
 		pageSize: pageSize,
-		collectedRecords: map[page.ID]Record{
-			firstPageID: {
-				Header:      RecordHeader{Type: RecordTypeData, PageID: firstPageID},
-				PageContent: []byte("x"),
-			},
-		},
 		nextTxid: transactionID,
 	}
+	records := []Record{
+		{
+			Header:      RecordHeader{Type: RecordTypeData, PageID: firstPageID},
+			PageContent: []byte("x"),
+		},
+	}
 
-	transaction, err := log.encodeCollectedRecords()
+	transaction, err := log.encodeRecords(records, transactionID)
 	if err != nil {
 		t.Fatal(err)
 	}

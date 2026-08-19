@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -25,35 +26,7 @@ type DB struct {
 	rootNode *btree.Node
 	options  *Options
 	wal      *wal.WAL
-	tree     *btree.Tree
 	closed   bool
-}
-
-// treeStore connects btree.Tree to this DB. It contains only db because each
-// method below forwards one storage operation to the database. This lets the
-// tree package change the tree while DB keeps control of pages and the WAL.
-type treeStore struct {
-	db *DB
-}
-
-// PageSize reports the page size from the database metadata.
-func (store treeStore) PageSize() int64 {
-	return store.db.meta.PageSize()
-}
-
-// ReadNode uses the database read path, including records staged in the WAL.
-func (store treeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
-	return store.db.readNode(pageID)
-}
-
-// AllocatePage reserves the next database page ID.
-func (store treeStore) AllocatePage() page.ID {
-	return store.db.allocate()
-}
-
-// StageNode places a changed tree node in the current WAL transaction.
-func (store treeStore) StageNode(node *btree.Node) {
-	store.db.wal.InsertNodeRecord(node)
 }
 
 func (db *DB) ensureOpen() error {
@@ -95,8 +68,6 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		file:    dbFile,
 		options: resolvedOptions,
 	}
-	db.tree = btree.NewTree(treeStore{db: db})
-
 	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()
 	var mainMetaErr error
@@ -278,16 +249,6 @@ func (db *DB) Put(bucketName, key, value []byte) error {
 	})
 }
 
-// putTreeEntry inserts entry into the tree that starts at rootNode. It returns
-// the current root because a split can create a replacement root. The caller
-// owns that root and must adopt it after this function succeeds.
-func (db *DB) putTreeEntry(rootNode *btree.Node, entry btree.Entry) (*btree.Node, error) {
-	if db.options.ReadOnly {
-		return nil, ErrDatabaseReadOnly
-	}
-	return db.tree.PutEntry(rootNode, entry)
-}
-
 // Get returns the value stored under key in the top-level bucket named
 // bucketName. It performs the lookup in its own read-only transaction.
 //
@@ -305,21 +266,21 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 			return err
 		}
 		value, err = bucket.Get(key)
+		if err == nil {
+			value = slices.Clone(value)
+			if value == nil {
+				value = []byte{}
+			}
+		}
 		return err
 	})
 	return value, err
 }
 
-func (db *DB) findTreeEntry(rootNode *btree.Node, key []byte) (btree.Entry, bool, error) {
-	return db.tree.FindEntry(rootNode, key)
-}
-
 func (db *DB) persistNode(node *btree.Node) error {
 	offset := int64(node.PageID()) * db.meta.PageSize()
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
-		return fmt.Errorf("seek node: %w", err)
-	}
-	if err := btree.WriteNode(db.file, node, db.meta.PageSize(), true); err != nil {
+	writer := io.NewOffsetWriter(db.file, offset)
+	if err := btree.WriteNode(writer, node, db.meta.PageSize(), true); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	return nil
@@ -334,8 +295,7 @@ func (db *DB) hasMeta() bool {
 }
 
 func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
-	// check if Node exists in current transaction
-
+	// check if Node exists exists in [wal.WAL.overlay]
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
 		node, err := wal.RecordToNode(&record)
@@ -349,14 +309,12 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	// Node not found in-memory, so we have to read its full page from the database file.
 
 	offset := int64(pgid) * db.meta.PageSize()
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+	data := make([]byte, db.meta.PageSize())
+	reader := io.NewSectionReader(db.file, offset, db.meta.PageSize())
+	if err := fileio.ReadFull(reader, data); err != nil {
 		return nil, err
 	}
-	page := make([]byte, db.meta.PageSize())
-	if err := fileio.ReadFull(db.file, page); err != nil {
-		return nil, err
-	}
-	node, err := btree.DecodeNode(page)
+	node, err := btree.DecodeNode(data)
 	if err != nil {
 		return nil, err
 	}
@@ -366,11 +324,9 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 }
 
 func (db *DB) readMeta() (*page.Meta, error) {
-	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
-		return nil, err
-	}
 	data := make([]byte, page.MetaSize)
-	if err := fileio.ReadFull(db.file, data); err != nil {
+	reader := io.NewSectionReader(db.file, 0, page.MetaSize)
+	if err := fileio.ReadFull(reader, data); err != nil {
 		return nil, errors.Join(ErrInvalid, err)
 	}
 	return page.DecodeMeta(data)
@@ -380,15 +336,9 @@ func (db *DB) persistMeta() error {
 	// recompute checksum
 	db.meta.RefreshChecksum()
 
-	if _, err := db.file.Seek(0, io.SeekStart); err != nil {
-		return fmt.Errorf("seek meta: %w", err)
-	}
-	if err := fileio.WriteFull(db.file, page.EncodeMeta(db.meta)); err != nil {
+	writer := io.NewOffsetWriter(db.file, 0)
+	if err := fileio.WriteFull(writer, page.EncodeMeta(db.meta)); err != nil {
 		return fmt.Errorf("write meta: %w", err)
 	}
 	return nil
-}
-
-func (db *DB) allocate() page.ID {
-	return db.meta.Allocate()
 }

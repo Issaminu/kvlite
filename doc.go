@@ -2,9 +2,9 @@
 //
 // A database stores every user key/value pair inside a named bucket. After opening one with [Open], callers can use [DB.Update] for atomic writes and [DB.View] for read-only access. For one value in a top-level bucket, [DB.Put] and [DB.Get] provide a simpler form of those transactions.
 //
-// Update and View manage each transaction from start to finish, so a [Tx] and every [Bucket] obtained from it are valid only while the callback runs. If an Update callback returns an error, KVLite rolls back its changes instead of committing them.
+// Update and View manage each transaction from start to finish, so a [Tx] and every [Bucket] obtained from it are valid only while the callback runs. If an Update callback returns an error, KVLite discards its changes instead of committing them.
 //
-// KVLite copies the keys and values that it stores, so callers can reuse or change those byte slices after a write returns. A successful lookup returns a new value slice for the same reason.
+// KVLite copies the keys and values that it stores, so callers can reuse or change those byte slices after a write returns. [DB.Get] returns a new value slice. [Bucket.Get] returns a read-only value that is valid only while its transaction callback runs.
 //
 // A [DB] is not safe for concurrent use, so the caller must serialize all operations, including [DB.Close]. KVLite also does not lock database files, which means an application must not open the same path more than once at the same time.
 //
