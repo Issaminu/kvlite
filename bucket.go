@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"bytes"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -9,8 +10,13 @@ import (
 
 // cacheBucket registers b as the one handle for its name within this transaction.
 func (tx *Tx) cacheBucket(b *Bucket) {
+	if tx.bucket == nil {
+		tx.bucket = b
+		return
+	}
 	if tx.buckets == nil {
 		tx.buckets = make(map[string]*Bucket)
+		tx.buckets[string(tx.bucket.name)] = tx.bucket
 	}
 	tx.buckets[string(b.name)] = b
 }
@@ -132,6 +138,9 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
 	}
+	if tx.bucket != nil && bytes.Equal(tx.bucket.name, bucketName) {
+		return tx.bucket, nil
+	}
 	if b, ok := tx.buckets[string(bucketName)]; ok {
 		return b, nil
 	}
@@ -145,7 +154,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 
 // loadBucket reads a bucket entry and opens the tree that it names. It returns (nil, nil) when no entry exists and [ErrIncompatibleValue] when the name belongs to a plain value.
 func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
-	entry, found, err := tx.findTreeEntry(rootNode, bucketName)
+	entry, found, err := tx.findTreeEntryRef(rootNode, bucketName)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +179,8 @@ func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket
 		return nil, err
 	}
 
-	return &Bucket{tx: tx, name: slices.Clone(bucketName), rootNode: bucketRootNode, parentBucket: parent}, nil
+	// The stored catalog key is immutable for the life of the transaction.
+	return &Bucket{tx: tx, name: entry.Key(), rootNode: bucketRootNode, parentBucket: parent}, nil
 }
 
 // CreateBucket creates a nested bucket named bucketName inside bucket. The new bucket is part of the owning transaction, so [DB.Update] commits or rolls it back with the other changes in that transaction.

@@ -169,6 +169,60 @@ func TestBucketGet_CachedLeafDoesNotAllocate(t *testing.T) {
 	}
 }
 
+func TestTxBucketKeepsMultipleTopLevelHandlesStable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("other"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.View(func(tx *Tx) error {
+		first := mustBucket(t, tx, testBucketName)
+		other := mustBucket(t, tx, []byte("other"))
+		if first != mustBucket(t, tx, testBucketName) {
+			t.Fatal("repeated lookup returned a different first bucket handle")
+		}
+		if other != mustBucket(t, tx, []byte("other")) {
+			t.Fatal("repeated lookup returned a different second bucket handle")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestViewOneBucketLookupUsesAtMostSixAllocations(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var viewErr error
+	allocations := testing.AllocsPerRun(100, func() {
+		viewErr = db.View(func(tx *Tx) error {
+			_, err := tx.Bucket(testBucketName)
+			return err
+		})
+	})
+	if viewErr != nil {
+		t.Fatal(viewErr)
+	}
+	if allocations > 6 {
+		t.Fatalf("one-bucket View allocations: got %v, want at most 6", allocations)
+	}
+}
+
 // TestBucketPut_ReusesTransactionOwnedRoot catches a write path that copies an
 // already private leaf again for each Put in the same transaction.
 func TestBucketPut_ReusesTransactionOwnedRoot(t *testing.T) {

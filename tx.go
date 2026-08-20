@@ -16,7 +16,8 @@ type Tx struct {
 	metaDirty bool
 	readOnly  bool
 	closed    bool
-	buckets   map[string]*Bucket // per-tx cache: one *Bucket handle per top-level name, so every caller in this tx observes the same in-memory state
+	bucket    *Bucket            // most transactions will only interact with a single bucket, we store it here instead of the [Tx.buckets] map attribute
+	buckets   map[string]*Bucket // created after a second top-level bucket so every caller in this tx observes the same in-memory state
 }
 
 // newTx borrows committed state for a read transaction and creates private mutable state for a write transaction.
