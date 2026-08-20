@@ -103,7 +103,7 @@ func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
 }
 
 func EncodeNode(node *Node) []byte {
-	data := make([]byte, 0)
+	data := make([]byte, 0, node.EncodedSize())
 	isLeafByte := byte(0)
 	if node.IsLeaf {
 		isLeafByte = 1

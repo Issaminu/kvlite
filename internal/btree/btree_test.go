@@ -109,6 +109,26 @@ func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 	}
 }
 
+func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
+	node := &Node{
+		IsLeaf: true,
+		entries: []Entry{
+			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
+			{key: []byte("beta"), value: bytes.Repeat([]byte("b"), 128)},
+		},
+	}
+
+	var encoded []byte
+	if got := testing.AllocsPerRun(100, func() {
+		encoded = EncodeNode(node)
+	}); got != 1 {
+		t.Fatalf("EncodeNode allocations: got %v, want 1", got)
+	}
+	if got, want := len(encoded), 294; got != want {
+		t.Fatalf("encoded length: got %d, want %d", got, want)
+	}
+}
+
 func TestNodeFindEntryRef_ReturnsStoredValue(t *testing.T) {
 	node := NewLeafNode(1)
 	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
