@@ -55,7 +55,7 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseNodes map
 //
 // If transaction returns an error, Update discards every change and returns that error. If it panics, Update discards every change before the panic continues to the caller. When transaction returns nil, Update writes the transaction to the write-ahead log and returns any error that prevents that commit.
 //
-// KVLite runs concurrent Update callbacks in serial order. In [SyncFull] mode, concurrent successful callbacks can form one atomic write batch. Later callbacks in that batch see earlier successful changes. A callback error discards only that callback's changes. A write-ahead log error returns to every successful callback whose result depends on that batch, and none of the batch changes become visible.
+// KVLite runs concurrent Update callbacks in serial order, and an Update callback does not overlap a [DB.View] callback. In [SyncFull] mode, concurrent successful callbacks can form one atomic write batch. Later callbacks in that batch see earlier successful changes. A callback error discards only that callback's changes. A write-ahead log error returns to every successful callback whose result depends on that batch, and none of the batch changes become visible.
 //
 // An automatic checkpoint can run after the write-ahead log commit. If that checkpoint fails, the transaction remains committed, Update returns nil, and KVLite keeps the log data so a later write or [DB.Close] can retry the checkpoint.
 func (db *DB) Update(transaction func(tx *Tx) error) error {
@@ -69,7 +69,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	if db.options.Synchronous == SyncFull {
 		return db.submitDurableUpdate(transaction)
 	}
-
+	// SyncNormal operation
 	db.operationMu.Lock()
 	defer db.operationMu.Unlock()
 	return db.updateDirect(transaction)
@@ -146,15 +146,15 @@ func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty 
 	return records
 }
 
-// View runs transaction as one managed read-only transaction and returns its error. Writes through the Tx or its buckets return [ErrTxNotWritable], while reads remain available until the callback returns. If the callback panics, View closes the transaction before the panic continues to the caller.
+// View runs transaction as one managed read-only transaction and returns its error. KVLite can run View callbacks together. A [DB.Update] callback waits for active View callbacks to return, and a View callback waits while an Update callback runs. Writes through the Tx or its buckets return [ErrTxNotWritable], while reads remain available until the callback returns. If the callback panics, View closes the transaction before the panic continues to the caller.
 func (db *DB) View(transaction func(tx *Tx) error) error {
 	if err := db.beginOperation(); err != nil {
 		return err
 	}
 	defer db.endOperation()
 
-	db.operationMu.Lock()
-	defer db.operationMu.Unlock()
+	db.operationMu.RLock()
+	defer db.operationMu.RUnlock()
 
 	tx := newTx(db, true)
 	defer func() { tx.closed = true }()

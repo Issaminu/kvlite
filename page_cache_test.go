@@ -1,10 +1,48 @@
 package kvlite
 
 import (
+	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/page"
 )
+
+func TestNodeCache_AllowsConcurrentGets(t *testing.T) {
+	const nodeCount = 8
+	cache := newNodeCache(nodeCount)
+	for pageID := page.ID(1); pageID <= nodeCount; pageID++ {
+		cache.Put(btree.NewLeafNode(pageID))
+	}
+
+	const readerCount = 8
+	const readsPerReader = 1_000
+	start := make(chan struct{})
+	errorsByReader := make(chan error, readerCount)
+	var readers sync.WaitGroup
+	readers.Add(readerCount)
+	for readerID := range readerCount {
+		go func() {
+			defer readers.Done()
+			<-start
+			for readIndex := range readsPerReader {
+				pageID := page.ID((readerID+readIndex)%nodeCount + 1)
+				node, ok := cache.Get(pageID)
+				if !ok || node.PageID() != pageID {
+					errorsByReader <- fmt.Errorf("page %d: node=%v cached=%t", pageID, node, ok)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	readers.Wait()
+	close(errorsByReader)
+	for err := range errorsByReader {
+		t.Fatal(err)
+	}
+}
 
 func TestNodeCache_RemovesLeastRecentlyUsedNode(t *testing.T) {
 	cache := newNodeCache(2)

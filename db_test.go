@@ -4648,6 +4648,154 @@ func TestUpdate_SerializesConcurrentCallbacks(t *testing.T) {
 	}
 }
 
+func TestView_AllowsConcurrentCallbacks(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseCallbacks := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseCallbacks()
+	errorsByView := make(chan error, 2)
+	firstEntered := make(chan struct{})
+	secondEntered := make(chan struct{})
+
+	go func() {
+		errorsByView <- db.View(func(*Tx) error {
+			close(firstEntered)
+			<-release
+			return nil
+		})
+	}()
+	<-firstEntered
+
+	go func() {
+		errorsByView <- db.View(func(*Tx) error {
+			close(secondEntered)
+			<-release
+			return nil
+		})
+	}()
+
+	select {
+	case <-secondEntered:
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("second View callback did not enter while the first callback was active")
+	}
+	releaseCallbacks()
+	for range 2 {
+		if err := <-errorsByView; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestGet_AllowsConcurrentReads(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	key := []byte("key")
+	want := []byte("value")
+	if err := db.Put(testBucketName, key, want); err != nil {
+		t.Fatal(err)
+	}
+
+	const readerCount = 16
+	const readsPerReader = 100
+	start := make(chan struct{})
+	errorsByReader := make(chan error, readerCount)
+	var readers sync.WaitGroup
+	readers.Add(readerCount)
+	for range readerCount {
+		go func() {
+			defer readers.Done()
+			<-start
+			for range readsPerReader {
+				got, err := db.Get(testBucketName, key)
+				if err != nil {
+					errorsByReader <- err
+					return
+				}
+				if !bytes.Equal(got, want) {
+					errorsByReader <- fmt.Errorf("value: got %q, want %q", got, want)
+					return
+				}
+			}
+		}()
+	}
+	close(start)
+	readers.Wait()
+	close(errorsByReader)
+	for err := range errorsByReader {
+		t.Fatal(err)
+	}
+}
+
+func TestUpdate_WaitsForActiveView(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	releaseView := make(chan struct{})
+	viewEntered := make(chan struct{})
+	viewDone := make(chan error, 1)
+	go func() {
+		viewDone <- db.View(func(*Tx) error {
+			close(viewEntered)
+			<-releaseView
+			return nil
+		})
+	}()
+	<-viewEntered
+
+	updateEntered := make(chan struct{})
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- db.Update(func(*Tx) error {
+			close(updateEntered)
+			return nil
+		})
+	}()
+	select {
+	case <-updateEntered:
+		close(releaseView)
+		t.Fatal("Update callback entered while a View callback was active")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseView)
+	if err := <-viewDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-updateEntered:
+	case <-time.After(time.Second):
+		t.Fatal("Update callback did not enter after the View callback finished")
+	}
+	if err := <-updateDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)

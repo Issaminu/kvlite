@@ -19,7 +19,7 @@ const (
 	MaxValueSize = btree.MaxValueSize
 )
 
-// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls, but KVLite runs transaction callbacks one at a time. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
+// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
 type DB struct {
 	path             string
 	file             *os.File
@@ -28,7 +28,7 @@ type DB struct {
 	pageCache        *nodeCache
 	options          *Options
 	wal              *wal.WAL
-	operationMu      sync.Mutex
+	operationMu      sync.RWMutex
 	lifecycleMu      sync.Mutex
 	activeOperations sync.WaitGroup
 	writeRequests    chan *writeRequest

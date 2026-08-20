@@ -2,6 +2,7 @@ package kvlite
 
 import (
 	"container/list"
+	"sync"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -12,9 +13,9 @@ type nodeCacheEntry struct {
 	node   *btree.Node
 }
 
-// nodeCache is a LRU (Least Recently Used) cache of nodes with capacity.
-// Automatically handles removal of the least recently used element if cache size surpassed `capacity`.
+// nodeCache stores committed nodes in least-recently-used order. Its methods permit concurrent calls, but callers must not mutate a stored node.
 type nodeCache struct {
+	mu       sync.Mutex
 	capacity int
 	entries  map[page.ID]*list.Element
 	order    list.List
@@ -32,6 +33,8 @@ func (cache *nodeCache) Get(pageID page.ID) (*btree.Node, bool) {
 	if cache == nil || cache.capacity == 0 {
 		return nil, false
 	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 	element, ok := cache.entries[pageID]
 	if !ok {
 		return nil, false
@@ -44,6 +47,8 @@ func (cache *nodeCache) Put(node *btree.Node) {
 	if cache == nil || cache.capacity == 0 {
 		return
 	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 	pageID := node.PageID()
 	if element, ok := cache.entries[pageID]; ok {
 		element.Value = nodeCacheEntry{pageID: pageID, node: node}
@@ -66,6 +71,8 @@ func (cache *nodeCache) Len() int {
 	if cache == nil {
 		return 0
 	}
+	cache.mu.Lock()
+	defer cache.mu.Unlock()
 	return cache.order.Len()
 }
 
