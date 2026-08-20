@@ -82,6 +82,61 @@ func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
 	}
 }
 
+func TestDecodeNode_AllocatesOnlyNodeAndEntryList(t *testing.T) {
+	node := &Node{
+		IsLeaf: true,
+		entries: []Entry{
+			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
+			{key: []byte("beta"), value: bytes.Repeat([]byte("b"), 128)},
+		},
+	}
+	encoded := EncodeNode(node)
+
+	var decoded *Node
+	var decodeErr error
+	if got := testing.AllocsPerRun(100, func() {
+		decoded, decodeErr = DecodeNode(encoded)
+	}); got != 2 {
+		t.Fatalf("DecodeNode allocations: got %v, want 2", got)
+	}
+	if decodeErr != nil {
+		t.Fatal(decodeErr)
+	}
+	if decoded == nil || len(decoded.entries) != 2 {
+		t.Fatalf("decoded entries: got %+v", decoded)
+	}
+}
+
+func TestDecodeNode_EntrySlicesCannotGrowIntoEncodedData(t *testing.T) {
+	node := &Node{
+		IsLeaf: true,
+		entries: []Entry{
+			{key: []byte("alpha"), value: []byte("one")},
+			{key: []byte("beta"), value: []byte("two")},
+		},
+	}
+	encoded := EncodeNode(node)
+	encodedBeforeAppend := bytes.Clone(encoded)
+
+	decoded, err := DecodeNode(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = append(decoded.entries[0].value, 'x')
+
+	if !bytes.Equal(encoded, encodedBeforeAppend) {
+		t.Fatal("appending to a decoded value changed the encoded node")
+	}
+}
+
+func TestDecodeNode_RejectsEntryCountLargerThanInputCanContain(t *testing.T) {
+	data := []byte{1, 0xff, 0xff, 0xff, 0xff}
+
+	if _, err := DecodeNode(data); err == nil {
+		t.Fatal("DecodeNode accepted an entry count larger than the input")
+	}
+}
+
 func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 	nodes := []*Node{
 		{

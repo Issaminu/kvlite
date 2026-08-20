@@ -17,13 +17,23 @@ const (
 	nodeHeaderSize = 1 + encodedUint32Size
 )
 
-// Decodes one bounded node buffer into a Node.
+// DecodeNode decodes one bounded node from data.
+// On success, the node owns data and keeps read-only key and value slices that
+// refer to it. The caller must not change or reuse data after a successful call.
 func DecodeNode(data []byte) (*Node, error) {
 	if len(data) < nodeHeaderSize {
 		return nil, fmt.Errorf("read node header: %w", ErrInvalid)
 	}
 	node := &Node{IsLeaf: data[0] != 0}
 	count := binary.LittleEndian.Uint32(data[1:nodeHeaderSize])
+	minimumEntrySize := 2 * encodedUint32Size // Flags and key length.
+	if node.IsLeaf {
+		minimumEntrySize += encodedUint32Size // Value length.
+	}
+	if uint64(count) > uint64(len(data)-nodeHeaderSize)/uint64(minimumEntrySize) {
+		return nil, fmt.Errorf("read node entry count: %w", ErrInvalid)
+	}
+	node.entries = make([]Entry, 0, int(count))
 	data = data[nodeHeaderSize:]
 
 	// looping through the entries (keys and values) of this node
@@ -66,6 +76,10 @@ func DecodeNode(data []byte) (*Node, error) {
 	return node, nil
 }
 
+// decodeLengthPrefixedBytes reads one little-endian uint32 length followed by that number of bytes.
+// It returns the value and the unread input without copying the value.
+// The value refers to data and must stay read-only.
+// It returns ErrInvalid when data does not contain the full length or value.
 func decodeLengthPrefixedBytes(data []byte) ([]byte, []byte, error) {
 	if len(data) < encodedUint32Size {
 		return nil, nil, ErrInvalid
@@ -77,9 +91,9 @@ func decodeLengthPrefixedBytes(data []byte) ([]byte, []byte, error) {
 	}
 
 	size := int(length)
-	value := make([]byte, size)
-	copy(value, data[:size])
-	return value, data[size:], nil
+	// The third index sets the capacity to size.
+	// This forces append to allocate instead of writing into the unread part of data.
+	return data[:size:size], data[size:], nil
 }
 
 func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
