@@ -78,22 +78,16 @@ func (n *Node) EntryCount() int {
 	return len(n.entries)
 }
 
-// Clone returns an independent copy of n with the same page ID.
+// Clone returns a structural copy of n with the same page ID.
+// The clone owns its entry and child lists but shares the immutable key and value bytes with n.
+// Node changes must replace an entry or byte slice instead of changing shared bytes in place.
 func (n *Node) Clone() *Node {
-	clone := &Node{
+	return &Node{
 		IsLeaf:   n.IsLeaf,
-		entries:  make([]Entry, len(n.entries)),
+		entries:  slices.Clone(n.entries),
 		Children: slices.Clone(n.Children),
 		pgid:     n.pgid,
 	}
-	for index, entry := range n.entries {
-		clone.entries[index] = Entry{
-			flags: entry.flags,
-			key:   slices.Clone(entry.key),
-			value: slices.Clone(entry.value),
-		}
-	}
-	return clone
 }
 
 // Find the correct child node for this key.

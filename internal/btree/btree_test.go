@@ -149,7 +149,7 @@ func TestNodeFindEntryRef_ReturnsStoredValue(t *testing.T) {
 	}
 }
 
-func TestNodeClone_DoesNotShareEntriesOrChildren(t *testing.T) {
+func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 	original := &Node{
 		entries:  []Entry{{key: []byte("middle")}},
 		Children: []page.ID{2, 3},
@@ -157,7 +157,7 @@ func TestNodeClone_DoesNotShareEntriesOrChildren(t *testing.T) {
 	}
 
 	clone := original.Clone()
-	clone.entries[0].key[0] = 'M'
+	clone.entries[0] = Entry{key: []byte("changed")}
 	clone.Children[0] = 20
 
 	if got := original.entries[0].key; !bytes.Equal(got, []byte("middle")) {
@@ -165,6 +165,26 @@ func TestNodeClone_DoesNotShareEntriesOrChildren(t *testing.T) {
 	}
 	if got := original.Children[0]; got != 2 {
 		t.Fatalf("original child changed through clone: got %d, want 2", got)
+	}
+}
+
+func TestNodeClone_AllocatesOnlyNodeAndEntryList(t *testing.T) {
+	original := &Node{
+		IsLeaf: true,
+		entries: []Entry{
+			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
+			{key: []byte("beta"), value: bytes.Repeat([]byte("b"), 128)},
+		},
+	}
+
+	var clone *Node
+	if got := testing.AllocsPerRun(100, func() {
+		clone = original.Clone()
+	}); got != 2 {
+		t.Fatalf("Node.Clone allocations: got %v, want 2", got)
+	}
+	if clone == nil || len(clone.entries) != 2 {
+		t.Fatalf("cloned entries: got %+v", clone)
 	}
 }
 
