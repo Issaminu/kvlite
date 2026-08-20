@@ -34,13 +34,19 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 	bucket.children[string(b.name)] = b
 }
 
-// writeBackRoot records this bucket's current root page in the entry that points to it. That entry belongs to the database catalog for a top-level bucket, or to the parent bucket for a nested bucket.
-func (b *Bucket) writeBackRoot() error {
-	entry := btree.NewEntry(btree.BucketLeafFlag, b.name, page.EncodeID(b.rootNode.PageID()))
-	if b.parentBucket == nil {
-		return b.tx.putCatalogEntry(entry)
+// writeBackRoot updates the existing fixed-size root pointer after a root split.
+// The transaction already loaded this entry before it changed the bucket tree.
+func (bucket *Bucket) writeBackRoot() {
+	entry := btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(bucket.rootNode.PageID()))
+	var err error
+	if bucket.parentBucket == nil {
+		err = bucket.tx.putCatalogEntry(entry)
+	} else {
+		err = bucket.parentBucket.putBucketEntry(entry)
 	}
-	return b.parentBucket.putBucketEntry(entry)
+	if err != nil {
+		panic("kvlite: failed to update an existing bucket root pointer: " + err.Error())
+	}
 }
 
 // CreateBucket creates a top-level bucket named bucketName in a writable transaction. The new bucket is part of the transaction, so [DB.Update] commits or rolls it back with the other changes in that transaction.
@@ -208,7 +214,12 @@ func (bucket *Bucket) lookupBucket(bucketName []byte) (*Bucket, error) {
 
 // Put stores value under key in bucket. The write is visible to later reads in the same transaction, but Put does not commit it; [DB.Update] commits or rolls back all transaction changes together.
 //
-// Put copies key and value before it returns, and it treats a nil value as empty. It returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the transaction callback returns. An empty key returns [ErrKeyRequired], while oversized data returns [ErrKeyTooLarge], [ErrValueTooLarge], or [ErrEntryTooLargeForPage]. If key names a nested bucket, Put returns [ErrIncompatibleValue] instead of replacing it.
+// Put copies key and value before it returns, and it treats a nil value as empty.
+// It returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the transaction callback returns.
+// An empty key returns [ErrKeyRequired], while oversized data returns [ErrKeyTooLarge], [ErrValueTooLarge], or [ErrEntryTooLargeForPage].
+// [ErrEntryTooLargeForPage] also applies when the entry fits a leaf but its key cannot fit a required branch separator.
+// If key names a nested bucket, Put returns [ErrIncompatibleValue] instead of replacing it.
+// A returned error does not change the bucket, so the caller can continue to use the transaction.
 func (bucket *Bucket) Put(key, value []byte) error {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
@@ -217,16 +228,17 @@ func (bucket *Bucket) Put(key, value []byte) error {
 }
 
 func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
+	oldRootPageID := bucket.rootNode.PageID()
 	newRoot, err := bucket.tx.putTreeEntry(bucket.rootNode, entry)
 	if err != nil {
 		return err
 	}
-	if newRoot == bucket.rootNode {
+	bucket.rootNode = newRoot
+	if newRoot.PageID() == oldRootPageID {
 		return nil
 	}
-
-	bucket.rootNode = newRoot
-	return bucket.writeBackRoot()
+	bucket.writeBackRoot()
+	return nil
 }
 
 // Get returns the value stored under key in bucket, including a value written earlier in the same transaction. It returns [ErrKeyNotFound] when the key is absent and [ErrIncompatibleValue] when the key names a nested bucket. An empty key returns [ErrKeyRequired], an oversized key returns [ErrKeyTooLarge], and a call after the transaction callback returns fails with [ErrTxClosed].

@@ -51,9 +51,7 @@ type Node struct {
 	IsLeaf   bool
 	entries  []Entry
 	Children []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
-	Index    int       // this node's index within it's parent node's Children array
 	pgid     page.ID
-	parent   *Node
 }
 
 func NewLeafNode(pgid page.ID) *Node {
@@ -61,14 +59,11 @@ func NewLeafNode(pgid page.ID) *Node {
 }
 
 func NewRootNode(pgid page.ID, leftNode, rightNode *Node, separator []byte) *Node {
-	rootNode := &Node{
-		entries:  []Entry{{key: separator}},
+	return &Node{
+		entries:  []Entry{{key: slices.Clone(separator)}},
 		Children: []page.ID{leftNode.pgid, rightNode.pgid},
 		pgid:     pgid,
 	}
-	leftNode.parent = rootNode
-	rightNode.parent = rootNode
-	return rootNode
 }
 
 func (n *Node) PageID() page.ID {
@@ -79,25 +74,16 @@ func (n *Node) SetPageID(pgid page.ID) {
 	n.pgid = pgid
 }
 
-func (n *Node) Parent() *Node {
-	return n.parent
-}
-
-func (n *Node) SetParent(parent *Node) {
-	n.parent = parent
-}
-
 func (n *Node) EntryCount() int {
 	return len(n.entries)
 }
 
-// Clone returns an independent copy of n without a parent link.
+// Clone returns an independent copy of n with the same page ID.
 func (n *Node) Clone() *Node {
 	clone := &Node{
 		IsLeaf:   n.IsLeaf,
 		entries:  make([]Entry, len(n.entries)),
 		Children: slices.Clone(n.Children),
-		Index:    n.Index,
 		pgid:     n.pgid,
 	}
 	for index, entry := range n.entries {
@@ -169,10 +155,11 @@ func (n *Node) FindEntryRef(key []byte) (Entry, bool, error) {
 		return Entry{}, found, err
 	}
 
-	if n.entries[idx].value == nil {
-		n.entries[idx].value = []byte{}
+	entry := n.entries[idx]
+	if entry.value == nil {
+		entry.value = []byte{}
 	}
-	return n.entries[idx], true, nil
+	return entry, true, nil
 }
 
 func cloneValue(value []byte) []byte {
@@ -183,32 +170,54 @@ func cloneValue(value []byte) []byte {
 	return value
 }
 
-func (n *Node) InsertEntry(entry Entry) error {
+type leafInsert struct {
+	entry Entry
+	index int
+	found bool
+}
+
+// prepareInsert checks a leaf insertion without changing the leaf.
+func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
 	if !n.IsLeaf {
-		return ErrNotLeafNode
+		return leafInsert{}, ErrNotLeafNode
 	}
 
 	idx, found, err := n.findKeyIndex(entry.key)
 	if err != nil {
-		return err
+		return leafInsert{}, err
 	}
 	if found {
 		existingIsBucket := n.entries[idx].flags&BucketLeafFlag != 0
 		newIsBucket := entry.flags&BucketLeafFlag != 0
 		if existingIsBucket != newIsBucket {
-			return ErrIncompatibleValue
+			return leafInsert{}, ErrIncompatibleValue
 		}
-		n.entries[idx].flags = entry.flags
-		n.entries[idx].value = cloneValue(entry.value)
-		return nil
+	}
+	return leafInsert{entry: entry, index: idx, found: found}, nil
+}
+
+// applyInsert changes a leaf after prepareInsert has accepted the operation.
+func (n *Node) applyInsert(prepared leafInsert) {
+	if prepared.found {
+		n.entries[prepared.index].flags = prepared.entry.flags
+		n.entries[prepared.index].value = cloneValue(prepared.entry.value)
+		return
 	}
 
+	entry := prepared.entry
 	entry.key = slices.Clone(entry.key)
 	entry.value = cloneValue(entry.value)
 
 	n.entries = append(n.entries, Entry{})
-	copy(n.entries[idx+1:], n.entries[idx:])
-	n.entries[idx] = entry
+	copy(n.entries[prepared.index+1:], n.entries[prepared.index:])
+	n.entries[prepared.index] = entry
+}
 
+func (n *Node) InsertEntry(entry Entry) error {
+	prepared, err := n.prepareInsert(entry)
+	if err != nil {
+		return err
+	}
+	n.applyInsert(prepared)
 	return nil
 }

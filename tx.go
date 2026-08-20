@@ -19,26 +19,26 @@ type Tx struct {
 	buckets   map[string]*Bucket // per-tx cache: one *Bucket handle per top-level name, so every caller in this tx observes the same in-memory state
 }
 
-// newTx creates an isolated metadata, root, and page-cache view of the current committed database state.
+// newTx borrows committed state for a read transaction and creates private mutable state for a write transaction.
 func newTx(db *DB, readOnly bool) *Tx {
-	meta := *db.meta
-	tx := &Tx{db: db, meta: &meta, readOnly: readOnly}
+	tx := &Tx{db: db, meta: db.meta, readOnly: readOnly}
 	tx.store = &txTreeStore{
-		tx:    tx,
-		nodes: make(map[page.ID]*btree.Node),
-		dirty: make(map[page.ID]*btree.Node),
+		tx: tx,
+	}
+	if !readOnly {
+		meta := *db.meta
+		tx.meta = &meta
+		tx.store.nodes = make(map[page.ID]*btree.Node)
+		tx.store.dirty = make(map[page.ID]*btree.Node)
 	}
 	tx.tree = btree.NewTree(tx.store)
 
-	// Writable transactions clone the cached catalog root because tree operations
-	// can change a node in place. Read-only transactions share the cached root;
-	// callers must treat Bucket.Get results as read-only (see doc.go).
-	rootNode := db.rootNode
+	// B+tree writes clone a node before they change it. Both transaction modes can
+	// start from this committed read-only root without changing shared state.
+	tx.rootNode = db.rootNode
 	if !readOnly {
-		rootNode = db.rootNode.Clone()
+		tx.store.nodes[db.rootNode.PageID()] = db.rootNode
 	}
-	tx.store.nodes[rootNode.PageID()] = rootNode
-	tx.rootNode = rootNode
 	return tx
 }
 
@@ -73,6 +73,16 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	}
 	db.meta = tx.meta
 	db.rootNode = tx.rootNode
+
+	// The WAL commit made these final node images committed. Publish child nodes
+	// only now so a failed append or sync cannot replace readable cache entries.
+	// The catalog root remains in db.rootNode and does not consume a cache slot.
+	for _, node := range tx.store.dirty {
+		if node.PageID() == db.rootNode.PageID() {
+			continue
+		}
+		db.pageCache.Put(node)
+	}
 	if needsCheckpoint {
 		// The WAL is already durable. A checkpoint failure must not turn this
 		// committed transaction into a reported failure.
@@ -135,10 +145,8 @@ func (tx *Tx) writableError() error {
 	return nil
 }
 
-// putCatalogEntry writes entry to the transaction's top-level tree. putTreeEntry
-// can return a replacement root after a split, but it does not install that
-// root. This method installs it and updates meta.root so recovery uses the root
-// that contains the entry.
+// putCatalogEntry writes entry to the transaction's top-level tree and records
+// a replacement catalog root in the transaction metadata.
 func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
 	newRoot, err := tx.putTreeEntry(tx.rootNode, entry)
 	if err != nil {

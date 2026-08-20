@@ -20,13 +20,14 @@ const (
 
 // DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied or used concurrently. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
 type DB struct {
-	path     string
-	file     *os.File
-	meta     *page.Meta
-	rootNode *btree.Node
-	options  *Options
-	wal      *wal.WAL
-	closed   bool
+	path      string
+	file      *os.File
+	meta      *page.Meta
+	rootNode  *btree.Node
+	pageCache *nodeCache
+	options   *Options
+	wal       *wal.WAL
+	closed    bool
 }
 
 func (db *DB) ensureOpen() error {
@@ -131,6 +132,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		}
 	}
 
+	db.pageCache = newNodeCache(pageCacheCapacity(db.options.PageCacheBytes, db.meta.PageSize(), db.options.DisablePageCache))
 	if err := db.loadRootNode(); err != nil {
 		return db.failOpen(err)
 	}
@@ -162,7 +164,7 @@ func (db *DB) loadRootNode() error {
 	if db.rootNode != nil {
 		return nil
 	}
-	rootNode, err := db.readNode(db.meta.Root())
+	rootNode, err := db.loadNode(db.meta.Root())
 	if err != nil {
 		return err
 	}
@@ -232,7 +234,8 @@ func (db *DB) Path() string {
 // Put stores value under key in the top-level bucket named bucketName.
 // It is equivalent to resolving the bucket and calling [Bucket.Put] inside
 // [DB.Update], so it replaces an existing value atomically and returns any
-// lookup, write, or commit error.
+// lookup, write, or commit error. See [Bucket.Put] for entry-size and
+// bucket-conflict errors.
 //
 // The bucket must already exist. An empty bucket name returns
 // [ErrBucketNameRequired], and a missing bucket returns [ErrBucketNotFound].
@@ -294,7 +297,20 @@ func (db *DB) hasMeta() bool {
 	return fi.Size() > 0
 }
 
+// readNode returns a read-only committed node. A cache miss reads the WAL before the main file so the cache never publishes an older page image.
 func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
+	if node, ok := db.pageCache.Get(pgid); ok {
+		return node, nil
+	}
+	node, err := db.loadNode(pgid)
+	if err != nil {
+		return nil, err
+	}
+	db.pageCache.Put(node)
+	return node, nil
+}
+
+func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
 	// check if Node exists exists in [wal.WAL.overlay]
 	record, ok := db.wal.Lookup(pgid)
 	if ok {

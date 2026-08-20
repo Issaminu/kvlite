@@ -17,7 +17,7 @@ var (
 	ErrKeyTooLarge       = errors.New("key too large")
 	ErrKeyRequired       = errors.New("key required")
 	ErrValueTooLarge     = errors.New("value too large")
-	ErrEntryTooLarge     = errors.New("key/value entry is too large to fit in a single page on its own")
+	ErrEntryTooLarge     = errors.New("entry cannot fit the fixed-page tree representation")
 )
 
 const BucketLeafFlag uint32 = 0x01

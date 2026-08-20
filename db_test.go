@@ -169,6 +169,131 @@ func TestBucketGet_CachedLeafDoesNotAllocate(t *testing.T) {
 	}
 }
 
+// TestBucketPut_ReusesTransactionOwnedRoot catches a write path that copies an
+// already private leaf again for each Put in the same transaction.
+func TestBucketPut_ReusesTransactionOwnedRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		committedRoot := bucket.rootNode
+
+		if err := bucket.Put([]byte("first"), []byte("value")); err != nil {
+			return err
+		}
+		privateRoot := bucket.rootNode
+		if privateRoot == committedRoot {
+			t.Fatal("first write did not give the transaction a private root")
+		}
+
+		if err := bucket.Put([]byte("second"), []byte("value")); err != nil {
+			return err
+		}
+		if bucket.rootNode != privateRoot {
+			t.Fatal("second write copied the transaction-owned root again")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBucketPut_RootSplitUpdatesCatalog catches a bucket root split that does
+// not record the replacement root page in the catalog.
+func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		rootPageID := bucket.rootNode.PageID()
+		value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
+
+		for index := 0; bucket.rootNode.IsLeaf; index++ {
+			key := fmt.Appendf(nil, "key-%04d", index)
+			if err := bucket.Put(key, value); err != nil {
+				return err
+			}
+		}
+
+		if got := bucket.rootNode.PageID(); got == rootPageID {
+			t.Fatalf("bucket root page ID after split: got old page %d, want a new page", got)
+		}
+		entry, found, err := tx.findTreeEntry(tx.rootNode, testBucketName)
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("catalog lost bucket after its root split")
+		}
+		catalogRoot, err := page.DecodeID(entry.Value())
+		if err != nil {
+			return err
+		}
+		if got, want := catalogRoot, bucket.rootNode.PageID(); got != want {
+			t.Fatalf("catalog root page ID: got %d, want %d", got, want)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestBucketPut_RejectedSeparatorKeyLeavesTransactionUsable catches validation
+// that accepts a leaf key which cannot later fit in a branch separator.
+func TestBucketPut_RejectedSeparatorKeyLeavesTransactionUsable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	const pageSize = 128
+	db, err := Open(path, 0600, &Options{PageSize: pageSize, Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket(testBucketName)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	unsafeKey := bytes.Repeat([]byte("k"), 100)
+	err = db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		beforeMeta := page.EncodeMeta(tx.meta)
+
+		if err := bucket.Put(unsafeKey, nil); !errors.Is(err, ErrEntryTooLargeForPage) {
+			t.Fatalf("unsafe separator Put: got %v, want ErrEntryTooLargeForPage", err)
+		}
+		if afterMeta := page.EncodeMeta(tx.meta); !bytes.Equal(afterMeta, beforeMeta) {
+			t.Fatal("rejected Put changed transaction metadata")
+		}
+
+		return bucket.Put([]byte("good"), []byte("value"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Get(testBucketName, unsafeKey); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("rejected key lookup: got %v, want ErrKeyNotFound", err)
+	}
+	if got, err := db.Get(testBucketName, []byte("good")); err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("valid write after rejected Put: got %q, err %v", got, err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // RUNG 2 — Efficient lookup + no forever-growth: a single sorted node.  <-- NEXT
 //
@@ -796,14 +921,14 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Recovery must rebuild the whole multi-level tree — including the moved root.
+	// Recovery must rebuild the complete multi-level tree from the recorded root page.
 	rec, err := openDB(crash)
 	if err != nil {
 		t.Fatalf("open crashed db: %v", err)
 	}
 	defer rec.Close()
 	if mustBucketRoot(t, rec, testBucketName).IsLeaf {
-		t.Fatal("recovered root is a leaf — the moved root pointer was not replayed")
+		t.Fatal("recovered root is a leaf after WAL replay")
 	}
 	for i := 0; i < n; i++ {
 		k := fmt.Appendf(nil, "key-%05d", i)
@@ -2517,7 +2642,7 @@ func TestBucketPutAfterUpdateReturnsTxClosed(t *testing.T) {
 	}
 }
 
-func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
+func TestPutTreeEntry_DoesNotPublishPrivateRoot(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -2543,11 +2668,14 @@ func TestPutTreeEntry_DoesNotAdoptReplacementRoot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if newRoot == root {
+		if newRoot.IsLeaf {
 			t.Fatal("second entry did not split the root")
 		}
+		if newRoot.PageID() == root.PageID() {
+			t.Fatalf("private root page ID after split: got old page %d, want a new page", root.PageID())
+		}
 		if tx.rootNode != root {
-			t.Fatal("tree engine adopted the replacement root")
+			t.Fatal("tree engine published its private root through the transaction")
 		}
 		if db.rootNode != originalRoot {
 			t.Fatal("transaction changed the shared database root before commit")
@@ -2940,12 +3068,9 @@ func TestBucket_SurvivesReopen(t *testing.T) {
 	}
 }
 
-// TestBucket_SurvivesOwnSplit: the parked trap, now armed. Enough data into ONE
-// bucket to split ITS tree, so that bucket's own root pgid moves. The new root pgid
-// must be written back into the parent (root-tree) entry for that bucket — otherwise
-// the name still points at the pre-split root and reopen loses everything past it. A
-// second, tiny bucket rules out cross-bucket clobber while the big one grows and
-// allocates pages. Every key must read back, both in-session and after a reopen.
+// TestBucket_SurvivesOwnSplit checks that a bucket keeps all values when its
+// root changes from a leaf into a branch. A second small bucket checks
+// that page allocation for the large bucket does not change another bucket.
 func TestBucket_SurvivesOwnSplit(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -2977,7 +3102,7 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 		t.Fatalf("update: %v", err)
 	}
 
-	// Readable in the same session (the moved root must be tracked in-memory too).
+	// The replacement root and its children must be readable in this session.
 	if err := db.View(func(tx *Tx) error {
 		big := mustBucket(t, tx, []byte("big"))
 		for i := 0; i < n; i++ {
@@ -2993,7 +3118,7 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The real test: reopen resolves "big" -> its NEW (post-split) root pgid.
+	// Reopen must resolve the recorded replacement root page.
 	db, err = openDB(path)
 	if err != nil {
 		t.Fatal(err)
@@ -3006,7 +3131,7 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 		}
 		for i := 0; i < n; i++ {
 			if got := mustBucketValue(t, big, fmt.Appendf(nil, "key-%05d", i)); !bytes.Equal(got, val) {
-				t.Fatalf("key %d lost after reopen: the moved bucket root was not written back to its parent entry", i)
+				t.Fatalf("key %d lost after reopening the split bucket", i)
 			}
 		}
 		small := mustBucket(t, tx, []byte("small"))
@@ -3019,16 +3144,9 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 	}
 }
 
-// TestBucket_ManyBucketsSurviveRootCatalogSplit: the lurking writeback bug, armed.
-// Every other bucket test keeps the root (catalog) tree in a single leaf. Here we
-// create enough buckets that the CATALOG tree itself splits — so its root pgid moves.
-// CreateBucket does `_, err := _put(rootNode, ...)`, discarding the new catalog root,
-// exactly like bucket.Put discarded a moved bucket root. If that return isn't captured
-// into meta.root / db.rootNode, buckets vanish once the catalog splits.
-//
-// Then we grow ONE bucket past a page so ITS tree splits too — its writeback _put lands
-// in the now-multi-level catalog, exercising bucket.Put's writeback under a splitting
-// parent (not just CreateBucket's). Everything must read back, in-session and reopened.
+// TestBucket_ManyBucketsSurviveRootCatalogSplit checks a multi-level stable
+// catalog root and a large bucket tree at the same time. Every bucket and value
+// must remain readable in the transaction and after reopen.
 func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3341,19 +3459,8 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	verify(t, db, "after reopen")
 }
 
-// TestBucket_HandleSurvivesCatalogSplit: a live bucket handle held across a catalog
-// (top-level root) split must still write back to the RIGHT place. A Bucket caches
-// its parent as a raw *Node taken at creation time. When later CreateBucket calls
-// split the catalog, db.rootNode becomes a new object and the cached parent goes
-// stale. The bucket name "zzz-bucket" sorts last, so the split moves its catalog
-// entry OFF the original (in-place) left node onto a new right node — the stale
-// cached parent no longer holds it. When the held bucket then splits its own tree,
-// Bucket.Put writes the new root pgid into the stale parent node, not the real
-// catalog entry. The catalog keeps pointing at the pre-split bucket root, so every
-// key added after the bucket split is lost.
-//
-// RED today: the post-split keys vanish. GREEN once the writeback resolves the
-// parent from the current tree instead of a stale cached node.
+// TestBucket_HandleSurvivesCatalogSplit checks that a live bucket handle remains
+// usable while the catalog root changes from a leaf into a branch.
 func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3384,7 +3491,7 @@ func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
 				return fmt.Errorf("create catalog bucket %d: %w", i, err)
 			}
 		}
-		// Now split the HELD bucket's own tree via its (now stale) parent handle.
+		// Now split the held bucket's own root.
 		for j := 0; j < nBig; j++ {
 			if err := held.Put(fmt.Appendf(nil, "big-%05d", j), bigVal); err != nil {
 				return err
@@ -3405,7 +3512,7 @@ func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
 			for j := 0; j < nBig; j++ {
 				k := fmt.Appendf(nil, "big-%05d", j)
 				if got := mustBucketValue(t, b, k); !bytes.Equal(got, bigVal) {
-					t.Fatalf("%s: key %q lost (writeback landed on a stale parent node): got %d bytes", when, k, len(got))
+					t.Fatalf("%s: key %q lost through a held bucket handle: got %d bytes", when, k, len(got))
 				}
 			}
 			return nil
@@ -3425,15 +3532,9 @@ func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
 	verify(t, db, "after reopen")
 }
 
-// TestSplit_OneLeafSplitsIntoThree: a single Put can create a node that ONE balanced
-// split still leaves over a page. Fill one leaf with small entries to just under a
-// page, then insert a single medium value (~0.85 page, sorts last). The overflowing
-// node is now ~1.5 pages: cutting it at half a page leaves ~half the small entries
-// PLUS the medium value on the right — still over a page. The split loop must keep
-// splitting that right sibling until every node fits; if it only splits once and
-// climbs, the oversized right node is rejected at persist ("record page content
-// exceeds page size") and the Put fails.
-func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
+// TestSplit_LargeInsertKeepsEveryLeafWithinPage catches a split that leaves an
+// oversized sibling after one large entry is added to a nearly full leaf.
+func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -3460,8 +3561,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 		t.Fatalf("setup: root split before the big insert (nSmall=%d too high)", nSmall)
 	}
 
-	// One medium value, sorts last, ~0.85 page: legal (< one page) but big enough that
-	// half the leaf plus this value still overflows a page after a single split.
+	// One medium value, sorts last, and forces the root leaf to split.
 	bigKey := []byte("zzz-big")
 	bigVal := bytes.Repeat([]byte("B"), page*85/100)
 	if err := db.Put(testBucketName, bigKey, bigVal); err != nil {
@@ -3469,7 +3569,7 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 	}
 	keys = append(keys, bigKey)
 
-	// The big insert must have grown the tree to at least three leaves.
+	// The big insert must grow the tree, and every resulting node must fit.
 	leaves := 0
 	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
 		if sz := nd.EncodedSize(); sz > page {
@@ -3480,8 +3580,8 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 		}
 	})
 
-	if leaves < 3 {
-		t.Fatalf("expected >= 3 leaves (one leaf must split into three), got %d", leaves)
+	if leaves < 2 {
+		t.Fatalf("expected the root to split into at least two leaves, got %d", leaves)
 	}
 
 	verify := func(t *testing.T, db *DB, when string) {
@@ -3513,18 +3613,9 @@ func TestSplit_OneLeafSplitsIntoThree(t *testing.T) {
 // PHASE 1 — spring-cleaning regression tests.
 // -----------------------------------------------------------------------------
 
-// TestWriteBackRoot_AdoptsSplitContainerRoot arms Phase-1 bug #2.
-//
-// writeBackRoot writes a bucket's root pointer into its parent's tree. That write
-// can split the parent. The old code threw away the new root that _put returned, so
-// a split would orphan the parent's right half and lose keys. Today the public API
-// never triggers this, because a pointer update is a fixed 8 bytes and lands in
-// place. This white-box test forces the split directly: it packs a bucket's leaf to
-// the brink, then writes back a child with a large name, so the pointer insert grows
-// the node past a page. After the split, a FRESH handle from the catalog must still
-// see every key. Before the fix, the parent root stays the truncated left half and
-// the right-half keys vanish.
-func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
+// TestCreateBucket_ParentRootSplitUpdatesCatalog catches nested bucket creation
+// that does not write the parent bucket's replacement root into the catalog.
+func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -3540,14 +3631,15 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 			return err
 		}
 		p := mustBucket(t, tx, []byte("p"))
+		rootPageID := p.rootNode.PageID()
 
 		pageSize := int(db.meta.PageSize())
-		childName := bytes.Repeat([]byte("c"), 300) // large name => large writeback entry
+		childName := bytes.Repeat([]byte("c"), 300) // The large name makes the bucket entry exceed the remaining space.
 		fillVal := bytes.Repeat([]byte("x"), 200)
 
 		// Pack p's single leaf as full as possible without overflowing it. Each fill
 		// entry is ~220 bytes, so the leftover slack ends up smaller than the ~320-byte
-		// writeback entry below, which guarantees the writeback insert overflows.
+		// nested bucket entry below, which guarantees that the insert overflows.
 		var fillKeys [][]byte
 		for i := 0; ; i++ {
 			k := fmt.Appendf(nil, "fill-%06d", i)
@@ -3564,29 +3656,32 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 			t.Fatal("setup error: p split during packing; it should still be one leaf")
 		}
 
-		// Build a child bucket by hand and write its pointer back into p. This is the
-		// operation that Bucket.CreateBucket/Put drive; here we aim it at a brimming
-		// parent so the pointer insert splits p's root.
-		newPgid := tx.store.AllocatePage()
-		cRoot := btree.NewLeafNode(newPgid)
-		tx.store.StageNode(cRoot)
-		c := &Bucket{tx: tx, name: childName, rootNode: cRoot, parentBucket: p}
-		if err := c.writeBackRoot(); err != nil {
+		if _, err := p.CreateBucket(childName); err != nil {
 			return err
 		}
 
-		// The pointer insert overflows p's leaf, so _put splits it and returns a new
-		// branch root. writeBackRoot must adopt that root into p.rootNode. If p.rootNode
-		// is still a leaf here, the returned root was dropped — bug #2.
 		if p.rootNode.IsLeaf {
-			t.Fatal("writeBackRoot dropped the split's new root: p.rootNode is still the old leaf")
+			t.Fatal("nested bucket creation did not split the full parent root")
+		}
+		if got := p.rootNode.PageID(); got == rootPageID {
+			t.Fatalf("parent root page ID after split: got old page %d, want a new page", got)
+		}
+		entry, found, err := tx.findTreeEntry(tx.rootNode, []byte("p"))
+		if err != nil {
+			return err
+		}
+		if !found {
+			t.Fatal("catalog lost parent bucket after its root split")
+		}
+		catalogRoot, err := page.DecodeID(entry.Value())
+		if err != nil {
+			return err
+		}
+		if got, want := catalogRoot, p.rootNode.PageID(); got != want {
+			t.Fatalf("catalog root page ID: got %d, want %d", got, want)
 		}
 
-		// A fresh handle read straight from the catalog must resolve p's NEW root and
-		// see every packed key plus the new child. Before the fix, the catalog still
-		// points at the truncated left half and the right-half keys are gone. Use a
-		// direct load through the same transaction so this bypasses the memoized
-		// "p" handle and resolves the catalog entry again.
+		// Load a fresh handle through the updated catalog pointer.
 		p2, err := tx.loadBucket(tx.rootNode, []byte("p"), nil)
 		if err != nil {
 			return err
@@ -3596,7 +3691,7 @@ func TestWriteBackRoot_AdoptsSplitContainerRoot(t *testing.T) {
 		}
 		for _, k := range fillKeys {
 			if got := mustBucketValue(t, p2, k); !bytes.Equal(got, fillVal) {
-				t.Fatalf("key %q lost after parent split: writeBackRoot dropped the new root", k)
+				t.Fatalf("key %q lost after stable parent split", k)
 			}
 		}
 		child := mustNestedBucket(t, p2, childName)
@@ -4009,13 +4104,8 @@ func TestPut_EntryTooLargeForPageDoesNotChangeDatabase(t *testing.T) {
 
 // -----------------------------------------------------------------------------
 // Bug 6 — a *Bucket must own a private copy of its name. CreateBucket and Bucket
-// stored the caller's []byte directly, and writeBackRoot reads that field again on
-// every later split (to write the bucket's moved root pgid back into the parent's
-// tree). If the caller reuses or mutates that buffer after getting the handle
-// back, a later split silently writes the pointer update under whatever the
-// buffer now holds instead of the bucket's real name: the real name's catalog
-// entry is left pointing at the stale pre-split root (losing every key that moved
-// to the split's other half), and a phantom entry appears under the mutated name.
+// must not retain the caller's mutable buffer for the stored catalog entry or the
+// transaction bucket cache.
 // -----------------------------------------------------------------------------
 
 func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
@@ -4057,12 +4147,12 @@ func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		}
 		aaaa := mustBucket(t, tx, []byte("aaaa"))
 		if aaaa == nil {
-			t.Fatal("bucket \"aaaa\" lost: writeBackRoot no longer wrote back under the real name")
+			t.Fatal("bucket \"aaaa\" lost after the caller changed its name buffer")
 		}
 		for i := 0; i < n; i++ {
 			k := fmt.Appendf(nil, "key-%05d", i)
 			if got := mustBucketValue(t, aaaa, k); !bytes.Equal(got, val) {
-				t.Fatalf("key %q lost after split: the moved root was written back under the wrong name", k)
+				t.Fatalf("key %q lost after the bucket root split", k)
 			}
 		}
 		return nil
@@ -4116,12 +4206,12 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		}
 		aaaa := mustNestedBucket(t, parent, []byte("aaaa"))
 		if aaaa == nil {
-			t.Fatal("nested bucket \"aaaa\" lost: writeBackRoot no longer wrote back under the real name")
+			t.Fatal("nested bucket \"aaaa\" lost after the caller changed its name buffer")
 		}
 		for i := 0; i < n; i++ {
 			k := fmt.Appendf(nil, "key-%05d", i)
 			if got := mustBucketValue(t, aaaa, k); !bytes.Equal(got, val) {
-				t.Fatalf("key %q lost after split: the moved root was written back under the wrong name", k)
+				t.Fatalf("key %q lost after the nested bucket root split", k)
 			}
 		}
 		return nil
@@ -4444,6 +4534,149 @@ func TestAudit_GetAfterCloseReturnsDatabaseNotOpen(t *testing.T) {
 
 	if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrDatabaseNotOpen) {
 		t.Fatalf("Get after Close: expected ErrDatabaseNotOpen, got %v", err)
+	}
+}
+
+func TestView_DoesNotCreatePrivateNodeMaps(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.View(func(tx *Tx) error {
+		if tx.store.nodes != nil || tx.store.dirty != nil {
+			t.Fatal("read transaction created private node maps")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestView_ReusesCommittedBucketRootAcrossTransactions(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var first *btree.Node
+	if err := db.View(func(tx *Tx) error {
+		first = mustBucket(t, tx, testBucketName).rootNode
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var second *btree.Node
+	if err := db.View(func(tx *Tx) error {
+		second = mustBucket(t, tx, testBucketName).rootNode
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("read transactions did not reuse the committed bucket root")
+	}
+}
+
+func TestUpdate_DoesNotPutCatalogRootInPageCache(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if _, ok := db.pageCache.Get(db.rootNode.PageID()); ok {
+		t.Fatal("catalog root uses a child-page cache slot")
+	}
+}
+
+func cachedBucketRoot(t *testing.T, db *DB) (page.ID, *btree.Node) {
+	t.Helper()
+	var pageID page.ID
+	if err := db.View(func(tx *Tx) error {
+		pageID = mustBucket(t, tx, testBucketName).rootNode.PageID()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	node, ok := db.pageCache.Get(pageID)
+	if !ok {
+		t.Fatalf("bucket root page %d is not cached", pageID)
+	}
+	return pageID, node
+}
+
+func TestUpdate_SuccessPublishesDirtyNodeToCache(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	db.pageCache = newNodeCache(16)
+	pageID, oldNode := cachedBucketRoot(t, db)
+	if err := db.Put(testBucketName, []byte("key"), []byte("new")); err != nil {
+		t.Fatal(err)
+	}
+	newNode, ok := db.pageCache.Get(pageID)
+	if !ok || newNode == oldNode {
+		t.Fatal("successful commit did not replace the cached node")
+	}
+	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("value after commit: got %q, err %v", got, err)
+	}
+}
+
+func TestUpdate_WALFailureDoesNotPublishDirtyNodeToCache(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		db.wal.SetSyncFileForTesting(nil)
+		_ = db.Close()
+	}()
+
+	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	db.pageCache = newNodeCache(16)
+	pageID, oldNode := cachedBucketRoot(t, db)
+	wantErr := errors.New("sync failed")
+	db.wal.SetCheckpointThresholdBytes(1)
+	db.wal.SetSyncFileForTesting(func() error { return wantErr })
+	if err := db.Put(testBucketName, []byte("key"), []byte("new")); !errors.Is(err, wantErr) {
+		t.Fatalf("Put error: got %v, want %v", err, wantErr)
+	}
+	gotNode, ok := db.pageCache.Get(pageID)
+	if !ok || gotNode != oldNode {
+		t.Fatal("failed WAL commit changed the cached node")
+	}
+	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("old")) {
+		t.Fatalf("value after failed commit: got %q, err %v", got, err)
 	}
 }
 

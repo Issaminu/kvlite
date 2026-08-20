@@ -194,12 +194,9 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 		},
 	}
 
-	rightNode, splitIndex, separator, err := node.Split(rightPgid, pageSize)
+	rightNode, separator, err := node.Split(rightPgid, pageSize)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if splitIndex != 1 {
-		t.Fatalf("split index: got %d, want 1", splitIndex)
 	}
 	if !bytes.Equal(separator, []byte("b")) {
 		t.Fatalf("separator: got %q, want %q", separator, "b")
@@ -219,6 +216,7 @@ type memoryTreeStore struct {
 	pageSize int64
 	nextID   page.ID
 	nodes    map[page.ID]*Node
+	dirty    map[page.ID]*Node
 }
 
 func (store *memoryTreeStore) PageSize() int64 {
@@ -235,8 +233,21 @@ func (store *memoryTreeStore) AllocatePage() page.ID {
 	return pageID
 }
 
+func (store *memoryTreeStore) WritableNode(node *Node) *Node {
+	if dirty, ok := store.dirty[node.PageID()]; ok {
+		return dirty
+	}
+	private := node.Clone()
+	store.StageNode(private)
+	return private
+}
+
 func (store *memoryTreeStore) StageNode(node *Node) {
+	if store.dirty == nil {
+		store.dirty = make(map[page.ID]*Node)
+	}
 	store.nodes[node.PageID()] = node
+	store.dirty[node.PageID()] = node
 }
 
 func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
@@ -282,6 +293,53 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 	}
 }
 
+// TestTreePutEntry_RootSplitReturnsNewRoot catches a split that overwrites the
+// old root instead of returning a new branch root above it.
+func TestTreePutEntry_RootSplitReturnsNewRoot(t *testing.T) {
+	const (
+		pageSize   int64   = 128
+		rootPageID page.ID = 1
+	)
+	store := &memoryTreeStore{
+		pageSize: pageSize,
+		nextID:   2,
+		nodes:    make(map[page.ID]*Node),
+	}
+	tree := NewTree(store)
+	root := NewLeafNode(rootPageID)
+	store.StageNode(root)
+
+	for index := 0; root.IsLeaf; index++ {
+		key := fmt.Appendf(nil, "key-%02d", index)
+		value := bytes.Repeat([]byte("v"), 40)
+		var err error
+		root, err = tree.PutEntry(root, NewEntry(0, key, value))
+		if err != nil {
+			t.Fatalf("put %q: %v", key, err)
+		}
+	}
+
+	if got := root.PageID(); got == rootPageID {
+		t.Fatalf("root page ID after split: got old page %d, want a new page", got)
+	}
+	if root.IsLeaf {
+		t.Fatal("root remains a leaf after split")
+	}
+	if got := root.Children[0]; got != rootPageID {
+		t.Fatalf("left child page ID: got %d, want old root page %d", got, rootPageID)
+	}
+	for index := 0; index < 3; index++ {
+		key := fmt.Appendf(nil, "key-%02d", index)
+		entry, found, err := tree.FindEntry(root, key)
+		if err != nil {
+			t.Fatalf("find %q: %v", key, err)
+		}
+		if !found || !bytes.Equal(entry.Value(), bytes.Repeat([]byte("v"), 40)) {
+			t.Fatalf("find %q after root split: found=%t value=%q", key, found, entry.Value())
+		}
+	}
+}
+
 func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
 	store := &memoryTreeStore{pageSize: 128, nextID: 2, nodes: make(map[page.ID]*Node)}
 	tree := NewTree(store)
@@ -296,5 +354,94 @@ func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
 	}
 	if !found || !bytes.Equal(entry.Value(), []byte("value")) {
 		t.Fatalf("find reference: found=%t value=%q", found, entry.Value())
+	}
+}
+
+// TestNodeFindEntryRef_DoesNotChangeStoredEmptyValue catches a read that
+// normalizes the value by changing the stored node.
+func TestNodeFindEntryRef_DoesNotChangeStoredEmptyValue(t *testing.T) {
+	node := NewLeafNode(1)
+	node.entries = append(node.entries, Entry{key: []byte("key")})
+
+	entry, found, err := node.FindEntryRef([]byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || entry.Value() == nil || len(entry.Value()) != 0 {
+		t.Fatalf("empty value lookup: found=%t value=%v", found, entry.Value())
+	}
+	if node.entries[0].value != nil {
+		t.Fatal("FindEntryRef changed the stored node")
+	}
+}
+
+func TestTreePutEntry_DoesNotChangeStoredInputNodes(t *testing.T) {
+	left := NewLeafNode(2)
+	if err := left.InsertEntry(NewEntry(0, []byte("a"), []byte("old"))); err != nil {
+		t.Fatal(err)
+	}
+	right := NewLeafNode(3)
+	if err := right.InsertEntry(NewEntry(0, []byte("z"), []byte("right"))); err != nil {
+		t.Fatal(err)
+	}
+	root := &Node{
+		entries:  []Entry{{key: []byte("m")}},
+		Children: []page.ID{left.PageID(), right.PageID()},
+		pgid:     1,
+	}
+	store := &memoryTreeStore{
+		pageSize: 128,
+		nextID:   4,
+		nodes:    map[page.ID]*Node{1: root, 2: left, 3: right},
+	}
+	tree := NewTree(store)
+	beforeRoot := EncodeNode(root)
+	beforeLeft := EncodeNode(left)
+
+	if _, err := tree.PutEntry(root, NewEntry(0, []byte("a"), []byte("changed"))); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(EncodeNode(root), beforeRoot) {
+		t.Fatal("write changed the input root")
+	}
+	if !bytes.Equal(EncodeNode(left), beforeLeft) {
+		t.Fatal("write changed the stored input leaf")
+	}
+}
+
+func TestTreePutEntry_ClonesOnlyChangedLeafWithoutSplit(t *testing.T) {
+	left := NewLeafNode(2)
+	if err := left.InsertEntry(NewEntry(0, []byte("a"), []byte("old"))); err != nil {
+		t.Fatal(err)
+	}
+	right := NewLeafNode(3)
+	if err := right.InsertEntry(NewEntry(0, []byte("z"), []byte("right"))); err != nil {
+		t.Fatal(err)
+	}
+	root := &Node{
+		entries:  []Entry{{key: []byte("m")}},
+		Children: []page.ID{left.PageID(), right.PageID()},
+		pgid:     1,
+	}
+	store := &memoryTreeStore{
+		pageSize: 4096,
+		nextID:   4,
+		nodes:    map[page.ID]*Node{1: root, 2: left, 3: right},
+		dirty:    make(map[page.ID]*Node),
+	}
+	tree := NewTree(store)
+
+	if _, err := tree.PutEntry(root, NewEntry(0, []byte("a"), []byte("changed"))); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(store.dirty) != 1 {
+		t.Fatalf("dirty node count: got %d, want 1", len(store.dirty))
+	}
+	if _, ok := store.dirty[left.PageID()]; !ok {
+		t.Fatalf("dirty nodes do not contain changed leaf %d", left.PageID())
+	}
+	if _, ok := store.dirty[root.PageID()]; ok {
+		t.Fatalf("unchanged root %d is dirty", root.PageID())
 	}
 }
