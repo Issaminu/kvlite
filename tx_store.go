@@ -9,6 +9,8 @@ import (
 // Discarding a write store discards uncommitted node and metadata changes without restoring shared database state.
 type txTreeStore struct {
 	tx *Tx
+	// baseNodes contains page images from earlier callbacks in the same write batch. They remain private until the full batch commits to the WAL.
+	baseNodes map[page.ID]*btree.Node
 	// nodes is a write transaction's complete page view. It contains committed
 	// nodes read by the transaction and private nodes staged by the transaction.
 	// It stays nil for a read transaction.
@@ -25,6 +27,11 @@ func (store *txTreeStore) PageSize() int64 {
 func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 	// Returning the cached pointer makes later reads observe writes made earlier in this transaction.
 	if node, ok := store.nodes[pageID]; ok {
+		return node, nil
+	}
+	// WritableNode clones this shared batch image before it changes the node. This keeps an unsuccessful callback from changing an earlier result.
+	if node, ok := store.baseNodes[pageID]; ok {
+		store.nodes[pageID] = node
 		return node, nil
 	}
 

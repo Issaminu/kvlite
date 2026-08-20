@@ -22,24 +22,32 @@ type Tx struct {
 
 // newTx borrows committed state for a read transaction and creates private mutable state for a write transaction.
 func newTx(db *DB, readOnly bool) *Tx {
-	tx := &Tx{db: db, meta: db.meta, readOnly: readOnly}
+	if !readOnly {
+		return newWriteTx(db, db.meta, db.rootNode, nil)
+	}
+
+	tx := &Tx{db: db, meta: db.meta, rootNode: db.rootNode, readOnly: true}
 	tx.store = &txTreeStore{
 		tx: tx,
 	}
-	if !readOnly {
-		meta := *db.meta
-		tx.meta = &meta
-		tx.store.nodes = make(map[page.ID]*btree.Node)
-		tx.store.dirty = make(map[page.ID]*btree.Node)
+	tx.tree = btree.NewTree(tx.store)
+	return tx
+}
+
+// newWriteTx starts one private write transaction from baseMeta, baseRoot, and any page images prepared by earlier callbacks in the same write batch.
+func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseNodes map[page.ID]*btree.Node) *Tx {
+	meta := *baseMeta
+	tx := &Tx{db: db, meta: &meta, rootNode: baseRoot}
+	tx.store = &txTreeStore{
+		tx:        tx,
+		baseNodes: baseNodes,
+		nodes:     make(map[page.ID]*btree.Node),
+		dirty:     make(map[page.ID]*btree.Node),
 	}
 	tx.tree = btree.NewTree(tx.store)
 
-	// B+tree writes clone a node before they change it. Both transaction modes can
-	// start from this committed read-only root without changing shared state.
-	tx.rootNode = db.rootNode
-	if !readOnly {
-		tx.store.nodes[db.rootNode.PageID()] = db.rootNode
-	}
+	// B+tree writes clone this read-only root before they change it.
+	tx.store.nodes[baseRoot.PageID()] = baseRoot
 	return tx
 }
 
@@ -47,15 +55,27 @@ func newTx(db *DB, readOnly bool) *Tx {
 //
 // If transaction returns an error, Update discards every change and returns that error. If it panics, Update discards every change before the panic continues to the caller. When transaction returns nil, Update writes the transaction to the write-ahead log and returns any error that prevents that commit.
 //
+// KVLite runs concurrent Update callbacks in serial order. In [SyncFull] mode, concurrent successful callbacks can form one atomic write batch. Later callbacks in that batch see earlier successful changes. A callback error discards only that callback's changes. A write-ahead log error returns to every successful callback whose result depends on that batch, and none of the batch changes become visible.
+//
 // An automatic checkpoint can run after the write-ahead log commit. If that checkpoint fails, the transaction remains committed, Update returns nil, and KVLite keeps the log data so a later write or [DB.Close] can retry the checkpoint.
 func (db *DB) Update(transaction func(tx *Tx) error) error {
-	if err := db.ensureOpen(); err != nil {
+	if err := db.beginOperation(); err != nil {
 		return err
 	}
+	defer db.endOperation()
 	if db.options.ReadOnly {
 		return ErrDatabaseReadOnly
 	}
+	if db.options.Synchronous == SyncFull {
+		return db.submitDurableUpdate(transaction)
+	}
 
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	return db.updateDirect(transaction)
+}
+
+func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	tx := newTx(db, false)
 	defer func() { tx.closed = true }()
 
@@ -96,26 +116,31 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 // walRecords encodes one final image for each changed page and includes metadata only when it changed.
 // Update calls it after the transaction callback succeeds, so callback failure does no encoding or WAL work.
 func (tx *Tx) walRecords() []wal.Record {
-	if len(tx.store.dirty) == 0 && !tx.metaDirty {
+	return encodeWALRecords(tx.store.dirty, tx.meta, tx.metaDirty)
+}
+
+// encodeWALRecords encodes the final private image of each changed page. Repeated changes to one page produce one record for the transaction or batch.
+func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty bool) []wal.Record {
+	if len(dirty) == 0 && !metaDirty {
 		return nil
 	}
 
-	recordCapacity := len(tx.store.dirty)
-	if tx.metaDirty {
+	recordCapacity := len(dirty)
+	if metaDirty {
 		recordCapacity++
 	}
 	records := make([]wal.Record, 0, recordCapacity)
-	for pageID, node := range tx.store.dirty {
+	for pageID, node := range dirty {
 		records = append(records, wal.Record{
 			Header:      wal.RecordHeader{Type: wal.RecordTypeData, PageID: pageID},
 			PageContent: btree.EncodeNode(node),
 		})
 	}
-	if tx.metaDirty {
-		tx.meta.RefreshChecksum()
+	if metaDirty {
+		meta.RefreshChecksum()
 		records = append(records, wal.Record{
 			Header:      wal.RecordHeader{Type: wal.RecordTypeMeta, PageID: page.MetaID},
-			PageContent: page.EncodeMeta(tx.meta),
+			PageContent: page.EncodeMeta(meta),
 		})
 	}
 	return records
@@ -123,9 +148,14 @@ func (tx *Tx) walRecords() []wal.Record {
 
 // View runs transaction as one managed read-only transaction and returns its error. Writes through the Tx or its buckets return [ErrTxNotWritable], while reads remain available until the callback returns. If the callback panics, View closes the transaction before the panic continues to the caller.
 func (db *DB) View(transaction func(tx *Tx) error) error {
-	if err := db.ensureOpen(); err != nil {
+	if err := db.beginOperation(); err != nil {
 		return err
 	}
+	defer db.endOperation()
+
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+
 	tx := newTx(db, true)
 	defer func() { tx.closed = true }()
 	return transaction(tx)

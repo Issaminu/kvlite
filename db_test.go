@@ -18,6 +18,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -4588,6 +4590,394 @@ func TestAudit_GetAfterCloseReturnsDatabaseNotOpen(t *testing.T) {
 
 	if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrDatabaseNotOpen) {
 		t.Fatalf("Get after Close: expected ErrDatabaseNotOpen, got %v", err)
+	}
+}
+
+func TestUpdate_SerializesConcurrentCallbacks(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const updateCount = 16
+	start := make(chan struct{})
+	errorsByUpdate := make(chan error, updateCount)
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	var active atomic.Int64
+	var maximumActive atomic.Int64
+	ready.Add(updateCount)
+	done.Add(updateCount)
+
+	for range updateCount {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			errorsByUpdate <- db.Update(func(*Tx) error {
+				current := active.Add(1)
+				for {
+					maximum := maximumActive.Load()
+					if current <= maximum || maximumActive.CompareAndSwap(maximum, current) {
+						break
+					}
+				}
+				time.Sleep(10 * time.Millisecond)
+				active.Add(-1)
+				return nil
+			})
+		}()
+	}
+
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(errorsByUpdate)
+	for err := range errorsByUpdate {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := maximumActive.Load(); got != 1 {
+		t.Fatalf("maximum concurrent update callbacks: got %d, want 1", got)
+	}
+}
+
+func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		db.wal.SetSyncFileForTesting(nil)
+		_ = db.Close()
+	}()
+	createBucket(t, db, testBucketName)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+
+	var syncCalls atomic.Int64
+	db.wal.SetSyncFileForTesting(func() error {
+		syncCalls.Add(1)
+		return nil
+	})
+
+	const writeCount = 32
+	start := make(chan struct{})
+	errorsByWrite := make(chan error, writeCount)
+	var ready sync.WaitGroup
+	var done sync.WaitGroup
+	ready.Add(writeCount)
+	done.Add(writeCount)
+	for index := range writeCount {
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			key := []byte(fmt.Sprintf("key-%02d", index))
+			errorsByWrite <- db.Put(testBucketName, key, []byte("value"))
+		}()
+	}
+
+	ready.Wait()
+	close(start)
+	done.Wait()
+	close(errorsByWrite)
+	for err := range errorsByWrite {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	db.wal.SetSyncFileForTesting(nil)
+
+	if got := syncCalls.Load(); got > 4 {
+		t.Fatalf("WAL sync calls for %d concurrent writes: got %d, want at most 4", writeCount, got)
+	}
+	walBytes, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bytes.NewReader(walBytes)
+	transactionIDs := make(map[wal.TxID]struct{})
+	commitMarkers := 0
+	for {
+		record, err := wal.DecodeRecord(reader, db.meta.PageSize())
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		transactionIDs[record.Header.TxID] = struct{}{}
+		if wal.IsCommitMarker(record) {
+			commitMarkers++
+		}
+	}
+	if got, want := len(transactionIDs), int(syncCalls.Load()); got != want {
+		t.Fatalf("WAL transactions: got %d, want one for each of %d syncs", got, want)
+	}
+	if commitMarkers != len(transactionIDs) {
+		t.Fatalf("WAL commit markers: got %d, want %d", commitMarkers, len(transactionIDs))
+	}
+	for index := range writeCount {
+		key := []byte(fmt.Sprintf("key-%02d", index))
+		if value, err := db.Get(testBucketName, key); err != nil || !bytes.Equal(value, []byte("value")) {
+			t.Fatalf("read %q after grouped commit: value=%q error=%v", key, value, err)
+		}
+	}
+}
+
+func TestUpdate_DurableGoexitDoesNotStopWriteBatcher(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+
+	updateDone := make(chan struct{})
+	go func() {
+		defer close(updateDone)
+		_ = db.Update(func(tx *Tx) error {
+			if err := mustBucket(t, tx, testBucketName).Put([]byte("doomed"), []byte("value")); err != nil {
+				return err
+			}
+			runtime.Goexit()
+			return nil
+		})
+	}()
+	<-updateDone
+
+	select {
+	case <-db.writeBatcherDone:
+		t.Fatal("runtime.Goexit in an Update callback stopped the write batcher")
+	default:
+	}
+	if _, err := db.Get(testBucketName, []byte("doomed")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("Goexit update changed the database: got %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestWriteBatch_LaterCallbackSeesEarlierWrite(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+
+	requests := []*writeRequest{
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("first"), []byte("one"))
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			transaction: func(tx *Tx) error {
+				bucket := mustBucket(t, tx, testBucketName)
+				value, err := bucket.Get([]byte("first"))
+				if err != nil {
+					return err
+				}
+				if !bytes.Equal(value, []byte("one")) {
+					t.Fatalf("earlier batch value: got %q, want %q", value, "one")
+				}
+				return bucket.Put([]byte("second"), []byte("two"))
+			},
+			result: make(chan writeResult, 1),
+		},
+	}
+
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	for _, request := range requests {
+		if result := <-request.result; result.err != nil || result.panicked || result.goexited {
+			t.Fatalf("write result: %+v", result)
+		}
+	}
+}
+
+func TestWriteBatch_CallbackErrorDiscardsOnlyItsChanges(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+
+	wantErr := errors.New("discard callback")
+	requests := []*writeRequest{
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("kept-first"), []byte("one"))
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			transaction: func(tx *Tx) error {
+				if err := mustBucket(t, tx, testBucketName).Put([]byte("discarded"), []byte("two")); err != nil {
+					return err
+				}
+				return wantErr
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("kept-last"), []byte("three"))
+			},
+			result: make(chan writeResult, 1),
+		},
+	}
+
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	if result := <-requests[0].result; result.err != nil {
+		t.Fatalf("first callback: %v", result.err)
+	}
+	if result := <-requests[1].result; !errors.Is(result.err, wantErr) {
+		t.Fatalf("failed callback: got %v, want %v", result.err, wantErr)
+	}
+	if result := <-requests[2].result; result.err != nil {
+		t.Fatalf("last callback: %v", result.err)
+	}
+
+	for _, key := range [][]byte{[]byte("kept-first"), []byte("kept-last")} {
+		if _, err := db.Get(testBucketName, key); err != nil {
+			t.Fatalf("read kept key %q: %v", key, err)
+		}
+	}
+	if _, err := db.Get(testBucketName, []byte("discarded")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("discarded callback value: got %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestWriteBatch_WALFailurePublishesNoCallback(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		db.wal.SetSyncFileForTesting(nil)
+		_ = db.Close()
+	}()
+	createBucket(t, db, testBucketName)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("batch sync failed")
+	db.wal.SetSyncFileForTesting(func() error { return wantErr })
+	requests := []*writeRequest{
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("first"), []byte("one"))
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("second"), []byte("two"))
+			},
+			result: make(chan writeResult, 1),
+		},
+	}
+
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	for _, request := range requests {
+		if result := <-request.result; !errors.Is(result.err, wantErr) {
+			t.Fatalf("write error: got %v, want %v", result.err, wantErr)
+		}
+	}
+	db.wal.SetSyncFileForTesting(nil)
+	for _, key := range [][]byte{[]byte("first"), []byte("second")} {
+		if _, err := db.Get(testBucketName, key); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("value %q after failed batch: got %v, want ErrKeyNotFound", key, err)
+		}
+	}
+}
+
+func TestClose_WaitsForActiveUpdate(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	updateDone := make(chan error, 1)
+	go func() {
+		updateDone <- db.Update(func(tx *Tx) error {
+			close(callbackStarted)
+			<-releaseCallback
+			bucket, err := tx.Bucket(testBucketName)
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte("key"), []byte("value"))
+		})
+	}()
+	<-callbackStarted
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- db.Close() }()
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the active Update ended: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseCallback)
+	if err := <-updateDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if value, err := reopened.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(value, []byte("value")) {
+		t.Fatalf("value after concurrent Close: value=%q error=%v", value, err)
 	}
 }
 

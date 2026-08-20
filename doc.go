@@ -6,7 +6,9 @@
 //
 // KVLite copies the keys and values that it stores, so callers can reuse or change those byte slices after a write returns. [DB.Get] returns a new value slice. [Bucket.Get] returns a read-only value that is valid only while its transaction callback runs.
 //
-// A [DB] is not safe for concurrent use, so the caller must serialize all operations, including [DB.Close]. KVLite also does not lock database files, which means an application must not open the same path more than once at the same time.
+// A [DB] accepts concurrent method calls. KVLite runs transaction callbacks one at a time. Concurrent [DB.Update] calls in [SyncFull] mode can share one write-ahead log append and storage synchronization.
+//
+// KVLite does not lock database files. An application must not open the same path more than once at the same time.
 //
 // Writes first go to a write-ahead log beside the database file. When Close succeeds, it checkpoints committed data into the database file and removes the log, so callers must check its error.
 package kvlite

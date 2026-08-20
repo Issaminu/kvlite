@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"slices"
+	"sync"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -18,23 +19,44 @@ const (
 	MaxValueSize = btree.MaxValueSize
 )
 
-// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied or used concurrently. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
+// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls, but KVLite runs transaction callbacks one at a time. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
 type DB struct {
-	path      string
-	file      *os.File
-	meta      *page.Meta
-	rootNode  *btree.Node
-	pageCache *nodeCache
-	options   *Options
-	wal       *wal.WAL
-	closed    bool
+	path             string
+	file             *os.File
+	meta             *page.Meta
+	rootNode         *btree.Node
+	pageCache        *nodeCache
+	options          *Options
+	wal              *wal.WAL
+	operationMu      sync.Mutex
+	lifecycleMu      sync.Mutex
+	activeOperations sync.WaitGroup
+	writeRequests    chan *writeRequest
+	stopWriteBatcher chan struct{}
+	writeBatcherDone chan struct{}
+	closing          bool
+	closed           bool
 }
 
 func (db *DB) ensureOpen() error {
-	if db.closed {
+	if db.closed || db.closing {
 		return ErrDatabaseNotOpen
 	}
 	return nil
+}
+
+func (db *DB) beginOperation() error {
+	db.lifecycleMu.Lock()
+	defer db.lifecycleMu.Unlock()
+	if err := db.ensureOpen(); err != nil {
+		return err
+	}
+	db.activeOperations.Add(1)
+	return nil
+}
+
+func (db *DB) endOperation() {
+	db.activeOperations.Done()
 }
 
 // Open opens the database at path and recovers any committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
@@ -142,6 +164,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			return db.failOpen(err)
 		}
 	}
+	db.startWriteBatcher()
 
 	return db, nil
 }
@@ -196,13 +219,39 @@ func (db *DB) failOpen(err error) (*DB, error) {
 
 // Close releases the database resources. For a writable database, it first checkpoints committed data into the database file and removes the write-ahead log, while a read-only database only closes its files.
 //
-// Callers must let every transaction callback return before they call Close. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, some cleanup can remain incomplete.
+// Close prevents new data operations and waits for active operations to finish. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, the database remains open so the caller can retry, but some cleanup can remain incomplete.
 func (db *DB) Close() error {
+	db.lifecycleMu.Lock()
+	if err := db.ensureOpen(); err != nil {
+		db.lifecycleMu.Unlock()
+		return err
+	}
+	db.closing = true
+	db.lifecycleMu.Unlock()
+
+	// closing prevents beginOperation from adding another operation while Wait is in progress. All queued updates finish before close touches the files.
+	db.activeOperations.Wait()
+	db.operationMu.Lock()
+	err := db.close()
+	db.operationMu.Unlock()
+
+	db.lifecycleMu.Lock()
+	if err != nil {
+		db.closing = false
+		db.lifecycleMu.Unlock()
+		return err
+	}
+	db.closed = true
+	db.lifecycleMu.Unlock()
+	db.stopWriteBatcherAndWait()
+	return nil
+}
+
+func (db *DB) close() error {
 	if db.options.ReadOnly {
 		if err := db.closeFiles(); err != nil {
 			return err
 		}
-		db.closed = true
 		return nil
 	}
 
@@ -222,7 +271,6 @@ func (db *DB) Close() error {
 	if err := db.file.Close(); err != nil {
 		return err
 	}
-	db.closed = true
 	return nil
 }
 

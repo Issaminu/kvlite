@@ -14,7 +14,7 @@ const (
 	// SyncDefault selects KVLite's default mode, SyncFull.
 	SyncDefault Sync = iota
 
-	// SyncFull favors durability over write speed. It waits for each non-empty write transaction to reach storage before [DB.Update] returns success, which adds synchronization work to every commit.
+	// SyncFull favors durability over write speed. It waits for each non-empty write transaction to reach storage before [DB.Update] returns success. Concurrent updates can share one write-ahead log append and storage synchronization.
 	SyncFull
 
 	// SyncNormal favors write speed over the durability of recent updates. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes.
