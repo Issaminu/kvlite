@@ -3,9 +3,9 @@ package wal
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/fnv"
 	"io"
 
+	"github.com/Issaminu/kvlite/internal/checksum"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -20,7 +20,7 @@ const (
 	recordTypeSize          = 1 // A record type uses one byte.
 	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
 	recordContentLengthSize = 4 // A content length uses one uint32 value.
-	ChecksumSize            = 8 // An FNV-1a checksum uses one uint64 value.
+	ChecksumSize            = 4 // A CRC32C checksum uses one uint32 value.
 	HeaderSize              = recordTypeSize + page.IDSize + recordTransactionIDSize + recordContentLengthSize
 )
 
@@ -63,7 +63,7 @@ func AppendEncodedRecord(data []byte, record *Record) []byte {
 	headerEnd := len(data)
 	data = append(data, record.PageContent...)
 	checksum := computeRecordChecksum(data[headerStart:headerEnd], record.PageContent)
-	data = binary.LittleEndian.AppendUint64(data, checksum)
+	data = binary.LittleEndian.AppendUint32(data, checksum)
 
 	return data
 }
@@ -98,7 +98,7 @@ func DecodeRecord(r io.Reader, pageSize int64) (*Record, error) {
 	if err := fileio.ReadFull(r, checksumData[:]); err != nil {
 		return nil, err
 	}
-	checksum := binary.LittleEndian.Uint64(checksumData[:])
+	checksum := binary.LittleEndian.Uint32(checksumData[:])
 	if computeRecordChecksum(headerData, record.PageContent) != checksum {
 		return nil, page.ErrChecksum
 	}
@@ -110,9 +110,6 @@ func IsCommitMarker(record *Record) bool {
 	return record.Header.Type == RecordTypeCommit
 }
 
-func computeRecordChecksum(header, content []byte) uint64 {
-	hashFunc := fnv.New64a()
-	hashFunc.Write(header)
-	hashFunc.Write(content)
-	return hashFunc.Sum64()
+func computeRecordChecksum(header, content []byte) uint32 {
+	return checksum.Sum32(header, content)
 }

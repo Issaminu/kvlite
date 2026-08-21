@@ -193,7 +193,7 @@ func RecordToNode(record *Record) (*btree.Node, error) {
 		return nil, fmt.Errorf("record has no page content")
 	}
 
-	node, err := btree.DecodeNode(record.PageContent)
+	node, err := btree.DecodeWALNode(record.PageContent, record.Header.PageID)
 
 	if err != nil {
 		return nil, fmt.Errorf("failed to deserialize node: %w", err)

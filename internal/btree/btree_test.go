@@ -2,33 +2,181 @@ package btree
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"hash/crc32"
+	"io"
 	"os"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-func TestNodeCodec_UsesFixedLeafLayout(t *testing.T) {
+const testNodePageSize int64 = 4096
+
+func TestNodeCodec_UsesProtectedNodeHeader(t *testing.T) {
+	const pageSize int64 = 64
+	node := NewLeafNode(page.ID(7))
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte("v"))); err != nil {
+		t.Fatal(err)
+	}
+
+	var pageData bytes.Buffer
+	if err := WriteNode(&pageData, node, pageSize, true); err != nil {
+		t.Fatal(err)
+	}
+	encoded := pageData.Bytes()
+	const headerSize = 16
+	if len(encoded) != int(pageSize) {
+		t.Fatalf("encoded page size: got %d, want %d", len(encoded), pageSize)
+	}
+	if got, want := binary.LittleEndian.Uint16(encoded[0:2]), uint16(1); got != want {
+		t.Fatalf("node format version: got %d, want %d", got, want)
+	}
+	if got, want := binary.LittleEndian.Uint16(encoded[2:4]), uint16(1); got != want {
+		t.Fatalf("node type: got %d, want leaf type %d", got, want)
+	}
+	if got, want := page.ID(binary.LittleEndian.Uint64(encoded[4:12])), node.PageID(); got != want {
+		t.Fatalf("node page ID: got %d, want %d", got, want)
+	}
+
+	hash := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	_, _ = hash.Write(encoded[:12])
+	_, _ = hash.Write(encoded[headerSize:])
+	if got, want := binary.LittleEndian.Uint32(encoded[12:headerSize]), hash.Sum32(); got != want {
+		t.Fatalf("node checksum: got %x, want %x", got, want)
+	}
+	if got, want := binary.LittleEndian.Uint32(encoded[headerSize:headerSize+encodedUint32Size]), uint32(1); got != want {
+		t.Fatalf("entry count: got %d, want %d", got, want)
+	}
+}
+
+func TestEncodeWALNode_LeavesDatabasePageChecksumUnset(t *testing.T) {
+	node := NewLeafNode(page.ID(7))
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+
+	encoded := EncodeWALNode(node)
+	if got := binary.LittleEndian.Uint32(encoded[12:NodeHeaderSize]); got != 0 {
+		t.Fatalf("WAL node page checksum: got %x, want zero", got)
+	}
+	decoded, err := DecodeWALNode(encoded, node.PageID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.PageID() != node.PageID() || decoded.EntryCount() != 1 {
+		t.Fatalf("decoded WAL node: got page=%d entries=%d", decoded.PageID(), decoded.EntryCount())
+	}
+}
+
+func TestDecodeNode_RejectsCorruptedPageBeforePayloadDecode(t *testing.T) {
+	node := NewLeafNode(page.ID(7))
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+
+	encoded := EncodeNode(node, testNodePageSize)
+	encoded[len(encoded)-1] ^= 0xff
+
+	if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("DecodeNode error: got %v, want ErrChecksum", err)
+	}
+}
+
+func TestDecodeNode_RejectsCorruptedPagePaddingBeforePayloadDecode(t *testing.T) {
+	const pageSize int64 = 64
+	node := NewLeafNode(page.ID(7))
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte("v"))); err != nil {
+		t.Fatal(err)
+	}
+
+	var encoded bytes.Buffer
+	if err := WriteNode(&encoded, node, pageSize, true); err != nil {
+		t.Fatal(err)
+	}
+	data := encoded.Bytes()
+	data[len(data)-1] ^= 0xff
+
+	if _, err := DecodeNode(data, node.PageID(), pageSize); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("DecodeNode error: got %v, want ErrChecksum", err)
+	}
+}
+
+func TestDecodeNode_RejectsHeaderForWrongPage(t *testing.T) {
+	node := NewLeafNode(page.ID(7))
+	encoded := EncodeNode(node, testNodePageSize)
+
+	if _, err := DecodeNode(encoded, page.ID(8), testNodePageSize); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("DecodeNode error: got %v, want ErrInvalid", err)
+	}
+}
+
+func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
+	node := NewLeafNode(page.ID(7))
+
+	testCases := []struct {
+		name    string
+		change  func([]byte)
+		wantErr error
+	}{
+		{
+			name: "unsupported node format version",
+			change: func(data []byte) {
+				binary.LittleEndian.PutUint16(data[0:2], 2)
+				resealNodeForTest(data, testNodePageSize)
+			},
+			wantErr: page.ErrVersionMismatch,
+		},
+		{
+			name: "unknown node type",
+			change: func(data []byte) {
+				binary.LittleEndian.PutUint16(data[2:4], 3)
+				resealNodeForTest(data, testNodePageSize)
+			},
+			wantErr: page.ErrInvalid,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			encoded := EncodeNode(node, testNodePageSize)
+			testCase.change(encoded)
+			if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize); !errors.Is(err, testCase.wantErr) {
+				t.Fatalf("DecodeNode error: got %v, want %v", err, testCase.wantErr)
+			}
+		})
+	}
+}
+
+func resealNodeForTest(data []byte, pageSize int64) {
+	table := crc32.MakeTable(crc32.Castagnoli)
+	checksum := crc32.Update(0, table, data[:12])
+	checksum = crc32.Update(checksum, table, data[NodeHeaderSize:])
+	checksum = crc32.Update(checksum, table, make([]byte, pageSize-int64(len(data))))
+	binary.LittleEndian.PutUint32(data[12:NodeHeaderSize], checksum)
+}
+
+func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
 	node := NewLeafNode(page.ID(1))
 	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte("v"))); err != nil {
 		t.Fatal(err)
 	}
 
-	// Layout: leaf marker, one entry, zero flags, one-byte key, and one-byte value.
+	// Payload layout: one entry, zero flags, one-byte key, and one-byte value.
 	want := []byte{
-		1,
 		1, 0, 0, 0,
 		0, 0, 0, 0,
 		1, 0, 0, 0, 'k',
 		1, 0, 0, 0, 'v',
 	}
-	encoded := EncodeNode(node)
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode leaf: got %x, want %x", encoded, want)
+	encoded := EncodeNode(node, testNodePageSize)
+	if !bytes.Equal(encoded[NodeHeaderSize:], want) {
+		t.Fatalf("encode leaf payload: got %x, want %x", encoded[NodeHeaderSize:], want)
 	}
 
-	decoded, err := DecodeNode(encoded)
+	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,20 +192,20 @@ func TestNodeCodec_UsesFixedLeafLayout(t *testing.T) {
 	}
 
 	for size := 0; size < len(encoded); size++ {
-		if _, err := DecodeNode(encoded[:size]); err == nil {
+		if _, err := DecodeNode(encoded[:size], node.PageID(), testNodePageSize); err == nil {
 			t.Errorf("decode %d-byte leaf prefix: expected an error", size)
 		}
 	}
 }
 
-func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
+func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
 	node := &Node{
+		header:   newNodeHeader(NodeTypeBranch, 0),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{2, 3},
 	}
-	// Layout: branch marker, one separator, zero flags, one-byte key, and two child page IDs.
+	// Payload layout: one separator, zero flags, one-byte key, and two child page IDs.
 	want := []byte{
-		0,
 		1, 0, 0, 0,
 		0, 0, 0, 0,
 		1, 0, 0, 0, 'm',
@@ -65,16 +213,16 @@ func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
 		3, 0, 0, 0, 0, 0, 0, 0,
 	}
 
-	encoded := EncodeNode(node)
-	if !bytes.Equal(encoded, want) {
-		t.Fatalf("encode branch: got %x, want %x", encoded, want)
+	encoded := EncodeNode(node, testNodePageSize)
+	if !bytes.Equal(encoded[NodeHeaderSize:], want) {
+		t.Fatalf("encode branch payload: got %x, want %x", encoded[NodeHeaderSize:], want)
 	}
 
-	decoded, err := DecodeNode(encoded)
+	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize)
 	if err != nil {
 		t.Fatalf("decode branch: %v", err)
 	}
-	if decoded.IsLeaf || len(decoded.entries) != 1 || len(decoded.Children) != 2 {
+	if decoded.IsLeaf() || len(decoded.entries) != 1 || len(decoded.Children) != 2 {
 		t.Fatalf("decode branch shape: %+v", decoded)
 	}
 	if !bytes.Equal(decoded.entries[0].key, []byte("m")) || decoded.Children[0] != 2 || decoded.Children[1] != 3 {
@@ -82,22 +230,22 @@ func TestNodeCodec_UsesFixedBranchLayout(t *testing.T) {
 	}
 }
 
-func TestDecodeNode_AllocatesOnlyNodeAndEntryList(t *testing.T) {
+func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	node := &Node{
-		IsLeaf: true,
+		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
 			{key: []byte("beta"), value: bytes.Repeat([]byte("b"), 128)},
 		},
 	}
-	encoded := EncodeNode(node)
+	encoded := EncodeNode(node, testNodePageSize)
 
 	var decoded *Node
 	var decodeErr error
 	if got := testing.AllocsPerRun(100, func() {
-		decoded, decodeErr = DecodeNode(encoded)
-	}); got != 2 {
-		t.Fatalf("DecodeNode allocations: got %v, want 2", got)
+		decoded, decodeErr = DecodeNode(encoded, node.PageID(), testNodePageSize)
+	}); got != 3 {
+		t.Fatalf("DecodeNode allocations: got %v, want 3", got)
 	}
 	if decodeErr != nil {
 		t.Fatal(decodeErr)
@@ -109,16 +257,16 @@ func TestDecodeNode_AllocatesOnlyNodeAndEntryList(t *testing.T) {
 
 func TestDecodeNode_EntrySlicesCannotGrowIntoEncodedData(t *testing.T) {
 	node := &Node{
-		IsLeaf: true,
+		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: []byte("one")},
 			{key: []byte("beta"), value: []byte("two")},
 		},
 	}
-	encoded := EncodeNode(node)
+	encoded := EncodeNode(node, testNodePageSize)
 	encodedBeforeAppend := bytes.Clone(encoded)
 
-	decoded, err := DecodeNode(encoded)
+	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,9 +278,12 @@ func TestDecodeNode_EntrySlicesCannotGrowIntoEncodedData(t *testing.T) {
 }
 
 func TestDecodeNode_RejectsEntryCountLargerThanInputCanContain(t *testing.T) {
-	data := []byte{1, 0xff, 0xff, 0xff, 0xff}
+	node := NewLeafNode(1)
+	data := EncodeNode(node, testNodePageSize)
+	binary.LittleEndian.PutUint32(data[NodeHeaderSize:NodeHeaderSize+encodedUint32Size], ^uint32(0))
+	resealNodeForTest(data, testNodePageSize)
 
-	if _, err := DecodeNode(data); err == nil {
+	if _, err := DecodeNode(data, 1, testNodePageSize); err == nil {
 		t.Fatal("DecodeNode accepted an entry count larger than the input")
 	}
 }
@@ -140,13 +291,14 @@ func TestDecodeNode_RejectsEntryCountLargerThanInputCanContain(t *testing.T) {
 func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 	nodes := []*Node{
 		{
-			IsLeaf: true,
+			header: newNodeHeader(NodeTypeLeaf, 0),
 			entries: []Entry{
 				{key: []byte("alpha"), value: []byte("one")},
 				{key: []byte("beta"), value: []byte{}},
 			},
 		},
 		{
+			header: newNodeHeader(NodeTypeBranch, 0),
 			entries: []Entry{
 				{key: []byte("middle")},
 			},
@@ -155,7 +307,7 @@ func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 	}
 
 	for index, node := range nodes {
-		if got, want := node.EncodedSize(), len(EncodeNode(node)); got != want {
+		if got, want := node.EncodedSize(), len(EncodeNode(node, testNodePageSize)); got != want {
 			t.Fatalf("node %d encoded size: got %d, want %d", index, got, want)
 		}
 		if got := testing.AllocsPerRun(100, func() { _ = node.EncodedSize() }); got != 0 {
@@ -166,7 +318,7 @@ func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 
 func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
 	node := &Node{
-		IsLeaf: true,
+		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
 			{key: []byte("beta"), value: bytes.Repeat([]byte("b"), 128)},
@@ -175,11 +327,11 @@ func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
 
 	var encoded []byte
 	if got := testing.AllocsPerRun(100, func() {
-		encoded = EncodeNode(node)
+		encoded = EncodeNode(node, testNodePageSize)
 	}); got != 1 {
 		t.Fatalf("EncodeNode allocations: got %v, want 1", got)
 	}
-	if got, want := len(encoded), 294; got != want {
+	if got, want := len(encoded), 309; got != want {
 		t.Fatalf("encoded length: got %d, want %d", got, want)
 	}
 }
@@ -206,9 +358,9 @@ func TestNodeFindEntryRef_ReturnsStoredValue(t *testing.T) {
 
 func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 	original := &Node{
+		header:   newNodeHeader(NodeTypeBranch, 1),
 		entries:  []Entry{{key: []byte("middle")}},
 		Children: []page.ID{2, 3},
-		pgid:     1,
 	}
 
 	clone := original.Clone()
@@ -223,9 +375,9 @@ func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 	}
 }
 
-func TestNodeClone_AllocatesOnlyNodeAndEntryList(t *testing.T) {
+func TestNodeClone_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	original := &Node{
-		IsLeaf: true,
+		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
 			{key: []byte("beta"), value: bytes.Repeat([]byte("b"), 128)},
@@ -235,8 +387,8 @@ func TestNodeClone_AllocatesOnlyNodeAndEntryList(t *testing.T) {
 	var clone *Node
 	if got := testing.AllocsPerRun(100, func() {
 		clone = original.Clone()
-	}); got != 2 {
-		t.Fatalf("Node.Clone allocations: got %v, want 2", got)
+	}); got != 3 {
+		t.Fatalf("Node.Clone allocations: got %v, want 3", got)
 	}
 	if clone == nil || len(clone.entries) != 2 {
 		t.Fatalf("cloned entries: got %+v", clone)
@@ -272,6 +424,36 @@ func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	}
 }
 
+func BenchmarkWriteNode(b *testing.B) {
+	const pageSize int64 = 4096
+
+	testCases := []struct {
+		name  string
+		value []byte
+	}{
+		{name: "sparse", value: []byte("v")},
+		{name: "half-full", value: bytes.Repeat([]byte("v"), 2048)},
+	}
+
+	for _, testCase := range testCases {
+		b.Run(testCase.name, func(b *testing.B) {
+			node := NewLeafNode(1)
+			if err := node.InsertEntry(NewEntry(0, []byte("key"), testCase.value)); err != nil {
+				b.Fatal(err)
+			}
+
+			b.ReportAllocs()
+			b.SetBytes(pageSize)
+			b.ResetTimer()
+			for index := 0; index < b.N; index++ {
+				if err := WriteNode(io.Discard, node, pageSize, true); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	const (
 		pageSize  int64   = 64 // Two 33-byte entries exceed this page size.
@@ -281,8 +463,7 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	)
 
 	node := &Node{
-		IsLeaf: true,
-		pgid:   leftPgid,
+		header: newNodeHeader(NodeTypeLeaf, leftPgid),
 		entries: []Entry{
 			{key: []byte("a"), value: make([]byte, valueSize)},
 			{key: []byte("b"), value: make([]byte, valueSize)},
@@ -299,10 +480,10 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	if len(node.entries) != 1 || !bytes.Equal(node.entries[0].key, []byte("a")) {
 		t.Fatalf("left entries: got %q, want [a]", node.entries)
 	}
-	if rightNode.pgid != rightPgid {
-		t.Fatalf("right page ID: got %d, want %d", rightNode.pgid, rightPgid)
+	if rightNode.PageID() != rightPgid {
+		t.Fatalf("right page ID: got %d, want %d", rightNode.PageID(), rightPgid)
 	}
-	if !rightNode.IsLeaf || len(rightNode.entries) != 1 || !bytes.Equal(rightNode.entries[0].key, []byte("b")) {
+	if !rightNode.IsLeaf() || len(rightNode.entries) != 1 || !bytes.Equal(rightNode.entries[0].key, []byte("b")) {
 		t.Fatalf("right entries: got %q, want [b]", rightNode.entries)
 	}
 }
@@ -371,7 +552,7 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 			t.Fatalf("put %q: %v", key, err)
 		}
 	}
-	if root.IsLeaf {
+	if root.IsLeaf() {
 		t.Fatal("tree did not create a branch root")
 	}
 
@@ -404,7 +585,9 @@ func TestTreePutEntry_RootSplitReturnsNewRoot(t *testing.T) {
 	root := NewLeafNode(rootPageID)
 	store.StageNode(root)
 
-	for index := 0; root.IsLeaf; index++ {
+	inserted := 0
+	for root.IsLeaf() {
+		index := inserted
 		key := fmt.Appendf(nil, "key-%02d", index)
 		value := bytes.Repeat([]byte("v"), 40)
 		var err error
@@ -412,18 +595,19 @@ func TestTreePutEntry_RootSplitReturnsNewRoot(t *testing.T) {
 		if err != nil {
 			t.Fatalf("put %q: %v", key, err)
 		}
+		inserted++
 	}
 
 	if got := root.PageID(); got == rootPageID {
 		t.Fatalf("root page ID after split: got old page %d, want a new page", got)
 	}
-	if root.IsLeaf {
+	if root.IsLeaf() {
 		t.Fatal("root remains a leaf after split")
 	}
 	if got := root.Children[0]; got != rootPageID {
 		t.Fatalf("left child page ID: got %d, want old root page %d", got, rootPageID)
 	}
-	for index := 0; index < 3; index++ {
+	for index := 0; index < inserted; index++ {
 		key := fmt.Appendf(nil, "key-%02d", index)
 		entry, found, err := tree.FindEntry(root, key)
 		if err != nil {
@@ -480,9 +664,9 @@ func TestTreePutEntry_DoesNotChangeStoredInputNodes(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := &Node{
+		header:   newNodeHeader(NodeTypeBranch, 1),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{left.PageID(), right.PageID()},
-		pgid:     1,
 	}
 	store := &memoryTreeStore{
 		pageSize: 128,
@@ -490,16 +674,16 @@ func TestTreePutEntry_DoesNotChangeStoredInputNodes(t *testing.T) {
 		nodes:    map[page.ID]*Node{1: root, 2: left, 3: right},
 	}
 	tree := NewTree(store)
-	beforeRoot := EncodeNode(root)
-	beforeLeft := EncodeNode(left)
+	beforeRoot := EncodeNode(root, testNodePageSize)
+	beforeLeft := EncodeNode(left, testNodePageSize)
 
 	if _, err := tree.PutEntry(root, NewEntry(0, []byte("a"), []byte("changed"))); err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(EncodeNode(root), beforeRoot) {
+	if !bytes.Equal(EncodeNode(root, testNodePageSize), beforeRoot) {
 		t.Fatal("write changed the input root")
 	}
-	if !bytes.Equal(EncodeNode(left), beforeLeft) {
+	if !bytes.Equal(EncodeNode(left, testNodePageSize), beforeLeft) {
 		t.Fatal("write changed the stored input leaf")
 	}
 }
@@ -514,9 +698,9 @@ func TestTreePutEntry_ClonesOnlyChangedLeafWithoutSplit(t *testing.T) {
 		t.Fatal(err)
 	}
 	root := &Node{
+		header:   newNodeHeader(NodeTypeBranch, 1),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{left.PageID(), right.PageID()},
-		pgid:     1,
 	}
 	store := &memoryTreeStore{
 		pageSize: 4096,

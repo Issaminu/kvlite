@@ -372,7 +372,6 @@ func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
 		if err != nil {
 			return nil, err
 		}
-		node.SetPageID(pgid)
 		return node, nil
 	}
 
@@ -384,12 +383,10 @@ func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
 	if err := fileio.ReadFull(reader, data); err != nil {
 		return nil, err
 	}
-	node, err := btree.DecodeNode(data)
+	node, err := btree.DecodeNode(data, pgid, db.meta.PageSize())
 	if err != nil {
 		return nil, err
 	}
-
-	node.SetPageID(pgid)
 	return node, nil
 }
 

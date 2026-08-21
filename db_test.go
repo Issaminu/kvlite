@@ -14,6 +14,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -30,6 +31,22 @@ import (
 
 var testBucketName = []byte("test-data")
 var errDiscardTx = errors.New("discard transaction")
+
+func TestEncodeWALRecords_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
+	meta := page.NewMeta(4096)
+	node := btree.NewLeafNode(1)
+	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+
+	records := encodeWALRecords(map[page.ID]*btree.Node{node.PageID(): node}, meta, false)
+	if len(records) != 1 {
+		t.Fatalf("WAL records: got %d, want 1", len(records))
+	}
+	if got := binary.LittleEndian.Uint32(records[0].PageContent[12:btree.NodeHeaderSize]); got != 0 {
+		t.Fatalf("WAL node page checksum: got %x, want zero", got)
+	}
+}
 
 // tempfile returns a temporary file path for a database.
 func tempfile() string {
@@ -275,7 +292,7 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 		rootPageID := bucket.rootNode.PageID()
 		value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
 
-		for index := 0; bucket.rootNode.IsLeaf; index++ {
+		for index := 0; bucket.rootNode.IsLeaf(); index++ {
 			key := fmt.Appendf(nil, "key-%04d", index)
 			if err := bucket.Put(key, value); err != nil {
 				return err
@@ -505,7 +522,7 @@ func TestSplit_TreeGrows(t *testing.T) {
 		}
 	}
 
-	if mustBucketRoot(t, db, testBucketName).IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf() {
 		t.Fatal("root is still a single leaf after ~38 KB of entries — a full node must " +
 			"split and grow a branch root (Rung 3b)")
 	}
@@ -573,7 +590,7 @@ func walkNodes(t *testing.T, db *DB, root *btree.Node, visit func(n *btree.Node)
 	var rec func(n *btree.Node)
 	rec = func(n *btree.Node) {
 		visit(n)
-		if n.IsLeaf {
+		if n.IsLeaf() {
 			return
 		}
 		for _, childPgid := range n.Children {
@@ -614,7 +631,7 @@ func TestSplit_RootBecomesBranch(t *testing.T) {
 	}
 
 	root := mustBucketRoot(t, db, testBucketName)
-	if root.IsLeaf {
+	if root.IsLeaf() {
 		t.Fatal("root is still a leaf after overflowing a page — it must split into a branch root")
 	}
 	if len(root.Children) < 2 {
@@ -679,12 +696,12 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 		}
 	}
 
-	if mustBucketRoot(t, db, testBucketName).IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf() {
 		t.Fatal("root must be a branch after 400 entries")
 	}
 	leaves := 0
 	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
-		if nd.IsLeaf {
+		if nd.IsLeaf() {
 			leaves++
 		}
 	})
@@ -734,14 +751,14 @@ func TestSplit_Cascades(t *testing.T) {
 	// Depth >= 3: root is a branch AND at least one of its children is ALSO a branch
 	// (which only happens once the root branch itself has split).
 	root := mustBucketRoot(t, db, testBucketName)
-	if root.IsLeaf {
+	if root.IsLeaf() {
 		t.Fatal("root must be a branch")
 	}
 	child, err := db.readNode(root.Children[0])
 	if err != nil || child == nil {
 		t.Fatalf("could not read root's first child: %v", err)
 	}
-	if child.IsLeaf {
+	if child.IsLeaf() {
 		t.Fatalf("tree only reached depth 2 — %d fat keys should overflow the root branch and force a BRANCH split (depth 3)", n)
 	}
 
@@ -956,7 +973,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 			t.Fatalf("put %d: %v", i, err)
 		}
 	}
-	if mustBucketRoot(t, db, testBucketName).IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf() {
 		t.Fatal("test setup: expected a split — root should be a branch")
 	}
 	walBytes, err := os.ReadFile(wal)
@@ -983,7 +1000,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 		t.Fatalf("open crashed db: %v", err)
 	}
 	defer rec.Close()
-	if mustBucketRoot(t, rec, testBucketName).IsLeaf {
+	if mustBucketRoot(t, rec, testBucketName).IsLeaf() {
 		t.Fatal("recovered root is a leaf after WAL replay")
 	}
 	for i := 0; i < n; i++ {
@@ -1284,7 +1301,7 @@ func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
 	}
 	// After the checkpoint the base lives in main and the WAL is reset. If the base
 	// never split, the "non-empty base" is trivial — make sure the seam is real.
-	if mustBucketRoot(t, db, testBucketName).IsLeaf {
+	if mustBucketRoot(t, db, testBucketName).IsLeaf() {
 		t.Fatal("test setup: base tree did not split; the checkpointed base must be multi-level")
 	}
 
@@ -1843,7 +1860,7 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf[4] = 0xFF // version was 1 -> now unsupported
+	buf[4] = 0xFF // Replace the current version with an unsupported value.
 	if err := os.WriteFile(path, buf, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1883,6 +1900,49 @@ func TestOpen_ErrChecksum(t *testing.T) {
 
 	if _, err := openDB(path); !errors.Is(err, ErrChecksum) {
 		t.Fatalf("expected ErrChecksum, got: %v", err)
+	}
+}
+
+func TestOpen_ErrChecksumForCorruptedBTreePage(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	rootPageID := db.meta.Root()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corruptOffset := int64(rootPageID)*pageSize + btree.NodeHeaderSize
+	byteAtOffset := []byte{0}
+	if _, err := file.ReadAt(byteAtOffset, corruptOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	byteAtOffset[0] ^= 0xff
+	if _, err := file.WriteAt(byteAtOffset, corruptOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if reopened != nil {
+		_ = reopened.Close()
+	}
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("Open error: got %v, want ErrChecksum", err)
 	}
 }
 
@@ -2867,7 +2927,7 @@ func TestPutTreeEntry_DoesNotPublishPrivateRoot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if newRoot.IsLeaf {
+		if newRoot.IsLeaf() {
 			t.Fatal("second entry did not split the root")
 		}
 		if newRoot.PageID() == root.PageID() {
@@ -3455,7 +3515,7 @@ func TestBucket_NestedInSplitParent(t *testing.T) {
 				return err
 			}
 		}
-		if parent.rootNode.IsLeaf {
+		if parent.rootNode.IsLeaf() {
 			t.Fatal("test setup: parent bucket tree did not split")
 		}
 		child, err := parent.CreateBucket([]byte("child"))
@@ -3756,7 +3816,7 @@ func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 		}
 		keys = append(keys, k)
 	}
-	if !mustBucketRoot(t, db, testBucketName).IsLeaf {
+	if !mustBucketRoot(t, db, testBucketName).IsLeaf() {
 		t.Fatalf("setup: root split before the big insert (nSmall=%d too high)", nSmall)
 	}
 
@@ -3774,7 +3834,7 @@ func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
-		if nd.IsLeaf {
+		if nd.IsLeaf() {
 			leaves++
 		}
 	})
@@ -3851,7 +3911,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 			}
 			fillKeys = append(fillKeys, k)
 		}
-		if !p.rootNode.IsLeaf {
+		if !p.rootNode.IsLeaf() {
 			t.Fatal("setup error: p split during packing; it should still be one leaf")
 		}
 
@@ -3859,7 +3919,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 			return err
 		}
 
-		if p.rootNode.IsLeaf {
+		if p.rootNode.IsLeaf() {
 			t.Fatal("nested bucket creation did not split the full parent root")
 		}
 		if got := p.rootNode.PageID(); got == rootPageID {
@@ -5843,16 +5903,25 @@ func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	pageData := make([]byte, pageSize)
+	pageOffset := int64(bucketPageID) * pageSize
+	if _, err := file.ReadAt(pageData, pageOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
 	const (
-		leafMarkerBytes    = 1 // A node starts with one byte that identifies a leaf.
 		entryCountBytes    = 4 // The entry count uses one uint32 value.
 		entryFlagsBytes    = 4 // Each entry stores flags in one uint32 value.
 		encodedLengthBytes = 4 // Each key or value length uses one uint32 value.
 	)
-	valueLengthOffset := int64(bucketPageID)*pageSize + leafMarkerBytes + entryCountBytes + entryFlagsBytes + encodedLengthBytes + int64(len(key))
-	valueLength := make([]byte, encodedLengthBytes)
-	binary.LittleEndian.PutUint32(valueLength, uint32(pageSize))
-	if _, err := file.WriteAt(valueLength, valueLengthOffset); err != nil {
+	valueLengthOffset := btree.NodeHeaderSize + entryCountBytes + entryFlagsBytes + encodedLengthBytes + len(key)
+	binary.LittleEndian.PutUint32(pageData[valueLengthOffset:valueLengthOffset+encodedLengthBytes], uint32(pageSize))
+
+	checksumTable := crc32.MakeTable(crc32.Castagnoli)
+	checksum := crc32.Update(0, checksumTable, pageData[:12])
+	checksum = crc32.Update(checksum, checksumTable, pageData[btree.NodeHeaderSize:])
+	binary.LittleEndian.PutUint32(pageData[12:btree.NodeHeaderSize], checksum)
+	if _, err := file.WriteAt(pageData, pageOffset); err != nil {
 		_ = file.Close()
 		t.Fatal(err)
 	}

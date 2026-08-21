@@ -11,7 +11,39 @@ import (
 const (
 	MaxKeySize   = 32768         // 32 KiB
 	MaxValueSize = (1 << 31) - 2 // ~2 GiB
+
+	// NodeHeaderSize is the 16-byte encoded size of a B+tree node header.
+	NodeHeaderSize = 16
+
+	nodeFormatVersion uint16 = 1
 )
+
+// NodeType identifies the body layout of a B+tree node.
+type NodeType uint16
+
+const (
+	// NodeTypeLeaf identifies a node that stores key and value entries.
+	NodeTypeLeaf NodeType = 1
+	// NodeTypeBranch identifies a node that stores separator keys and child page IDs.
+	NodeTypeBranch NodeType = 2
+)
+
+// NodeHeader contains the fixed fields that identify and protect one B+tree node.
+// All fields use little-endian encoding:
+//
+//	[0:2]   format version, uint16
+//	[2:4]   node type, uint16
+//	[4:12]  page ID, uint64
+//	[12:16] CRC32C checksum, uint32
+//
+// Checksum covers bytes [0:12] and [16:pageSize]. It includes the node body and zero padding.
+// A node change can make Checksum stale. [EncodeNode] always calculates a new value before it returns encoded bytes.
+type NodeHeader struct {
+	FormatVersion uint16
+	Type          NodeType
+	PageID        page.ID
+	Checksum      uint32
+}
 
 type Entry struct {
 	flags uint32
@@ -47,31 +79,49 @@ func (e Entry) EncodedSize(isLeaf bool) int {
 	return size
 }
 
+// Node contains one B+tree node and its header.
 type Node struct {
-	IsLeaf   bool
+	header   *NodeHeader
 	entries  []Entry
 	Children []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
-	pgid     page.ID
 }
 
 func NewLeafNode(pgid page.ID) *Node {
-	return &Node{IsLeaf: true, pgid: pgid, Children: []page.ID{}, entries: []Entry{}}
+	return &Node{
+		header:   newNodeHeader(NodeTypeLeaf, pgid),
+		Children: []page.ID{},
+		entries:  []Entry{},
+	}
 }
 
 func NewRootNode(pgid page.ID, leftNode, rightNode *Node, separator []byte) *Node {
 	return &Node{
+		header:   newNodeHeader(NodeTypeBranch, pgid),
 		entries:  []Entry{{key: slices.Clone(separator)}},
-		Children: []page.ID{leftNode.pgid, rightNode.pgid},
-		pgid:     pgid,
+		Children: []page.ID{leftNode.PageID(), rightNode.PageID()},
 	}
 }
 
+func newNodeHeader(nodeType NodeType, pgid page.ID) *NodeHeader {
+	return &NodeHeader{
+		FormatVersion: nodeFormatVersion,
+		Type:          nodeType,
+		PageID:        pgid,
+	}
+}
+
+// IsLeaf reports whether n stores key and value entries.
+func (n *Node) IsLeaf() bool {
+	return n.header.Type == NodeTypeLeaf
+}
+
 func (n *Node) PageID() page.ID {
-	return n.pgid
+	return n.header.PageID
 }
 
 func (n *Node) SetPageID(pgid page.ID) {
-	n.pgid = pgid
+	n.header.PageID = pgid
+	n.header.Checksum = 0
 }
 
 func (n *Node) EntryCount() int {
@@ -82,18 +132,18 @@ func (n *Node) EntryCount() int {
 // The clone owns its entry and child lists but shares the immutable key and value bytes with n.
 // Node changes must replace an entry or byte slice instead of changing shared bytes in place.
 func (n *Node) Clone() *Node {
+	header := *n.header
 	return &Node{
-		IsLeaf:   n.IsLeaf,
+		header:   &header,
 		entries:  slices.Clone(n.entries),
 		Children: slices.Clone(n.Children),
-		pgid:     n.pgid,
 	}
 }
 
 // Find the correct child node for this key.
 // It only returns the correct child for this node, if you actually want to reach the leaf node that has the key, then this function should be called in a loop.
 func (n *Node) FindChildIndex(key []byte) (int, error) {
-	if n.IsLeaf {
+	if n.IsLeaf() {
 		return -1, ErrNotBranchNode
 	}
 	index := sort.Search(len(n.entries), func(index int) bool {
@@ -105,7 +155,7 @@ func (n *Node) FindChildIndex(key []byte) (int, error) {
 // Find the index of the key in it's leaf node.
 // Returns (index, isFound, err)
 func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
-	if !n.IsLeaf {
+	if !n.IsLeaf() {
 		return -1, false, ErrNotLeafNode
 	}
 	index := sort.Search(len(n.entries), func(index int) bool {
@@ -118,7 +168,7 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 // FindEntry looks a key up in this leaf. The returned found reports whether the
 // key is present because a stored value can be empty.
 func (n *Node) FindEntry(key []byte) (Entry, bool, error) {
-	if !n.IsLeaf {
+	if !n.IsLeaf() {
 		return Entry{}, false, ErrNotLeafNode
 	}
 	idx, found, err := n.findKeyIndex(key)
@@ -141,7 +191,7 @@ func (n *Node) FindEntry(key []byte) (Entry, bool, error) {
 // FindEntryRef looks a key up in this leaf without copying its key or value.
 // The returned entry refers to storage owned by the node.
 func (n *Node) FindEntryRef(key []byte) (Entry, bool, error) {
-	if !n.IsLeaf {
+	if !n.IsLeaf() {
 		return Entry{}, false, ErrNotLeafNode
 	}
 	idx, found, err := n.findKeyIndex(key)
@@ -172,7 +222,7 @@ type leafInsert struct {
 
 // prepareInsert checks a leaf insertion without changing the leaf.
 func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
-	if !n.IsLeaf {
+	if !n.IsLeaf() {
 		return leafInsert{}, ErrNotLeafNode
 	}
 
@@ -192,6 +242,7 @@ func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
 
 // applyInsert changes a leaf after prepareInsert has accepted the operation.
 func (n *Node) applyInsert(prepared leafInsert) {
+	n.header.Checksum = 0
 	if prepared.found {
 		n.entries[prepared.index].flags = prepared.entry.flags
 		n.entries[prepared.index].value = cloneValue(prepared.entry.value)

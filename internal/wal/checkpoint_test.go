@@ -2,9 +2,11 @@ package wal
 
 import (
 	"bytes"
+	"errors"
 	"slices"
 	"testing"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -17,6 +19,34 @@ type checkpointWriter struct {
 	writes []checkpointWrite
 }
 
+func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
+	const pageSize int64 = 64
+	node := btree.NewLeafNode(1)
+	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	records := []Record{{
+		Header:      RecordHeader{Type: RecordTypeData, PageID: node.PageID()},
+		PageContent: btree.EncodeWALNode(node),
+	}}
+	writer := &checkpointWriter{}
+
+	if err := writeCheckpointRecordRuns(writer, records, pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if len(writer.writes) != 1 {
+		t.Fatalf("checkpoint writes: got %d, want 1", len(writer.writes))
+	}
+	pageData := writer.writes[0].data
+	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize); err != nil {
+		t.Fatalf("decode checkpoint page: %v", err)
+	}
+	pageData[len(pageData)-1] ^= 0xff
+	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("decode corrupted checkpoint page: got %v, want ErrChecksum", err)
+	}
+}
+
 func (writer *checkpointWriter) WriteAt(data []byte, offset int64) (int, error) {
 	writer.writes = append(writer.writes, checkpointWrite{offset: offset, data: slices.Clone(data)})
 	return len(data), nil
@@ -24,10 +54,10 @@ func (writer *checkpointWriter) WriteAt(data []byte, offset int64) (int, error) 
 
 func TestWriteCheckpointRecordRuns_CombinesAdjacentPages(t *testing.T) {
 	records := []Record{
-		{Header: RecordHeader{PageID: 1}, PageContent: []byte("a")},
-		{Header: RecordHeader{PageID: 2}, PageContent: []byte("bb")},
-		{Header: RecordHeader{PageID: 4}, PageContent: []byte("d")},
-		{Header: RecordHeader{PageID: 5}, PageContent: []byte("ee")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 1}, PageContent: []byte("a")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 2}, PageContent: []byte("bb")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 4}, PageContent: []byte("d")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 5}, PageContent: []byte("ee")},
 	}
 	writer := &checkpointWriter{}
 
@@ -53,6 +83,7 @@ func TestWriteCheckpointRecordRuns_LimitsContiguousWriteSize(t *testing.T) {
 	const pageSize int64 = 4096
 	records := make([]Record, 257)
 	for index := range records {
+		records[index].Header.Type = RecordTypeMeta
 		records[index].Header.PageID = page.ID(index + 1)
 	}
 	writer := &checkpointWriter{}

@@ -3,6 +3,7 @@ package kvlite
 import (
 	"io"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
@@ -19,6 +20,11 @@ func (db *DB) applyWALRecordWithBuffer(record *wal.Record, pageBuffer []byte) er
 	// WAL records omit page padding. The main file stores every page at its full size.
 	clear(pageBuffer)
 	copy(pageBuffer, record.PageContent)
+	if record.Header.Type == wal.RecordTypeData {
+		if err := btree.VerifyNodeIDAndSetChecksum(pageBuffer, record.Header.PageID); err != nil {
+			return err
+		}
+	}
 	offset := int64(record.Header.PageID) * pageSize
 	return fileio.WriteFull(io.NewOffsetWriter(db.file, offset), pageBuffer)
 }

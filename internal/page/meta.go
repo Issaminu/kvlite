@@ -3,7 +3,8 @@ package page
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/fnv"
+
+	"github.com/Issaminu/kvlite/internal/checksum"
 )
 
 const version uint32 = 1        // format version, bumps only when making a breaking change to the DB file format itself
@@ -13,10 +14,10 @@ const magic uint32 = 0x7317DC29 // The hexadecimal value encodes the KVLite file
 const MetaID ID = 0
 
 const (
-	// MetaSize is the encoded size of two uint32 fields and four uint64 fields.
-	MetaSize = 40
-	// The final metadata field is one uint64 checksum.
-	metaChecksumSize = 8
+	// MetaSize is the encoded size of three uint32 fields and three uint64 fields.
+	MetaSize = 36
+	// The final metadata field is one CRC32C checksum.
+	metaChecksumSize = 4
 )
 
 type Meta struct {
@@ -25,7 +26,7 @@ type Meta struct {
 	pageSize int64
 	pgid     ID
 	root     ID // pgid of the root node
-	checksum uint64
+	checksum uint32
 }
 
 func NewMeta(pageSize int64) *Meta {
@@ -49,7 +50,7 @@ func EncodeMeta(meta *Meta) []byte {
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pageSize))
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pgid))
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.root))
-	data = binary.LittleEndian.AppendUint64(data, meta.checksum)
+	data = binary.LittleEndian.AppendUint32(data, meta.checksum)
 	return data
 }
 
@@ -58,14 +59,14 @@ func DecodeMeta(data []byte) (*Meta, error) {
 		return nil, fmt.Errorf("decode meta: got %d bytes, want %d: %w", len(data), MetaSize, ErrInvalid)
 	}
 
-	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], and checksum[32:40].
+	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], and checksum[32:36].
 	return &Meta{
 		magic:    binary.LittleEndian.Uint32(data[0:4]),
 		version:  binary.LittleEndian.Uint32(data[4:8]),
 		pageSize: int64(binary.LittleEndian.Uint64(data[8:16])),
 		pgid:     ID(binary.LittleEndian.Uint64(data[16:24])),
 		root:     ID(binary.LittleEndian.Uint64(data[24:32])),
-		checksum: binary.LittleEndian.Uint64(data[32:40]),
+		checksum: binary.LittleEndian.Uint32(data[32:36]),
 	}, nil
 }
 
@@ -103,11 +104,8 @@ func (m *Meta) Validate() error {
 	return nil
 }
 
-func (m *Meta) generateChecksum() uint64 {
+func (m *Meta) generateChecksum() uint32 {
 	encoded := EncodeMeta(m)
 	sealed := encoded[:MetaSize-metaChecksumSize]
-
-	hashFunc := fnv.New64a()
-	hashFunc.Write(sealed)
-	return hashFunc.Sum64()
+	return checksum.Sum32(sealed)
 }

@@ -2,7 +2,9 @@ package page
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"testing"
 )
 
@@ -41,7 +43,7 @@ func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		3, 0, 0, 0, 0, 0, 0, 0,
 		4, 0, 0, 0, 0, 0, 0, 0,
 		5, 0, 0, 0, 0, 0, 0, 0,
-		6, 0, 0, 0, 0, 0, 0, 0,
+		6, 0, 0, 0,
 	}
 
 	encoded := EncodeMeta(meta)
@@ -57,11 +59,21 @@ func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		t.Fatalf("decode meta: got %+v, want %+v", decoded, meta)
 	}
 
-	// The six metadata fields occupy exactly 40 bytes.
-	for _, size := range []int{39, 41} {
+	// The six metadata fields occupy exactly 36 bytes.
+	for _, size := range []int{35, 37} {
 		if _, err := DecodeMeta(make([]byte, size)); !errors.Is(err, ErrInvalid) {
 			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
 		}
+	}
+}
+
+func TestMetaChecksum_UsesCRC32C(t *testing.T) {
+	meta := NewMeta(4096)
+	encoded := EncodeMeta(meta)
+
+	want := crc32.Checksum(encoded[:MetaSize-metaChecksumSize], crc32.MakeTable(crc32.Castagnoli))
+	if got := binary.LittleEndian.Uint32(encoded[MetaSize-metaChecksumSize:]); got != want {
+		t.Fatalf("metadata checksum: got %x, want CRC32C %x", got, want)
 	}
 }
 

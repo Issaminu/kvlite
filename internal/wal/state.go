@@ -6,6 +6,7 @@ import (
 	"os"
 	"slices"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -126,6 +127,11 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 		pageData := buffer[pageStart:pageEnd]
 		clear(pageData)
 		copy(pageData, record.PageContent)
+		if record.Header.Type == RecordTypeData {
+			if err := btree.VerifyNodeIDAndSetChecksum(pageData, pageID); err != nil {
+				return err
+			}
+		}
 		previousPageID = pageID
 	}
 	return flush()

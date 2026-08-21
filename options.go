@@ -35,7 +35,7 @@ type Options struct {
 	// LockTimeout limits how long [Open] waits for a conflicting database-file lock. A zero value waits until the other handle closes, a positive value returns an error that matches [ErrDatabaseLocked] after that duration, and a negative value is invalid. KVLite holds the lock for the full [DB] lifetime, not for one transaction.
 	LockTimeout time.Duration
 
-	// PageSize sets the page size in bytes for a new database. It must be between 40 bytes, the encoded metadata size, and [MaxValueSize]. A zero value uses the operating system page size, while an existing database always uses the page size stored in its file. A smaller page reduces the largest entry and branch separator that KVLite can store.
+	// PageSize sets the page size in bytes for a new database. It must be between 36 bytes, the encoded metadata size, and [MaxValueSize]. A zero value uses the operating system page size, while an existing database always uses the page size stored in its file. A smaller page reduces the largest entry and branch separator that KVLite can store.
 	PageSize int
 
 	// Synchronous controls when KVLite synchronizes committed write-ahead log data. A zero value uses SyncFull.

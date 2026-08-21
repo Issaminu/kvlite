@@ -2,9 +2,12 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
+	"hash/crc32"
 	"os"
 	"testing"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -56,9 +59,13 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 	log := New(Config{File: walFile, PageSize: 64})
 	for index := range 32 {
 		pageID := page.ID(32 - index)
+		node := btree.NewLeafNode(pageID)
+		if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte{byte(pageID)})); err != nil {
+			t.Fatal(err)
+		}
 		log.LoadCommittedRecord(Record{
 			Header:      RecordHeader{Type: RecordTypeData, PageID: pageID},
-			PageContent: []byte{byte(pageID)},
+			PageContent: btree.EncodeWALNode(node),
 		})
 	}
 
@@ -70,10 +77,13 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 		if _, err := mainFile.ReadAt(pageContent, int64(pageID)*64); err != nil {
 			t.Fatal(err)
 		}
-		want := make([]byte, 64)
-		want[0] = byte(pageID)
-		if !bytes.Equal(pageContent, want) {
-			t.Fatalf("checkpoint page %d: got %v, want %v", pageID, pageContent, want)
+		node, err := btree.DecodeNode(pageContent, pageID, 64)
+		if err != nil {
+			t.Fatalf("decode checkpoint page %d: %v", pageID, err)
+		}
+		entry, found, err := node.FindEntry([]byte("key"))
+		if err != nil || !found || !bytes.Equal(entry.Value(), []byte{byte(pageID)}) {
+			t.Fatalf("checkpoint page %d entry: found=%t value=%v err=%v", pageID, found, entry.Value(), err)
 		}
 	}
 }
@@ -88,15 +98,16 @@ func TestRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		PageContent: []byte("xy"),
 	}
 	// Layout: record type, page ID, transaction ID, content length, content,
-	// and the FNV-1a checksum of all preceding bytes.
+	// and the CRC32C checksum of all preceding bytes.
 	want := []byte{
 		0,
 		1, 0, 0, 0, 0, 0, 0, 0,
 		2, 0, 0, 0, 0, 0, 0, 0,
 		2, 0, 0, 0,
 		'x', 'y',
-		0xf1, 0x3c, 0x9c, 0xc5, 0x52, 0x74, 0xd3, 0x4f,
 	}
+	wantChecksum := crc32.Checksum(want, crc32.MakeTable(crc32.Castagnoli))
+	want = binary.LittleEndian.AppendUint32(want, wantChecksum)
 
 	encoded, err := EncodeRecord(record, int64(len(record.PageContent)))
 	if err != nil {

@@ -46,7 +46,7 @@ func NewTree(store Store) *Tree {
 // It returns [ErrKeyNotFound] if a selected child page has no node.
 func (tree *Tree) findLeafNode(root *Node, key []byte) (*Node, error) {
 	node := root
-	for !node.IsLeaf {
+	for !node.IsLeaf() {
 		childIndex, err := node.FindChildIndex(key)
 		if err != nil {
 			return nil, err
@@ -78,9 +78,12 @@ func (tree *Tree) validateEntry(entry Entry) error {
 		return ErrValueTooLarge
 	}
 	pageSize := int(tree.store.PageSize())
-	leafSize := nodeHeaderSize + entry.EncodedSize(true)
+
+	// for leafSize and branchSize, encodedUint32Size: checksum uint32 size
+
+	leafSize := NodeHeaderSize + encodedUint32Size + entry.EncodedSize(true)
 	// The smallest branch has one separator with a left and right child, so it needs two page IDs.
-	branchSize := nodeHeaderSize + entry.EncodedSize(false) + 2*page.IDSize
+	branchSize := NodeHeaderSize + encodedUint32Size + entry.EncodedSize(false) + 2*page.IDSize
 	if leafSize > pageSize || branchSize > pageSize {
 		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLarge, entry.Key(), tree.store.PageSize())
 	}
@@ -100,7 +103,7 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 	var path []treePathStep
 	// Find the target leaf and save each branch-to-child move.
 	// The split loop can use this local path without changing committed nodes.
-	for !node.IsLeaf {
+	for !node.IsLeaf() {
 		childIndex, err := node.FindChildIndex(entry.Key())
 		if err != nil {
 			return nil, err
@@ -240,14 +243,7 @@ func (n *Node) NeedsSplit(pageSize int64) bool {
 
 // EncodedSize reports the exact number of bytes that [EncodeNode] writes for n.
 func (n *Node) EncodedSize() int {
-	size := nodeHeaderSize
-	for _, entry := range n.entries {
-		size += entry.EncodedSize(n.IsLeaf)
-	}
-	if !n.IsLeaf {
-		size += len(n.Children) * page.IDSize
-	}
-	return size
+	return NodeHeaderSize + nodePayloadSize(n)
 }
 
 // chooseSplitIndex selects a separator near half a page based on encoded entry bytes while preserving valid left and right node shapes.
@@ -258,7 +254,7 @@ func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
 	separatorIndex := -1
 
 	for i, entry := range n.entries {
-		currSize += entry.EncodedSize(n.IsLeaf)
+		currSize += entry.EncodedSize(n.IsLeaf())
 		if currSize >= limit {
 			separatorIndex = i
 			break
@@ -270,7 +266,7 @@ func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
 	}
 
 	// The leaf separator remains in the right node, so each side must keep at least one entry.
-	if n.IsLeaf {
+	if n.IsLeaf() {
 		if len(n.entries) < 2 {
 			return -1, ErrNodeNotSaturated
 		}
@@ -298,13 +294,12 @@ func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
 	}
 
 	rightNode := &Node{
-		IsLeaf:   n.IsLeaf,
+		header:   newNodeHeader(n.header.Type, newPageID),
 		Children: []page.ID{},
-		pgid:     newPageID,
 	}
 
 	separator := n.entries[separatorIndex].key
-	if n.IsLeaf {
+	if n.IsLeaf() {
 		rightNode.entries = slices.Clone(n.entries[separatorIndex:])
 		n.entries = n.entries[:separatorIndex]
 	} else {
@@ -312,10 +307,11 @@ func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
 		n.entries = n.entries[:separatorIndex]
 	}
 
-	if !n.IsLeaf {
+	if !n.IsLeaf() {
 		rightNode.Children = slices.Clone(n.Children[separatorIndex+1:])
 		n.Children = n.Children[:separatorIndex+1]
 	}
+	n.header.Checksum = 0
 
 	return rightNode, separator, nil
 }
@@ -329,5 +325,6 @@ func (parent *Node) InsertSplitChild(leftIndex int, rightNode *Node, separator [
 
 	parent.Children = append(parent.Children, 0)
 	copy(parent.Children[leftIndex+2:], parent.Children[leftIndex+1:])
-	parent.Children[leftIndex+1] = rightNode.pgid
+	parent.Children[leftIndex+1] = rightNode.PageID()
+	parent.header.Checksum = 0
 }
