@@ -44,7 +44,7 @@ func TestNodeCache_AllowsConcurrentGets(t *testing.T) {
 	}
 }
 
-func TestNodeCache_RemovesLeastRecentlyUsedNode(t *testing.T) {
+func TestNodeCache_CoalescesReferencesBeforeClockSweep(t *testing.T) {
 	cache := newNodeCache(2)
 	first := btree.NewLeafNode(1)
 	second := btree.NewLeafNode(2)
@@ -57,11 +57,34 @@ func TestNodeCache_RemovesLeastRecentlyUsedNode(t *testing.T) {
 	}
 	cache.Put(third)
 
-	if _, ok := cache.Get(2); ok {
-		t.Fatal("least recently used node remains cached")
+	if _, ok := cache.Get(1); ok {
+		t.Fatal("first clock candidate remains cached")
+	}
+	if _, ok := cache.Get(2); !ok {
+		t.Fatal("second clock candidate was evicted")
 	}
 	if got := cache.Len(); got != 2 {
 		t.Fatalf("cache length: got %d, want 2", got)
+	}
+}
+
+func TestNodeCache_GivesReferencedNodeSecondChance(t *testing.T) {
+	cache := newNodeCache(3)
+	cache.Put(btree.NewLeafNode(1))
+	cache.Put(btree.NewLeafNode(2))
+	cache.Put(btree.NewLeafNode(3))
+	cache.Put(btree.NewLeafNode(4))
+
+	if _, ok := cache.Get(2); !ok {
+		t.Fatal("second node not cached")
+	}
+	cache.Put(btree.NewLeafNode(5))
+
+	if _, ok := cache.Get(2); !ok {
+		t.Fatal("referenced node was evicted")
+	}
+	if _, ok := cache.Get(3); ok {
+		t.Fatal("unreferenced node remains cached")
 	}
 }
 

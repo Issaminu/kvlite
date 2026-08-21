@@ -3,22 +3,26 @@ package kvlite
 import (
 	"container/list"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
 type nodeCacheEntry struct {
-	pageID page.ID
-	node   *btree.Node
+	pageID     page.ID
+	node       *btree.Node
+	referenced atomic.Bool
 }
 
-// nodeCache stores committed nodes in least-recently-used order. Its methods permit concurrent calls, but callers must not mutate a stored node.
+// nodeCache stores committed nodes with CLOCK eviction. Its methods permit concurrent calls, but callers must not mutate a stored node.
 type nodeCache struct {
-	mu       sync.Mutex
+	mu       sync.RWMutex
 	capacity int
 	entries  map[page.ID]*list.Element
 	order    list.List
+	// hand names the next eviction candidate. It is nil only when order is empty.
+	hand *list.Element
 }
 
 func newNodeCache(capacity int) *nodeCache {
@@ -33,14 +37,20 @@ func (cache *nodeCache) Get(pageID page.ID) (*btree.Node, bool) {
 	if cache == nil || cache.capacity == 0 {
 		return nil, false
 	}
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
+	cache.mu.RLock()
 	element, ok := cache.entries[pageID]
 	if !ok {
+		cache.mu.RUnlock()
 		return nil, false
 	}
-	cache.order.MoveToFront(element)
-	return element.Value.(nodeCacheEntry).node, true
+	entry := element.Value.(*nodeCacheEntry)
+	// Avoid an atomic write after the first reference in the current clock cycle.
+	if !entry.referenced.Load() {
+		entry.referenced.Store(true)
+	}
+	node := entry.node
+	cache.mu.RUnlock()
+	return node, true
 }
 
 func (cache *nodeCache) Put(node *btree.Node) {
@@ -51,28 +61,59 @@ func (cache *nodeCache) Put(node *btree.Node) {
 	defer cache.mu.Unlock()
 	pageID := node.PageID()
 	if element, ok := cache.entries[pageID]; ok {
-		element.Value = nodeCacheEntry{pageID: pageID, node: node}
-		cache.order.MoveToFront(element)
+		entry := element.Value.(*nodeCacheEntry)
+		entry.node = node
+		entry.referenced.Store(true)
 		return
 	}
 
-	element := cache.order.PushFront(nodeCacheEntry{pageID: pageID, node: node})
+	if cache.order.Len() == cache.capacity {
+		cache.evictOne()
+	}
+	entry := &nodeCacheEntry{pageID: pageID, node: node}
+	entry.referenced.Store(true)
+	element := cache.order.PushBack(entry)
 	cache.entries[pageID] = element
-	if cache.order.Len() <= cache.capacity {
+	if cache.hand == nil {
+		cache.hand = element
+	}
+}
+
+// evictOne clears each referenced entry once and removes the first entry that has not been referenced since the clock hand last passed it.
+func (cache *nodeCache) evictOne() {
+	for {
+		element := cache.hand
+		entry := element.Value.(*nodeCacheEntry)
+		if entry.referenced.Load() {
+			entry.referenced.Store(false)
+			cache.advanceClockHand()
+			continue
+		}
+
+		delete(cache.entries, entry.pageID)
+		if cache.order.Len() == 1 {
+			cache.hand = nil
+		} else {
+			cache.advanceClockHand()
+		}
+		cache.order.Remove(element)
 		return
 	}
+}
 
-	oldest := cache.order.Back()
-	delete(cache.entries, oldest.Value.(nodeCacheEntry).pageID)
-	cache.order.Remove(oldest)
+func (cache *nodeCache) advanceClockHand() {
+	cache.hand = cache.hand.Next()
+	if cache.hand == nil {
+		cache.hand = cache.order.Front()
+	}
 }
 
 func (cache *nodeCache) Len() int {
 	if cache == nil {
 		return 0
 	}
-	cache.mu.Lock()
-	defer cache.mu.Unlock()
+	cache.mu.RLock()
+	defer cache.mu.RUnlock()
 	return cache.order.Len()
 }
 
