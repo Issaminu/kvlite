@@ -3,6 +3,7 @@ package kvlite
 import (
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -30,6 +31,9 @@ const (
 type Options struct {
 	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. Because this mode cannot write, [DB.Update] and [DB.Put] return [ErrDatabaseReadOnly].
 	ReadOnly bool
+
+	// LockTimeout limits how long [Open] waits for a conflicting database-file lock. A zero value waits until the other handle closes, a positive value returns an error that matches [ErrDatabaseLocked] after that duration, and a negative value is invalid. KVLite holds the lock for the full [DB] lifetime, not for one transaction.
+	LockTimeout time.Duration
 
 	// PageSize sets the page size in bytes for a new database. It must be between 40 bytes, the encoded metadata size, and [MaxValueSize]. A zero value uses the operating system page size, while an existing database always uses the page size stored in its file. A smaller page reduces the largest entry and branch separator that KVLite can store.
 	PageSize int
@@ -75,6 +79,9 @@ func resolveOptions(options *Options) (*Options, error) {
 
 	if resolved.PageSize == 0 {
 		resolved.PageSize = os.Getpagesize()
+	}
+	if resolved.LockTimeout < 0 {
+		return nil, fmt.Errorf("invalid database lock timeout %s: %w", resolved.LockTimeout, ErrInvalid)
 	}
 	if resolved.PageSize < page.MetaSize || resolved.PageSize > MaxValueSize {
 		return nil, fmt.Errorf("invalid database page size %d: %w", resolved.PageSize, ErrInvalid)

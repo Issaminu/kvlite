@@ -8,7 +8,7 @@
 //
 // A [DB] accepts concurrent method calls. Read-only transaction callbacks can run together, but a write callback does not overlap another transaction callback. Concurrent [DB.Update] calls in [SyncFull] mode can share one write-ahead log append and storage synchronization.
 //
-// KVLite does not lock database files. An application must not open the same path more than once at the same time.
+// KVLite holds a database-file lock while a [DB] is open. Several read-only handles can hold shared locks together, while a writable handle holds an exclusive lock that prevents every other KVLite handle from opening the same database. By default, [Open] waits until a conflicting handle closes.
 //
 // Writes first go to a write-ahead log beside the database file. When Close succeeds, it checkpoints committed data into the database file and removes the log, so callers must check its error.
 package kvlite

@@ -9,6 +9,7 @@ import (
 
 var (
 	ErrDatabaseNotOpen      = errors.New("database not open")
+	ErrDatabaseLocked       = errors.New("database is locked") // ErrDatabaseLocked means Open did not acquire a conflicting database-file lock before the configured positive timeout expired.
 	ErrInvalid              = page.ErrInvalid
 	ErrVersionMismatch      = page.ErrVersionMismatch
 	ErrChecksum             = page.ErrChecksum

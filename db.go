@@ -63,6 +63,8 @@ func (db *DB) endOperation() {
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
 //
+// A read-only Open takes a shared database-file lock, so several read-only handles can open the database together. A writable Open takes an exclusive lock. Open waits for a conflicting handle to close unless a positive [Options.LockTimeout] expires.
+//
 // The caller must call [DB.Close] when the database is no longer needed and must check its error.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if path == "" {
@@ -90,6 +92,10 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		path:    path,
 		file:    dbFile,
 		options: resolvedOptions,
+	}
+	// The main file descriptor owns the process lock, so failOpen and Close release the lock through their existing file-close paths.
+	if err := lockDatabaseFile(db.file, db.options.ReadOnly, db.options.LockTimeout); err != nil {
+		return db.failOpen(err)
 	}
 	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()

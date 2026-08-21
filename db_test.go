@@ -1978,9 +1978,152 @@ func TestDB_Open_ReadOnly_NoCreate(t *testing.T) {
 	}
 }
 
-// TestOpen_MultipleGoroutines: concurrent opens/closes must be safe (exclusive lock).
-func TestOpen_MultipleGoroutines(t *testing.T) {
-	t.Skip("deferred: needs file locking")
+func TestOpen_EnforcesProcessLockModes(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	firstReader, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer firstReader.Close()
+	secondReader, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("second read-only Open: %v", err)
+	}
+	defer secondReader.Close()
+
+	writer, err := Open(path, 0600, &Options{LockTimeout: time.Nanosecond})
+	if writer != nil {
+		defer writer.Close()
+	}
+	if !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("writable Open while read-only handles were open: got %v, want ErrDatabaseLocked", err)
+	}
+
+	if err := secondReader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := firstReader.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	writer, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatalf("writable Open after readers closed: %v", err)
+	}
+	defer writer.Close()
+
+	secondWriter, err := Open(path, 0600, &Options{LockTimeout: time.Nanosecond})
+	if secondWriter != nil {
+		defer secondWriter.Close()
+	}
+	if !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("second writable Open: got %v, want ErrDatabaseLocked", err)
+	}
+	reader, err := Open(path, 0600, &Options{ReadOnly: true, LockTimeout: time.Nanosecond})
+	if reader != nil {
+		defer reader.Close()
+	}
+	if !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("read-only Open while a writable handle was open: got %v, want ErrDatabaseLocked", err)
+	}
+}
+
+func TestOpen_DefaultWaitsForProcessLock(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	first, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	type openResult struct {
+		db  *DB
+		err error
+	}
+	result := make(chan openResult, 1)
+	go func() {
+		db, err := Open(path, 0600, nil)
+		result <- openResult{db: db, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		if got.db != nil {
+			_ = got.db.Close()
+		}
+		t.Fatalf("Open returned while the first handle still held the lock: %v", got.err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-result:
+		if got.err != nil {
+			t.Fatalf("Open after the first handle closed: %v", got.err)
+		}
+		if err := got.db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Open did not acquire the released process lock")
+	}
+}
+
+func TestOpen_ProcessLockTimeout(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	first, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+
+	const timeout = 75 * time.Millisecond
+	started := time.Now()
+	second, err := Open(path, 0600, &Options{LockTimeout: timeout})
+	elapsed := time.Since(started)
+	if second != nil {
+		_ = second.Close()
+		t.Fatal("Open acquired a process lock that another handle held")
+	}
+	if !errors.Is(err, ErrDatabaseLocked) {
+		t.Fatalf("Open after lock timeout: got %v, want ErrDatabaseLocked", err)
+	}
+	if elapsed < timeout {
+		t.Fatalf("Open returned after %v, before the %v lock timeout", elapsed, timeout)
+	}
+}
+
+func TestOpen_RejectsNegativeLockTimeout(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, &Options{LockTimeout: -time.Nanosecond})
+	if db != nil {
+		_ = db.Close()
+	}
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Open with a negative lock timeout: got %v, want ErrInvalid", err)
+	}
 }
 
 // TestOpen_MetaInitWriteError: write errors during meta init must surface from Open.
