@@ -36,14 +36,15 @@ func TestIDCodec_UsesExactlyEightLittleEndianBytes(t *testing.T) {
 
 func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 	// Distinct field values make the order and width of every field visible.
-	meta := &Meta{magic: 1, version: 2, pageSize: 3, pgid: 4, root: 5, checksum: 6}
+	meta := &Meta{magic: 1, version: 2, pageSize: 3, pgid: 4, root: 5, generation: 6, checksum: 7}
 	want := []byte{
 		1, 0, 0, 0,
 		2, 0, 0, 0,
 		3, 0, 0, 0, 0, 0, 0, 0,
 		4, 0, 0, 0, 0, 0, 0, 0,
 		5, 0, 0, 0, 0, 0, 0, 0,
-		6, 0, 0, 0,
+		6, 0, 0, 0, 0, 0, 0, 0,
+		7, 0, 0, 0,
 	}
 
 	encoded := EncodeMeta(meta)
@@ -59,8 +60,8 @@ func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		t.Fatalf("decode meta: got %+v, want %+v", decoded, meta)
 	}
 
-	// The six metadata fields occupy exactly 36 bytes.
-	for _, size := range []int{35, 37} {
+	// The seven metadata fields occupy exactly 44 bytes.
+	for _, size := range []int{43, 45} {
 		if _, err := DecodeMeta(make([]byte, size)); !errors.Is(err, ErrInvalid) {
 			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
 		}
@@ -80,8 +81,8 @@ func TestMetaChecksum_UsesCRC32C(t *testing.T) {
 func TestMeta_TracksRootAndAllocatedPages(t *testing.T) {
 	const pageSize int64 = 4096 // The page size does not affect page ID allocation.
 	const (
-		initialRoot ID = 1 // Page zero holds metadata, so the first node uses page one.
-		nextPage    ID = 2 // The next allocation follows the initial root page.
+		initialRoot ID = 2 // Pages zero and one hold metadata, so the first node uses page two.
+		nextPage    ID = 3 // The next allocation follows the initial root page.
 	)
 
 	meta := NewMeta(pageSize)
@@ -91,12 +92,23 @@ func TestMeta_TracksRootAndAllocatedPages(t *testing.T) {
 	if got := meta.Root(); got != initialRoot {
 		t.Fatalf("initial root: got %d, want %d", got, initialRoot)
 	}
+	if got := meta.Generation(); got != 0 {
+		t.Fatalf("initial generation: got %d, want 0", got)
+	}
 	if got := meta.Allocate(); got != nextPage {
 		t.Fatalf("allocated page: got %d, want %d", got, nextPage)
 	}
 
 	meta.SetRoot(nextPage)
+	meta.AdvanceGeneration()
+	meta.RefreshChecksum()
 	if got := meta.Root(); got != nextPage {
 		t.Fatalf("replacement root: got %d, want %d", got, nextPage)
+	}
+	if got := meta.Generation(); got != 1 {
+		t.Fatalf("advanced generation: got %d, want 1", got)
+	}
+	if err := meta.Validate(); err != nil {
+		t.Fatalf("validate advanced metadata: %v", err)
 	}
 }

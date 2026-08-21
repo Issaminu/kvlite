@@ -19,7 +19,7 @@ func (db *DB) replayWAL(records []wal.Record) error {
 	return db.ingestWalRecords(records)
 }
 
-func (db *DB) readOrCreateWal() (*wal.WAL, []wal.Record, error) {
+func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.Record, error) {
 	walPath := db.path + "-wal"
 	var walFile *os.File
 	var err error
@@ -45,7 +45,7 @@ func (db *DB) readOrCreateWal() (*wal.WAL, []wal.Record, error) {
 	log := wal.New(wal.Config{
 		Path:                     walPath,
 		File:                     walFile,
-		PageSize:                 db.meta.PageSize(),
+		PageSize:                 pageSize,
 		SyncOnCommit:             db.options.Synchronous == SyncFull,
 		CheckpointThresholdBytes: db.options.CheckpointThresholdBytes,
 	})
@@ -103,22 +103,23 @@ func committedWALRecords(records []wal.Record) ([]wal.Record, error) {
 	return committed, nil
 }
 
+// metaFromCommittedWAL returns the newest valid metadata from a complete WAL transaction.
 func metaFromCommittedWAL(records []wal.Record) (*page.Meta, error) {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return nil, err
 	}
-	// starting from the last record downwards to get the most recent version of the meta, then early break then
+	// Scan backward because the newest committed transaction contains the latest metadata generation.
 	for index := len(committed) - 1; index >= 0; index-- {
 		record := committed[index]
-		if record.Header.Type != wal.RecordTypeMeta || record.Header.PageID != page.MetaID {
+		if record.Header.Type != wal.RecordTypeMeta || !page.IsMetaID(record.Header.PageID) {
 			continue
 		}
 		meta, err := page.DecodeMeta(record.PageContent)
 		if err != nil {
 			return nil, err
 		}
-		if err := meta.Validate(); err != nil {
+		if err := validateMeta(meta); err != nil {
 			return nil, err
 		}
 		return meta, nil
@@ -126,12 +127,7 @@ func metaFromCommittedWAL(records []wal.Record) (*page.Meta, error) {
 	return nil, ErrInvalid
 }
 
-// loadCommittedIntoOverlay replays a crashed WAL into the in-memory overlay instead
-// of the main file. It is the read-only counterpart to ingestWalRecords: a read-only
-// handle may not write the main file, yet it must still expose every committed page.
-// It groups records by commit marker (so a torn, uncommitted tail is dropped), keeps
-// the latest page per pgid, and adopts the committed meta (page 0) so reads resolve
-// the recovered root.
+// loadCommittedIntoOverlay makes committed WAL pages visible to a read-only database. It does not change the main file. Validated WAL metadata replaces db.meta when a committed transaction includes metadata.
 func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
 	committed, err := committedWALRecords(records)
 	if err != nil {
@@ -141,12 +137,20 @@ func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
 		db.wal.LoadCommittedRecord(record)
 	}
 
-	if metaRecord, ok := db.wal.CommittedRecord(page.MetaID); ok {
-		meta, err := page.DecodeMeta(metaRecord.PageContent)
-		if err != nil {
-			return fmt.Errorf("read committed meta from WAL: %w", err)
+	hasMetaRecord := false
+	for _, record := range committed {
+		if record.Header.Type == wal.RecordTypeMeta && page.IsMetaID(record.Header.PageID) {
+			hasMetaRecord = true
+			break
 		}
-		db.meta = meta
 	}
+	if !hasMetaRecord {
+		return nil
+	}
+	meta, metaErr := metaFromCommittedWAL(records)
+	if metaErr != nil {
+		return fmt.Errorf("read committed meta from WAL: %w", metaErr)
+	}
+	db.meta = meta
 	return nil
 }

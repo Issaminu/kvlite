@@ -3,11 +3,8 @@ package kvlite
 // Some tests here are adapted from etcd-io/bbolt
 // (https://github.com/etcd-io/bbolt), MIT License, Copyright (c) 2013 Ben Johnson.
 //
-// We build DFS: the thinnest working database first, then deepen. So the LIVE
-// target right now is "Rung 1 — walking skeleton" (Put/Get that survives reopen).
-// The bbolt-flavored open/meta tests are PARKED (skipped) until Rung 4, because
-// they demand a meta page before we even have a working store — that's the
-// breadth-first trap we're avoiding.
+// The suite started from a small Put/Get path and now covers the database file,
+// metadata, WAL, transactions, buckets, locking, and recovery behavior.
 
 import (
 	"bytes"
@@ -45,6 +42,34 @@ func TestEncodeWALRecords_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 	}
 	if got := binary.LittleEndian.Uint32(records[0].PageContent[12:btree.NodeHeaderSize]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
+	}
+}
+
+func TestEncodeWALRecords_ReplicatesChangedMetadata(t *testing.T) {
+	meta := page.NewMeta(4096)
+	records := encodeWALRecords(nil, meta, true)
+	if len(records) != 2 {
+		t.Fatalf("metadata WAL records: got %d, want 2", len(records))
+	}
+
+	for index, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
+		record := records[index]
+		if record.Header.Type != wal.RecordTypeMeta || record.Header.PageID != pageID {
+			t.Fatalf("metadata WAL record %d header: got %+v, want page %d metadata", index, record.Header, pageID)
+		}
+		decoded, err := page.DecodeMeta(record.PageContent)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := decoded.Validate(); err != nil {
+			t.Fatalf("validate metadata WAL record %d: %v", index, err)
+		}
+		if got := decoded.Generation(); got != 1 {
+			t.Fatalf("metadata WAL record %d generation: got %d, want 1", index, got)
+		}
+	}
+	if !bytes.Equal(records[0].PageContent, records[1].PageContent) {
+		t.Fatal("metadata WAL records contain different copies")
 	}
 }
 
@@ -94,6 +119,30 @@ func fileSize(t *testing.T, path string) int64 {
 		t.Fatal(err)
 	}
 	return fi.Size()
+}
+
+func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
+	t.Helper()
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	meta := page.NewMeta(pageSize)
+	encodedMeta := page.EncodeMeta(meta)
+	for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
+		if _, err := file.WriteAt(encodedMeta, int64(pageID)*pageSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root := btree.NewLeafNode(meta.Root())
+	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Sync(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func createBucket(tb testing.TB, db *DB, name []byte) {
@@ -323,12 +372,9 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 	}
 }
 
-// TestBucketPut_RejectedSeparatorKeyLeavesTransactionUsable catches validation
-// that accepts a leaf key which cannot later fit in a branch separator.
-func TestBucketPut_RejectedSeparatorKeyLeavesTransactionUsable(t *testing.T) {
+func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	const pageSize = 128
-	db, err := Open(path, 0600, &Options{PageSize: pageSize, Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -341,13 +387,14 @@ func TestBucketPut_RejectedSeparatorKeyLeavesTransactionUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	unsafeKey := bytes.Repeat([]byte("k"), 100)
+	rejectedKey := []byte("too-large")
+	rejectedValue := bytes.Repeat([]byte("v"), int(db.meta.PageSize()))
 	err = db.Update(func(tx *Tx) error {
 		bucket := mustBucket(t, tx, testBucketName)
 		beforeMeta := page.EncodeMeta(tx.meta)
 
-		if err := bucket.Put(unsafeKey, nil); !errors.Is(err, ErrEntryTooLargeForPage) {
-			t.Fatalf("unsafe separator Put: got %v, want ErrEntryTooLargeForPage", err)
+		if err := bucket.Put(rejectedKey, rejectedValue); !errors.Is(err, ErrEntryTooLargeForPage) {
+			t.Fatalf("oversized Put: got %v, want ErrEntryTooLargeForPage", err)
 		}
 		if afterMeta := page.EncodeMeta(tx.meta); !bytes.Equal(afterMeta, beforeMeta) {
 			t.Fatal("rejected Put changed transaction metadata")
@@ -359,7 +406,7 @@ func TestBucketPut_RejectedSeparatorKeyLeavesTransactionUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := db.Get(testBucketName, unsafeKey); !errors.Is(err, ErrKeyNotFound) {
+	if _, err := db.Get(testBucketName, rejectedKey); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("rejected key lookup: got %v, want ErrKeyNotFound", err)
 	}
 	if got, err := db.Get(testBucketName, []byte("good")); err != nil || !bytes.Equal(got, []byte("value")) {
@@ -487,9 +534,9 @@ func TestFile_SinglePage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Page 0 is metadata, page 1 is the bucket catalog, and page 2 is the data leaf.
-	if size := fileSize(t, path); size != 3*pageBytes {
-		t.Fatalf("a small bucket should occupy exactly three %d-byte pages (meta + catalog + data leaf), got %d bytes "+
+	// Pages 0 and 1 are metadata, page 2 is the bucket catalog, and page 3 is the data leaf.
+	if size := fileSize(t, path); size != 4*pageBytes {
+		t.Fatalf("a small bucket should occupy exactly four %d-byte pages (two metadata + catalog + data leaf), got %d bytes "+
 			"(nodes must be padded to page boundaries)", pageBytes, size)
 	}
 }
@@ -1211,7 +1258,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The main file right after Open holds the initial meta + root.
+	// The main file right after Open holds both initial metadata copies and the root.
 	mainAfterOpen, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
@@ -1593,29 +1640,27 @@ func TestDefaultOptionsAreIndependent(t *testing.T) {
 	}
 }
 
-func TestOpen_PageSizeOptionControlsNewDatabase(t *testing.T) {
+func TestOpen_NewDatabaseUsesOperatingSystemPageSize(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	const pageSize = 8 * 1024 // Use an 8 KiB page so the expected file layout is explicit.
-	db, err := Open(path, 0600, &Options{PageSize: pageSize, Synchronous: SyncNormal})
+	pageSize := int64(os.Getpagesize())
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if db.meta.PageSize() != pageSize {
 		t.Fatalf("new database page size: got %d, want %d", db.meta.PageSize(), pageSize)
 	}
-	if got := fileSize(t, path); got != 2*pageSize {
-		t.Fatalf("new database file size: got %d, want two %d-byte pages", got, pageSize)
+	if got := fileSize(t, path); got != 3*pageSize {
+		t.Fatalf("new database file size: got %d, want three %d-byte pages", got, pageSize)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// An existing database owns its page size. A later option must not reinterpret
-	// its pages with a different size.
-	reopened, err := Open(path, 0600, &Options{PageSize: pageSize / 2, Synchronous: SyncNormal})
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1625,48 +1670,18 @@ func TestOpen_PageSizeOptionControlsNewDatabase(t *testing.T) {
 	}
 }
 
-func TestOpen_ZeroPageSizeUsesOperatingSystemPageSize(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-	defer os.RemoveAll(path + "-wal")
+func TestOpen_ExistingDatabaseUsesStoredPageSize(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	storedPageSize := int64(os.Getpagesize()) * 2
+	writeEmptyDatabaseWithPageSize(t, path, storedPageSize)
 
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	if got, want := db.meta.PageSize(), int64(os.Getpagesize()); got != want {
-		t.Fatalf("zero page size: got %d, want operating system page size %d", got, want)
-	}
-}
-
-func TestOpen_InvalidPageSizeDoesNotCreateDatabase(t *testing.T) {
-	testCases := []struct {
-		name     string
-		pageSize int
-	}{
-		{name: "negative", pageSize: -1},
-		{name: "smaller than metadata", pageSize: page.MetaSize - 1},
-		{name: "larger than supported value", pageSize: MaxValueSize + 1},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			path := tempfile()
-			defer os.RemoveAll(path)
-			defer os.RemoveAll(path + "-wal")
-
-			db, err := Open(path, 0600, &Options{PageSize: testCase.pageSize})
-			if db != nil {
-				_ = db.Close()
-			}
-			if !errors.Is(err, ErrInvalid) {
-				t.Fatalf("Open error: got %v, want ErrInvalid", err)
-			}
-			if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
-				t.Fatalf("invalid page size created the database, stat error %v", statErr)
-			}
-		})
+	if got := db.meta.PageSize(); got != storedPageSize {
+		t.Fatalf("existing database page size: got %d, want stored size %d", got, storedPageSize)
 	}
 }
 
@@ -1798,13 +1813,10 @@ func TestDB_Path(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// PARKED until Rung 4 (robustness). These demand a meta page / locking / tx and
-// are premature for the walking skeleton — deliberately skipped so the only red
-// signal is Rung 1. Un-skip each when its wall actually bites.
+// Open and metadata robustness.
 // -----------------------------------------------------------------------------
 
-// TestOpen_ErrInvalid: opening a non-kvlite file must return ErrInvalid.
-// (Needs a meta page to validate against — Rung 4.)
+// TestOpen_ErrInvalid checks that opening a non-KVLite file returns ErrInvalid.
 func TestOpen_ErrInvalid(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1825,8 +1837,7 @@ func TestOpen_ErrInvalid(t *testing.T) {
 	}
 }
 
-// TestOpen_FileTooSmall: opening a file too small to hold the meta pages errors.
-// (Needs meta/page validation — Rung 4.)
+// TestOpen_FileTooSmall checks that a file too small for metadata cannot open.
 func TestOpen_FileTooSmall(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1839,9 +1850,7 @@ func TestOpen_FileTooSmall(t *testing.T) {
 	}
 }
 
-// TestOpen_ErrVersionMismatch: meta with a different format version must fail with
-// ErrVersionMismatch. TODO(Rung 4/meta): create a valid DB, flip `version` in both
-// meta pages, reopen, assert errors.Is(err, ErrVersionMismatch).
+// TestOpen_ErrVersionMismatch checks that two unsupported metadata versions fail.
 func TestOpen_ErrVersionMismatch(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1850,17 +1859,19 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pageSize := db.meta.PageSize()
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// Meta lives at offset 0: magic(0-3), version(4-7), pageSize(8-15), pgid(16-23),
-	// root(24-31). Bump the version field, leaving the magic intact.
+	// Both metadata copies use version bytes 4-7 within their page. Bump both
+	// version fields so Open has no valid current-format copy.
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf[4] = 0xFF // Replace the current version with an unsupported value.
+	buf[4] = 0xFF
+	buf[pageSize+4] = 0xFF
 	if err := os.WriteFile(path, buf, 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1870,8 +1881,7 @@ func TestOpen_ErrVersionMismatch(t *testing.T) {
 	}
 }
 
-// TestOpen_ErrChecksum: a corrupted meta checksum must fail with ErrChecksum.
-// TODO(Rung 4/meta): corrupt a meta field in both pages so the seal mismatches.
+// TestOpen_ErrChecksum checks that corruption in both metadata copies fails.
 func TestOpen_ErrChecksum(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1880,6 +1890,7 @@ func TestOpen_ErrChecksum(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pageSize := db.meta.PageSize()
 	if err := db.Put(testBucketName, []byte("a"), []byte("1")); err != nil {
 		t.Fatal(err)
 	}
@@ -1887,19 +1898,181 @@ func TestOpen_ErrChecksum(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Corrupt a meta DATA field (root pgid, uint64 at offset 24). magic + version stay
-	// valid, so ONLY a checksum can catch this — that's what forces the checksum to exist.
+	// Corrupt the root field in both copies. Magic and version remain valid, so
+	// only the checksums can reject the damage.
 	buf, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	buf[24] ^= 0xFF
+	buf[pageSize+24] ^= 0xFF
 	if err := os.WriteFile(path, buf, 0600); err != nil {
 		t.Fatal(err)
 	}
 
 	if _, err := openDB(path); !errors.Is(err, ErrChecksum) {
 		t.Fatalf("expected ErrChecksum, got: %v", err)
+	}
+}
+
+func readMetaCopy(t *testing.T, path string, pageSize int64, pageID page.ID) *page.Meta {
+	t.Helper()
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	data := make([]byte, page.MetaSize)
+	if _, err := file.ReadAt(data, int64(pageID)*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	meta, err := page.DecodeMeta(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return meta
+}
+
+func TestCheckpoint_PersistsCurrentMetadataToBothCopies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	meta0 := readMetaCopy(t, path, pageSize, page.Meta0ID)
+	meta1 := readMetaCopy(t, path, pageSize, page.Meta1ID)
+	if err := meta0.Validate(); err != nil {
+		t.Fatalf("validate metadata page 0: %v", err)
+	}
+	if err := meta1.Validate(); err != nil {
+		t.Fatalf("validate metadata page 1: %v", err)
+	}
+	if !bytes.Equal(page.EncodeMeta(meta0), page.EncodeMeta(meta1)) {
+		t.Fatal("checkpoint stored different metadata copies")
+	}
+	if meta0.Generation() == 0 {
+		t.Fatal("checkpoint did not advance the metadata generation")
+	}
+}
+
+func TestOpen_RecoversFromCorruptMetadataPage1(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootOffset := pageSize + 24
+	rootByte := []byte{0}
+	if _, err := file.ReadAt(rootByte, rootOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	rootByte[0] ^= 0xff
+	if _, err := file.WriteAt(rootByte, rootOffset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatalf("open with corrupt metadata page 1: %v", err)
+	}
+	defer reopened.Close()
+	value, err := reopened.Get(testBucketName, []byte("key"))
+	if err != nil || !bytes.Equal(value, []byte("value")) {
+		t.Fatalf("recovered value: got %q, error %v", value, err)
+	}
+}
+
+func TestOpen_SelectsValidMetadataWithHighestGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	newer := readMetaCopy(t, path, pageSize, page.Meta1ID)
+	newer.AdvanceGeneration()
+	newer.RefreshChecksum()
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page.EncodeMeta(newer), pageSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got := reopened.meta.Generation(); got != newer.Generation() {
+		t.Fatalf("selected metadata generation: got %d, want %d", got, newer.Generation())
+	}
+}
+
+func TestOpen_RejectsDifferentMetadataAtSameGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	conflicting := readMetaCopy(t, path, pageSize, page.Meta1ID)
+	conflicting.SetRoot(conflicting.Root() + 1)
+	conflicting.RefreshChecksum()
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(page.EncodeMeta(conflicting), pageSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if reopened != nil {
+		_ = reopened.Close()
+	}
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Open error: got %v, want ErrInvalid", err)
 	}
 }
 
@@ -1946,10 +2119,53 @@ func TestOpen_ErrChecksumForCorruptedBTreePage(t *testing.T) {
 	}
 }
 
-// TestOpen_ReadPageSize_FromMeta1: if meta page 0 is corrupt, recover page size + DB
-// from meta page 1. TODO(Rung 4/meta): needs dual meta pages + page-size detection.
+// TestOpen_ReadPageSize_FromMeta1 checks that a valid second metadata page can
+// recover the stored page size when the first metadata page is corrupt.
 func TestOpen_ReadPageSize_FromMeta1(t *testing.T) {
-	t.Skip("deferred to Rung 4: needs dual meta pages")
+	path := filepath.Join(t.TempDir(), "database")
+	pageSize := int64(os.Getpagesize())
+
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket(testBucketName)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt(make([]byte, page.MetaSize), 0); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatalf("open with corrupt metadata page 0: %v", err)
+	}
+	defer reopened.Close()
+	if got := reopened.meta.PageSize(); got != pageSize {
+		t.Fatalf("recovered page size: got %d, want %d", got, pageSize)
+	}
+	value, err := reopened.Get(testBucketName, []byte("key"))
+	if err != nil || !bytes.Equal(value, []byte("value")) {
+		t.Fatalf("recovered value: got %q, error %v", value, err)
+	}
 }
 
 // TestOpen_Size: a fresh DB lays out a fixed initial set of pages; reopen + a small
@@ -2432,8 +2648,10 @@ func TestUpdate_OverwriteDoesNotCommitUnchangedMetadata(t *testing.T) {
 	if stats.CommittedRecordCount != 1 {
 		t.Fatalf("overwrite committed records: got %d, want one data record", stats.CommittedRecordCount)
 	}
-	if _, ok := db.wal.CommittedRecord(page.MetaID); ok {
-		t.Fatal("overwrite committed unchanged metadata")
+	for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
+		if _, ok := db.wal.CommittedRecord(pageID); ok {
+			t.Fatalf("overwrite committed unchanged metadata page %d", pageID)
+		}
 	}
 }
 
@@ -2464,7 +2682,7 @@ func TestReadNode_DoesNotChangeMainFileOffset(t *testing.T) {
 	}
 }
 
-func TestReadMeta_DoesNotChangeMainFileOffset(t *testing.T) {
+func TestReadValidMainMeta_DoesNotChangeMainFileOffset(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := openDB(path)
 	if err != nil {
@@ -2476,7 +2694,7 @@ func TestReadMeta_DoesNotChangeMainFileOffset(t *testing.T) {
 	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.readMeta(); err != nil {
+	if _, _, err := db.readValidMainMeta(); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.file.Seek(0, io.SeekCurrent)
@@ -5855,6 +6073,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 	mainBytes[24] ^= 0xff
+	mainBytes[db.meta.PageSize()+24] ^= 0xff
 	if err := os.WriteFile(path, mainBytes, 0600); err != nil {
 		t.Fatal(err)
 	}

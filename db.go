@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -59,9 +60,11 @@ func (db *DB) endOperation() {
 	db.activeOperations.Done()
 }
 
-// Open opens the database at path and recovers any committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
+// Open opens the database at path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
+//
+// A new database uses the operating system page size. Open uses the stored page size when it reopens that database.
 //
 // A read-only Open takes a shared database-file lock, so several read-only handles can open the database together. A writable Open takes an exclusive lock. Open waits for a conflicting handle to close unless a positive [Options.LockTimeout] expires.
 //
@@ -93,42 +96,38 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		file:    dbFile,
 		options: resolvedOptions,
 	}
-	// The main file descriptor owns the process lock, so failOpen and Close release the lock through their existing file-close paths.
+	// The main file descriptor owns the process lock. failOpen and Close release the lock when they close this file.
 	if err := lockDatabaseFile(db.file, db.options.ReadOnly, db.options.LockTimeout); err != nil {
 		return db.failOpen(err)
 	}
-	// if the file is empty, create the meta, otherwise read it
 	isNew := !db.hasMeta()
 	var mainMetaErr error
+	var walPageSize int64
 	if isNew {
-		db.meta = page.NewMeta(int64(db.options.PageSize))
+		db.meta = page.NewMeta(int64(os.Getpagesize()))
+		walPageSize = db.meta.PageSize()
 	} else {
-		db.meta, err = db.readMeta()
-		if err != nil {
-			return db.failOpen(fmt.Errorf("read db meta: %w", err))
+		db.meta, walPageSize, mainMetaErr = db.readValidMainMeta()
+		if mainMetaErr != nil {
+			mainMetaErr = fmt.Errorf("read db meta: %w", mainMetaErr)
 		}
-		if err := db.meta.Validate(); err != nil {
-			mainMetaErr = fmt.Errorf("db version is unsupported: %w", err)
-			if !errors.Is(err, ErrChecksum) {
-				return db.failOpen(mainMetaErr)
-			}
+		// An unsupported main-file format can use another WAL layout. Current-format WAL data must not replace it.
+		if errors.Is(mainMetaErr, ErrVersionMismatch) {
+			return db.failOpen(mainMetaErr)
 		}
-		if db.meta.PageSize() < page.MetaSize || db.meta.PageSize() > MaxValueSize {
-			if mainMetaErr != nil {
-				return db.failOpen(mainMetaErr)
-			}
-			return db.failOpen(fmt.Errorf("invalid database page size %d: %w", db.meta.PageSize(), ErrInvalid))
+		if walPageSize == 0 {
+			return db.failOpen(mainMetaErr)
 		}
 	}
 
-	// if there's no WAL, create it. Otherwise, read it
-	wal, records, err := db.readOrCreateWal()
+	wal, records, err := db.readOrCreateWal(walPageSize)
 	if err != nil {
 		return db.failOpen(err)
 	}
 
 	db.wal = wal
 	if mainMetaErr != nil {
+		// Main-file metadata is not trusted here. Only validated metadata from a complete WAL transaction can establish db.meta.
 		if len(records) == 0 {
 			return db.failOpen(mainMetaErr)
 		}
@@ -145,16 +144,14 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		}
 	}
 
-	// If the WAL has records, the previous run crashed before checkpointing.
+	// A remaining WAL can contain committed data from an unclean close, an interrupted checkpoint, or failed cleanup. Writable recovery copies committed records to the main file. Read-only recovery keeps them in the WAL overlay.
 	if err := db.replayWAL(records); err != nil {
 		return db.failOpen(err)
 	}
 
-	// A writable open re-reads meta from the main file. A
-	// read-only open already holds the right meta: from the file when there is no
-	// WAL, or from the committed overlay when a WAL was replayed above.
+	// Writable recovery can replace either main-file metadata copy. Select and validate the copies again before a root page is read. Read-only recovery already selected main-file metadata or adopted validated WAL metadata.
 	if !db.options.ReadOnly {
-		db.meta, err = db.readMeta()
+		db.meta, _, err = db.readValidMainMeta()
 		if err != nil {
 			return db.failOpen(err)
 		}
@@ -365,7 +362,7 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 }
 
 func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
-	// check if Node exists exists in [wal.WAL.overlay]
+	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
 		node, err := wal.RecordToNode(&record)
@@ -390,22 +387,111 @@ func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
 	return node, nil
 }
 
-func (db *DB) readMeta() (*page.Meta, error) {
+func (db *DB) readMetaAt(offset int64) (*page.Meta, error) {
 	data := make([]byte, page.MetaSize)
-	reader := io.NewSectionReader(db.file, 0, page.MetaSize)
+	reader := io.NewSectionReader(db.file, offset, page.MetaSize)
 	if err := fileio.ReadFull(reader, data); err != nil {
 		return nil, errors.Join(ErrInvalid, err)
 	}
 	return page.DecodeMeta(data)
 }
 
-func (db *DB) persistMeta() error {
-	// recompute checksum
-	db.meta.RefreshChecksum()
+func validMetaPageSize(pageSize int64) bool {
+	return pageSize >= page.MetaSize && pageSize <= MaxValueSize
+}
 
-	writer := io.NewOffsetWriter(db.file, 0)
-	if err := fileio.WriteFull(writer, page.EncodeMeta(db.meta)); err != nil {
-		return fmt.Errorf("write meta: %w", err)
+// validateMeta checks the file marker, format version, checksum, and supported page size.
+func validateMeta(meta *page.Meta) error {
+	if meta == nil {
+		return ErrInvalid
+	}
+	if err := meta.Validate(); err != nil {
+		return err
+	}
+	if !validMetaPageSize(meta.PageSize()) {
+		return fmt.Errorf("invalid database page size %d: %w", meta.PageSize(), ErrInvalid)
+	}
+	return nil
+}
+
+// readValidMainMeta returns selected main-file metadata and the page size for WAL decoding. The selected metadata always passes full validation. If selection fails, the WAL page size can come from a supported field in a decoded metadata copy. Open does not treat that copy as valid.
+func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err error) {
+	// Metadata page 0 starts at byte zero. Open can read it before it knows the database page size.
+	meta0, meta0Err := db.readMetaAt(0)
+	if meta0Err == nil {
+		meta0Err = validateMeta(meta0)
+	}
+
+	// Metadata page 1 starts at the database page size. A supported page-size field from page 0 can locate it after page 0 fails validation. The operating system page size is the second choice because every new database uses that size.
+	pageSizes := make([]int64, 0, 2)
+	if meta0 != nil && validMetaPageSize(meta0.PageSize()) {
+		pageSizes = append(pageSizes, meta0.PageSize())
+	}
+	operatingSystemPageSize := int64(os.Getpagesize())
+	if validMetaPageSize(operatingSystemPageSize) && (len(pageSizes) == 0 || pageSizes[0] != operatingSystemPageSize) {
+		pageSizes = append(pageSizes, operatingSystemPageSize)
+	}
+
+	var meta1 *page.Meta
+	meta1Err := error(ErrInvalid)
+	for _, pageSize := range pageSizes {
+		candidate, readErr := db.readMetaAt(pageSize)
+		if readErr != nil {
+			meta1Err = errors.Join(meta1Err, readErr)
+			continue
+		}
+
+		candidateErr := validateMeta(candidate)
+		if candidateErr == nil && candidate.PageSize() != pageSize {
+			candidateErr = fmt.Errorf("metadata page size %d does not match page offset %d: %w", candidate.PageSize(), pageSize, ErrInvalid)
+		}
+		if candidateErr == nil {
+			meta1 = candidate
+			meta1Err = nil
+			break
+		}
+		if walPageSize == 0 && validMetaPageSize(candidate.PageSize()) {
+			walPageSize = candidate.PageSize()
+		}
+		meta1Err = errors.Join(meta1Err, candidateErr)
+	}
+
+	// One valid copy is sufficient. If both copies are valid, select the highest generation. Equal generations must contain the same checkpoint values.
+	switch {
+	case meta0Err == nil && meta1Err == nil:
+		if meta1.Generation() == meta0.Generation() && !bytes.Equal(page.EncodeMeta(meta0), page.EncodeMeta(meta1)) {
+			return nil, meta0.PageSize(), fmt.Errorf("metadata pages have different contents at generation %d: %w", meta0.Generation(), ErrInvalid)
+		}
+		if meta1.Generation() > meta0.Generation() {
+			return meta1, meta1.PageSize(), nil
+		}
+		return meta0, meta0.PageSize(), nil
+	case meta0Err == nil:
+		return meta0, meta0.PageSize(), nil
+	case meta1Err == nil:
+		return meta1, meta1.PageSize(), nil
+	}
+
+	// WAL decoding needs a page size before it can recover metadata. A supported field from an invalid metadata copy can set this size. It never makes that copy valid or assigns it to db.meta.
+	if meta0 != nil && validMetaPageSize(meta0.PageSize()) {
+		walPageSize = meta0.PageSize()
+	}
+	return nil, walPageSize, errors.Join(
+		fmt.Errorf("metadata page %d: %w", page.Meta0ID, meta0Err),
+		fmt.Errorf("metadata page %d: %w", page.Meta1ID, meta1Err),
+	)
+}
+
+// persistMeta initializes both metadata pages with the same checksummed values. Checkpoints update both copies through WAL metadata records.
+func (db *DB) persistMeta() error {
+	db.meta.RefreshChecksum()
+	encoded := page.EncodeMeta(db.meta)
+	for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
+		offset := int64(pageID) * db.meta.PageSize()
+		writer := io.NewOffsetWriter(db.file, offset)
+		if err := fileio.WriteFull(writer, encoded); err != nil {
+			return fmt.Errorf("write meta page %d: %w", pageID, err)
+		}
 	}
 	return nil
 }

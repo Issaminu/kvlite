@@ -157,7 +157,7 @@ func TestWAL_ByteCounterDoesNotWrapAtMaxInt64(t *testing.T) {
 func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 	const (
 		pageSize      int64   = 64 // The record content must fit inside this page size.
-		firstPageID   page.ID = 1  // Page zero contains metadata, so node pages start at one.
+		firstPageID   page.ID = 2  // Pages zero and one contain metadata, so node pages start at two.
 		transactionID TxID    = 1  // A new WAL starts with transaction ID one.
 	)
 

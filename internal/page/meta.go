@@ -10,27 +10,32 @@ import (
 const version uint32 = 1        // format version, bumps only when making a breaking change to the DB file format itself
 const magic uint32 = 0x7317DC29 // The hexadecimal value encodes the KVLite file marker ("KVLT").
 
-// MetaID identifies the metadata page. Node pages start after page zero.
-const MetaID ID = 0
+const (
+	// Meta0ID identifies the first metadata page.
+	Meta0ID ID = 0
+	// Meta1ID identifies the second metadata page. Node pages start after it.
+	Meta1ID ID = 1
+)
 
 const (
-	// MetaSize is the encoded size of three uint32 fields and three uint64 fields.
-	MetaSize = 36
+	// MetaSize is the encoded size of three uint32 fields and four uint64 fields.
+	MetaSize = 44
 	// The final metadata field is one CRC32C checksum.
 	metaChecksumSize = 4
 )
 
 type Meta struct {
-	magic    uint32
-	version  uint32
-	pageSize int64
-	pgid     ID
-	root     ID // pgid of the root node
-	checksum uint32
+	magic      uint32
+	version    uint32
+	pageSize   int64
+	pgid       ID
+	root       ID // pgid of the root node
+	generation uint64
+	checksum   uint32
 }
 
 func NewMeta(pageSize int64) *Meta {
-	const firstNodeID ID = MetaID + 1
+	const firstNodeID ID = Meta1ID + 1
 
 	meta := &Meta{
 		magic:    magic,
@@ -50,6 +55,7 @@ func EncodeMeta(meta *Meta) []byte {
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pageSize))
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pgid))
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.root))
+	data = binary.LittleEndian.AppendUint64(data, meta.generation)
 	data = binary.LittleEndian.AppendUint32(data, meta.checksum)
 	return data
 }
@@ -59,15 +65,20 @@ func DecodeMeta(data []byte) (*Meta, error) {
 		return nil, fmt.Errorf("decode meta: got %d bytes, want %d: %w", len(data), MetaSize, ErrInvalid)
 	}
 
-	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], and checksum[32:36].
+	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], generation[32:40], and checksum[40:44].
 	return &Meta{
-		magic:    binary.LittleEndian.Uint32(data[0:4]),
-		version:  binary.LittleEndian.Uint32(data[4:8]),
-		pageSize: int64(binary.LittleEndian.Uint64(data[8:16])),
-		pgid:     ID(binary.LittleEndian.Uint64(data[16:24])),
-		root:     ID(binary.LittleEndian.Uint64(data[24:32])),
-		checksum: binary.LittleEndian.Uint32(data[32:36]),
+		magic:      binary.LittleEndian.Uint32(data[0:4]),
+		version:    binary.LittleEndian.Uint32(data[4:8]),
+		pageSize:   int64(binary.LittleEndian.Uint64(data[8:16])),
+		pgid:       ID(binary.LittleEndian.Uint64(data[16:24])),
+		root:       ID(binary.LittleEndian.Uint64(data[24:32])),
+		generation: binary.LittleEndian.Uint64(data[32:40]),
+		checksum:   binary.LittleEndian.Uint32(data[40:44]),
 	}, nil
+}
+
+func IsMetaID(id ID) bool {
+	return id == Meta0ID || id == Meta1ID
 }
 
 func (m *Meta) PageSize() int64 {
@@ -76,6 +87,14 @@ func (m *Meta) PageSize() int64 {
 
 func (m *Meta) Root() ID {
 	return m.root
+}
+
+func (m *Meta) Generation() uint64 {
+	return m.generation
+}
+
+func (m *Meta) AdvanceGeneration() {
+	m.generation++
 }
 
 func (m *Meta) SetRoot(root ID) {

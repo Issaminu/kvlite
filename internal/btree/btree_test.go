@@ -458,8 +458,8 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	const (
 		pageSize  int64   = 64 // Two 33-byte entries exceed this page size.
 		valueSize         = 20 // A leaf entry uses 12 fixed bytes, a one-byte key, and this value.
-		leftPgid  page.ID = 1  // Page 1 is the first node page after the metadata page.
-		rightPgid page.ID = 2  // Page 2 is the next page allocated for the split.
+		leftPgid  page.ID = 2  // Page 2 is the first node page after both metadata pages.
+		rightPgid page.ID = 3  // Page 3 is the next page allocated for the split.
 	)
 
 	node := &Node{
@@ -526,11 +526,29 @@ func (store *memoryTreeStore) StageNode(node *Node) {
 	store.dirty[node.PageID()] = node
 }
 
+// TestTreePutEntry_RejectsKeyThatCannotFitBranch checks the branch separator
+// limit without changing the database page-size policy.
+func TestTreePutEntry_RejectsKeyThatCannotFitBranch(t *testing.T) {
+	const pageSize int64 = 128
+	store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	root := NewLeafNode(2)
+	store.StageNode(root)
+
+	key := bytes.Repeat([]byte("k"), 88)
+	if _, err := tree.PutEntry(root, NewEntry(0, key, nil)); !errors.Is(err, ErrEntryTooLarge) {
+		t.Fatalf("PutEntry error: got %v, want ErrEntryTooLarge", err)
+	}
+	if got := len(root.entries); got != 0 {
+		t.Fatalf("root entry count: got %d, want 0", got)
+	}
+}
+
 func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 	const (
 		pageSize   int64   = 128 // This small page size forces several tree levels.
-		rootPageID page.ID = 1   // Page zero is reserved for metadata.
-		firstNewID page.ID = 2   // New tree pages start after the root page.
+		rootPageID page.ID = 2   // Pages zero and one are reserved for metadata.
+		firstNewID page.ID = 3   // New tree pages start after the root page.
 		entryCount         = 100 // This many entries cannot fit in one 128-byte page.
 	)
 

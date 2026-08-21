@@ -113,13 +113,13 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	return nil
 }
 
-// walRecords encodes one final image for each changed page and includes metadata only when it changed.
+// walRecords encodes one final image for each changed node page and two metadata copies when metadata changed.
 // Update calls it after the transaction callback succeeds, so callback failure does no encoding or WAL work.
 func (tx *Tx) walRecords() []wal.Record {
 	return encodeWALRecords(tx.store.dirty, tx.meta, tx.metaDirty)
 }
 
-// encodeWALRecords encodes the final private image of each changed page. Repeated changes to one page produce one record for the transaction or batch.
+// encodeWALRecords encodes the final private image of each changed node page. Repeated node changes produce one record, while changed metadata produces one record for each metadata page.
 func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty bool) []wal.Record {
 	if len(dirty) == 0 && !metaDirty {
 		return nil
@@ -127,7 +127,7 @@ func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty 
 
 	recordCapacity := len(dirty)
 	if metaDirty {
-		recordCapacity++
+		recordCapacity += 2
 	}
 	records := make([]wal.Record, 0, recordCapacity)
 	for pageID, node := range dirty {
@@ -137,11 +137,15 @@ func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty 
 		})
 	}
 	if metaDirty {
+		meta.AdvanceGeneration()
 		meta.RefreshChecksum()
-		records = append(records, wal.Record{
-			Header:      wal.RecordHeader{Type: wal.RecordTypeMeta, PageID: page.MetaID},
-			PageContent: page.EncodeMeta(meta),
-		})
+		encodedMeta := page.EncodeMeta(meta)
+		for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
+			records = append(records, wal.Record{
+				Header:      wal.RecordHeader{Type: wal.RecordTypeMeta, PageID: pageID},
+				PageContent: encodedMeta,
+			})
+		}
 	}
 	return records
 }
