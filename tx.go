@@ -6,7 +6,7 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-// Tx is a managed transaction passed to a [DB.Update] or [DB.View] callback. It is valid only while that callback runs, so callers must not retain it or any [Bucket] obtained from it. Transactions must not be nested, and a Tx must not be copied or used concurrently.
+// Tx gives a [DB.View] or [DB.Update] callback access to one transaction. Use [Tx.Bucket] to open a top-level bucket. A Tx and every bucket or cursor obtained from it are valid only until the callback returns. Do not save, copy, or share them with another goroutine.
 type Tx struct {
 	db        *DB
 	meta      *page.Meta
@@ -51,13 +51,13 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseNodes map
 	return tx
 }
 
-// Update runs transaction as one managed read-write transaction. Writes made inside the callback are visible to later reads in the same callback, but other database operations can observe them only after Update commits.
+// Update runs fn in one read-write transaction. The callback can read and write buckets. A read in fn can see a write made earlier in the same fn.
 //
-// If transaction returns an error, Update discards every change and returns that error. If it panics, Update discards every change before the panic continues to the caller. When transaction returns nil, Update writes the transaction to the write-ahead log and returns any error that prevents that commit.
+// If fn returns nil, Update commits all changes together. Other database operations can then read them. If fn returns an error, Update discards all changes and returns that error.
 //
-// KVLite runs concurrent Update callbacks in serial order, and an Update callback does not overlap a [DB.View] callback. In [SyncFull] mode, concurrent successful callbacks can form one atomic write batch. Later callbacks in that batch see earlier successful changes. A callback error discards only that callback's changes. A write-ahead log error returns to every successful callback whose result depends on that batch, and none of the batch changes become visible.
+// Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
 //
-// An automatic checkpoint can run after the write-ahead log commit. If that checkpoint fails, the transaction remains committed, Update returns nil, and KVLite keeps the log data so a later write or [DB.Close] can retry the checkpoint.
+// Do not start another transaction from fn. Use the Tx passed to fn. If fn panics, Update discards its changes before the panic continues.
 func (db *DB) Update(transaction func(tx *Tx) error) error {
 	if err := db.beginOperation(); err != nil {
 		return err
@@ -150,7 +150,11 @@ func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty 
 	return records
 }
 
-// View runs transaction as one managed read-only transaction and returns its error. KVLite can run View callbacks together. A [DB.Update] callback waits for active View callbacks to return, and a View callback waits while an Update callback runs. Writes through the Tx or its buckets return [ErrTxNotWritable], while reads remain available until the callback returns. If the callback panics, View closes the transaction before the panic continues to the caller.
+// View runs fn in one read-only transaction. Every read in fn sees the same database state. Writes through the Tx or its buckets return [ErrTxNotWritable].
+//
+// Several View callbacks can run at the same time. A View callback waits while [DB.Update] runs. Update waits for all active View callbacks to return.
+//
+// Do not start another transaction from fn. Use the Tx passed to fn. View returns the error from fn. If fn panics, View closes the transaction before the panic continues.
 func (db *DB) View(transaction func(tx *Tx) error) error {
 	if err := db.beginOperation(); err != nil {
 		return err

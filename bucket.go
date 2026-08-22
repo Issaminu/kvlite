@@ -21,15 +21,18 @@ func (tx *Tx) cacheBucket(b *Bucket) {
 	tx.buckets[string(b.name)] = b
 }
 
-// Bucket represents a named key space inside a transaction. A bucket can contain key/value pairs and nested buckets, and each nested bucket has its own key space.
+// Bucket is a named group of keys inside a transaction. A bucket can store values and other buckets. Each nested bucket has its own keys.
 //
-// A Bucket is valid only during the [DB.Update] or [DB.View] callback in which the caller obtained it. Callers must not retain it after that callback returns, and they must not copy it or use it concurrently.
+// A Bucket is valid only until its [DB.View] or [DB.Update] callback returns. Do not save, copy, or share it with another goroutine.
+//
+// Ordered reads include the names of nested buckets. A nested bucket has a nil value. A stored empty value has a non-nil value with length zero.
 type Bucket struct {
 	tx           *Tx
 	name         []byte
 	rootNode     *btree.Node
 	parentBucket *Bucket
 	children     map[string]*Bucket // per-parent cache: one *Bucket handle per nested name
+	treeVersion  uint64             // A cursor captures this value and rejects a stale path after a successful tree change.
 }
 
 // cacheChild registers b as the one handle for its name within this bucket.
@@ -244,10 +247,10 @@ func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 		return err
 	}
 	bucket.rootNode = newRoot
-	if newRoot.PageID() == oldRootPageID {
-		return nil
+	if newRoot.PageID() != oldRootPageID {
+		bucket.writeBackRoot()
 	}
-	bucket.writeBackRoot()
+	bucket.treeVersion++
 	return nil
 }
 

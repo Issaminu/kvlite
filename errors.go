@@ -25,4 +25,6 @@ var (
 	ErrValueTooLarge        = btree.ErrValueTooLarge
 	ErrIncompatibleValue    = btree.ErrIncompatibleValue
 	ErrEntryTooLargeForPage = btree.ErrEntryTooLarge
+	ErrCursorInvalidated    = errors.New("cursor invalidated by bucket change") // ErrCursorInvalidated is returned when a bucket changes while one of its cursors is in use. Create a new cursor before traversal continues.
+	ErrScanCallbackRequired = errors.New("scan callback required")              // ErrScanCallbackRequired is returned when [Bucket.ScanPrefix] or [Bucket.ScanRange] receives a nil callback.
 )
