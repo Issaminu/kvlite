@@ -2,6 +2,7 @@ package kvlite
 
 import (
 	"runtime"
+	"sync"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -11,6 +12,13 @@ const (
 	// defaultWriteBatchSize bounds the number of callbacks and private states held by one durable commit.
 	defaultWriteBatchSize = 128
 )
+
+// writeCallbackResultChannels reuses empty result channels after each callback completes.
+var writeCallbackResultChannels = sync.Pool{
+	New: func() any {
+		return make(chan writeResult, 1)
+	},
+}
 
 type writeRequest struct {
 	transaction func(*Tx) error
@@ -166,26 +174,26 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 }
 
 // executeWriteCallback runs transaction without allowing runtime.Goexit to stop the long-lived batch worker.
-func executeWriteCallback(transaction func(*Tx) error, tx *Tx) (result writeResult) {
+func executeWriteCallback(transaction func(*Tx) error, tx *Tx) writeResult {
 	// A separate goroutine lets the coordinator detect runtime.Goexit and forward it to the caller without losing the long-lived coordinator.
-	resultReady := make(chan writeResult, 1)
-	callbackDone := make(chan struct{})
+	resultReady := writeCallbackResultChannels.Get().(chan writeResult)
 	go func() {
-		defer close(callbackDone)
-		resultReady <- callWriteCallback(transaction, tx)
+		callbackReturned := false
+		var result writeResult
+		defer func() {
+			if !callbackReturned {
+				result = writeResult{goexited: true}
+			}
+			resultReady <- result
+		}()
+
+		result = callWriteCallback(transaction, tx)
+		callbackReturned = true
 	}()
 
-	select {
-	case result = <-resultReady:
-		return result
-	case <-callbackDone:
-		select {
-		case result = <-resultReady:
-			return result
-		default:
-			return writeResult{goexited: true}
-		}
-	}
+	result := <-resultReady
+	writeCallbackResultChannels.Put(resultReady)
+	return result
 }
 
 // callWriteCallback closes tx after transaction returns or panics. It converts a panic into a writeResult so the original Update caller can continue it.

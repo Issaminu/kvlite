@@ -5341,6 +5341,17 @@ func TestUpdate_DurableGoexitDoesNotStopWriteBatcher(t *testing.T) {
 	}
 }
 
+func TestExecuteWriteCallback_UsesAtMostTwoAllocations(t *testing.T) {
+	tx := &Tx{}
+	allocations := testing.AllocsPerRun(100, func() {
+		tx.closed = false
+		_ = executeWriteCallback(func(*Tx) error { return nil }, tx)
+	})
+	if allocations > 2 {
+		t.Fatalf("execute write callback allocations: got %v, want at most 2", allocations)
+	}
+}
+
 func TestWriteBatch_LaterCallbackSeesEarlierWrite(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
