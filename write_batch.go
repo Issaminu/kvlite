@@ -2,7 +2,6 @@ package kvlite
 
 import (
 	"runtime"
-	"time"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -11,8 +10,6 @@ import (
 const (
 	// defaultWriteBatchSize bounds the number of callbacks and private states held by one durable commit.
 	defaultWriteBatchSize = 128
-	// defaultWriteBatchDelay gives concurrent callers a short time to join a durable commit.
-	defaultWriteBatchDelay = 200 * time.Microsecond
 )
 
 type writeRequest struct {
@@ -91,19 +88,17 @@ func (db *DB) runWriteBatcher() {
 	}
 }
 
-// collectWriteBatch returns a batch that starts with first. It stops when the batch reaches its size limit or its one fixed collection delay expires.
+// collectWriteBatch returns first and the requests that are ready in the queue. It yields once so concurrent callers can enter the queue without a timer.
 func (db *DB) collectWriteBatch(first *writeRequest) []*writeRequest {
 	requests := make([]*writeRequest, 1, defaultWriteBatchSize)
 	requests[0] = first
-	// Do not restart the timer when another request arrives. The first caller must wait for no more than one collection delay.
-	timer := time.NewTimer(defaultWriteBatchDelay)
-	defer timer.Stop()
+	runtime.Gosched()
 
 	for len(requests) < defaultWriteBatchSize {
 		select {
 		case request := <-db.writeRequests:
 			requests = append(requests, request)
-		case <-timer.C:
+		default:
 			return requests
 		}
 	}
