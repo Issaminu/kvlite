@@ -11,6 +11,10 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+// maxRetainedEncodingBufferBytes is the largest transaction encoding buffer kept across commits.
+// Larger buffers are dropped after [WAL.Commit] returns so one large transaction does not retain memory.
+const maxRetainedEncodingBufferBytes = 1 << 20
+
 type WAL struct {
 	path                     string
 	file                     *os.File
@@ -21,15 +25,23 @@ type WAL struct {
 	overlay                  map[page.ID]Record // Committed pages that are not yet checkpointed.
 	nextTxid                 TxID               // sequence number stamped on the next committed transaction
 	hasUnsyncedWrites        bool               // true when WAL bytes were appended after the last successful sync
+	appendOffset             int64              // byte offset of the next WAL append; independent of the file read/write cursor
+	encodingBuffer           []byte             // reusable transaction encoding buffer; capacity may be cleared after large commits
+	appendFailure            error              // set when rollback truncate fails; blocks later commits until [WAL.Truncate] succeeds
 	syncFile                 func() error       // syncFile is an hook used exclusively for tests to determine deterministic sync failures and call counts.
 }
 
 // Commit appends one transaction and publishes each changed page to the committed overlay.
 // It returns whether the committed WAL size reached the checkpoint threshold.
 //
-// On failure, Commit truncates the failed append and restores the pre-append byte
-// and synchronization state.
+// Appends use [WAL.appendOffset], not the WAL file read/write cursor, so unrelated seeks on the file cannot corrupt the log.
+//
+// On failure, Commit truncates the failed append and restores the pre-append byte and synchronization state without updating the overlay.
+// If that rollback truncate fails, Commit stores the truncate error and later Commit calls return it until [WAL.Truncate] succeeds.
 func (wal *WAL) Commit(records []Record) (bool, error) {
+	if wal.appendFailure != nil {
+		return false, fmt.Errorf("WAL append is disabled after failed rollback: %w", wal.appendFailure)
+	}
 	if len(records) == 0 {
 		return false, nil
 	}
@@ -38,10 +50,8 @@ func (wal *WAL) Commit(records []Record) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	startOffset, err := wal.file.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return false, err
-	}
+	defer wal.releaseEncodingBuffer()
+	startOffset := wal.appendOffset
 	bytesBefore := wal.bytesSinceCheckpoint
 	unsyncedBefore := wal.hasUnsyncedWrites
 
@@ -58,6 +68,13 @@ func (wal *WAL) Commit(records []Record) (bool, error) {
 	return needsCheckpoint, nil
 }
 
+// releaseEncodingBuffer drops an oversized transaction encoding buffer after Commit returns.
+func (wal *WAL) releaseEncodingBuffer() {
+	if cap(wal.encodingBuffer) > maxRetainedEncodingBufferBytes {
+		wal.encodingBuffer = nil
+	}
+}
+
 func (wal *WAL) encodeRecords(records []Record, txid TxID) ([]byte, error) {
 	transactionSize := HeaderSize + ChecksumSize
 	for index := range records {
@@ -69,31 +86,47 @@ func (wal *WAL) encodeRecords(records []Record, txid TxID) ([]byte, error) {
 		transactionSize += size
 	}
 
-	transaction := make([]byte, 0, transactionSize)
+	transaction := wal.encodingBuffer[:0]
+	if cap(transaction) < transactionSize {
+		transaction = make([]byte, 0, transactionSize)
+	}
 	for index := range records {
 		transaction = AppendEncodedRecord(transaction, &records[index])
 	}
 	commitMarker := Record{Header: RecordHeader{Type: RecordTypeCommit, TxID: txid}}
-	return AppendEncodedRecord(transaction, &commitMarker), nil
+	transaction = AppendEncodedRecord(transaction, &commitMarker)
+	wal.encodingBuffer = transaction[:0]
+	return transaction, nil
 }
 
 // rollbackAppend removes bytes from a failed commit and restores the counters that describe the retained WAL prefix.
+// A truncate failure leaves [WAL.appendFailure] set and blocks later appends until [WAL.Truncate] succeeds.
 func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUnsyncedWrites bool) error {
+	if err := wal.file.Truncate(offset); err != nil {
+		wal.appendFailure = fmt.Errorf("truncate failed WAL transaction: %w", err)
+		return wal.appendFailure
+	}
 	wal.bytesSinceCheckpoint = bytesSinceCheckpoint
 	wal.hasUnsyncedWrites = hasUnsyncedWrites
-	if err := wal.file.Truncate(offset); err != nil {
-		return fmt.Errorf("truncate failed WAL transaction: %w", err)
-	}
-	if _, err := wal.file.Seek(offset, io.SeekStart); err != nil {
-		return fmt.Errorf("rewind after failed WAL transaction: %w", err)
-	}
+	wal.appendOffset = offset
 	return nil
 }
 
+// ReadRecords decodes every record currently stored in the WAL file.
+// It returns nil, nil when no WAL file is configured or the file is empty.
+// On success it sets [WAL.appendOffset] to the file size so a later [WAL.Commit] appends after the recovered prefix.
 func (wal *WAL) ReadRecords() ([]Record, error) {
-	if !wal.hasRecords() {
+	if wal.file == nil {
 		return nil, nil
 	}
+	info, err := wal.file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if info.Size() == 0 {
+		return nil, nil
+	}
+	wal.appendOffset = info.Size()
 
 	var records []Record
 	for {
@@ -112,14 +145,6 @@ func (wal *WAL) ReadRecords() ([]Record, error) {
 	}
 
 	return records, nil
-}
-
-func (wal *WAL) hasRecords() bool {
-	fi, err := wal.file.Stat()
-	if err != nil {
-		return false
-	}
-	return fi.Size() > 0
 }
 
 func (wal *WAL) Sync() error {
@@ -141,16 +166,16 @@ func (wal *WAL) Sync() error {
 	return nil
 }
 
-// Truncate the WAL file.
-// Important: only truncate the file after making sure that it's content has been ingested to the database
+// Truncate clears the WAL file.
+// It resets [WAL.appendOffset] and clears [WAL.appendFailure] so appends can resume after a failed rollback truncate.
+//
+// Only truncate after the WAL contents have been ingested into the database.
 func (wal *WAL) Truncate() error {
-	if _, err := wal.file.Seek(0, io.SeekStart); err != nil {
+	if err := wal.file.Truncate(0); err != nil {
 		return err
 	}
-	if err := wal.file.Truncate(0); err != nil {
-		_, seekErr := wal.file.Seek(0, io.SeekEnd)
-		return errors.Join(err, seekErr)
-	}
+	wal.appendOffset = 0
+	wal.appendFailure = nil
 	return nil
 }
 
@@ -167,10 +192,12 @@ func (wal *WAL) Delete() error {
 	return err
 }
 
+// appendTransaction persists transaction with [fileio.WriteFullAt] at [WAL.appendOffset] and advances WAL size counters.
 func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
-	if err := fileio.WriteFull(wal.file, transaction); err != nil {
+	if err := fileio.WriteFullAt(wal.file, transaction, wal.appendOffset); err != nil {
 		return false, fmt.Errorf("persist multiple records: %w", err)
 	}
+	wal.appendOffset += int64(len(transaction))
 	wal.hasUnsyncedWrites = true
 	wal.bytesSinceCheckpoint += uint64(len(transaction))
 

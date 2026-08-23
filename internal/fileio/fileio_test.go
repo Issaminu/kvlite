@@ -2,6 +2,7 @@ package fileio
 
 import (
 	"bytes"
+	"io"
 	"testing"
 	"testing/iotest"
 )
@@ -28,6 +29,38 @@ func TestWriteFull_CompletesPartialWrites(t *testing.T) {
 
 	if !bytes.Equal(writer.Bytes(), data) {
 		t.Fatalf("wrote %q, want %q", writer.Bytes(), data)
+	}
+}
+
+type oneByteWriterAt struct {
+	data []byte
+}
+
+func (w *oneByteWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, io.EOF
+	}
+	end := off + int64(len(p))
+	if end > int64(len(w.data)) {
+		w.data = append(w.data, make([]byte, end-int64(len(w.data)))...)
+	}
+	if len(p) > 1 {
+		p = p[:1]
+	}
+	n := copy(w.data[off:], p)
+	return n, nil
+}
+
+func TestWriteFullAt_CompletesPartialWrites(t *testing.T) {
+	writer := &oneByteWriterAt{}
+	data := []byte("partial write at offset")
+	if err := WriteFullAt(writer, data, 4); err != nil {
+		t.Fatal(err)
+	}
+
+	want := append(make([]byte, 4), data...)
+	if !bytes.Equal(writer.data, want) {
+		t.Fatalf("wrote %q, want %q", writer.data, want)
 	}
 }
 
