@@ -177,7 +177,7 @@ func (tx *Tx) writableError() error {
 // putCatalogEntry writes entry to the transaction's top-level tree and records
 // a replacement catalog root in the transaction metadata.
 func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
-	newRoot, err := tx.putTreeEntry(tx.rootNode, entry)
+	newRoot, err := tx.tree.PutEntry(tx.rootNode, entry)
 	if err != nil {
 		return err
 	}
@@ -187,16 +187,4 @@ func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
 		tx.metaDirty = true
 	}
 	return nil
-}
-
-func (tx *Tx) putTreeEntry(rootNode *btree.Node, entry btree.Entry) (*btree.Node, error) {
-	return tx.tree.PutEntry(rootNode, entry)
-}
-
-func (tx *Tx) findTreeEntry(rootNode *btree.Node, key []byte) (btree.Entry, bool, error) {
-	return tx.tree.FindEntry(rootNode, key)
-}
-
-func (tx *Tx) findTreeEntryRef(rootNode *btree.Node, key []byte) (btree.Entry, bool, error) {
-	return tx.tree.FindEntryRef(rootNode, key)
 }

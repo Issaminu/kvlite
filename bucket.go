@@ -158,7 +158,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 
 // loadBucket reads a bucket entry and opens the tree that it names. It returns (nil, nil) when no entry exists and [ErrIncompatibleValue] when the name belongs to a plain value.
 func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
-	entry, found, err := tx.findTreeEntryRef(rootNode, bucketName)
+	entry, found, err := tx.tree.FindEntryRef(rootNode, bucketName)
 	if err != nil {
 		return nil, err
 	}
@@ -261,7 +261,7 @@ func (bucket *Bucket) Put(key, value []byte) error {
 
 func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 	oldRootPageID := bucket.rootNode.PageID()
-	newRoot, err := bucket.tx.putTreeEntry(bucket.rootNode, entry)
+	newRoot, err := bucket.tx.tree.PutEntry(bucket.rootNode, entry)
 	if err != nil {
 		return err
 	}
@@ -289,7 +289,7 @@ func (bucket *Bucket) Get(key []byte) ([]byte, error) {
 
 func (bucket *Bucket) findEntry(key []byte) (btree.Entry, bool, error) {
 	if bucket.rootNode != nil {
-		return bucket.tx.findTreeEntryRef(bucket.rootNode, key)
+		return bucket.tx.tree.FindEntryRef(bucket.rootNode, key)
 	}
 	return bucket.tx.tree.FindEntryRefFromPage(bucket.rootPageID, key)
 }
