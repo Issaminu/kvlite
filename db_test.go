@@ -2501,8 +2501,7 @@ func BenchmarkPut_ReusedBucket(b *testing.B) {
 	}
 }
 
-// BenchmarkGet_OneOperationBucket measures the DB convenience path. Each Get
-// opens one transaction and resolves the named bucket.
+// BenchmarkGet_OneOperationBucket measures the direct DB convenience path.
 func BenchmarkGet_OneOperationBucket(b *testing.B) {
 	path := tempfile()
 	defer os.RemoveAll(path)

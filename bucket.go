@@ -165,14 +165,7 @@ func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket
 		return nil, nil
 	}
 
-	if entry.Flags()&btree.BucketLeafFlag == 0 {
-		// exists, but it's a regular value
-		return nil, ErrIncompatibleValue
-	}
-
-	// exists and is actually a bucket
-
-	pgid, err := page.DecodeID(entry.Value())
+	pgid, err := decodeBucketRootPageID(entry)
 	if err != nil {
 		return nil, err
 	}
@@ -184,6 +177,23 @@ func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket
 
 	// The stored catalog key is immutable for the life of the transaction.
 	return &Bucket{tx: tx, name: entry.Key(), rootNode: bucketRootNode, parentBucket: parent}, nil
+}
+
+func decodeBucketRootPageID(entry btree.Entry) (page.ID, error) {
+	if entry.Flags()&btree.BucketLeafFlag == 0 {
+		return 0, ErrIncompatibleValue
+	}
+	return page.DecodeID(entry.Value())
+}
+
+func valueFromEntry(entry btree.Entry, found bool) ([]byte, error) {
+	if !found {
+		return nil, ErrKeyNotFound
+	}
+	if entry.Flags()&btree.BucketLeafFlag != 0 {
+		return nil, ErrIncompatibleValue
+	}
+	return entry.Value(), nil
 }
 
 // CreateBucket creates a nested bucket named bucketName inside bucket. The new bucket is part of the owning transaction, so [DB.Update] commits or rolls it back with the other changes in that transaction.
@@ -265,12 +275,5 @@ func (bucket *Bucket) Get(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !found {
-		return nil, ErrKeyNotFound
-	}
-
-	if entry.Flags()&btree.BucketLeafFlag != 0 {
-		return nil, ErrIncompatibleValue
-	}
-	return entry.Value(), nil
+	return valueFromEntry(entry, found)
 }

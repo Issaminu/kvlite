@@ -742,3 +742,46 @@ func TestTreePutEntry_ClonesOnlyChangedLeafWithoutSplit(t *testing.T) {
 		t.Fatalf("unchanged root %d is dirty", root.PageID())
 	}
 }
+
+func TestLookupMappedNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
+	node := NewLeafNode(7)
+	if err := node.InsertEntry(NewEntry(0, []byte("alpha"), []byte("one"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.InsertEntry(NewEntry(0, []byte("beta"), []byte("two"))); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, testNodePageSize)
+	copy(data, EncodeNode(node, testNodePageSize))
+
+	var entry Entry
+	var found bool
+	var child page.ID
+	var lookupErr error
+	if got := testing.AllocsPerRun(100, func() {
+		entry, found, child, lookupErr = LookupMappedNode(data, node.PageID(), []byte("beta"))
+	}); got != 0 {
+		t.Fatalf("LookupMappedNode allocations: got %v, want 0", got)
+	}
+	if lookupErr != nil || !found || child != 0 || !bytes.Equal(entry.Value(), []byte("two")) {
+		t.Fatalf("LookupMappedNode: entry=%q found=%t child=%d err=%v", entry.Value(), found, child, lookupErr)
+	}
+}
+
+func TestLookupMappedNode_SelectsBranchChild(t *testing.T) {
+	root := &Node{
+		header:   newNodeHeader(NodeTypeBranch, 8),
+		entries:  []Entry{{key: []byte("m")}},
+		Children: []page.ID{9, 10},
+	}
+	data := make([]byte, testNodePageSize)
+	copy(data, EncodeNode(root, testNodePageSize))
+
+	_, found, child, err := LookupMappedNode(data, root.PageID(), []byte("z"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found || child != 10 {
+		t.Fatalf("branch lookup: found=%t child=%d, want false and 10", found, child)
+	}
+}

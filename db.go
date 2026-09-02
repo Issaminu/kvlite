@@ -320,32 +320,50 @@ func (db *DB) Put(bucketName, key, value []byte) error {
 	})
 }
 
-// Get returns the value stored under key in the top-level bucket named
-// bucketName. It performs the lookup in its own read-only transaction.
+// Get returns an owned copy of the value stored under key in the top-level bucket named bucketName.
+// It reads one committed database state without creating a transaction.
 //
-// The bucket must already exist. An empty bucket name returns
-// [ErrBucketNameRequired], and a missing bucket returns [ErrBucketNotFound].
-// Get returns [ErrKeyNotFound] when the key is absent and
-// [ErrIncompatibleValue] when the key names a nested bucket. It returns a new
-// slice that the caller can retain and modify. A stored empty value returns a
-// non-nil slice with length zero.
+// The bucket must already exist.
+// An empty bucket name returns [ErrBucketNameRequired].
+// A missing bucket returns [ErrBucketNotFound].
+// Get returns [ErrKeyNotFound] when the key is absent.
+// It returns [ErrIncompatibleValue] when the key names a nested bucket.
+// The caller can retain and change the returned slice.
+// A stored empty value returns a non-nil slice with length zero.
 func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
-	var value []byte
-	err := db.View(func(tx *Tx) error {
-		bucket, err := tx.Bucket(bucketName)
-		if err != nil {
-			return err
-		}
-		value, err = bucket.Get(key)
-		if err == nil {
-			value = slices.Clone(value)
-			if value == nil {
-				value = []byte{}
-			}
-		}
-		return err
-	})
-	return value, err
+	if err := db.beginOperation(); err != nil {
+		return nil, err
+	}
+	defer db.endOperation()
+
+	// Keep the root, WAL pages, and mapped bytes unchanged during both lookups.
+	db.operationMu.RLock()
+	defer db.operationMu.RUnlock()
+
+	if len(bucketName) == 0 {
+		return nil, ErrBucketNameRequired
+	}
+	bucketEntry, found, err := db.findCommittedEntry(db.meta.Root(), bucketName)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, ErrBucketNotFound
+	}
+	bucketRootPageID, err := decodeBucketRootPageID(bucketEntry)
+	if err != nil {
+		return nil, err
+	}
+
+	entry, found, err := db.findCommittedEntry(bucketRootPageID, key)
+	if err != nil {
+		return nil, err
+	}
+	value, err := valueFromEntry(entry, found)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Clone(value), nil
 }
 
 func (db *DB) persistNode(node *btree.Node) error {
@@ -382,6 +400,34 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 		return nil, err
 	}
 	return btree.DecodeNode(data, pgid, db.meta.PageSize())
+}
+
+// lookupCommittedPage searches one committed page.
+// A WAL page has priority over the main-file page with the same ID.
+func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
+	if record, ok := db.wal.Lookup(pageID); ok {
+		return btree.LookupEncodedWALNode(record.PageContent, pageID, key)
+	}
+	data, err := db.readMainPage(pageID)
+	if err != nil {
+		return btree.Entry{}, false, 0, err
+	}
+	return btree.LookupMappedNode(data, pageID, key)
+}
+
+// findCommittedEntry searches one committed tree without decoding its pages.
+// A found entry refers to the WAL or the mapped main file.
+func (db *DB) findCommittedEntry(pageID page.ID, key []byte) (btree.Entry, bool, error) {
+	for {
+		entry, found, childPageID, err := db.lookupCommittedPage(pageID, key)
+		if err != nil {
+			return btree.Entry{}, false, err
+		}
+		if childPageID == 0 {
+			return entry, found, nil
+		}
+		pageID = childPageID
+	}
 }
 
 func (db *DB) readMetaAt(offset int64) (*page.Meta, error) {
