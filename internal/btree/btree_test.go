@@ -499,6 +499,14 @@ func (store *memoryTreeStore) PageSize() int64 {
 	return store.pageSize
 }
 
+func (store *memoryTreeStore) LookupPage(pageID page.ID, key []byte) (Entry, bool, page.ID, error) {
+	node := store.nodes[pageID]
+	if node == nil {
+		return Entry{}, false, 0, ErrKeyNotFound
+	}
+	return LookupNode(node, key)
+}
+
 func (store *memoryTreeStore) ReadNode(pageID page.ID) (*Node, error) {
 	return store.nodes[pageID], nil
 }

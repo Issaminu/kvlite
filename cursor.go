@@ -26,6 +26,9 @@ func (bucket *Bucket) Cursor() (*Cursor, error) {
 	if bucket.tx.closed {
 		return nil, ErrTxClosed
 	}
+	if err := bucket.loadRootNode(); err != nil {
+		return nil, err
+	}
 	return &Cursor{
 		bucket:        bucket,
 		treeCursor:    *bucket.tx.tree.Cursor(bucket.rootNode),

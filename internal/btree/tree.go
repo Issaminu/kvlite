@@ -9,6 +9,11 @@ import (
 
 // Store provides the page view, mutable-node ownership, and page allocation used by a [Tree].
 type Store interface {
+	// LookupPage searches one page without returning a Node.
+	// The store selects the page representation.
+	// A leaf returns an entry and a zero child page ID.
+	// A branch returns the selected child page ID.
+	LookupPage(page.ID, []byte) (Entry, bool, page.ID, error)
 	// PageSize returns the fixed encoded size of one tree page.
 	PageSize() int64
 	// ReadNode returns the node visible to the current operation.
@@ -40,6 +45,26 @@ type treePathStep struct {
 // NewTree returns a tree that uses store for every node read, write, and page allocation.
 func NewTree(store Store) *Tree {
 	return &Tree{store: store}
+}
+
+// LookupNode searches one decoded node.
+// A leaf returns an entry and a zero child page ID.
+// A branch returns the selected child page ID.
+// The caller must validate key.
+func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
+	if node.IsLeaf() {
+		entry, found, err := node.FindEntryRef(key)
+		return entry, found, 0, err
+	}
+	childIndex, err := node.FindChildIndex(key)
+	if err != nil {
+		return Entry{}, false, 0, err
+	}
+	childPageID := node.Children[childIndex]
+	if childPageID == page.Meta0ID {
+		return Entry{}, false, 0, fmt.Errorf("read node child page ID %d: %w", childPageID, ErrInvalid)
+	}
+	return Entry{}, false, childPageID, nil
 }
 
 // findLeafNode follows branch separators without requesting mutable nodes.
@@ -219,7 +244,7 @@ func (tree *Tree) FindEntry(root *Node, key []byte) (Entry, bool, error) {
 
 // FindEntryRef looks key up without copying the stored key or value.
 // It returns a zero entry with found false when the key is absent.
-// A found entry refers to read-only storage owned by the leaf node and must not outlive that node's owner.
+// A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
 // An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
 func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
 	if len(key) == 0 {
@@ -229,11 +254,39 @@ func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
 		return Entry{}, false, ErrKeyTooLarge
 	}
 
-	node, err := tree.findLeafNode(root, key)
+	if root.IsLeaf() {
+		return root.FindEntryRef(key)
+	}
+	_, _, childPageID, err := LookupNode(root, key)
 	if err != nil {
 		return Entry{}, false, err
 	}
-	return node.FindEntryRef(key)
+	return tree.findEntryRefFromPage(childPageID, key)
+}
+
+// FindEntryRefFromPage starts at rootPageID without requiring a root Node.
+// A found entry refers to storage owned by the store.
+func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte) (Entry, bool, error) {
+	if len(key) == 0 {
+		return Entry{}, false, ErrKeyRequired
+	}
+	if len(key) > MaxKeySize {
+		return Entry{}, false, ErrKeyTooLarge
+	}
+	return tree.findEntryRefFromPage(rootPageID, key)
+}
+
+func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool, error) {
+	for {
+		entry, found, childPageID, err := tree.store.LookupPage(pageID, key)
+		if err != nil {
+			return Entry{}, false, err
+		}
+		if childPageID == 0 {
+			return entry, found, nil
+		}
+		pageID = childPageID
+	}
 }
 
 // NeedsSplit reports whether the encoded node is larger than one page.

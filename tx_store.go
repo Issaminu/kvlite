@@ -24,6 +24,22 @@ func (store *txTreeStore) PageSize() int64 {
 	return store.tx.meta.PageSize()
 }
 
+// LookupPage uses encoded pages for a read transaction.
+// A write transaction decodes and keeps each page that it reads.
+func (store *txTreeStore) LookupPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
+	if store.tx.readOnly {
+		return store.tx.db.lookupCommittedPage(pageID, key)
+	}
+	node, err := store.ReadNode(pageID)
+	if err != nil {
+		return btree.Entry{}, false, 0, err
+	}
+	if node == nil {
+		return btree.Entry{}, false, 0, btree.ErrKeyNotFound
+	}
+	return btree.LookupNode(node, key)
+}
+
 func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 	// Returning the cached pointer makes later reads observe writes made earlier in this transaction.
 	if node, ok := store.nodes[pageID]; ok {

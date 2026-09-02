@@ -29,6 +29,7 @@ func (tx *Tx) cacheBucket(b *Bucket) {
 type Bucket struct {
 	tx           *Tx
 	name         []byte
+	rootPageID   page.ID // Set only while a read-only bucket has not loaded rootNode.
 	rootNode     *btree.Node
 	parentBucket *Bucket
 	children     map[string]*Bucket // per-parent cache: one *Bucket handle per nested name
@@ -164,19 +165,23 @@ func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket
 	if !found {
 		return nil, nil
 	}
+	return tx.openBucket(entry, parent)
+}
 
-	pgid, err := decodeBucketRootPageID(entry)
+func (tx *Tx) openBucket(entry btree.Entry, parent *Bucket) (*Bucket, error) {
+	rootPageID, err := decodeBucketRootPageID(entry)
 	if err != nil {
 		return nil, err
 	}
+	if tx.readOnly {
+		return &Bucket{tx: tx, name: entry.Key(), rootPageID: rootPageID, parentBucket: parent}, nil
+	}
 
-	bucketRootNode, err := tx.store.ReadNode(pgid)
+	rootNode, err := tx.store.ReadNode(rootPageID)
 	if err != nil {
 		return nil, err
 	}
-
-	// The stored catalog key is immutable for the life of the transaction.
-	return &Bucket{tx: tx, name: entry.Key(), rootNode: bucketRootNode, parentBucket: parent}, nil
+	return &Bucket{tx: tx, name: entry.Key(), rootNode: rootNode, parentBucket: parent}, nil
 }
 
 func decodeBucketRootPageID(entry btree.Entry) (page.ID, error) {
@@ -227,9 +232,13 @@ func (bucket *Bucket) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if b, ok := bucket.children[string(bucketName)]; ok {
 		return b, nil
 	}
-	child, err := bucket.tx.loadBucket(bucket.rootNode, bucketName, bucket)
-	if err != nil || child == nil {
-		return child, err
+	entry, found, err := bucket.findEntry(bucketName)
+	if err != nil || !found {
+		return nil, err
+	}
+	child, err := bucket.tx.openBucket(entry, bucket)
+	if err != nil {
+		return nil, err
 	}
 	bucket.cacheChild(child)
 	return child, nil
@@ -271,9 +280,29 @@ func (bucket *Bucket) Get(key []byte) ([]byte, error) {
 	if bucket.tx.closed {
 		return nil, ErrTxClosed
 	}
-	entry, found, err := bucket.tx.findTreeEntryRef(bucket.rootNode, key)
+	entry, found, err := bucket.findEntry(key)
 	if err != nil {
 		return nil, err
 	}
 	return valueFromEntry(entry, found)
+}
+
+func (bucket *Bucket) findEntry(key []byte) (btree.Entry, bool, error) {
+	if bucket.rootNode != nil {
+		return bucket.tx.findTreeEntryRef(bucket.rootNode, key)
+	}
+	return bucket.tx.tree.FindEntryRefFromPage(bucket.rootPageID, key)
+}
+
+func (bucket *Bucket) loadRootNode() error {
+	if bucket.rootNode != nil {
+		return nil
+	}
+	rootNode, err := bucket.tx.store.ReadNode(bucket.rootPageID)
+	if err != nil {
+		return err
+	}
+	bucket.rootNode = rootNode
+	bucket.rootPageID = page.Meta0ID
+	return nil
 }

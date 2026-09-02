@@ -190,6 +190,9 @@ func mustBucketRoot(t *testing.T, db *DB, name []byte) *btree.Node {
 		if err != nil {
 			return err
 		}
+		if err := bucket.loadRootNode(); err != nil {
+			return err
+		}
 		root = bucket.rootNode
 		return nil
 	}); err != nil {
@@ -229,6 +232,59 @@ func TestBucketGet_CachedLeafDoesNotAllocate(t *testing.T) {
 		}
 		if allocations != 0 {
 			t.Fatalf("cached Bucket.Get allocations: got %v, want 0", allocations)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBucketGet_ReadOnlyBranchDoesNotAllocate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	var key []byte
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
+		for index := 0; bucket.rootNode.IsLeaf(); index++ {
+			key = fmt.Appendf(nil, "key-%04d", index)
+			if err := bucket.Put(key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+
+		var getErr error
+		allocations := testing.AllocsPerRun(100, func() {
+			_, getErr = bucket.Get(key)
+		})
+		if getErr != nil {
+			return getErr
+		}
+		if allocations != 0 {
+			t.Fatalf("read-only branch Bucket.Get allocations: got %v, want 0", allocations)
 		}
 		return nil
 	})
@@ -4319,6 +4375,9 @@ func TestFindTreeEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 		if err != nil {
 			return err
 		}
+		if err := bucket.loadRootNode(); err != nil {
+			return err
+		}
 		root := bucket.rootNode
 		entry, found, err := tx.findTreeEntry(root, []byte("present"))
 		if err != nil {
@@ -5950,7 +6009,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 	}
 }
 
-func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
+func TestAudit_MainNodeLookupCannotCrossPageBoundary(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -6010,11 +6069,12 @@ func TestAudit_MainNodeDecodeCannotCrossPageBoundary(t *testing.T) {
 	}
 
 	reopened, err := openDB(path)
-	if !errors.Is(err, ErrInvalid) {
-		if reopened != nil {
-			_ = reopened.Close()
-		}
-		t.Fatalf("Open error: got %v, want ErrInvalid for a node value that crossed its page boundary", err)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if _, err := reopened.Get(testBucketName, key); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Get error: got %v, want ErrInvalid for a node value that crossed its page boundary", err)
 	}
 }
 
