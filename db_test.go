@@ -324,7 +324,7 @@ func TestTxBucketKeepsMultipleTopLevelHandlesStable(t *testing.T) {
 	}
 }
 
-func TestViewOneBucketLookupUsesAtMostSixAllocations(t *testing.T) {
+func TestViewOneBucketLookupUsesAtMostThreeAllocations(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := openDB(path)
 	if err != nil {
@@ -342,8 +342,8 @@ func TestViewOneBucketLookupUsesAtMostSixAllocations(t *testing.T) {
 	if viewErr != nil {
 		t.Fatal(viewErr)
 	}
-	if allocations > 6 {
-		t.Fatalf("one-bucket View allocations: got %v, want at most 6", allocations)
+	if allocations > 3 {
+		t.Fatalf("one-bucket View allocations: got %v, want at most 3", allocations)
 	}
 }
 
@@ -1572,6 +1572,36 @@ func TestGet_Missing(t *testing.T) {
 
 	if _, err := db.Get(testBucketName, []byte("nope")); err == nil {
 		t.Fatal("expected an error for a missing key")
+	}
+}
+
+func TestGet_WALValueIsOwnedByCaller(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{
+		Synchronous:              SyncNormal,
+		CheckpointThresholdBytes: ^uint64(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	value, err := db.Get(testBucketName, []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	value[0] = 'X'
+
+	got, err := db.Get(testBucketName, []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("second Get: got %q, want value", got)
 	}
 }
 

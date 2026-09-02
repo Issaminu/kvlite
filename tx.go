@@ -11,7 +11,7 @@ type Tx struct {
 	db        *DB
 	meta      *page.Meta
 	rootNode  *btree.Node
-	store     *txTreeStore
+	store     txTreeStore
 	tree      *btree.Tree
 	metaDirty bool
 	readOnly  bool
@@ -27,10 +27,10 @@ func newTx(db *DB, readOnly bool) *Tx {
 	}
 
 	tx := &Tx{db: db, meta: db.meta, rootNode: db.rootNode, readOnly: true}
-	tx.store = &txTreeStore{
+	tx.store = txTreeStore{
 		tx: tx,
 	}
-	tx.tree = btree.NewTree(tx.store)
+	tx.tree = btree.NewTree(&tx.store)
 	return tx
 }
 
@@ -38,13 +38,13 @@ func newTx(db *DB, readOnly bool) *Tx {
 func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseNodes map[page.ID]*btree.Node) *Tx {
 	meta := *baseMeta
 	tx := &Tx{db: db, meta: &meta, rootNode: baseRoot}
-	tx.store = &txTreeStore{
+	tx.store = txTreeStore{
 		tx:        tx,
 		baseNodes: baseNodes,
 		nodes:     make(map[page.ID]*btree.Node),
 		dirty:     make(map[page.ID]*btree.Node),
 	}
-	tx.tree = btree.NewTree(tx.store)
+	tx.tree = btree.NewTree(&tx.store)
 
 	// B+tree writes clone this read-only root before they change it.
 	tx.store.nodes[baseRoot.PageID()] = baseRoot
@@ -56,6 +56,8 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseNodes map
 // If fn returns nil, Update commits all changes together. Other database operations can then read them. If fn returns an error, Update discards all changes and returns that error.
 //
 // Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
+//
+// In [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch. If the WAL commit fails, each callback that depends on that commit receives the same error.
 //
 // Do not start another transaction from fn. Use the Tx passed to fn. If fn panics, Update discards its changes before the panic continues.
 func (db *DB) Update(transaction func(tx *Tx) error) error {

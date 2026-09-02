@@ -793,3 +793,55 @@ func TestLookupMappedNode_SelectsBranchChild(t *testing.T) {
 		t.Fatalf("branch lookup: found=%t child=%d, want false and 10", found, child)
 	}
 }
+
+func TestLookupEncodedWALNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
+	node := NewLeafNode(7)
+	if err := node.InsertEntry(NewEntry(0, []byte("alpha"), []byte("one"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := node.InsertEntry(NewEntry(0, []byte("beta"), []byte("two"))); err != nil {
+		t.Fatal(err)
+	}
+	data := EncodeWALNode(node)
+
+	var entry Entry
+	var found bool
+	var child page.ID
+	var lookupErr error
+	if got := testing.AllocsPerRun(100, func() {
+		entry, found, child, lookupErr = LookupEncodedWALNode(data, node.PageID(), []byte("beta"))
+	}); got != 0 {
+		t.Fatalf("LookupEncodedWALNode allocations: got %v, want 0", got)
+	}
+	if lookupErr != nil || !found || child != 0 || !bytes.Equal(entry.Value(), []byte("two")) {
+		t.Fatalf("LookupEncodedWALNode: entry=%q found=%t child=%d err=%v", entry.Value(), found, child, lookupErr)
+	}
+}
+
+func TestLookupEncodedWALNode_SelectsBranchChild(t *testing.T) {
+	root := &Node{
+		header:   newNodeHeader(NodeTypeBranch, 8),
+		entries:  []Entry{{key: []byte("m")}, {key: []byte("t")}},
+		Children: []page.ID{9, 10, 11},
+	}
+	data := EncodeWALNode(root)
+
+	for _, testCase := range []struct {
+		key       string
+		wantChild page.ID
+	}{
+		{key: "a", wantChild: 9},
+		{key: "m", wantChild: 10},
+		{key: "z", wantChild: 11},
+	} {
+		t.Run(testCase.key, func(t *testing.T) {
+			_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte(testCase.key))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if found || child != testCase.wantChild {
+				t.Fatalf("branch lookup: found=%t child=%d, want false and %d", found, child, testCase.wantChild)
+			}
+		})
+	}
+}
