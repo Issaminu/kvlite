@@ -21,8 +21,6 @@ const (
 
 	// defaultCheckpointPageCount keeps about 1,000 operating-system pages of data in the write-ahead log before KVLite starts a checkpoint. This limits log growth without running a checkpoint after every update.
 	defaultCheckpointPageCount = 1000
-
-	defaultPageCacheBytes uint64 = 16 << 20 // 16 MiB
 )
 
 // Options configures [Open]. Open resolves the zero values described below and then copies the result, so callers can reuse or change their Options after Open returns.
@@ -38,12 +36,6 @@ type Options struct {
 
 	// CheckpointThresholdBytes is the number of committed write-ahead log bytes that starts a checkpoint. A zero value uses about 1,000 operating-system pages, while a smaller value keeps the log smaller at the cost of more frequent checkpoints.
 	CheckpointThresholdBytes uint64
-
-	// PageCacheBytes limits the encoded size of committed child pages that KVLite keeps decoded between transactions. A zero value uses 16 MiB. The cache grows as pages are read and decoded Go values can use more memory than this limit.
-	PageCacheBytes uint64
-
-	// DisablePageCache prevents KVLite from keeping decoded child pages between transactions. The catalog root remains in memory while the database is open.
-	DisablePageCache bool
 }
 
 func defaultOptions() Options {
@@ -51,7 +43,6 @@ func defaultOptions() Options {
 		ReadOnly:                 false,
 		Synchronous:              SyncFull,
 		CheckpointThresholdBytes: defaultCheckpointPageCount * uint64(os.Getpagesize()),
-		PageCacheBytes:           defaultPageCacheBytes,
 	}
 }
 
@@ -65,9 +56,6 @@ func resolveOptions(options *Options) (*Options, error) {
 		}
 		if resolved.CheckpointThresholdBytes == 0 {
 			resolved.CheckpointThresholdBytes = defaults.CheckpointThresholdBytes
-		}
-		if resolved.PageCacheBytes == 0 {
-			resolved.PageCacheBytes = defaults.PageCacheBytes
 		}
 	}
 

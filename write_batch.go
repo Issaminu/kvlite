@@ -155,8 +155,9 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		var needsCheckpoint bool
 		needsCheckpoint, commitErr = db.wal.Commit(records)
 		if commitErr == nil {
-			// Publish metadata, the root, and cached child nodes only after the WAL append and required synchronization succeed.
-			db.publishWriteBatch(&state)
+			// Publish the new state only after the WAL append and required synchronization succeed.
+			db.meta = state.meta
+			db.rootNode = state.rootNode
 			if needsCheckpoint {
 				// The batch is already committed. A checkpoint error must not change a successful Update result.
 				_ = db.checkpointWAL()
@@ -210,16 +211,4 @@ func callWriteCallback(transaction func(*Tx) error, tx *Tx) (result writeResult)
 	result.err = transaction(tx)
 	returned = true
 	return result
-}
-
-// publishWriteBatch installs a committed batch in the database state and page cache. The caller must call it only after the WAL commit succeeds.
-func (db *DB) publishWriteBatch(state *writeBatchState) {
-	db.meta = state.meta
-	db.rootNode = state.rootNode
-	for _, node := range state.dirty {
-		if node.PageID() == db.rootNode.PageID() {
-			continue
-		}
-		db.pageCache.Put(node)
-	}
 }

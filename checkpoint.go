@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"errors"
 	"io"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -29,8 +30,20 @@ func (db *DB) applyWALRecordWithBuffer(record *wal.Record, pageBuffer []byte) er
 	return fileio.WriteFull(io.NewOffsetWriter(db.file, offset), pageBuffer)
 }
 
-// checkpointWAL makes the WAL durable, copies its committed pages into the main file, and then makes the main file durable.
-// The WAL removes its committed state only after those steps succeed, so a failed write or main-file sync can be retried.
+// checkpointWAL copies committed WAL pages into the main file.
+// It first makes the WAL durable.
+// It then makes the main file durable.
+// The WAL removes its committed state only after these steps succeed.
+// A failed write or sync can be retried.
+//
+// The checkpoint refreshes the mapping before another operation can read it.
+//
+// The caller must hold the exclusive database operation lock.
 func (db *DB) checkpointWAL() error {
-	return db.wal.Checkpoint(db.file)
+	if db.wal.Stats().CommittedRecordCount == 0 {
+		return nil
+	}
+	checkpointErr := db.wal.Checkpoint(db.file)
+	mapErr := db.refreshMainFileMapping()
+	return errors.Join(checkpointErr, mapErr)
 }

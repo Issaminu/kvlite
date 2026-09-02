@@ -26,7 +26,7 @@ type DB struct {
 	file             *os.File
 	meta             *page.Meta
 	rootNode         *btree.Node
-	pageCache        *nodeCache
+	mappedFile       []byte
 	options          *Options
 	wal              *wal.WAL
 	operationMu      sync.RWMutex
@@ -157,8 +157,10 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 		}
 	}
 
-	db.pageCache = newNodeCache(pageCacheCapacity(db.options.PageCacheBytes, db.meta.PageSize(), db.options.DisablePageCache))
 	if err := db.loadRootNode(); err != nil {
+		return db.failOpen(err)
+	}
+	if err := db.mapMainFile(); err != nil {
 		return db.failOpen(err)
 	}
 
@@ -190,7 +192,7 @@ func (db *DB) loadRootNode() error {
 	if db.rootNode != nil {
 		return nil
 	}
-	rootNode, err := db.loadNode(db.meta.Root())
+	rootNode, err := db.readNode(db.meta.Root())
 	if err != nil {
 		return err
 	}
@@ -214,8 +216,16 @@ func (db *DB) closeFiles() error {
 }
 
 func (db *DB) failOpen(err error) (*DB, error) {
-	if closeErr := db.closeFiles(); closeErr != nil {
-		return nil, errors.Join(err, fmt.Errorf("failed to close database files: %w", closeErr))
+	mappingErr := db.unmapMainFile()
+	closeErr := db.closeFiles()
+	if mappingErr != nil || closeErr != nil {
+		if mappingErr != nil {
+			mappingErr = fmt.Errorf("failed to unmap database: %w", mappingErr)
+		}
+		if closeErr != nil {
+			closeErr = fmt.Errorf("failed to close database files: %w", closeErr)
+		}
+		return nil, errors.Join(err, mappingErr, closeErr)
 	}
 	return nil, err
 }
@@ -252,6 +262,9 @@ func (db *DB) Close() error {
 
 func (db *DB) close() error {
 	if db.options.ReadOnly {
+		if err := db.unmapMainFile(); err != nil {
+			return err
+		}
 		if err := db.closeFiles(); err != nil {
 			return err
 		}
@@ -262,12 +275,16 @@ func (db *DB) close() error {
 		if err := db.checkpointWAL(); err != nil {
 			return err
 		}
-		if err := db.wal.Delete(); err != nil {
+	} else {
+		if err := db.file.Sync(); err != nil {
 			return err
 		}
-	} else {
-		err := db.file.Sync()
-		if err != nil {
+	}
+	if err := db.unmapMainFile(); err != nil {
+		return err
+	}
+	if db.wal != nil {
+		if err := db.wal.Delete(); err != nil {
 			return err
 		}
 	}
@@ -348,20 +365,8 @@ func (db *DB) hasMeta() bool {
 	return fi.Size() > 0
 }
 
-// readNode returns a read-only committed node. A cache miss reads the WAL before the main file so the cache never publishes an older page image.
+// readNode decodes one committed node. The WAL image has priority over the main-file image.
 func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
-	if node, ok := db.pageCache.Get(pgid); ok {
-		return node, nil
-	}
-	node, err := db.loadNode(pgid)
-	if err != nil {
-		return nil, err
-	}
-	db.pageCache.Put(node)
-	return node, nil
-}
-
-func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
 	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
@@ -372,19 +377,11 @@ func (db *DB) loadNode(pgid page.ID) (*btree.Node, error) {
 		return node, nil
 	}
 
-	// Node not found in-memory, so we have to read its full page from the database file.
-
-	offset := int64(pgid) * db.meta.PageSize()
-	data := make([]byte, db.meta.PageSize())
-	reader := io.NewSectionReader(db.file, offset, db.meta.PageSize())
-	if err := fileio.ReadFull(reader, data); err != nil {
-		return nil, err
-	}
-	node, err := btree.DecodeNode(data, pgid, db.meta.PageSize())
+	data, err := db.readMainPage(pgid)
 	if err != nil {
 		return nil, err
 	}
-	return node, nil
+	return btree.DecodeNode(data, pgid, db.meta.PageSize())
 }
 
 func (db *DB) readMetaAt(offset int64) (*page.Meta, error) {
