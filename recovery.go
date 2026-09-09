@@ -64,12 +64,9 @@ func (db *DB) ingestWalRecords(records []wal.Record) error {
 		return err
 	}
 	for _, record := range committed {
-		if err := db.applyWALRecord(&record); err != nil {
-			return err
-		}
+		db.wal.LoadCommittedRecord(record)
 	}
-
-	return db.file.Sync()
+	return db.wal.Checkpoint(db.file)
 }
 
 func committedWALRecords(records []wal.Record) ([]wal.Record, error) {
