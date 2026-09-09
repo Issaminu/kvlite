@@ -407,7 +407,7 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 		if got := bucket.rootNode.PageID(); got == rootPageID {
 			t.Fatalf("bucket root page ID after split: got old page %d, want a new page", got)
 		}
-		entry, found, err := tx.tree.FindEntry(tx.rootNode, testBucketName)
+		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, testBucketName)
 		if err != nil {
 			return err
 		}
@@ -4201,7 +4201,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 		if got := p.rootNode.PageID(); got == rootPageID {
 			t.Fatalf("parent root page ID after split: got old page %d, want a new page", got)
 		}
-		entry, found, err := tx.tree.FindEntry(tx.rootNode, []byte("p"))
+		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, []byte("p"))
 		if err != nil {
 			return err
 		}
@@ -4388,7 +4388,7 @@ func TestGet_MissingStillErrKeyNotFound(t *testing.T) {
 	}
 }
 
-func TestTreeFindEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
+func TestTreeFindEntryRef_DistinguishesEmptyValueFromMissing(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
 	if err != nil {
@@ -4409,7 +4409,7 @@ func TestTreeFindEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 			return err
 		}
 		root := bucket.rootNode
-		entry, found, err := tx.tree.FindEntry(root, []byte("present"))
+		entry, found, err := tx.tree.FindEntryRef(root, []byte("present"))
 		if err != nil {
 			return err
 		}
@@ -4420,7 +4420,7 @@ func TestTreeFindEntry_DistinguishesEmptyValueFromMissing(t *testing.T) {
 			t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
 		}
 
-		_, found, err = tx.tree.FindEntry(root, []byte("missing"))
+		_, found, err = tx.tree.FindEntryRef(root, []byte("missing"))
 		if err != nil {
 			return err
 		}

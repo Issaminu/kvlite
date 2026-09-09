@@ -180,7 +180,7 @@ func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	entry, found, err := decoded.FindEntry([]byte("k"))
+	entry, found, err := decoded.FindEntryRef([]byte("k"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -585,7 +585,7 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 	for index := 0; index < entryCount; index++ {
 		key := fmt.Appendf(nil, "key-%03d", index)
 		want := fmt.Appendf(nil, "value-%03d", index)
-		entry, found, err := tree.FindEntry(root, key)
+		entry, found, err := tree.FindEntryRef(root, key)
 		if err != nil {
 			t.Fatalf("find %q: %v", key, err)
 		}
@@ -635,7 +635,7 @@ func TestTreePutEntry_RootSplitReturnsNewRoot(t *testing.T) {
 	}
 	for index := 0; index < inserted; index++ {
 		key := fmt.Appendf(nil, "key-%02d", index)
-		entry, found, err := tree.FindEntry(root, key)
+		entry, found, err := tree.FindEntryRef(root, key)
 		if err != nil {
 			t.Fatalf("find %q: %v", key, err)
 		}

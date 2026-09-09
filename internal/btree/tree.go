@@ -67,27 +67,6 @@ func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
 	return Entry{}, false, childPageID, nil
 }
 
-// findLeafNode follows branch separators without requesting mutable nodes.
-// It returns [ErrKeyNotFound] if a selected child page has no node.
-func (tree *Tree) findLeafNode(root *Node, key []byte) (*Node, error) {
-	node := root
-	for !node.IsLeaf() {
-		childIndex, err := node.FindChildIndex(key)
-		if err != nil {
-			return nil, err
-		}
-		childNode, err := tree.store.ReadNode(node.Children[childIndex])
-		if err != nil {
-			return nil, err
-		}
-		if childNode == nil {
-			return nil, ErrKeyNotFound
-		}
-		node = childNode
-	}
-	return node, nil
-}
-
 // validateEntry rejects an empty or oversized key, an oversized value, or an entry that cannot fit the tree's fixed-page representation.
 // A leaf stores the full key and value.
 // A later split can promote the key into a branch separator, where the smallest valid branch stores the separator and two child page IDs.
@@ -222,24 +201,6 @@ func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pa
 		child = rightNode
 		childIndex++
 	}
-}
-
-// FindEntry looks key up and returns an entry whose key and value do not share storage with the leaf node.
-// It returns a zero entry with found false when the key is absent.
-// An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
-func (tree *Tree) FindEntry(root *Node, key []byte) (Entry, bool, error) {
-	if len(key) == 0 {
-		return Entry{}, false, ErrKeyRequired
-	}
-	if len(key) > MaxKeySize {
-		return Entry{}, false, ErrKeyTooLarge
-	}
-
-	node, err := tree.findLeafNode(root, key)
-	if err != nil {
-		return Entry{}, false, err
-	}
-	return node.FindEntry(key)
 }
 
 // FindEntryRef looks key up without copying the stored key or value.

@@ -456,7 +456,7 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 		if err != nil {
 			t.Fatalf("decode checkpoint page %d: %v", pageID, err)
 		}
-		entry, found, err := node.FindEntry([]byte("key"))
+		entry, found, err := node.FindEntryRef([]byte("key"))
 		if err != nil || !found || !bytes.Equal(entry.Value(), []byte{byte(pageID)}) {
 			t.Fatalf("checkpoint page %d entry: found=%t value=%v err=%v", pageID, found, entry.Value(), err)
 		}

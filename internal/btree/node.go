@@ -165,29 +165,6 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 	return index, found, nil
 }
 
-// FindEntry looks a key up in this leaf. The returned found reports whether the
-// key is present because a stored value can be empty.
-func (n *Node) FindEntry(key []byte) (Entry, bool, error) {
-	if !n.IsLeaf() {
-		return Entry{}, false, ErrNotLeafNode
-	}
-	idx, found, err := n.findKeyIndex(key)
-	if err != nil {
-		return Entry{}, false, err
-	}
-	if !found {
-		return Entry{}, false, nil
-	}
-
-	entry := n.entries[idx]
-	entry.key = slices.Clone(entry.key)
-	entry.value = slices.Clone(entry.value)
-	if entry.value == nil {
-		entry.value = []byte{}
-	}
-	return entry, true, nil
-}
-
 // FindEntryRef looks a key up in this leaf without copying its key or value.
 // The returned entry refers to storage owned by the node.
 func (n *Node) FindEntryRef(key []byte) (Entry, bool, error) {
