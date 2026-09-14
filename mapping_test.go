@@ -9,7 +9,7 @@ import (
 
 func TestOpen_MapsTheCompleteMainFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -44,7 +44,7 @@ func TestOpen_MapsTheCompleteMainFile(t *testing.T) {
 func TestCheckpoint_ReplacesTheMappingAfterTheMainFileGrows(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: 1,
 	})
 	if err != nil {
@@ -86,7 +86,7 @@ func TestCheckpoint_ReplacesTheMappingAfterTheMainFileGrows(t *testing.T) {
 func TestClose_UnmapsTheMainFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: math.MaxUint64,
 	})
 	if err != nil {
@@ -107,7 +107,7 @@ func TestClose_UnmapsTheMainFile(t *testing.T) {
 func TestCheckpoint_PreservesChangedAndUnchangedMappedEntries(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: math.MaxUint64,
 	})
 	if err != nil {
@@ -130,7 +130,7 @@ func TestCheckpoint_PreservesChangedAndUnchangedMappedEntries(t *testing.T) {
 	}
 
 	db, err = Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: 1,
 	})
 	if err != nil {

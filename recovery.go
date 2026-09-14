@@ -48,6 +48,7 @@ func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.Record, error) {
 		File:                     walFile,
 		PageSize:                 pageSize,
 		SyncOnCommit:             db.options.Synchronous == SyncFull,
+		SyncOnCheckpoint:         db.options.Synchronous != SyncNone,
 		CheckpointThresholdBytes: db.options.CheckpointThresholdBytes,
 	})
 

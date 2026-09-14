@@ -39,7 +39,7 @@ func prepareLargeGetBenchmark(b *testing.B) (string, *DB, [][]byte) {
 
 	path := filepath.Join(b.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: math.MaxUint64,
 	})
 	if err != nil {

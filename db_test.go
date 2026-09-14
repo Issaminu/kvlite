@@ -78,13 +78,9 @@ func tempfile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("kvlite-%d.db", time.Now().UnixNano()))
 }
 
-// openDB opens a database for tests in NORMAL sync mode, so the suite is not
-// dominated by a per-commit fsync (FULL, the production default, costs ~one macOS
-// F_FULLFSYNC per Put). NORMAL is functionally identical here — it only defers the
-// fsync to the checkpoint — so every test that does not specifically assert
-// per-commit durability uses this.
+// openDB opens a database for tests in SyncNone mode, so repeated storage syncs do not dominate the suite. Tests that require synchronized storage use [Open] with the default SyncFull mode.
 func openDB(path string) (*DB, error) {
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +426,7 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 
 func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -888,14 +884,7 @@ func TestSplit_Cascades(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// RUNG 4c — redo WAL (eager / write-through to start).  <-- NEXT
-//
-// Commit = append changed pages to the WAL (convention: main + "-wal") + fsync = the
-// commit point. Main file stays current (eager) so reads are unchanged. A clean Close
-// checkpoints the WAL into the main file and deletes it (single file at rest). A crash
-// (unclean shutdown, WAL left behind) is recovered by replaying the WAL on open.
-// -----------------------------------------------------------------------------
+// These WAL lifecycle tests use SyncNone. A commit appends changed pages to the WAL. A clean Close copies those pages into the main file and deletes the WAL. SyncNone does not sync either file.
 
 // TestWAL_WrittenThenCheckpointed: the plumbing. During operation the WAL exists and is
 // non-empty; a clean Close checkpoints it away → single file at rest, data intact.
@@ -966,7 +955,7 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	db.wal.ReplaceFileForTesting(readOnlyWAL)
 
 	if err := db.checkpointWAL(); err != nil {
-		t.Fatalf("checkpoint returned an error after the main file was durable: %v", err)
+		t.Fatalf("checkpoint returned an error after the main-file write: %v", err)
 	}
 	walAfter, err := os.ReadFile(path + "-wal")
 	if err != nil {
@@ -1233,14 +1222,6 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 // checkpoint must fire, drain the committed data into the main file, and reset the
 // WAL — so the WAL at rest stays near the threshold instead of growing with the
 // data. Every key must be readable before the close and after a reopen.
-//
-// This will not compile until you add the trigger + the checkpoint it drives:
-//   - wal.bytesSinceCheckpoint: an in-memory counter, bumped by largeBuf.Len() in
-//     persistCollectedRecords, reset in checkpoint(). No syscall.
-//   - wal.checkpointThresholdBytes: the knob below (rename freely — adjust the test).
-//   - checkpoint(): fsync(main) -> truncate(WAL) -> reset the counter.
-//   - after each commit: if bytesSinceCheckpoint > checkpointThresholdBytes { checkpoint() }
-//   - Close: checkpoint (or fsync(main)) BEFORE wal.delete().
 func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	path := tempfile()
 	wal := path + "-wal"
@@ -1309,7 +1290,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := openDB(path) // NORMAL by default
+	db, err := openDB(path) // SyncNone by default.
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1578,7 +1559,7 @@ func TestGet_Missing(t *testing.T) {
 func TestGet_WALValueIsOwnedByCaller(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: ^uint64(0),
 	})
 	if err != nil {
@@ -1711,7 +1692,7 @@ func TestOpen_Reopen(t *testing.T) {
 func TestDefaultOptionsAreIndependent(t *testing.T) {
 	first := defaultOptions()
 	first.ReadOnly = true
-	first.Synchronous = SyncNormal
+	first.Synchronous = SyncNone
 	first.CheckpointThresholdBytes = 1
 
 	second := defaultOptions()
@@ -1732,7 +1713,7 @@ func TestOpen_NewDatabaseUsesOperatingSystemPageSize(t *testing.T) {
 	defer os.RemoveAll(path + "-wal")
 
 	pageSize := int64(os.Getpagesize())
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1746,7 +1727,7 @@ func TestOpen_NewDatabaseUsesOperatingSystemPageSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1761,7 +1742,7 @@ func TestOpen_ExistingDatabaseUsesStoredPageSize(t *testing.T) {
 	storedPageSize := int64(os.Getpagesize()) * 2
 	writeEmptyDatabaseWithPageSize(t, path, storedPageSize)
 
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1776,7 +1757,7 @@ func TestOpen_InvalidSynchronousModeDoesNotCreateDatabase(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal + 1})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone + 1})
 	if db != nil {
 		_ = db.Close()
 	}
@@ -1794,7 +1775,7 @@ func TestOpen_UsesModeForDatabaseAndWAL(t *testing.T) {
 	defer os.RemoveAll(path + "-wal")
 
 	const mode os.FileMode = 0600
-	db, err := Open(path, mode, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, mode, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1828,34 +1809,43 @@ func TestOpen_NilOptionsCreatesWritableDatabase(t *testing.T) {
 	}
 }
 
-func TestOpen_SynchronousNormalDefersWALSync(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-	defer os.RemoveAll(path + "-wal")
-
-	// The threshold is larger than this test transaction, so NORMAL mode must
-	// leave the WAL unsynced until a later checkpoint or close.
-	const checkpointBeyondTestWrite uint64 = 1 << 30
-	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
-		CheckpointThresholdBytes: checkpointBeyondTestWrite,
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestOpen_RelaxedSyncModesDoNotSyncEachCommit(t *testing.T) {
+	tests := []struct {
+		name string
+		mode Sync
+	}{
+		{name: "normal", mode: SyncNormal},
+		{name: "none", mode: SyncNone},
 	}
-	defer db.Close()
-	createBucket(t, db, testBucketName)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			const checkpointBeyondTestWrite uint64 = 1 << 30
+			db, err := Open(path, 0600, &Options{
+				Synchronous:              test.mode,
+				CheckpointThresholdBytes: checkpointBeyondTestWrite,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				db.wal.SetSyncFileForTesting(nil)
+				_ = db.Close()
+			}()
+			createBucket(t, db, testBucketName)
 
-	syncCalls := 0
-	db.wal.SetSyncFileForTesting(func() error {
-		syncCalls++
-		return nil
-	})
-	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
-		t.Fatal(err)
-	}
-	if syncCalls != 0 {
-		t.Fatalf("NORMAL commit sync calls: got %d, want 0", syncCalls)
+			syncCalls := 0
+			db.wal.SetSyncFileForTesting(func() error {
+				syncCalls++
+				return nil
+			})
+			if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			if syncCalls != 0 {
+				t.Fatalf("commit sync calls: got %d, want 0", syncCalls)
+			}
+		})
 	}
 }
 
@@ -1865,7 +1855,7 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 	defer os.RemoveAll(path + "-wal")
 
 	db, err := Open(path, 0600, &Options{
-		Synchronous:              SyncNormal,
+		Synchronous:              SyncNone,
 		CheckpointThresholdBytes: 1, // Every WAL transaction is larger than one byte.
 	})
 	if err != nil {
@@ -2211,7 +2201,7 @@ func TestOpen_ReadPageSize_FromMeta1(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	pageSize := int64(os.Getpagesize())
 
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3182,7 +3172,7 @@ func TestTreePutEntry_DoesNotPublishPrivateRoot(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5697,7 +5687,7 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 		return bucket.Put([]byte("key"), []byte("new"))
 	})
 	if err != nil {
-		t.Fatalf("durable WAL commit returned a checkpoint error: %v", err)
+		t.Fatalf("committed WAL update returned a checkpoint error: %v", err)
 	}
 	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("committed overlay value: got %q, err %v", got, err)
@@ -5716,34 +5706,46 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	}
 }
 
-func TestAudit_AutomaticCheckpointSyncsWALOnce(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-	defer os.RemoveAll(path + "-wal")
-
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
+func TestAudit_AutomaticCheckpointUsesSelectedSyncMode(t *testing.T) {
+	tests := []struct {
+		name      string
+		mode      Sync
+		syncCalls int
+	}{
+		{name: "normal", mode: SyncNormal, syncCalls: 1},
+		{name: "none", mode: SyncNone, syncCalls: 0},
 	}
-	defer func() {
-		db.wal.SetSyncFileForTesting(nil)
-		_ = db.Close()
-	}()
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{Synchronous: test.mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				db.wal.SetSyncFileForTesting(nil)
+				_ = db.Close()
+			}()
+			createBucket(t, db, testBucketName)
 
-	// One byte makes every non-empty WAL append cross the checkpoint threshold.
-	db.wal.SetCheckpointThresholdBytes(1)
-	syncCalls := 0
-	db.wal.SetSyncFileForTesting(func() error {
-		syncCalls++
-		return nil
-	})
+			// One byte makes every non-empty WAL append cross the checkpoint threshold.
+			db.wal.SetCheckpointThresholdBytes(1)
+			syncCalls := 0
+			db.wal.SetSyncFileForTesting(func() error {
+				syncCalls++
+				return nil
+			})
 
-	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
-		t.Fatal(err)
-	}
-	db.wal.SetSyncFileForTesting(nil)
-	if syncCalls != 1 {
-		t.Fatalf("automatic checkpoint WAL sync calls: got %d, want 1", syncCalls)
+			if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			if got := fileSize(t, path+"-wal"); got != 0 {
+				t.Fatalf("WAL size after automatic checkpoint: got %d, want 0", got)
+			}
+			if syncCalls != test.syncCalls {
+				t.Fatalf("automatic checkpoint WAL sync calls: got %d, want %d", syncCalls, test.syncCalls)
+			}
+		})
 	}
 }
 
@@ -5781,7 +5783,7 @@ func TestAudit_CloseAfterFullCommitDoesNotResyncWAL(t *testing.T) {
 	}
 }
 
-func TestAudit_CloseSyncsUnsyncedNormalWAL(t *testing.T) {
+func TestAudit_CloseDoesNotSyncWALInSyncNoneMode(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -5809,8 +5811,44 @@ func TestAudit_CloseSyncsUnsyncedNormalWAL(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if syncCalls != 0 {
+		t.Fatalf("SyncNone commit and close WAL sync calls: got %d, want 0", syncCalls)
+	}
+}
+
+func TestAudit_CloseSyncsWALInSyncNormalMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{
+		Synchronous:              SyncNormal,
+		CheckpointThresholdBytes: 1 << 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if !db.closed {
+			db.wal.SetSyncFileForTesting(nil)
+			_ = db.Close()
+		}
+	}()
+	createBucket(t, db, testBucketName)
+
+	syncCalls := 0
+	db.wal.SetSyncFileForTesting(func() error {
+		syncCalls++
+		return nil
+	})
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if syncCalls != 0 {
+		t.Fatalf("commit sync calls: got %d, want 0", syncCalls)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if syncCalls != 1 {
-		t.Fatalf("normal commit and close WAL sync calls: got %d, want 1", syncCalls)
+		t.Fatalf("commit and close WAL sync calls: got %d, want 1", syncCalls)
 	}
 }
 
@@ -5862,11 +5900,12 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := openDB(path)
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	createBucket(t, db, testBucketName)
 
 	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
 		t.Fatal(err)
@@ -5948,7 +5987,7 @@ func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
 		return bucket.Put([]byte("first"), []byte("one"))
 	})
 	if err != nil {
-		t.Fatalf("first durable WAL commit returned a checkpoint error: %v", err)
+		t.Fatalf("first committed WAL update returned a checkpoint error: %v", err)
 	}
 	stats := db.wal.Stats()
 	if stats.CommittedRecordCount == 0 || stats.BytesSinceCheckpoint == 0 {

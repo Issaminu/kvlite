@@ -33,7 +33,7 @@ func kvliteSync(mode DurabilityMode) (kvlite.Sync, error) {
 	case DurabilityDurable:
 		return kvlite.SyncFull, nil
 	case DurabilityNoCommitSync:
-		return kvlite.SyncNormal, nil
+		return kvlite.SyncNone, nil
 	default:
 		return kvlite.SyncDefault, fmt.Errorf("unsupported KVLite durability mode %q", mode)
 	}

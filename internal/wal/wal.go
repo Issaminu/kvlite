@@ -20,6 +20,7 @@ type WAL struct {
 	file                     *os.File
 	pageSize                 int64
 	syncOnCommit             bool
+	syncOnCheckpoint         bool
 	checkpointThresholdBytes uint64
 	bytesSinceCheckpoint     uint64
 	overlay                  map[page.ID]Record // Committed pages that are not yet checkpointed.
@@ -202,7 +203,7 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	wal.bytesSinceCheckpoint += uint64(len(transaction))
 
 	needsCheckpoint := wal.reachedCheckpointThreshold()
-	if wal.syncOnCommit || needsCheckpoint {
+	if wal.syncOnCommit || (needsCheckpoint && wal.syncOnCheckpoint) {
 		if err := wal.Sync(); err != nil {
 			return false, err
 		}

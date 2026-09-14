@@ -120,7 +120,7 @@ Set `KVBENCH_DURABILITY` before the run.
 | Mode             | KVLite       | bbolt                      | Redis                                 |
 | ---------------- | ------------ | -------------------------- | ------------------------------------- |
 | `durable`        | `SyncFull`   | Default synchronous writes | AOF enabled with `appendfsync always` |
-| `no-commit-sync` | `SyncNormal` | `NoSync=true`              | AOF enabled with `appendfsync no`     |
+| `no-commit-sync` | `SyncNone`   | `NoSync=true`              | AOF enabled with `appendfsync no`     |
 
 
 Run the relaxed mode:
@@ -130,7 +130,7 @@ KVBENCH_DURABILITY=no-commit-sync \
 go test -run '^$' -bench '^BenchmarkAcknowledgedOperations$' -benchmem -count=5
 ```
 
-`no-commit-sync` measures the time until the API returns success without a per-commit storage sync. KVLite can perform deferred sync and checkpoint work during `Close`. Close is outside the benchmark timer. Do not use this mode to compare total lifecycle cost.
+`no-commit-sync` measures the time until the API returns success without an explicit storage sync. KVLite can perform checkpoint work during measured calls and during `Close`, but `SyncNone` does not sync storage. Close is outside the benchmark timer. Do not use this mode to compare total lifecycle cost.
 
 ## Redis setup and safety
 
@@ -259,5 +259,4 @@ Add a workload only when all compared engines can use matched data, durability r
 | `bbolt_engine.go`   | bbolt adapter                                                    |
 | `redis_engine.go`   | Redis adapter and persistence validation                         |
 | `*_test.go`         | Data, adapter, and safety checks                                 |
-
 

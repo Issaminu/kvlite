@@ -71,7 +71,6 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	if db.options.Synchronous == SyncFull {
 		return db.submitDurableUpdate(transaction)
 	}
-	// SyncNormal operation
 	db.operationMu.Lock()
 	defer db.operationMu.Unlock()
 	return db.updateDirect(transaction)

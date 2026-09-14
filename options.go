@@ -16,8 +16,11 @@ const (
 	// SyncFull favors durability over write speed. It waits for each non-empty write transaction to reach storage before [DB.Update] returns success. Concurrent updates can share one write-ahead log append and storage synchronization.
 	SyncFull
 
-	// SyncNormal favors write speed over the durability of recent updates. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes.
+	// SyncNormal is a middle ground between write speed and durability. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes.
 	SyncNormal
+
+	// SyncNone favors write speed over the durability of recent updates. It disables storage synchronization after commits, checkpoints, and close. A system failure can lose committed updates or corrupt the database. Use this mode only when the data can be rebuilt.
+	SyncNone
 
 	// defaultCheckpointPageCount keeps about 1,000 operating-system pages of data in the write-ahead log before KVLite starts a checkpoint. This limits log growth without running a checkpoint after every update.
 	defaultCheckpointPageCount = 1000
@@ -63,7 +66,7 @@ func resolveOptions(options *Options) (*Options, error) {
 		return nil, fmt.Errorf("invalid database lock timeout %s: %w", resolved.LockTimeout, ErrInvalid)
 	}
 
-	if resolved.Synchronous != SyncFull && resolved.Synchronous != SyncNormal {
+	if resolved.Synchronous != SyncFull && resolved.Synchronous != SyncNormal && resolved.Synchronous != SyncNone {
 		return nil, fmt.Errorf("invalid synchronous mode %d: %w", resolved.Synchronous, ErrInvalid)
 	}
 	return &resolved, nil

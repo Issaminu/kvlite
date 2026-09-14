@@ -20,6 +20,7 @@ type Config struct {
 	File                     *os.File
 	PageSize                 int64
 	SyncOnCommit             bool
+	SyncOnCheckpoint         bool
 	CheckpointThresholdBytes uint64
 }
 
@@ -29,22 +30,26 @@ func New(config Config) *WAL {
 		file:                     config.File,
 		pageSize:                 config.PageSize,
 		syncOnCommit:             config.SyncOnCommit,
+		syncOnCheckpoint:         config.SyncOnCheckpoint,
 		checkpointThresholdBytes: config.CheckpointThresholdBytes,
 		overlay:                  make(map[page.ID]Record),
 		nextTxid:                 1,
 	}
 }
 
-// Checkpoint copies the committed overlay into mainFile and clears the WAL contents only after mainFile is synchronized.
+// Checkpoint copies the committed overlay into mainFile and then clears the WAL contents.
 // It borrows mainFile and does not close it.
-// A WAL sync, main-file write, or main-file sync failure leaves the overlay and WAL available for a later retry.
-// A WAL truncate failure after the main-file sync leaves the overlay in memory for cleanup retry but does not make the committed transaction fail.
+// When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
+// A main-file write or required sync failure leaves the overlay and WAL available for a later retry.
+// A WAL truncate failure leaves the overlay in memory for cleanup retry but does not make the committed transaction fail.
 func (wal *WAL) Checkpoint(mainFile *os.File) error {
 	if len(wal.overlay) == 0 {
 		return nil
 	}
-	if err := wal.Sync(); err != nil {
-		return err
+	if wal.syncOnCheckpoint {
+		if err := wal.Sync(); err != nil {
+			return err
+		}
 	}
 	records := make([]Record, 0, len(wal.overlay))
 	for _, record := range wal.overlay {
@@ -64,11 +69,13 @@ func (wal *WAL) Checkpoint(mainFile *os.File) error {
 	if err := writeCheckpointRecordRuns(mainFile, records, wal.pageSize); err != nil {
 		return err
 	}
-	if err := mainFile.Sync(); err != nil {
-		return err
+	if wal.syncOnCheckpoint {
+		if err := mainFile.Sync(); err != nil {
+			return err
+		}
 	}
 	if err := wal.Truncate(); err != nil {
-		// The main file is already durable. Keep the overlay so WAL cleanup can be retried.
+		// Keep the overlay so WAL cleanup can be retried.
 		return nil
 	}
 	clear(wal.overlay)
