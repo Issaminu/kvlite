@@ -8,28 +8,25 @@ It also measures operation time at the client API boundary. It does not measure 
 
 ## Quick start
 
-Run the adapter tests:
+Run the complete three-engine suite in Docker:
 
 ```sh
 cd benchmarks/kvbench
-go test ./...
+./run-docker.sh
 ```
 
-Run all KVLite and bbolt benchmarks in durable mode:
+This is the recommended method for comparable durability results. The script runs Go and Redis on Linux. It stores the Redis AOF, KVLite files, and bbolt files on one temporary Docker volume. It runs the durable and no-commit-sync modes in sequence. It saves the raw measured output under `/tmp/kvlite-kvbench-results` by default.
 
-```sh
-go test -run '^$' -bench '^BenchmarkAcknowledgedOperations$' -benchmem -count=5
-```
+Set `KVBENCH_RESULTS_DIR` to select another output directory. Set `KVBENCH_COUNT` to change the measured run count from its default value of five. Set `KVBENCH_BENCH` to use a Go benchmark filter.
 
-The default durability mode is `durable`. Redis is disabled unless `KVBENCH_REDIS_ADDR` is set.
+The runner tests the adapters before it starts the workloads. It is the supported entry point. Do not compare results from direct host runs. A direct host run can use a different kernel, file system, or sync operation.
 
 ## Requirements
 
-- Go 1.26 or later.
+- Docker.
 - The KVLite source tree that contains this module.
-- A dedicated Redis server only when Redis results are required.
 
-The module uses the current KVLite checkout through a local `replace` directive. It pins bbolt 1.4.3 and go-redis 9.22.0. The Redis server version is not fixed by the suite. Record it with every saved result.
+The Docker runner pins Go 1.26.7 and Redis 8.8.0. The module uses the current KVLite checkout through a local `replace` directive. It pins bbolt 1.4.3 and go-redis 9.22.0.
 
 ## What the suite measures
 
@@ -114,36 +111,19 @@ Redis operations include the Go client and local network path. KVLite and bbolt 
 
 ## Durability modes
 
-Set `KVBENCH_DURABILITY` before the run.
-
-
 | Mode             | KVLite       | bbolt                      | Redis                                 |
 | ---------------- | ------------ | -------------------------- | ------------------------------------- |
 | `durable`        | `SyncFull`   | Default synchronous writes | AOF enabled with `appendfsync always` |
 | `no-commit-sync` | `SyncNone`   | `NoSync=true`              | AOF enabled with `appendfsync no`     |
 
 
-Run the relaxed mode:
-
-```sh
-KVBENCH_DURABILITY=no-commit-sync \
-go test -run '^$' -bench '^BenchmarkAcknowledgedOperations$' -benchmem -count=5
-```
-
 `no-commit-sync` measures the time until the API returns success without an explicit storage sync. KVLite can perform checkpoint work during measured calls and during `Close`, but `SyncNone` does not sync storage. Close is outside the benchmark timer. Do not use this mode to compare total lifecycle cost.
 
-## Redis setup and safety
+## Redis safety
 
-Use a dedicated Redis instance. The benchmark runs `FLUSHDB` and `BGREWRITEAOF` before it loads data. These commands clear Redis database 0 and rewrite the server AOF.
+The runner creates a temporary Redis instance. The benchmark runs `FLUSHDB` and `BGREWRITEAOF` before it loads data. These commands clear Redis database 0 and rewrite the server AOF.
 
-The suite requires both environment variables below for a Redis run:
-
-```sh
-KVBENCH_REDIS_ADDR=127.0.0.1:6380
-KVBENCH_REDIS_FLUSHDB=1
-```
-
-`KVBENCH_REDIS_FLUSHDB=1` is a required acknowledgement that the suite can clear the selected database.
+The runner sets `KVBENCH_REDIS_FLUSHDB=1` for its temporary instance. The benchmark refuses to clear Redis without this value.
 
 The Redis server must allow `PING`, `CONFIG GET`, `INFO`, `FLUSHDB`, `BGREWRITEAOF`, `GET`, `SET`, `MULTI`, `EXEC`, and `DBSIZE`.
 
@@ -165,16 +145,6 @@ appendfsync no
 
 The suite checks these settings before it clears or measures the database. Redis persistence must also be idle. No load, RDB save, or AOF rewrite can be active.
 
-Example durable run against a dedicated Redis server:
-
-```sh
-KVBENCH_REDIS_ADDR=127.0.0.1:6380 \
-KVBENCH_REDIS_FLUSHDB=1 \
-go test -run '^$' -bench '^BenchmarkAcknowledgedOperations$' -benchmem -count=5
-```
-
-
-
 ## Select a smaller workload
 
 Go treats each slash in a sub-benchmark name as a filter level. Quote the regular expression so the shell does not change it.
@@ -182,27 +152,23 @@ Go treats each slash in a sub-benchmark name as a filter level. Quote the regula
 Run one value size for point reads:
 
 ```sh
-go test -run '^$' \
-  -bench 'BenchmarkAcknowledgedOperations/durable/read/random/value=128/clients=1/(kvlite|bbolt)$' \
-  -benchmem -count=5
+KVBENCH_BENCH='BenchmarkAcknowledgedOperations/.*/read/random/value=128/clients=1/(kvlite|bbolt|redis)$' \
+  ./run-docker.sh
 ```
 
 Run the 32-client point-write case:
 
 ```sh
-go test -run '^$' \
-  -bench 'BenchmarkAcknowledgedOperations/durable/write/random/value=128/clients=32/(kvlite|bbolt)$' \
-  -benchmem -count=5
+KVBENCH_BENCH='BenchmarkAcknowledgedOperations/.*/write/random/value=128/clients=32/(kvlite|bbolt|redis)$' \
+  ./run-docker.sh
 ```
-
-Use `-benchtime=100x` when you need an exact operation count. Use a time value such as `-benchtime=3s` when you need a longer calibrated run.
 
 ## Repeat and compare results
 
-Use more than one run for performance comparisons:
+The runner performs five measured runs by default. Increase the count for a sensitive comparison:
 
 ```sh
-go test -run '^$' -bench '^BenchmarkAcknowledgedOperations$' -benchmem -count=10 > results.txt
+KVBENCH_COUNT=10 ./run-docker.sh
 ```
 
 Keep the hardware, operating system, Go version, database versions, durability mode, Redis configuration, and background load unchanged between compared runs.
@@ -211,25 +177,7 @@ The output uses the standard Go benchmark format. Tools such as `benchstat` can 
 
 ## Profiles
 
-Filter to one workload before profiling. This keeps setup and unrelated workloads out of the profile as much as possible.
-
-Create a CPU profile:
-
-```sh
-go test -run '^$' \
-  -bench 'BenchmarkAcknowledgedOperations/durable/write/random/value=128/clients=32/kvlite$' \
-  -benchtime=10s -cpuprofile cpu.out
-```
-
-Create a memory profile:
-
-```sh
-go test -run '^$' \
-  -bench 'BenchmarkAcknowledgedOperations/durable/write/random/value=128/clients=32/kvlite$' \
-  -benchtime=10s -memprofile mem.out
-```
-
-
+The current Docker runner does not create profiles. Add profile output to the runner when a focused investigation needs it. Keep the same container and volume model.
 
 ## Current limits
 
@@ -258,5 +206,5 @@ Add a workload only when all compared engines can use matched data, durability r
 | `kvlite_engine.go`  | KVLite adapter                                                   |
 | `bbolt_engine.go`   | bbolt adapter                                                    |
 | `redis_engine.go`   | Redis adapter and persistence validation                         |
+| `run-docker.sh`     | Linux runner that uses one shared storage volume                 |
 | `*_test.go`         | Data, adapter, and safety checks                                 |
-
