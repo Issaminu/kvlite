@@ -83,6 +83,17 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 	if len(records) == 0 {
 		return nil
 	}
+	for index := range records {
+		record := &records[index]
+		if int64(len(record.PageContent)) > pageSize {
+			return page.ErrInvalid
+		}
+		if record.Header.Type == RecordTypeData {
+			if err := btree.ValidateWALNode(record.PageContent, record.Header.PageID); err != nil {
+				return err
+			}
+		}
+	}
 
 	pagesPerBatch := max(checkpointWriteBatchBytes/pageSize, 1)
 	if pagesPerBatch > int64(len(records)) {

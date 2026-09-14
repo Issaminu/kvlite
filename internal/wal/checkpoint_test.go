@@ -2,6 +2,7 @@ package wal
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"slices"
 	"testing"
@@ -44,6 +45,31 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 	pageData[len(pageData)-1] ^= 0xff
 	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("decode corrupted checkpoint page: got %v, want ErrChecksum", err)
+	}
+}
+
+func TestWriteCheckpointRecordRuns_ValidatesAllNodesBeforeWriting(t *testing.T) {
+	const pageSize int64 = 600_000
+	records := make([]Record, 0, 3)
+	for pageID := page.ID(2); pageID <= 4; pageID++ {
+		node := btree.NewLeafNode(pageID)
+		if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, Record{
+			Header:      RecordHeader{Type: RecordTypeData, PageID: pageID},
+			PageContent: btree.EncodeWALNode(node),
+		})
+	}
+	const firstLeafEntryOffsetField = btree.NodeHeaderSize + 4
+	binary.LittleEndian.PutUint32(records[2].PageContent[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
+
+	writer := &checkpointWriter{}
+	if err := writeCheckpointRecordRuns(writer, records, pageSize); !errors.Is(err, btree.ErrInvalid) {
+		t.Fatalf("checkpoint error: got %v, want ErrInvalid", err)
+	}
+	if len(writer.writes) != 0 {
+		t.Fatalf("checkpoint wrote %d runs before full validation", len(writer.writes))
 	}
 }
 

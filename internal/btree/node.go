@@ -12,8 +12,8 @@ const (
 	MaxKeySize   = 32768         // 32 KiB
 	MaxValueSize = (1 << 31) - 2 // ~2 GiB
 
-	// NodeHeaderSize is the 16-byte encoded size of a B+tree node header.
-	NodeHeaderSize = 16
+	// NodeHeaderSize is the 20-byte encoded size of a B+tree node header.
+	NodeHeaderSize = 20
 
 	nodeFormatVersion uint16 = 1
 )
@@ -34,14 +34,16 @@ const (
 //	[0:2]   format version, uint16
 //	[2:4]   node type, uint16
 //	[4:12]  page ID, uint64
-//	[12:16] CRC32C checksum, uint32
+//	[12:16] entry count, uint32
+//	[16:20] CRC32C checksum, uint32
 //
-// Checksum covers bytes [0:12] and [16:pageSize]. It includes the node body and zero padding.
-// A node change can make Checksum stale. [EncodeNode] always calculates a new value before it returns encoded bytes.
+// Checksum covers bytes [0:16] and [20:pageSize]. It includes the node body and zero padding.
+// A node change can make Checksum and EntryCount stale. [EncodeNode] and [EncodeWALNode] write the current entry count. [EncodeNode] also calculates a new checksum before it returns encoded bytes.
 type NodeHeader struct {
 	FormatVersion uint16
 	Type          NodeType
 	PageID        page.ID
+	EntryCount    uint32
 	Checksum      uint32
 }
 
@@ -68,13 +70,13 @@ func (e Entry) Value() []byte {
 }
 
 // EncodedSize reports how many bytes this entry occupies inside an encoded node.
-// It must stay in lockstep with EncodeNode: flags(4) + a length-prefixed key
-// (4 + len(key)), plus a length-prefixed value (4 + len(value)) for leaf entries.
-// Branch entries hold only a separator key, so they carry no value.
+// A leaf uses one 16-byte descriptor followed by its key and value.
+// A branch uses one 8-byte descriptor, one child page ID, and its separator key.
+// The branch node also stores one extra child page ID.
 func (e Entry) EncodedSize(isLeaf bool) int {
-	size := 4 + 4 + len(e.key)
+	size := branchEntryDescriptorSize + page.IDSize + len(e.key)
 	if isLeaf {
-		size += 4 + len(e.value)
+		size = leafEntryDescriptorSize + len(e.key) + len(e.value)
 	}
 	return size
 }

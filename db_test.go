@@ -40,7 +40,7 @@ func TestEncodeWALRecords_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("WAL records: got %d, want 1", len(records))
 	}
-	if got := binary.LittleEndian.Uint32(records[0].PageContent[12:btree.NodeHeaderSize]); got != 0 {
+	if got := binary.LittleEndian.Uint32(records[0].PageContent[btree.NodeHeaderSize-4 : btree.NodeHeaderSize]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
 }
@@ -4081,7 +4081,7 @@ func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 
 	page := int(db.meta.PageSize())
 	smallVal := bytes.Repeat([]byte("s"), 100)
-	smallEntry := 12 + 6 + len(smallVal) // flags(4)+keylen(4)+key(6)+vallen(4)+val
+	smallEntry := 16 + 6 + len(smallVal) // One leaf descriptor, the key, and the value.
 	// Fill one leaf to ~0.9 of a page so it stays a single leaf before the big insert.
 	nSmall := (page * 9 / 10) / smallEntry
 	keys := make([][]byte, 0, nSmall+1)
@@ -4178,7 +4178,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 		var fillKeys [][]byte
 		for i := 0; ; i++ {
 			k := fmt.Appendf(nil, "fill-%06d", i)
-			entrySize := 4 + 4 + len(k) + 4 + len(fillVal)
+			entrySize := 16 + len(k) + len(fillVal)
 			if p.rootNode.EncodedSize()+entrySize > pageSize {
 				break
 			}
@@ -6078,18 +6078,14 @@ func TestAudit_MainNodeLookupCannotCrossPageBoundary(t *testing.T) {
 		_ = file.Close()
 		t.Fatal(err)
 	}
-	const (
-		entryCountBytes    = 4 // The entry count uses one uint32 value.
-		entryFlagsBytes    = 4 // Each entry stores flags in one uint32 value.
-		encodedLengthBytes = 4 // Each key or value length uses one uint32 value.
-	)
-	valueLengthOffset := btree.NodeHeaderSize + entryCountBytes + entryFlagsBytes + encodedLengthBytes + len(key)
-	binary.LittleEndian.PutUint32(pageData[valueLengthOffset:valueLengthOffset+encodedLengthBytes], uint32(pageSize))
+	const leafDescriptorValueSizeFieldOffset = 12
+	valueSizeOffset := btree.NodeHeaderSize + leafDescriptorValueSizeFieldOffset
+	binary.LittleEndian.PutUint32(pageData[valueSizeOffset:valueSizeOffset+4], uint32(pageSize))
 
 	checksumTable := crc32.MakeTable(crc32.Castagnoli)
-	checksum := crc32.Update(0, checksumTable, pageData[:12])
+	checksum := crc32.Update(0, checksumTable, pageData[:btree.NodeHeaderSize-4])
 	checksum = crc32.Update(checksum, checksumTable, pageData[btree.NodeHeaderSize:])
-	binary.LittleEndian.PutUint32(pageData[12:btree.NodeHeaderSize], checksum)
+	binary.LittleEndian.PutUint32(pageData[btree.NodeHeaderSize-4:btree.NodeHeaderSize], checksum)
 	if _, err := file.WriteAt(pageData, pageOffset); err != nil {
 		_ = file.Close()
 		t.Fatal(err)

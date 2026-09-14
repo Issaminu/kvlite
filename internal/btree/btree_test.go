@@ -27,11 +27,10 @@ func TestNodeCodec_UsesProtectedNodeHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 	encoded := pageData.Bytes()
-	const headerSize = 16
 	if len(encoded) != int(pageSize) {
 		t.Fatalf("encoded page size: got %d, want %d", len(encoded), pageSize)
 	}
-	if got, want := binary.LittleEndian.Uint16(encoded[0:2]), uint16(1); got != want {
+	if got, want := binary.LittleEndian.Uint16(encoded[0:2]), nodeFormatVersion; got != want {
 		t.Fatalf("node format version: got %d, want %d", got, want)
 	}
 	if got, want := binary.LittleEndian.Uint16(encoded[2:4]), uint16(1); got != want {
@@ -40,15 +39,15 @@ func TestNodeCodec_UsesProtectedNodeHeader(t *testing.T) {
 	if got, want := page.ID(binary.LittleEndian.Uint64(encoded[4:12])), node.PageID(); got != want {
 		t.Fatalf("node page ID: got %d, want %d", got, want)
 	}
+	if got, want := binary.LittleEndian.Uint32(encoded[12:16]), uint32(1); got != want {
+		t.Fatalf("entry count: got %d, want %d", got, want)
+	}
 
 	hash := crc32.New(crc32.MakeTable(crc32.Castagnoli))
-	_, _ = hash.Write(encoded[:12])
-	_, _ = hash.Write(encoded[headerSize:])
-	if got, want := binary.LittleEndian.Uint32(encoded[12:headerSize]), hash.Sum32(); got != want {
+	_, _ = hash.Write(encoded[:nodeChecksumOffset])
+	_, _ = hash.Write(encoded[NodeHeaderSize:])
+	if got, want := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset:NodeHeaderSize]), hash.Sum32(); got != want {
 		t.Fatalf("node checksum: got %x, want %x", got, want)
-	}
-	if got, want := binary.LittleEndian.Uint32(encoded[headerSize:headerSize+encodedUint32Size]), uint32(1); got != want {
-		t.Fatalf("entry count: got %d, want %d", got, want)
 	}
 }
 
@@ -59,7 +58,7 @@ func TestEncodeWALNode_LeavesDatabasePageChecksumUnset(t *testing.T) {
 	}
 
 	encoded := EncodeWALNode(node)
-	if got := binary.LittleEndian.Uint32(encoded[12:NodeHeaderSize]); got != 0 {
+	if got := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset:NodeHeaderSize]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
 	decoded, err := DecodeWALNode(encoded, node.PageID())
@@ -124,7 +123,7 @@ func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
 		{
 			name: "unsupported node format version",
 			change: func(data []byte) {
-				binary.LittleEndian.PutUint16(data[0:2], 2)
+				binary.LittleEndian.PutUint16(data[0:2], nodeFormatVersion+1)
 				resealNodeForTest(data, testNodePageSize)
 			},
 			wantErr: page.ErrVersionMismatch,
@@ -152,10 +151,10 @@ func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
 
 func resealNodeForTest(data []byte, pageSize int64) {
 	table := crc32.MakeTable(crc32.Castagnoli)
-	checksum := crc32.Update(0, table, data[:12])
+	checksum := crc32.Update(0, table, data[:nodeChecksumOffset])
 	checksum = crc32.Update(checksum, table, data[NodeHeaderSize:])
 	checksum = crc32.Update(checksum, table, make([]byte, pageSize-int64(len(data))))
-	binary.LittleEndian.PutUint32(data[12:NodeHeaderSize], checksum)
+	binary.LittleEndian.PutUint32(data[nodeChecksumOffset:NodeHeaderSize], checksum)
 }
 
 func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
@@ -164,12 +163,13 @@ func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Payload layout: one entry, zero flags, one-byte key, and one-byte value.
+	// Payload layout: one 16-byte descriptor, then the key and value.
 	want := []byte{
-		1, 0, 0, 0,
 		0, 0, 0, 0,
-		1, 0, 0, 0, 'k',
-		1, 0, 0, 0, 'v',
+		36, 0, 0, 0,
+		1, 0, 0, 0,
+		1, 0, 0, 0,
+		'k', 'v',
 	}
 	encoded := EncodeNode(node, testNodePageSize)
 	if !bytes.Equal(encoded[NodeHeaderSize:], want) {
@@ -204,13 +204,13 @@ func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{2, 3},
 	}
-	// Payload layout: one separator, zero flags, one-byte key, and two child page IDs.
+	// Payload layout: one 8-byte descriptor, two child page IDs, then the key.
 	want := []byte{
+		44, 0, 0, 0,
 		1, 0, 0, 0,
-		0, 0, 0, 0,
-		1, 0, 0, 0, 'm',
 		2, 0, 0, 0, 0, 0, 0, 0,
 		3, 0, 0, 0, 0, 0, 0, 0,
+		'm',
 	}
 
 	encoded := EncodeNode(node, testNodePageSize)
@@ -280,7 +280,7 @@ func TestDecodeNode_EntrySlicesCannotGrowIntoEncodedData(t *testing.T) {
 func TestDecodeNode_RejectsEntryCountLargerThanInputCanContain(t *testing.T) {
 	node := NewLeafNode(1)
 	data := EncodeNode(node, testNodePageSize)
-	binary.LittleEndian.PutUint32(data[NodeHeaderSize:NodeHeaderSize+encodedUint32Size], ^uint32(0))
+	binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], ^uint32(0))
 	resealNodeForTest(data, testNodePageSize)
 
 	if _, err := DecodeNode(data, 1, testNodePageSize); err == nil {
@@ -331,7 +331,7 @@ func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
 	}); got != 1 {
 		t.Fatalf("EncodeNode allocations: got %v, want 1", got)
 	}
-	if got, want := len(encoded), 309; got != want {
+	if got, want := len(encoded), 317; got != want {
 		t.Fatalf("encoded length: got %d, want %d", got, want)
 	}
 }
@@ -456,8 +456,8 @@ func BenchmarkWriteNode(b *testing.B) {
 
 func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 	const (
-		pageSize  int64   = 64 // Two 33-byte entries exceed this page size.
-		valueSize         = 20 // A leaf entry uses 12 fixed bytes, a one-byte key, and this value.
+		pageSize  int64   = 64 // Two 37-byte entries exceed this page size.
+		valueSize         = 20 // A leaf entry uses one 16-byte descriptor, a one-byte key, and this value.
 		leftPgid  page.ID = 2  // Page 2 is the first node page after both metadata pages.
 		rightPgid page.ID = 3  // Page 3 is the next page allocated for the split.
 	)

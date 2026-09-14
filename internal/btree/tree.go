@@ -72,22 +72,17 @@ func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
 // A later split can promote the key into a branch separator, where the smallest valid branch stores the separator and two child page IDs.
 // Both forms must fit before insertion starts.
 func (tree *Tree) validateEntry(entry Entry) error {
-	if len(entry.Key()) == 0 {
-		return ErrKeyRequired
-	}
-	if len(entry.Key()) > MaxKeySize {
-		return ErrKeyTooLarge
+	if err := validateLookupKey(entry.Key()); err != nil {
+		return err
 	}
 	if len(entry.Value()) > MaxValueSize {
 		return ErrValueTooLarge
 	}
 	pageSize := int(tree.store.PageSize())
 
-	// for leafSize and branchSize, encodedUint32Size: checksum uint32 size
-
-	leafSize := NodeHeaderSize + encodedUint32Size + entry.EncodedSize(true)
-	// The smallest branch has one separator with a left and right child, so it needs two page IDs.
-	branchSize := NodeHeaderSize + encodedUint32Size + entry.EncodedSize(false) + 2*page.IDSize
+	leafSize := NodeHeaderSize + entry.EncodedSize(true)
+	// A one-entry branch stores two child page IDs.
+	branchSize := NodeHeaderSize + page.IDSize + entry.EncodedSize(false)
 	if leafSize > pageSize || branchSize > pageSize {
 		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLarge, entry.Key(), tree.store.PageSize())
 	}
@@ -208,11 +203,8 @@ func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pa
 // A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
 // An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
 func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
-	if len(key) == 0 {
-		return Entry{}, false, ErrKeyRequired
-	}
-	if len(key) > MaxKeySize {
-		return Entry{}, false, ErrKeyTooLarge
+	if err := validateLookupKey(key); err != nil {
+		return Entry{}, false, err
 	}
 
 	if root.IsLeaf() {
@@ -228,11 +220,8 @@ func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
 // FindEntryRefFromPage starts at rootPageID without requiring a root Node.
 // A found entry refers to storage owned by the store.
 func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte) (Entry, bool, error) {
-	if len(key) == 0 {
-		return Entry{}, false, ErrKeyRequired
-	}
-	if len(key) > MaxKeySize {
-		return Entry{}, false, ErrKeyTooLarge
+	if err := validateLookupKey(key); err != nil {
+		return Entry{}, false, err
 	}
 	return tree.findEntryRefFromPage(rootPageID, key)
 }

@@ -12,13 +12,21 @@ import (
 )
 
 const (
-	nodeVersionOffset  = 0
-	nodeTypeOffset     = 2
-	nodePageIDOffset   = 4
-	nodeChecksumOffset = 12
+	nodeVersionOffset    = 0
+	nodeTypeOffset       = 2
+	nodePageIDOffset     = 4
+	nodeEntryCountOffset = 12
+	nodeChecksumOffset   = 16
 
 	// encodedUint32Size is the size of each uint32 field.
 	encodedUint32Size = 4
+	// Each descriptor data offset is relative to the start of the encoded node.
+	// A leaf body stores N descriptors, then N packed key and value pairs.
+	// A leaf descriptor stores flags, data offset, key size, and value size.
+	leafEntryDescriptorSize = 4 * encodedUint32Size
+	// A branch body stores N descriptors, N+1 child page IDs, then N packed keys.
+	// A branch descriptor stores data offset and key size.
+	branchEntryDescriptorSize = 2 * encodedUint32Size
 
 	checksumZeroBlockSize = 4096
 )
@@ -50,7 +58,7 @@ func DecodeNode(data []byte, expectedPageID page.ID, pageSize int64) (*Node, err
 	if storedChecksum != nodePageChecksum(data, pageSize) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
-	node, _, _, _, err := readEncodedNode(data, expectedPageID, storedChecksum, nil, true)
+	node, _, _, _, err := readEncodedNode(data, expectedPageID, storedChecksum, nil, true, true)
 	if err != nil {
 		return nil, err
 	}
@@ -77,11 +85,24 @@ func DecodeWALNode(data []byte, expectedPageID page.ID) (*Node, error) {
 	if checksum := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]); checksum != 0 {
 		return nil, fmt.Errorf("read WAL node checksum %x: %w", checksum, ErrInvalid)
 	}
-	node, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, true)
+	node, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, true, false)
 	if err != nil {
 		return nil, err
 	}
 	return node, nil
+}
+
+// ValidateWALNode checks every field in one compact node from a verified WAL record.
+// It does not create a [Node] or change data.
+func ValidateWALNode(data []byte, expectedPageID page.ID) error {
+	if len(data) < NodeHeaderSize {
+		return fmt.Errorf("read node header: %w", ErrInvalid)
+	}
+	if checksum := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]); checksum != 0 {
+		return fmt.Errorf("read WAL node checksum %x: %w", checksum, ErrInvalid)
+	}
+	_, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, false, false)
+	return err
 }
 
 func validateLookupKey(key []byte) error {
@@ -107,7 +128,7 @@ func LookupMappedNode(data []byte, expectedPageID page.ID, key []byte) (Entry, b
 	if len(data) < NodeHeaderSize {
 		return Entry{}, false, 0, fmt.Errorf("read node header: %w", ErrInvalid)
 	}
-	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false)
+	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false, true)
 	return entry, found, child, err
 }
 
@@ -127,20 +148,24 @@ func LookupEncodedWALNode(data []byte, expectedPageID page.ID, key []byte) (Entr
 	if checksum := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]); checksum != 0 {
 		return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", checksum, ErrInvalid)
 	}
-	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false)
+	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false, false)
 	return entry, found, child, err
 }
 
-// readEncodedNode reads one encoded node in node mode or point lookup mode.
+// readEncodedNode reads one fixed-directory node.
 //
-// If createNode is true, readEncodedNode ignores key. It validates the complete body and returns a [Node]. The other results are zero.
+// If createNode is true, readEncodedNode ignores key. It validates the complete body and returns a [Node].
 //
-// If createNode is false, readEncodedNode does not create a [Node]. A leaf match returns an [Entry] and true. A branch returns its child page ID. A missing leaf key returns zero results. Point lookup validates only the fields that it reads.
+// If createNode is false and key is nil, readEncodedNode validates the complete body without creating a [Node].
+//
+// If createNode is false and key is not nil, readEncodedNode performs a point lookup. A leaf match returns an [Entry] and true. A branch returns its child page ID. A missing leaf key returns zero results. Point lookup validates only the fields that it reads.
 //
 // Node entries and returned entry bytes refer to data. The caller must keep data unchanged while it uses these results.
 //
-// The caller must check the header length and the source checksum before this call.
-func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool) (*Node, Entry, bool, page.ID, error) {
+// The caller must check the header length and the source checksum before this call. allowPadding applies only to complete-body validation.
+//
+// @TODO: This function does too many things (it has a horrible signature with a billion params and returns), but the alternative is worse (defining 2 traversal paths for encoded/decoded reading like we did before). We need to find a way to minimize the cognitive load here without reintroducing the duplicated logic for traversal (and without read perf regressions!)
+func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool) (*Node, Entry, bool, page.ID, error) {
 	formatVersion := binary.LittleEndian.Uint16(data[nodeVersionOffset:nodeTypeOffset])
 	if formatVersion != nodeFormatVersion {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node format version %d: %w", formatVersion, page.ErrVersionMismatch)
@@ -149,29 +174,88 @@ func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32,
 	if nodeType != NodeTypeLeaf && nodeType != NodeTypeBranch {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node type %d: %w", nodeType, ErrInvalid)
 	}
-	pageID := page.ID(binary.LittleEndian.Uint64(data[nodePageIDOffset:nodeChecksumOffset]))
+	pageID := page.ID(binary.LittleEndian.Uint64(data[nodePageIDOffset:nodeEntryCountOffset]))
 	if pageID != expectedPageID {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
 	}
 
-	body := data[NodeHeaderSize:]
-	if len(body) < encodedUint32Size {
-		return nil, Entry{}, false, 0, fmt.Errorf("read node entry count: %w", ErrInvalid)
-	}
-	entryCount := binary.LittleEndian.Uint32(body[:encodedUint32Size])
-	// Every entry stores flags and a key length. A leaf also stores a value length.
-	minimumEntrySize := 2 * encodedUint32Size
-	if nodeType == NodeTypeLeaf {
-		minimumEntrySize += encodedUint32Size
+	entryCount := binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset])
+	directoryStart := NodeHeaderSize
+	descriptorSize := leafEntryDescriptorSize
+	minimumEntrySize := descriptorSize
+	// payload size = bytes available for descriptors and entry data.
+	payloadSize := len(data) - directoryStart
+	if nodeType == NodeTypeBranch {
+		descriptorSize = branchEntryDescriptorSize
+		minimumEntrySize = descriptorSize + page.IDSize
+		if payloadSize < page.IDSize {
+			return nil, Entry{}, false, 0, fmt.Errorf("read node children: %w", ErrInvalid)
+		}
+		// A branch has one more child than separator keys.
+		payloadSize -= page.IDSize
 	}
 
-	// payload size = len(what remains in the body slice) - size of entryCount
-	payloadSize := len(body) - encodedUint32Size
 	maximumEntryCount := uint64(payloadSize / minimumEntrySize)
 	if uint64(entryCount) > maximumEntryCount {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node entry count: %w", ErrInvalid)
 	}
-	body = body[encodedUint32Size:]
+	childrenStart := directoryStart + int(entryCount)*descriptorSize
+	payloadStart := childrenStart
+
+	// For branch nodes, we need to skip over the child page IDs that come after each entry descriptor.
+	// Branch nodes have one more child than they have separator keys (entryCount + 1 children total).
+	// Each child page ID takes up page.IDSize bytes, so we advance payloadStart by that amount.
+	if nodeType == NodeTypeBranch {
+		payloadStart += (int(entryCount) + 1) * page.IDSize
+	}
+
+	readEntry := func(index uint32) (Entry, int, int, error) {
+		descriptorStart := directoryStart + int(index)*descriptorSize
+		fields := data[descriptorStart : descriptorStart+descriptorSize]
+		var flags, valueSize uint32
+		offsetField := 0
+		keySizeField := encodedUint32Size
+		if nodeType == NodeTypeLeaf {
+			flags = binary.LittleEndian.Uint32(fields[:encodedUint32Size])
+			offsetField = encodedUint32Size
+			keySizeField = 2 * encodedUint32Size
+			valueSize = binary.LittleEndian.Uint32(fields[3*encodedUint32Size : leafEntryDescriptorSize])
+		}
+
+		offset := binary.LittleEndian.Uint32(fields[offsetField : offsetField+encodedUint32Size])
+		keySize := binary.LittleEndian.Uint32(fields[keySizeField : keySizeField+encodedUint32Size])
+		if keySize == 0 || uint64(keySize) > uint64(MaxKeySize) {
+			return Entry{}, 0, 0, fmt.Errorf("read node key %d: %w", index, ErrInvalid)
+		}
+		if flags&^uint32(BucketLeafFlag) != 0 || uint64(valueSize) > uint64(MaxValueSize) {
+			return Entry{}, 0, 0, fmt.Errorf("read node entry %d: %w", index, ErrInvalid)
+		}
+
+		start := uint64(offset)
+		keyEnd := start + uint64(keySize)
+		end := keyEnd + uint64(valueSize)
+		if start < uint64(payloadStart) || end > uint64(len(data)) {
+			return Entry{}, 0, 0, fmt.Errorf("read node entry %d: %w", index, ErrInvalid)
+		}
+		startIndex, keyEndIndex, endIndex := int(start), int(keyEnd), int(end)
+		entry := Entry{
+			flags: flags,
+			key:   data[startIndex:keyEndIndex:keyEndIndex],
+		}
+		if nodeType == NodeTypeLeaf {
+			entry.value = data[keyEndIndex:endIndex:endIndex]
+		}
+		return entry, startIndex, endIndex, nil
+	}
+
+	readChild := func(index uint32) (page.ID, error) {
+		start := childrenStart + int(index)*page.IDSize
+		child := page.ID(binary.LittleEndian.Uint64(data[start : start+page.IDSize]))
+		if page.IsMetaID(child) {
+			return 0, fmt.Errorf("read node child page ID %d: %w", child, ErrInvalid)
+		}
+		return child, nil
+	}
 
 	var node *Node
 	if createNode {
@@ -180,95 +264,92 @@ func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32,
 				FormatVersion: nodeFormatVersion,
 				Type:          nodeType,
 				PageID:        expectedPageID,
+				EntryCount:    entryCount,
 				Checksum:      storedChecksum,
 			},
 			entries: make([]Entry, 0, int(entryCount)),
 		}
-	}
-
-	// Branch child IDs follow all variable-size entries. Branch lookup must read every entry before it can read the selected child.
-	childIndex := entryCount
-	for index := uint32(0); index < entryCount; index++ {
-		if len(body) < encodedUint32Size {
-			return nil, Entry{}, false, 0, fmt.Errorf("read node flags %d: %w", index, ErrInvalid)
-		}
-		entry := Entry{flags: binary.LittleEndian.Uint32(body[:encodedUint32Size])}
-		body = body[encodedUint32Size:]
-
-		if len(body) < encodedUint32Size {
-			return nil, Entry{}, false, 0, fmt.Errorf("read node key %d: %w", index, ErrInvalid)
-		}
-		keySize := binary.LittleEndian.Uint32(body[:encodedUint32Size])
-		body = body[encodedUint32Size:]
-		if uint64(keySize) > uint64(len(body)) {
-			return nil, Entry{}, false, 0, fmt.Errorf("read node key %d: %w", index, ErrInvalid)
-		}
-		size := int(keySize)
-		entry.key = body[:size:size]
-		body = body[size:]
-
-		if nodeType == NodeTypeLeaf {
-			if len(body) < encodedUint32Size {
-				return nil, Entry{}, false, 0, fmt.Errorf("read node value %d: %w", index, ErrInvalid)
-			}
-			valueSize := binary.LittleEndian.Uint32(body[:encodedUint32Size])
-			body = body[encodedUint32Size:]
-			if uint64(valueSize) > uint64(len(body)) {
-				return nil, Entry{}, false, 0, fmt.Errorf("read node value %d: %w", index, ErrInvalid)
-			}
-			size = int(valueSize)
-			entry.value = body[:size:size]
-			body = body[size:]
-		}
-
-		if createNode {
-			node.entries = append(node.entries, entry)
-		} else if nodeType == NodeTypeLeaf {
-			comparison := bytes.Compare(entry.key, key)
-			if comparison == 0 {
-				return nil, entry, true, 0, nil
-			}
-			if comparison > 0 {
-				return nil, Entry{}, false, 0, nil
-			}
-		} else if childIndex == entryCount && bytes.Compare(key, entry.key) < 0 {
-			childIndex = index
-		}
-	}
-
-	if nodeType == NodeTypeLeaf && !createNode {
-		return nil, Entry{}, false, 0, nil
-	}
-
-	childCount := uint64(entryCount) + 1
-	childrenSize := childCount * uint64(page.IDSize)
-	if nodeType == NodeTypeLeaf {
-		childrenSize = 0
-	}
-	if childrenSize > uint64(len(body)) {
-		return nil, Entry{}, false, 0, fmt.Errorf("read node children: %w", ErrInvalid)
-	}
-	children := body[:int(childrenSize):int(childrenSize)]
-	body = body[len(children):]
-
-	if createNode {
-		if !allZero(body) {
-			return nil, Entry{}, false, 0, fmt.Errorf("read node padding: %w", ErrInvalid)
-		}
 		if nodeType == NodeTypeBranch {
-			node.Children = make([]page.ID, int(childCount))
-			for index := range node.Children {
-				offset := index * page.IDSize
-				node.Children[index] = page.ID(binary.LittleEndian.Uint64(children[offset : offset+page.IDSize]))
+			node.Children = make([]page.ID, 0, int(entryCount)+1)
+		}
+	}
+
+	if createNode || key == nil {
+		nextOffset := payloadStart
+		var previousKey []byte
+		if nodeType == NodeTypeBranch {
+			for index := uint32(0); index <= entryCount; index++ {
+				child, err := readChild(index)
+				if err != nil {
+					return nil, Entry{}, false, 0, err
+				}
+				if createNode {
+					node.Children = append(node.Children, child)
+				}
 			}
+		}
+
+		for index := uint32(0); index < entryCount; index++ {
+			entry, start, end, err := readEntry(index)
+			if err != nil {
+				return nil, Entry{}, false, 0, err
+			}
+			if start != nextOffset {
+				return nil, Entry{}, false, 0, fmt.Errorf("read node entry offset %d: %w", index, ErrInvalid)
+			}
+			if index > 0 && bytes.Compare(previousKey, entry.key) >= 0 {
+				return nil, Entry{}, false, 0, fmt.Errorf("read node key order %d: %w", index, ErrInvalid)
+			}
+			previousKey = entry.key
+			nextOffset = end
+			if createNode {
+				node.entries = append(node.entries, entry)
+			}
+		}
+
+		if allowPadding {
+			if !allZero(data[nextOffset:]) {
+				return nil, Entry{}, false, 0, fmt.Errorf("read node padding: %w", ErrInvalid)
+			}
+		} else if nextOffset != len(data) {
+			return nil, Entry{}, false, 0, fmt.Errorf("read WAL node size: %w", ErrInvalid)
 		}
 		return node, Entry{}, false, 0, nil
 	}
 
-	childOffset := uint64(childIndex) * uint64(page.IDSize)
-	childPageID := page.ID(binary.LittleEndian.Uint64(children[childOffset : childOffset+page.IDSize]))
-	if childPageID == page.Meta0ID {
-		return nil, Entry{}, false, 0, fmt.Errorf("read node child page ID %d: %w", childPageID, ErrInvalid)
+	low, high := uint32(0), entryCount
+	for low < high {
+		middle := low + (high-low)/2
+		entry, _, _, err := readEntry(middle)
+		if err != nil {
+			return nil, Entry{}, false, 0, err
+		}
+		comparison := bytes.Compare(entry.key, key)
+		// A leaf uses a lower bound. A branch uses an upper bound.
+		if comparison > 0 || (nodeType == NodeTypeLeaf && comparison == 0) {
+			high = middle
+		} else {
+			low = middle + 1
+		}
+	}
+
+	if nodeType == NodeTypeLeaf {
+		if low == entryCount {
+			return nil, Entry{}, false, 0, nil
+		}
+		entry, _, _, err := readEntry(low)
+		if err != nil {
+			return nil, Entry{}, false, 0, err
+		}
+		if !bytes.Equal(entry.key, key) {
+			return nil, Entry{}, false, 0, nil
+		}
+		return nil, entry, true, 0, nil
+	}
+
+	childPageID, err := readChild(low)
+	if err != nil {
+		return nil, Entry{}, false, 0, err
 	}
 	return nil, Entry{}, false, childPageID, nil
 }
@@ -323,26 +404,41 @@ func EncodeNode(node *Node, pageSize int64) []byte {
 // EncodeWALNode does not change the checksum in node.
 func EncodeWALNode(node *Node) []byte {
 	payloadSize := nodePayloadSize(node)
-	data := make([]byte, NodeHeaderSize, NodeHeaderSize+payloadSize)
+	data := make([]byte, NodeHeaderSize+payloadSize)
 	binary.LittleEndian.PutUint16(data[nodeVersionOffset:nodeTypeOffset], node.header.FormatVersion)
 	binary.LittleEndian.PutUint16(data[nodeTypeOffset:nodePageIDOffset], uint16(node.header.Type))
-	binary.LittleEndian.PutUint64(data[nodePageIDOffset:nodeChecksumOffset], uint64(node.header.PageID))
-	data = binary.LittleEndian.AppendUint32(data, uint32(len(node.entries)))
-
-	for _, e := range node.entries {
-		data = binary.LittleEndian.AppendUint32(data, e.flags)
-		data = binary.LittleEndian.AppendUint32(data, uint32(len(e.key)))
-		data = append(data, e.key...)
-		if node.IsLeaf() {
-			data = binary.LittleEndian.AppendUint32(data, uint32(len(e.value)))
-			data = append(data, e.value...)
+	binary.LittleEndian.PutUint64(data[nodePageIDOffset:nodeEntryCountOffset], uint64(node.header.PageID))
+	binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], uint32(len(node.entries)))
+	directoryStart := NodeHeaderSize
+	descriptorSize := leafEntryDescriptorSize
+	if !node.IsLeaf() {
+		descriptorSize = branchEntryDescriptorSize
+	}
+	childrenStart := directoryStart + len(node.entries)*descriptorSize
+	payloadOffset := childrenStart
+	if !node.IsLeaf() {
+		for index := 0; index <= len(node.entries); index++ {
+			start := childrenStart + index*page.IDSize
+			binary.LittleEndian.PutUint64(data[start:start+page.IDSize], uint64(node.Children[index]))
 		}
+		payloadOffset += (len(node.entries) + 1) * page.IDSize
 	}
 
-	if !node.IsLeaf() {
-		for _, child := range node.Children {
-			data = binary.LittleEndian.AppendUint64(data, uint64(child))
+	for index, entry := range node.entries {
+		descriptorStart := directoryStart + index*descriptorSize
+		descriptor := data[descriptorStart : descriptorStart+descriptorSize]
+		if node.IsLeaf() {
+			binary.LittleEndian.PutUint32(descriptor[:encodedUint32Size], entry.flags)
+			binary.LittleEndian.PutUint32(descriptor[encodedUint32Size:2*encodedUint32Size], uint32(payloadOffset))
+			binary.LittleEndian.PutUint32(descriptor[2*encodedUint32Size:3*encodedUint32Size], uint32(len(entry.key)))
+			binary.LittleEndian.PutUint32(descriptor[3*encodedUint32Size:leafEntryDescriptorSize], uint32(len(entry.value)))
+			payloadOffset += copy(data[payloadOffset:], entry.key)
+			payloadOffset += copy(data[payloadOffset:], entry.value)
+			continue
 		}
+		binary.LittleEndian.PutUint32(descriptor[:encodedUint32Size], uint32(payloadOffset))
+		binary.LittleEndian.PutUint32(descriptor[encodedUint32Size:branchEntryDescriptorSize], uint32(len(entry.key)))
+		payloadOffset += copy(data[payloadOffset:], entry.key)
 	}
 	return data
 }
@@ -359,7 +455,7 @@ func VerifyNodeIDAndSetChecksum(data []byte, expectedPageID page.ID) error {
 	if len(data) < NodeHeaderSize {
 		return fmt.Errorf("set node checksum: read header: %w", ErrInvalid)
 	}
-	pageID := page.ID(binary.LittleEndian.Uint64(data[nodePageIDOffset:nodeChecksumOffset]))
+	pageID := page.ID(binary.LittleEndian.Uint64(data[nodePageIDOffset:nodeEntryCountOffset]))
 	if pageID != expectedPageID {
 		return fmt.Errorf("set node checksum: read page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
 	}
@@ -369,12 +465,12 @@ func VerifyNodeIDAndSetChecksum(data []byte, expectedPageID page.ID) error {
 }
 
 func nodePayloadSize(node *Node) int {
-	size := encodedUint32Size
+	size := 0
+	if !node.IsLeaf() {
+		size += page.IDSize
+	}
 	for _, entry := range node.entries {
 		size += entry.EncodedSize(node.IsLeaf())
-	}
-	if !node.IsLeaf() {
-		size += len(node.Children) * page.IDSize
 	}
 	return size
 }

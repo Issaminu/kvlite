@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
@@ -129,6 +130,15 @@ func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return err
+	}
+	// Check all data before any record becomes visible.
+	for _, record := range committed {
+		if record.Header.Type != wal.RecordTypeData {
+			continue
+		}
+		if err := btree.ValidateWALNode(record.PageContent, record.Header.PageID); err != nil {
+			return err
+		}
 	}
 	for _, record := range committed {
 		db.wal.LoadCommittedRecord(record)
