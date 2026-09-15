@@ -217,6 +217,9 @@ func (wal *WAL) reachedCheckpointThreshold() bool {
 }
 
 func RecordToNode(record *Record) (*btree.Node, error) {
+	if record.Node != nil {
+		return record.Node, nil
+	}
 	if record.PageContent == nil {
 		return nil, fmt.Errorf("record has no page content")
 	}

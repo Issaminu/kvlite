@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/checksum"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -403,8 +404,28 @@ func EncodeNode(node *Node, pageSize int64) []byte {
 // The WAL record stores the data length and checksum.
 // EncodeWALNode does not change the checksum in node.
 func EncodeWALNode(node *Node) []byte {
-	payloadSize := nodePayloadSize(node)
-	data := make([]byte, NodeHeaderSize+payloadSize)
+	data := make([]byte, WALNodeEncodedSize(node))
+	encodeWALNode(data, node)
+	return data
+}
+
+// WALNodeEncodedSize returns the compact encoded size of node in a WAL record.
+func WALNodeEncodedSize(node *Node) int {
+	return NodeHeaderSize + nodePayloadSize(node)
+}
+
+// AppendEncodedWALNode appends one compact node to data. It writes zero in the node checksum field because the WAL record checksum protects the data.
+func AppendEncodedWALNode(data []byte, node *Node) []byte {
+	start := len(data)
+	encodedSize := WALNodeEncodedSize(node)
+	data = slices.Grow(data, encodedSize)
+	data = data[:start+encodedSize]
+	encodeWALNode(data[start:], node)
+	return data
+}
+
+func encodeWALNode(data []byte, node *Node) {
+	clear(data)
 	binary.LittleEndian.PutUint16(data[nodeVersionOffset:nodeTypeOffset], node.header.FormatVersion)
 	binary.LittleEndian.PutUint16(data[nodeTypeOffset:nodePageIDOffset], uint16(node.header.Type))
 	binary.LittleEndian.PutUint64(data[nodePageIDOffset:nodeEntryCountOffset], uint64(node.header.PageID))
@@ -440,7 +461,6 @@ func EncodeWALNode(node *Node) []byte {
 		binary.LittleEndian.PutUint32(descriptor[encodedUint32Size:branchEntryDescriptorSize], uint32(len(entry.key)))
 		payloadOffset += copy(data[payloadOffset:], entry.key)
 	}
-	return data
 }
 
 // VerifyNodeIDAndSetChecksum checks the node ID and sets the page checksum.

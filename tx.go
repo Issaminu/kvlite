@@ -123,8 +123,8 @@ func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty 
 	records := make([]wal.Record, 0, recordCapacity)
 	for pageID, node := range dirty {
 		records = append(records, wal.Record{
-			Header:      wal.RecordHeader{Type: wal.RecordTypeData, PageID: pageID},
-			PageContent: btree.EncodeWALNode(node),
+			Header: wal.RecordHeader{Type: wal.RecordTypeData, PageID: pageID},
+			Node:   node,
 		})
 	}
 	if metaDirty {

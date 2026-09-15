@@ -8,6 +8,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/page"
@@ -67,6 +68,21 @@ func TestEncodeWALNode_LeavesDatabasePageChecksumUnset(t *testing.T) {
 	}
 	if decoded.PageID() != node.PageID() || decoded.EntryCount() != 1 {
 		t.Fatalf("decoded WAL node: got page=%d entries=%d", decoded.PageID(), decoded.EntryCount())
+	}
+}
+
+func TestAppendEncodedWALNode_PreservesPrefix(t *testing.T) {
+	node := NewLeafNode(7)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	prefix := []byte("prefix")
+	got := AppendEncodedWALNode(slices.Clone(prefix), node)
+	if !bytes.Equal(got[:len(prefix)], prefix) {
+		t.Fatalf("prefix: got %q, want %q", got[:len(prefix)], prefix)
+	}
+	if want := EncodeWALNode(node); !bytes.Equal(got[len(prefix):], want) {
+		t.Fatal("appended WAL node differs from standalone encoding")
 	}
 }
 
@@ -372,6 +388,26 @@ func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 	}
 	if got := original.Children[0]; got != 2 {
 		t.Fatalf("original child changed through clone: got %d, want 2", got)
+	}
+}
+
+func TestNodeCloneOwned_DoesNotShareEntryBytes(t *testing.T) {
+	key := []byte("key")
+	value := []byte("value")
+	node := &Node{
+		header:  newNodeHeader(NodeTypeLeaf, 1),
+		entries: []Entry{{key: key, value: value}},
+	}
+
+	clone := node.CloneOwned()
+	key[0] = 'K'
+	value[0] = 'V'
+
+	if got := string(clone.entries[0].key); got != "key" {
+		t.Fatalf("cloned key: got %q, want %q", got, "key")
+	}
+	if got := string(clone.entries[0].value); got != "value" {
+		t.Fatalf("cloned value: got %q, want %q", got, "value")
 	}
 }
 

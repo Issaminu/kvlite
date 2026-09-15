@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/checksum"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -33,9 +34,11 @@ type RecordHeader struct {
 	TxID   TxID
 }
 
+// Record contains one WAL header and its content. An in-memory data record can hold Node instead of PageContent. A decoded record holds PageContent. A record must not hold both forms.
 type Record struct {
 	Header      RecordHeader
 	PageContent []byte
+	Node        *btree.Node
 }
 
 func EncodeRecord(record *Record, pageSize int64) ([]byte, error) {
@@ -48,21 +51,37 @@ func EncodeRecord(record *Record, pageSize int64) ([]byte, error) {
 }
 
 func EncodedRecordSize(record *Record, pageSize int64) (int, error) {
-	if int64(len(record.PageContent)) > pageSize {
-		return 0, fmt.Errorf("record page content exceeds page size (%d > %d)", len(record.PageContent), pageSize)
+	contentSize := len(record.PageContent)
+	if record.Node != nil {
+		if record.Header.Type != RecordTypeData || record.Header.PageID != record.Node.PageID() || record.PageContent != nil {
+			return 0, fmt.Errorf("invalid WAL node record")
+		}
+		contentSize = btree.WALNodeEncodedSize(record.Node)
 	}
-	return HeaderSize + len(record.PageContent) + ChecksumSize, nil
+	if int64(contentSize) > pageSize {
+		return 0, fmt.Errorf("record page content exceeds page size (%d > %d)", contentSize, pageSize)
+	}
+	return HeaderSize + contentSize + ChecksumSize, nil
 }
 
 func AppendEncodedRecord(data []byte, record *Record) []byte {
+	contentSize := len(record.PageContent)
+	if record.Node != nil {
+		contentSize = btree.WALNodeEncodedSize(record.Node)
+	}
 	headerStart := len(data)
 	data = append(data, byte(record.Header.Type))
 	data = binary.LittleEndian.AppendUint64(data, uint64(record.Header.PageID))
 	data = binary.LittleEndian.AppendUint64(data, uint64(record.Header.TxID))
-	data = binary.LittleEndian.AppendUint32(data, uint32(len(record.PageContent)))
+	data = binary.LittleEndian.AppendUint32(data, uint32(contentSize))
 	headerEnd := len(data)
-	data = append(data, record.PageContent...)
-	checksum := computeRecordChecksum(data[headerStart:headerEnd], record.PageContent)
+	contentStart := len(data)
+	if record.Node != nil {
+		data = btree.AppendEncodedWALNode(data, record.Node)
+	} else {
+		data = append(data, record.PageContent...)
+	}
+	checksum := computeRecordChecksum(data[headerStart:headerEnd], data[contentStart:])
 	data = binary.LittleEndian.AppendUint32(data, checksum)
 
 	return data

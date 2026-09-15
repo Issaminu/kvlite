@@ -40,7 +40,18 @@ func TestEncodeWALRecords_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 	if len(records) != 1 {
 		t.Fatalf("WAL records: got %d, want 1", len(records))
 	}
-	if got := binary.LittleEndian.Uint32(records[0].PageContent[btree.NodeHeaderSize-4 : btree.NodeHeaderSize]); got != 0 {
+	if records[0].Node != node || records[0].PageContent != nil {
+		t.Fatal("WAL record did not keep the changed node for direct encoding")
+	}
+	encoded, err := wal.EncodeRecord(&records[0], meta.PageSize())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := wal.DecodeRecord(bytes.NewReader(encoded), meta.PageSize())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(decoded.PageContent[btree.NodeHeaderSize-4 : btree.NodeHeaderSize]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
 }

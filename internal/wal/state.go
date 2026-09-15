@@ -92,10 +92,17 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 	}
 	for index := range records {
 		record := &records[index]
-		if int64(len(record.PageContent)) > pageSize {
+		contentSize := len(record.PageContent)
+		if record.Node != nil {
+			if record.Header.Type != RecordTypeData || record.Header.PageID != record.Node.PageID() || record.PageContent != nil {
+				return page.ErrInvalid
+			}
+			contentSize = btree.WALNodeEncodedSize(record.Node)
+		}
+		if int64(contentSize) > pageSize {
 			return page.ErrInvalid
 		}
-		if record.Header.Type == RecordTypeData {
+		if record.Header.Type == RecordTypeData && record.Node == nil {
 			if err := btree.ValidateWALNode(record.PageContent, record.Header.PageID); err != nil {
 				return err
 			}
@@ -144,7 +151,11 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 
 		pageData := buffer[pageStart:pageEnd]
 		clear(pageData)
-		copy(pageData, record.PageContent)
+		if record.Node != nil {
+			btree.AppendEncodedWALNode(pageData[:0], record.Node)
+		} else {
+			copy(pageData, record.PageContent)
+		}
 		if record.Header.Type == RecordTypeData {
 			if err := btree.VerifyNodeIDAndSetChecksum(pageData, pageID); err != nil {
 				return err

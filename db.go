@@ -406,6 +406,9 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 // A WAL page has priority over the main-file page with the same ID.
 func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
 	if record, ok := db.wal.Lookup(pageID); ok {
+		if record.Node != nil {
+			return btree.LookupDecodedNode(record.Node, key)
+		}
 		return btree.LookupEncodedWALNode(record.PageContent, pageID, key)
 	}
 	data, err := db.readMainPage(pageID)

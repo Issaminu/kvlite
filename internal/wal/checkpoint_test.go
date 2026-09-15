@@ -27,8 +27,8 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 		t.Fatal(err)
 	}
 	records := []Record{{
-		Header:      RecordHeader{Type: RecordTypeData, PageID: node.PageID()},
-		PageContent: btree.EncodeWALNode(node),
+		Header: RecordHeader{Type: RecordTypeData, PageID: node.PageID()},
+		Node:   node,
 	}}
 	writer := &checkpointWriter{}
 

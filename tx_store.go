@@ -73,7 +73,7 @@ func (store *txTreeStore) WritableNode(node *btree.Node) *btree.Node {
 	if dirty, ok := store.dirty[node.PageID()]; ok {
 		return dirty
 	}
-	private := node.Clone()
+	private := node.CloneOwned()
 	store.StageNode(private)
 	return private
 }

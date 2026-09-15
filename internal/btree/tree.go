@@ -67,6 +67,14 @@ func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
 	return Entry{}, false, childPageID, nil
 }
 
+// LookupDecodedNode validates key and searches one decoded node.
+func LookupDecodedNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
+	if err := validateLookupKey(key); err != nil {
+		return Entry{}, false, 0, err
+	}
+	return LookupNode(node, key)
+}
+
 // validateEntry rejects an empty or oversized key, an oversized value, or an entry that cannot fit the tree's fixed-page representation.
 // A leaf stores the full key and value.
 // A later split can promote the key into a branch separator, where the smallest valid branch stores the separator and two child page IDs.
