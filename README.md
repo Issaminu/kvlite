@@ -1,4 +1,4 @@
-![KVLite mascot carrying B+ tree pages](assets/mascot/kvlite-mascot-concept-v1.png)
+<img src="assets/mascot/kvlite-mascot-concept-v1.png" alt="KVLite mascot carrying B+ tree pages" width="120">
 
 # KVLite
 
