@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 )
@@ -22,6 +25,22 @@ func TestEmbeddedEngineContract(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestRedisEngineContract(t *testing.T) {
+	address := os.Getenv("KVBENCH_REDIS_ADDR")
+	if address == "" {
+		t.Skip("KVBENCH_REDIS_ADDR is empty")
+	}
+	mode := DurabilityDurable
+	if value := os.Getenv("KVBENCH_DURABILITY"); value != "" {
+		mode = DurabilityMode(value)
+	}
+	engine, err := openRedisEngine(context.Background(), address, mode, 1, os.Getenv("KVBENCH_REDIS_FLUSHDB") == "1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testEngineContract(t, engine)
 }
 
 func testEngineContract(t *testing.T, engine Engine) {
@@ -63,6 +82,31 @@ func testEngineContract(t *testing.T, engine Engine) {
 	if got, err := engine.Get(ctx, pairs[1].Key); err != nil || string(got) != "second" {
 		t.Fatalf("batch update: got %q, error %v", got, err)
 	}
+
+	key := []byte("owned-put-key")
+	value := []byte("owned-put-value")
+	wantKey := bytes.Clone(key)
+	wantValue := bytes.Clone(value)
+	if err := engine.Put(ctx, key, value); err != nil {
+		t.Fatal(err)
+	}
+	key[0] = 'x'
+	value[0] = 'x'
+	if got, err := engine.Get(ctx, wantKey); err != nil || !bytes.Equal(got, wantValue) {
+		t.Fatalf("Put retained input memory: got %q, want %q, error %v", got, wantValue, err)
+	}
+
+	batch := []Pair{{Key: []byte("owned-batch-key"), Value: []byte("owned-batch-value")}}
+	wantBatchKey := bytes.Clone(batch[0].Key)
+	wantBatchValue := bytes.Clone(batch[0].Value)
+	if err := engine.PutBatch(ctx, batch); err != nil {
+		t.Fatal(err)
+	}
+	batch[0].Key[0] = 'x'
+	batch[0].Value[0] = 'x'
+	if got, err := engine.Get(ctx, wantBatchKey); err != nil || !bytes.Equal(got, wantBatchValue) {
+		t.Fatalf("PutBatch retained input memory: got %q, want %q, error %v", got, wantBatchValue, err)
+	}
 }
 
 func openTestKVLiteEngine(t *testing.T, mode DurabilityMode) Engine {
@@ -76,9 +120,53 @@ func openTestKVLiteEngine(t *testing.T, mode DurabilityMode) Engine {
 
 func openTestBBoltEngine(t *testing.T, mode DurabilityMode) Engine {
 	t.Helper()
-	engine, err := openBBoltEngine(filepath.Join(t.TempDir(), "bbolt.db"), mode)
+	engine, err := openBBoltEngine(filepath.Join(t.TempDir(), "bbolt.db"), mode, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return engine
+}
+
+func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
+	if kind := os.Getenv("KVBENCH_CRASH_HELPER"); kind != "" {
+		engine, err := openEngine(context.Background(), engineOpenOptions{
+			Kind:        EngineKind(kind),
+			Mode:        DurabilityDurable,
+			DataDir:     os.Getenv("KVBENCH_CRASH_DIR"),
+			ClientCount: 1,
+		})
+		if err == nil {
+			err = engine.Put(context.Background(), []byte("crash-key"), []byte("crash-value"))
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		os.Exit(0)
+	}
+
+	for _, kind := range []EngineKind{EngineKVLite, EngineBBolt} {
+		t.Run(string(kind), func(t *testing.T) {
+			dataDir := t.TempDir()
+			command := exec.Command(os.Args[0], "-test.run=^TestDurableEmbeddedEngineReopensWithoutCleanClose$")
+			command.Env = append(os.Environ(), "KVBENCH_CRASH_HELPER="+string(kind), "KVBENCH_CRASH_DIR="+dataDir)
+			if output, err := command.CombinedOutput(); err != nil {
+				t.Fatalf("crash helper: %v\n%s", err, output)
+			}
+			engine, err := openEngine(context.Background(), engineOpenOptions{
+				Kind:        kind,
+				Mode:        DurabilityDurable,
+				DataDir:     dataDir,
+				ClientCount: 1,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer engine.Close()
+			got, err := engine.Get(context.Background(), []byte("crash-key"))
+			if err != nil || string(got) != "crash-value" {
+				t.Fatalf("recovered value: got %q, error %v", got, err)
+			}
+		})
+	}
 }

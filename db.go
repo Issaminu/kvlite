@@ -182,7 +182,7 @@ func (db *DB) initializeNewDatabase() error {
 	if err := db.persistNode(db.rootNode); err != nil {
 		return fmt.Errorf("init root node: %w", err)
 	}
-	if err := db.file.Sync(); err != nil {
+	if err := fileio.SyncData(db.file); err != nil {
 		return fmt.Errorf("sync new database: %w", err)
 	}
 	return nil
@@ -276,7 +276,7 @@ func (db *DB) close() error {
 			return err
 		}
 	} else {
-		if err := db.file.Sync(); err != nil {
+		if err := fileio.SyncData(db.file); err != nil {
 			return err
 		}
 	}

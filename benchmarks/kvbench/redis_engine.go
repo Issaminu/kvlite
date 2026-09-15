@@ -13,8 +13,9 @@ import (
 )
 
 type redisEngine struct {
-	client *redis.Client
-	mode   DurabilityMode
+	client  *redis.Client
+	mode    DurabilityMode
+	clients int
 }
 
 func redisOptions(address string, clients int) *redis.Options {
@@ -36,7 +37,10 @@ func openRedisEngine(ctx context.Context, address string, mode DurabilityMode, c
 		return nil, fmt.Errorf("Redis client count must be positive: %d", clients)
 	}
 	client := redis.NewClient(redisOptions(address, clients))
-	engine := &redisEngine{client: client, mode: mode}
+	engine := &redisEngine{client: client, mode: mode, clients: clients}
+	if err := engine.configureDurability(ctx); err != nil {
+		return nil, errors.Join(err, client.Close())
+	}
 	if err := engine.warmConnections(ctx, clients); err != nil {
 		return nil, errors.Join(err, client.Close())
 	}
@@ -44,6 +48,9 @@ func openRedisEngine(ctx context.Context, address string, mode DurabilityMode, c
 		return nil, errors.Join(err, client.Close())
 	}
 	if err := engine.reset(ctx); err != nil {
+		return nil, errors.Join(err, client.Close())
+	}
+	if err := engine.validateDurability(ctx); err != nil {
 		return nil, errors.Join(err, client.Close())
 	}
 	return engine, nil
@@ -68,7 +75,21 @@ func (engine *redisEngine) warmConnections(ctx context.Context, clients int) err
 			return err
 		}
 	}
-	return nil
+	deadline := time.Now().Add(time.Second)
+	for {
+		if err := engine.validatePool(); err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			stats := engine.client.PoolStats()
+			return fmt.Errorf("Redis pool has %d total and %d idle connections, want at least %d", stats.TotalConns, stats.IdleConns, clients)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
 }
 
 func (engine *redisEngine) reset(ctx context.Context) error {
@@ -134,7 +155,22 @@ func (engine *redisEngine) Count(ctx context.Context) (int, error) {
 	return int(count), nil
 }
 
+func (engine *redisEngine) Validate(ctx context.Context) error {
+	if err := engine.validateDurability(ctx); err != nil {
+		return err
+	}
+	return engine.validatePool()
+}
+
 func (engine *redisEngine) Close() error { return engine.client.Close() }
+
+func (engine *redisEngine) validatePool() error {
+	stats := engine.client.PoolStats()
+	if stats.TotalConns < uint32(engine.clients) || stats.IdleConns < uint32(engine.clients) {
+		return fmt.Errorf("Redis pool has %d total and %d idle connections, want at least %d", stats.TotalConns, stats.IdleConns, engine.clients)
+	}
+	return nil
+}
 
 func redisAppendFsync(mode DurabilityMode) (string, error) {
 	switch mode {
@@ -171,6 +207,22 @@ func (engine *redisEngine) validateDurability(ctx context.Context) error {
 	return engine.validatePersistenceIdle(ctx)
 }
 
+func (engine *redisEngine) configureDurability(ctx context.Context) error {
+	wantFsync, err := redisAppendFsync(engine.mode)
+	if err != nil {
+		return err
+	}
+	return engine.client.ConfigSet(ctx, "appendfsync", wantFsync).Err()
+}
+
+func (engine *redisEngine) setDurability(ctx context.Context, mode DurabilityMode) error {
+	engine.mode = mode
+	if err := engine.configureDurability(ctx); err != nil {
+		return err
+	}
+	return engine.validateDurability(ctx)
+}
+
 func (engine *redisEngine) configValue(ctx context.Context, name string) (string, error) {
 	values, err := engine.client.ConfigGet(ctx, name).Result()
 	if err != nil {
@@ -192,6 +244,9 @@ func (engine *redisEngine) validatePersistenceIdle(ctx context.Context) error {
 		if info[field] != "0" {
 			return fmt.Errorf("Redis persistence field %s is %q, want 0", field, info[field])
 		}
+	}
+	if value, found := info["aof_pending_bio_fsync"]; found && value != "0" {
+		return fmt.Errorf("Redis persistence field aof_pending_bio_fsync is %q, want 0", value)
 	}
 	if value := info["aof_last_write_status"]; value != "" && value != "ok" {
 		return fmt.Errorf("Redis AOF write status is %q", value)

@@ -157,8 +157,8 @@ func (wal *WAL) Sync() error {
 	if wal.syncFile != nil {
 		err = wal.syncFile()
 	} else {
-		// Production leaves syncFile nil and syncs the WAL file directly.
-		err = wal.file.Sync()
+		// Production leaves syncFile nil and syncs the WAL data directly.
+		err = fileio.SyncData(wal.file)
 	}
 	if err != nil {
 		return err

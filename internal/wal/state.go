@@ -70,7 +70,7 @@ func (wal *WAL) Checkpoint(mainFile *os.File) error {
 		return err
 	}
 	if wal.syncOnCheckpoint {
-		if err := mainFile.Sync(); err != nil {
+		if err := fileio.SyncData(mainFile); err != nil {
 			return err
 		}
 	}

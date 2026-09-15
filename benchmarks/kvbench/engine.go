@@ -16,7 +16,7 @@ type DurabilityMode string
 const (
 	// DurabilityDurable waits for the engine's required storage sync before a successful write returns.
 	DurabilityDurable DurabilityMode = "durable"
-	// DurabilityNoCommitSync lets a successful write return without a storage sync.
+	// DurabilityNoCommitSync lets a successful write return without waiting for an engine-requested storage sync.
 	DurabilityNoCommitSync DurabilityMode = "no-commit-sync"
 )
 
@@ -37,6 +37,7 @@ type Engine interface {
 	Put(context.Context, []byte, []byte) error
 	PutBatch(context.Context, []Pair) error
 	Count(context.Context) (int, error)
+	Validate(context.Context) error
 	Close() error
 }
 
@@ -54,7 +55,7 @@ func openEngine(ctx context.Context, options engineOpenOptions) (Engine, error) 
 	case EngineKVLite:
 		return openKVLiteEngine(filepath.Join(options.DataDir, "kvlite.db"), options.Mode)
 	case EngineBBolt:
-		return openBBoltEngine(filepath.Join(options.DataDir, "bbolt.db"), options.Mode)
+		return openBBoltEngine(filepath.Join(options.DataDir, "bbolt.db"), options.Mode, options.ClientCount)
 	case EngineRedis:
 		return openRedisEngine(ctx, options.RedisAddr, options.Mode, options.ClientCount, options.RedisFlushDB)
 	default:

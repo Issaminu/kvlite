@@ -9,7 +9,9 @@ import (
 )
 
 type kvliteEngine struct {
-	db *kvlite.DB
+	db          *kvlite.DB
+	mode        DurabilityMode
+	synchronous kvlite.Sync
 }
 
 func openKVLiteEngine(path string, mode DurabilityMode) (Engine, error) {
@@ -21,7 +23,7 @@ func openKVLiteEngine(path string, mode DurabilityMode) (Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	engine := &kvliteEngine{db: db}
+	engine := &kvliteEngine{db: db, mode: mode, synchronous: synchronous}
 	if err := engine.ensureBucket(); err != nil {
 		return nil, errors.Join(err, db.Close())
 	}
@@ -100,6 +102,17 @@ func (engine *kvliteEngine) Count(_ context.Context) (int, error) {
 		return nil
 	})
 	return count, err
+}
+
+func (engine *kvliteEngine) Validate(_ context.Context) error {
+	want, err := kvliteSync(engine.mode)
+	if err != nil {
+		return err
+	}
+	if engine.synchronous != want {
+		return fmt.Errorf("KVLite sync mode is %d, want %d", engine.synchronous, want)
+	}
+	return nil
 }
 
 func (engine *kvliteEngine) Close() error { return engine.db.Close() }
