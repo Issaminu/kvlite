@@ -338,10 +338,10 @@ func TestWALCommit_DoesNotRetainLargeEncodingBuffer(t *testing.T) {
 	}
 	defer walFile.Close()
 
-	const retentionLimit = 1 << 20
+	const retentionLimit = maxRetainedEncodingBufferBytes
 	log := New(Config{
 		File:                     walFile,
-		PageSize:                 2 << 20,
+		PageSize:                 4 << 20,
 		CheckpointThresholdBytes: 4 << 20,
 	})
 	records := []Record{{
@@ -353,6 +353,31 @@ func TestWALCommit_DoesNotRetainLargeEncodingBuffer(t *testing.T) {
 	}
 	if capacity := cap(log.encodingBuffer); capacity > retentionLimit {
 		t.Fatalf("retained encoding capacity: got %d, want at most %d", capacity, retentionLimit)
+	}
+}
+
+func TestWALCommit_RetainsBenchmarkSizedEncodingBuffer(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	const transactionBytes = 1400 << 10
+	log := New(Config{
+		File:                     walFile,
+		PageSize:                 transactionBytes,
+		CheckpointThresholdBytes: 4 << 20,
+	})
+	records := []Record{{
+		Header:      RecordHeader{Type: RecordTypeData, PageID: 1},
+		PageContent: make([]byte, transactionBytes-HeaderSize-ChecksumSize),
+	}}
+	if _, err := log.Commit(records); err != nil {
+		t.Fatal(err)
+	}
+	if capacity := cap(log.encodingBuffer); capacity < transactionBytes || capacity > maxRetainedEncodingBufferBytes {
+		t.Fatalf("retained encoding capacity: got %d, want %d..%d", capacity, transactionBytes, maxRetainedEncodingBufferBytes)
 	}
 }
 

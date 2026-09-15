@@ -13,7 +13,7 @@ import (
 
 // maxRetainedEncodingBufferBytes is the largest transaction encoding buffer kept across commits.
 // Larger buffers are dropped after [WAL.Commit] returns so one large transaction does not retain memory.
-const maxRetainedEncodingBufferBytes = 1 << 20
+const maxRetainedEncodingBufferBytes = 2 << 20
 
 type WAL struct {
 	path                     string
