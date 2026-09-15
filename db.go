@@ -16,27 +16,36 @@ import (
 )
 
 const (
-	MaxKeySize   = btree.MaxKeySize
-	MaxValueSize = btree.MaxValueSize
+	MaxKeySize              = btree.MaxKeySize
+	MaxValueSize            = btree.MaxValueSize
+	maxCachedWriteNodePages = 1024
 )
+
+type writeNodeCacheEntry struct {
+	node       *btree.Node
+	referenced bool
+}
 
 // DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
 type DB struct {
-	path             string
-	file             *os.File
-	meta             *page.Meta
-	rootNode         *btree.Node
-	mappedFile       []byte
-	options          *Options
-	wal              *wal.WAL
-	operationMu      sync.RWMutex
-	lifecycleMu      sync.Mutex
-	activeOperations sync.WaitGroup
-	writeRequests    chan *writeRequest
-	stopWriteBatcher chan struct{}
-	writeBatcherDone chan struct{}
-	closing          bool
-	closed           bool
+	path              string
+	file              *os.File
+	meta              *page.Meta
+	rootNode          *btree.Node
+	writeNodes        map[page.ID]*writeNodeCacheEntry // Each committed node refers only to stable heap bytes that later write clones can share.
+	writeNodeSlots    []page.ID
+	nextWriteNodeSlot int
+	mappedFile        []byte
+	options           *Options
+	wal               *wal.WAL
+	operationMu       sync.RWMutex
+	lifecycleMu       sync.Mutex
+	activeOperations  sync.WaitGroup
+	writeRequests     chan *writeRequest
+	stopWriteBatcher  chan struct{}
+	writeBatcherDone  chan struct{}
+	closing           bool
+	closed            bool
 }
 
 func (db *DB) ensureOpen() error {
@@ -92,9 +101,10 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	db := &DB{
-		path:    path,
-		file:    dbFile,
-		options: resolvedOptions,
+		path:       path,
+		file:       dbFile,
+		options:    resolvedOptions,
+		writeNodes: make(map[page.ID]*writeNodeCacheEntry),
 	}
 	// The main file descriptor owns the process lock. failOpen and Close release the lock when they close this file.
 	if err := lockDatabaseFile(db.file, db.options.ReadOnly, db.options.LockTimeout); err != nil {
@@ -392,6 +402,10 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 		if err != nil {
 			return nil, err
 		}
+		db.cacheWriteNode(node)
+		return node, nil
+	}
+	if node, ok := db.cachedWriteNode(pgid); ok {
 		return node, nil
 	}
 
@@ -399,7 +413,53 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	return btree.DecodeNode(data, pgid, db.meta.PageSize())
+	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize())
+	if err != nil {
+		return nil, err
+	}
+	db.cacheWriteNode(node)
+	return node, nil
+}
+
+// cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
+// The caller must have exclusive access to database state. Open has this access before it returns. Writes use the database operation lock.
+func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {
+	entry, ok := db.writeNodes[pageID]
+	if !ok {
+		return nil, false
+	}
+	entry.referenced = true
+	return entry.node, true
+}
+
+// cacheWriteNode keeps an immutable committed node for later write transactions. It keeps at most [maxCachedWriteNodePages] nodes.
+// The caller must have exclusive access to database state. Open has this access before it returns. Writes use the database operation lock.
+func (db *DB) cacheWriteNode(node *btree.Node) {
+	pageID := node.PageID()
+	if entry, ok := db.writeNodes[pageID]; ok {
+		entry.node = node
+		entry.referenced = true
+		return
+	}
+
+	if len(db.writeNodeSlots) < maxCachedWriteNodePages {
+		db.writeNodeSlots = append(db.writeNodeSlots, pageID)
+	} else {
+		// Give recently used nodes one more pass. Remove the first node that no read used after the last pass.
+		for {
+			victimPageID := db.writeNodeSlots[db.nextWriteNodeSlot]
+			victim := db.writeNodes[victimPageID]
+			if !victim.referenced {
+				delete(db.writeNodes, victimPageID)
+				db.writeNodeSlots[db.nextWriteNodeSlot] = pageID
+				db.nextWriteNodeSlot = (db.nextWriteNodeSlot + 1) % maxCachedWriteNodePages
+				break
+			}
+			victim.referenced = false
+			db.nextWriteNodeSlot = (db.nextWriteNodeSlot + 1) % maxCachedWriteNodePages
+		}
+	}
+	db.writeNodes[pageID] = &writeNodeCacheEntry{node: node, referenced: true}
 }
 
 // lookupCommittedPage searches one committed page.

@@ -95,6 +95,9 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	}
 	db.meta = tx.meta
 	db.rootNode = tx.rootNode
+	for _, node := range tx.store.dirty {
+		db.cacheWriteNode(node)
+	}
 	if needsCheckpoint {
 		// The WAL is already durable. A checkpoint failure must not turn this
 		// committed transaction into a reported failure.

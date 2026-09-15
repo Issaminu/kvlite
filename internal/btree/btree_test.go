@@ -391,26 +391,6 @@ func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 	}
 }
 
-func TestNodeCloneOwned_DoesNotShareEntryBytes(t *testing.T) {
-	key := []byte("key")
-	value := []byte("value")
-	node := &Node{
-		header:  newNodeHeader(NodeTypeLeaf, 1),
-		entries: []Entry{{key: key, value: value}},
-	}
-
-	clone := node.CloneOwned()
-	key[0] = 'K'
-	value[0] = 'V'
-
-	if got := string(clone.entries[0].key); got != "key" {
-		t.Fatalf("cloned key: got %q, want %q", got, "key")
-	}
-	if got := string(clone.entries[0].value); got != "value" {
-		t.Fatalf("cloned value: got %q, want %q", got, "value")
-	}
-}
-
 func TestNodeClone_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	original := &Node{
 		header: newNodeHeader(NodeTypeLeaf, 0),

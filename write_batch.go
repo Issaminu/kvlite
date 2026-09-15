@@ -164,6 +164,9 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 			// Publish the new state only after the WAL append and required synchronization succeed.
 			db.meta = state.meta
 			db.rootNode = state.rootNode
+			for _, node := range state.dirty {
+				db.cacheWriteNode(node)
+			}
 		}
 	}
 

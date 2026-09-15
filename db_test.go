@@ -84,6 +84,71 @@ func TestEncodeWALRecords_ReplicatesChangedMetadata(t *testing.T) {
 	}
 }
 
+func TestReadNode_ReusesOwnedCommittedNodeAfterMappingRefresh(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	clear(db.writeNodes)
+	db.writeNodeSlots = nil
+	db.nextWriteNodeSlot = 0
+
+	first, err := db.readNode(db.meta.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := db.readNode(db.meta.Root())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("second write-page read decoded a new node")
+	}
+	if err := db.refreshMainFileMapping(); err != nil {
+		t.Fatal(err)
+	}
+	if first.EntryCount() != second.EntryCount() {
+		t.Fatal("cached node changed after mapping refresh")
+	}
+}
+
+func TestWriteNodeCache_BoundsPagesAndGivesReferencesAnotherChance(t *testing.T) {
+	db := &DB{writeNodes: make(map[page.ID]*writeNodeCacheEntry)}
+	for pageID := page.ID(1); pageID <= maxCachedWriteNodePages; pageID++ {
+		db.cacheWriteNode(btree.NewLeafNode(pageID))
+	}
+
+	db.cacheWriteNode(btree.NewLeafNode(maxCachedWriteNodePages + 1))
+	if _, ok := db.writeNodes[1]; ok {
+		t.Fatal("first CLOCK candidate remains cached")
+	}
+	if _, ok := db.cachedWriteNode(2); !ok {
+		t.Fatal("referenced node is not cached")
+	}
+	db.cacheWriteNode(btree.NewLeafNode(maxCachedWriteNodePages + 2))
+
+	if _, ok := db.writeNodes[2]; !ok {
+		t.Fatal("referenced node was evicted")
+	}
+	if _, ok := db.writeNodes[3]; ok {
+		t.Fatal("unreferenced node remains cached")
+	}
+	if got := len(db.writeNodes); got != maxCachedWriteNodePages {
+		t.Fatalf("cached write pages: got %d, want %d", got, maxCachedWriteNodePages)
+	}
+}
+
 // tempfile returns a temporary file path for a database.
 func tempfile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("kvlite-%d.db", time.Now().UnixNano()))

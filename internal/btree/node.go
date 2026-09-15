@@ -142,33 +142,6 @@ func (n *Node) Clone() *Node {
 	}
 }
 
-// CloneOwned returns a structural copy whose entry bytes do not refer to n.
-// It uses one backing buffer for all keys and values in the copy.
-func (n *Node) CloneOwned() *Node {
-	clone := n.Clone()
-	dataSize := 0
-	for _, entry := range clone.entries {
-		dataSize += len(entry.key) + len(entry.value)
-	}
-	data := make([]byte, dataSize)
-	offset := 0
-	for index := range clone.entries {
-		keyEnd := offset + len(clone.entries[index].key)
-		copy(data[offset:keyEnd], clone.entries[index].key)
-		clone.entries[index].key = data[offset:keyEnd:keyEnd]
-		offset = keyEnd
-
-		if clone.entries[index].value == nil {
-			continue
-		}
-		valueEnd := offset + len(clone.entries[index].value)
-		copy(data[offset:valueEnd], clone.entries[index].value)
-		clone.entries[index].value = data[offset:valueEnd:valueEnd]
-		offset = valueEnd
-	}
-	return clone
-}
-
 // Find the correct child node for this key.
 // It only returns the correct child for this node, if you actually want to reach the leaf node that has the key, then this function should be called in a loop.
 func (n *Node) FindChildIndex(key []byte) (int, error) {
