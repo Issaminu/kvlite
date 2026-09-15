@@ -1,6 +1,8 @@
-<img src="assets/mascot/kvlite-mascot-concept-v1.png" alt="KVLite mascot carrying B+ tree pages" width="120">
+<p align="center">
+  <img src="assets/mascot/kvlite-mascot.png" alt="KVLite mascot carrying B+ tree pages" width="200">
+</p>
 
-# KVLite
+<h1 align="center">KVLite</h1>
 
 A blazingly-fast embedded key/value database for Go.
 
