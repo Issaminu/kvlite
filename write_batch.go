@@ -155,19 +155,15 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	}
 
 	var commitErr error
+	needsCheckpoint := false
 	if hasPendingWrites {
 		// state.dirty contains one final image for each changed page. One WAL transaction gives all dependent callbacks the same commit result.
 		records := encodeWALRecords(state.dirty, state.meta, state.metaDirty)
-		var needsCheckpoint bool
 		needsCheckpoint, commitErr = db.wal.Commit(records)
 		if commitErr == nil {
 			// Publish the new state only after the WAL append and required synchronization succeed.
 			db.meta = state.meta
 			db.rootNode = state.rootNode
-			if needsCheckpoint {
-				// The batch is already committed. A checkpoint error must not change a successful Update result.
-				_ = db.checkpointWAL()
-			}
 		}
 	}
 
@@ -177,6 +173,10 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 			result.err = commitErr
 		}
 		request.result <- result
+	}
+	if needsCheckpoint && commitErr == nil {
+		// The WAL commit is complete. Callers do not need to wait for main-file maintenance.
+		_ = db.checkpointWAL()
 	}
 }
 
