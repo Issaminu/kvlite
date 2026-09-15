@@ -20,6 +20,12 @@ var writeCallbackResultChannels = sync.Pool{
 	},
 }
 
+var durableWriteRequests = sync.Pool{
+	New: func() any {
+		return &writeRequest{result: make(chan writeResult, 1)}
+	},
+}
+
 type writeRequest struct {
 	transaction func(*Tx) error
 	result      chan writeResult
@@ -64,12 +70,12 @@ func (db *DB) stopWriteBatcherAndWait() {
 
 // submitDurableUpdate waits for the batch worker to run transaction and commit its dependent state. It forwards a callback panic or Goexit to the caller.
 func (db *DB) submitDurableUpdate(transaction func(*Tx) error) error {
-	request := &writeRequest{
-		transaction: transaction,
-		result:      make(chan writeResult, 1),
-	}
+	request := durableWriteRequests.Get().(*writeRequest)
+	request.transaction = transaction
 	db.writeRequests <- request
 	result := <-request.result
+	request.transaction = nil
+	durableWriteRequests.Put(request)
 	if result.panicked {
 		panic(result.panicValue)
 	}
