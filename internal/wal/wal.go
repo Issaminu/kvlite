@@ -23,6 +23,8 @@ type WAL struct {
 	syncOnCheckpoint         bool
 	checkpointThresholdBytes uint64
 	bytesSinceCheckpoint     uint64
+	totalBytesWritten        uint64
+	checkpointCount          uint64
 	overlay                  map[page.ID]Record // Committed pages that are not yet checkpointed.
 	nextTxid                 TxID               // sequence number stamped on the next committed transaction
 	hasUnsyncedWrites        bool               // true when WAL bytes were appended after the last successful sync
@@ -61,6 +63,7 @@ func (wal *WAL) Commit(records []Record) (bool, error) {
 		rollbackErr := wal.rollbackAppend(startOffset, bytesBefore, unsyncedBefore)
 		return false, errors.Join(err, rollbackErr)
 	}
+	wal.totalBytesWritten += uint64(len(transaction))
 
 	for _, record := range records {
 		wal.overlay[record.Header.PageID] = record

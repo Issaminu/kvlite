@@ -80,6 +80,7 @@ func (wal *WAL) Checkpoint(mainFile *os.File) error {
 	}
 	clear(wal.overlay)
 	wal.bytesSinceCheckpoint = 0
+	wal.checkpointCount++
 	return nil
 }
 
@@ -183,6 +184,8 @@ func (wal *WAL) CommittedRecord(pageID page.ID) (Record, bool) {
 type Stats struct {
 	CheckpointThresholdBytes uint64
 	BytesSinceCheckpoint     uint64
+	TotalBytesWritten        uint64
+	CheckpointCount          uint64
 	CommittedRecordCount     int
 	NextTxID                 TxID
 }
@@ -191,6 +194,8 @@ func (wal *WAL) Stats() Stats {
 	return Stats{
 		CheckpointThresholdBytes: wal.checkpointThresholdBytes,
 		BytesSinceCheckpoint:     wal.bytesSinceCheckpoint,
+		TotalBytesWritten:        wal.totalBytesWritten,
+		CheckpointCount:          wal.checkpointCount,
 		CommittedRecordCount:     len(wal.overlay),
 		NextTxID:                 wal.nextTxid,
 	}

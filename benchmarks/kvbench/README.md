@@ -129,12 +129,14 @@ Deletion and delete churn are not in this version.
 | `primary-B` | Main database-file bytes. Redis reports zero because AOF is its tested persistent file. |
 | `log-B` | KVLite WAL bytes or Redis AOF bytes. bbolt reports zero because it has no separate log file. |
 | `persistent-B` | `primary-B + log-B`. |
+| `wal-written-B` | Successful KVLite WAL transaction bytes since the benchmark opened the database. A checkpoint does not decrease this value. |
+| `checkpoints` | Completed KVLite checkpoints since the benchmark opened the database. The value excludes the final close. |
 | `dataset-memory-B` | Redis `used_memory_dataset`. It is an extra Redis-only value. |
 | `checksum` | A deterministic value that proves scan output was consumed. |
 
 The suite does not report cross-engine Go allocation values. Redis server allocations do not appear in the Go client process.
 
-The suite does not yet report a fair combined CPU value, peak resident memory value, operating-system write-byte count, or sync-call count. A Go-process value would omit the Redis server. A Redis-server value would omit the Go client. Collect these values at the container boundary before you use them for a cross-engine claim.
+`wal-written-B` and `checkpoints` explain KVLite work. They are not cross-engine storage metrics. The suite does not yet report a fair combined CPU value, peak resident memory value, operating-system write-byte count, or sync-call count. A Go-process value would omit the Redis server. A Redis-server value would omit the Go client. Collect these values at the container boundary before you use them for a cross-engine claim.
 
 ## Matched API boundaries
 

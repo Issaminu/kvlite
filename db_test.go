@@ -1937,6 +1937,16 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 	if got := fileSize(t, path+"-wal"); got != 0 {
 		t.Fatalf("WAL size after threshold checkpoint: got %d, want 0", got)
 	}
+	stats, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.WALBytesWritten == 0 {
+		t.Fatal("WAL bytes written is zero after committed updates")
+	}
+	if stats.CheckpointCount != 2 {
+		t.Fatalf("checkpoint count: got %d, want 2", stats.CheckpointCount)
+	}
 }
 
 // TestDB_Path ensures Path returns the database's file path.

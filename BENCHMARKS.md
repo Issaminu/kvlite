@@ -89,7 +89,7 @@ Other containers were active on the host. CPU assignment reduced direct CPU comp
 
 The runner used fixed work and one process per engine. It changed engine and durability order between rounds. Each reported result is the median of 10 runs. Fixture loads used durable mode.
 
-The timed sections included the selected API operations and their required acknowledgements. They excluded setup, final validation, close, checkpoint, and deferred sync unless a life-cycle case names that work. The latency tables report the median p50, p95, p99, and maximum values from the 10 runs.
+The timed sections included the selected API operations and their required acknowledgements. Automatic checkpoint work can occur during a timed sequence. A later API operation waits for that work. The final automatic checkpoint can finish after the timer stops. The timed sections excluded setup, final validation, close, and deferred sync unless a life-cycle case names that work. The latency tables report the median p50, p95, p99, and maximum values from the 10 runs.
 
 The run used the full suite without the optional one-million-key cases. All 60 measured engine runs passed their runtime and data checks.
 

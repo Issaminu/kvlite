@@ -220,7 +220,17 @@ func (engine *kvliteEngine) StorageStats(_ context.Context) (storageStats, error
 	if err != nil {
 		return storageStats{}, err
 	}
-	return storageStats{primaryBytes: primaryBytes, logBytes: logBytes}, nil
+	runtimeStats, err := engine.db.Stats()
+	if err != nil {
+		return storageStats{}, err
+	}
+	return storageStats{
+		primaryBytes:      primaryBytes,
+		logBytes:          logBytes,
+		walBytesWritten:   runtimeStats.WALBytesWritten,
+		checkpointCount:   runtimeStats.CheckpointCount,
+		hasKVLiteWALStats: true,
+	}, nil
 }
 
 func (engine *kvliteEngine) PrepareCollections(_ context.Context, paths [][][]byte) error {

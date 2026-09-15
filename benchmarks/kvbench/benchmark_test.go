@@ -242,6 +242,10 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	b.ReportMetric(float64(stats.primaryBytes), "primary-B")
 	b.ReportMetric(float64(stats.logBytes), "log-B")
 	b.ReportMetric(float64(stats.primaryBytes+stats.logBytes), "persistent-B")
+	if stats.hasKVLiteWALStats {
+		b.ReportMetric(float64(stats.walBytesWritten), "wal-written-B")
+		b.ReportMetric(float64(stats.checkpointCount), "checkpoints")
+	}
 	if stats.memoryBytes > 0 {
 		b.ReportMetric(float64(stats.memoryBytes), "dataset-memory-B")
 	}

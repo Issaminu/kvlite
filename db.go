@@ -26,6 +26,14 @@ type writeNodeCacheEntry struct {
 	referenced bool
 }
 
+// Stats contains cumulative storage work for one open [DB] handle.
+type Stats struct {
+	// WALBytesWritten is the total size of successful WAL transaction appends. A checkpoint does not decrease this value.
+	WALBytesWritten uint64
+	// CheckpointCount is the number of checkpoints that wrote all committed pages and cleared the WAL.
+	CheckpointCount uint64
+}
+
 // DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
 type DB struct {
 	path              string
@@ -307,6 +315,23 @@ func (db *DB) close() error {
 // Path returns the database path passed to [Open]. It does not clean the path or convert it to an absolute path, and it remains available after [DB.Close].
 func (db *DB) Path() string {
 	return db.path
+}
+
+// Stats returns cumulative storage work for this database handle. It waits for an active write or checkpoint to finish. It returns [ErrDatabaseNotOpen] after close starts.
+func (db *DB) Stats() (Stats, error) {
+	if err := db.beginOperation(); err != nil {
+		return Stats{}, err
+	}
+	defer db.endOperation()
+
+	db.operationMu.RLock()
+	defer db.operationMu.RUnlock()
+
+	stats := db.wal.Stats()
+	return Stats{
+		WALBytesWritten: stats.TotalBytesWritten,
+		CheckpointCount: stats.CheckpointCount,
+	}, nil
 }
 
 // Put stores value under key in the top-level bucket named bucketName.

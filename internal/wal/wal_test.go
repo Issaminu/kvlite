@@ -90,6 +90,9 @@ func TestWALCommit_SyncFailureRestoresAppendOffset(t *testing.T) {
 	if log.appendOffset != 0 {
 		t.Fatalf("append offset after failed commit: got %d, want 0", log.appendOffset)
 	}
+	if got := log.Stats().TotalBytesWritten; got != 0 {
+		t.Fatalf("total WAL bytes after failed commit: got %d, want 0", got)
+	}
 
 	log.syncFile = nil
 	if _, err := log.Commit(records); err != nil {
@@ -101,6 +104,9 @@ func TestWALCommit_SyncFailureRestoresAppendOffset(t *testing.T) {
 	}
 	if info.Size() != log.appendOffset {
 		t.Fatalf("WAL size after retry: got %d, append offset %d", info.Size(), log.appendOffset)
+	}
+	if got := log.Stats().TotalBytesWritten; got != uint64(info.Size()) {
+		t.Fatalf("total WAL bytes after retry: got %d, want %d", got, info.Size())
 	}
 }
 
@@ -435,7 +441,15 @@ func TestWALCommit_PublishesOneRecordForEachChangedPage(t *testing.T) {
 	if needsCheckpoint {
 		t.Fatal("small transaction reached the checkpoint threshold")
 	}
-	if got := log.Stats().CommittedRecordCount; got != 2 {
+	stats := log.Stats()
+	info, err := walFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalBytesWritten != uint64(info.Size()) {
+		t.Fatalf("total WAL bytes written: got %d, want %d", stats.TotalBytesWritten, info.Size())
+	}
+	if got := stats.CommittedRecordCount; got != 2 {
 		t.Fatalf("committed record count: got %d, want 2", got)
 	}
 	record, ok := log.CommittedRecord(2)
@@ -457,20 +471,38 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 	defer mainFile.Close()
 
 	log := New(Config{File: walFile, PageSize: 64})
+	records := make([]Record, 0, 32)
 	for index := range 32 {
 		pageID := page.ID(32 - index)
 		node := btree.NewLeafNode(pageID)
 		if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte{byte(pageID)})); err != nil {
 			t.Fatal(err)
 		}
-		log.LoadCommittedRecord(Record{
+		records = append(records, Record{
 			Header:      RecordHeader{Type: RecordTypeData, PageID: pageID},
 			PageContent: btree.EncodeWALNode(node),
 		})
 	}
+	if _, err := log.Commit(records); err != nil {
+		t.Fatal(err)
+	}
+	writtenBytes := log.Stats().TotalBytesWritten
 
 	if err := log.Checkpoint(mainFile); err != nil {
 		t.Fatal(err)
+	}
+	stats := log.Stats()
+	if stats.TotalBytesWritten != writtenBytes {
+		t.Fatalf("total WAL bytes after checkpoint: got %d, want %d", stats.TotalBytesWritten, writtenBytes)
+	}
+	if got := stats.CheckpointCount; got != 1 {
+		t.Fatalf("checkpoint count: got %d, want 1", got)
+	}
+	if err := log.Checkpoint(mainFile); err != nil {
+		t.Fatal(err)
+	}
+	if got := log.Stats().CheckpointCount; got != 1 {
+		t.Fatalf("checkpoint count after empty checkpoint: got %d, want 1", got)
 	}
 	for pageID := page.ID(1); pageID <= 32; pageID++ {
 		pageContent := make([]byte, 64)

@@ -47,9 +47,12 @@ type Engine interface {
 }
 
 type storageStats struct {
-	primaryBytes int64
-	logBytes     int64
-	memoryBytes  int64
+	primaryBytes      int64
+	logBytes          int64
+	memoryBytes       int64
+	walBytesWritten   uint64
+	checkpointCount   uint64
+	hasKVLiteWALStats bool
 }
 
 type orderedEngine interface {
