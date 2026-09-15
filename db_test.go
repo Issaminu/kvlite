@@ -473,9 +473,6 @@ func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 // "is it ACTUALLY binary search?" test needs a probe counter in your Get — see chat.)
 // -----------------------------------------------------------------------------
 
-// TestPut_Overwrite_BoundedGrowth: overwriting ONE key 1000x must not grow the file
-// without bound. RED against an append-log (each Put appends a record); GREEN once a
-// real structure updates the key in place.
 func TestPut_Overwrite_BoundedGrowth(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1115,12 +1112,6 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 // fully committed, T2 incomplete. EVERY such truncation must recover to *exactly* the
 // post-T1 state — "a" present, "b" absent — and Open must SUCCEED (a torn tail is
 // normal recovery, not an error).
-//
-// RED today: recovery has no commit concept. It either errors on the partial record
-// (io.ReadFull fails -> Open fails) or blindly applies T2's leading records without
-// its meta -> wrong state. GREEN needs (1) a commit marker ending each transaction,
-// (2) buffering a txn's dirty pages and appending its frames + commit marker as a unit,
-// (3) replay that scans to the LAST valid commit marker and drops anything after it.
 func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 	path := tempfile()
 	wal := path + "-wal"
@@ -3756,9 +3747,6 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 // in a large parent is wrongly reported missing (and CreateBucket's guard then silently
 // overwrites). Here the parent is filled past one page BEFORE the child is created, then
 // the child is read back both in-session and after a reopen.
-//
-// RED today: parent.Bucket("child") returns nil once the parent root is a branch. GREEN
-// once the nested lookup descends the parent's tree (share Tx.Bucket's _get path).
 func TestBucket_NestedInSplitParent(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)

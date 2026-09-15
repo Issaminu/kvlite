@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 )
 
@@ -31,14 +32,34 @@ const (
 
 var benchmarkBucketName = []byte("kvbench")
 
-// Engine runs matched point operations against one logical collection.
+// Engine runs operations that have a matched contract across all three databases.
 type Engine interface {
 	Get(context.Context, []byte) ([]byte, error)
+	GetBatch(context.Context, [][]byte) ([][]byte, error)
 	Put(context.Context, []byte, []byte) error
 	PutBatch(context.Context, []Pair) error
+	MixedBatch(context.Context, [][]byte, []Pair) ([][]byte, error)
+	ScanPrefix(context.Context, []byte, func([]byte, []byte) error) error
 	Count(context.Context) (int, error)
+	StorageStats(context.Context) (storageStats, error)
 	Validate(context.Context) error
 	Close() error
+}
+
+type storageStats struct {
+	primaryBytes int64
+	logBytes     int64
+	memoryBytes  int64
+}
+
+type orderedEngine interface {
+	VisitOrdered(context.Context, []byte, []byte, bool, int, func([]byte, []byte) error) error
+}
+
+type collectionEngine interface {
+	PrepareCollections(context.Context, [][][]byte) error
+	PutCollectionBatch(context.Context, [][]byte, []Pair) error
+	GetCollection(context.Context, [][]byte, []byte) ([]byte, error)
 }
 
 type engineOpenOptions struct {
@@ -74,4 +95,15 @@ func loadPairs(ctx context.Context, engine Engine, pairs []Pair, batchSize int) 
 		}
 	}
 	return nil
+}
+
+func fileSize(path string) (int64, error) {
+	info, err := os.Stat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }

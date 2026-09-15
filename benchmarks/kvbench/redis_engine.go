@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -130,6 +131,32 @@ func (engine *redisEngine) Get(ctx context.Context, key []byte) ([]byte, error) 
 	return value, err
 }
 
+func (engine *redisEngine) GetBatch(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	arguments := make([]string, len(keys))
+	for index, key := range keys {
+		arguments[index] = string(key)
+	}
+	results, err := engine.client.MGet(ctx, arguments...).Result()
+	if err != nil {
+		return nil, err
+	}
+	values := make([][]byte, len(results))
+	for index, result := range results {
+		if result == nil {
+			return nil, ErrKeyNotFound
+		}
+		switch value := result.(type) {
+		case string:
+			values[index] = []byte(value)
+		case []byte:
+			values[index] = value
+		default:
+			return nil, fmt.Errorf("Redis MGET returned %T", result)
+		}
+	}
+	return values, nil
+}
+
 func (engine *redisEngine) Put(ctx context.Context, key, value []byte) error {
 	return engine.client.Set(ctx, string(key), value, 0).Err()
 }
@@ -142,6 +169,90 @@ func (engine *redisEngine) PutBatch(ctx context.Context, pairs []Pair) error {
 		return nil
 	})
 	return err
+}
+
+func (engine *redisEngine) MixedBatch(ctx context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
+	commands, err := engine.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, key := range keys {
+			pipe.Get(ctx, string(key))
+		}
+		for _, pair := range pairs {
+			pipe.Set(ctx, string(pair.Key), pair.Value, 0)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	values := make([][]byte, len(keys))
+	for index, command := range commands[:len(keys)] {
+		if errors.Is(command.Err(), redis.Nil) {
+			return nil, ErrKeyNotFound
+		}
+		if command.Err() != nil {
+			return nil, command.Err()
+		}
+		stringCommand, ok := command.(*redis.StringCmd)
+		if !ok {
+			return nil, fmt.Errorf("Redis transaction read returned %T", command)
+		}
+		value, err := stringCommand.Bytes()
+		if err != nil {
+			return nil, err
+		}
+		values[index] = value
+	}
+	return values, nil
+}
+
+func (engine *redisEngine) ScanPrefix(ctx context.Context, prefix []byte, visit func([]byte, []byte) error) error {
+	pattern := redisPrefixPattern(prefix)
+	seen := make(map[string]struct{})
+	var cursor uint64
+	for {
+		keys, next, err := engine.client.Scan(ctx, cursor, pattern, 1_000).Result()
+		if err != nil {
+			return err
+		}
+		if len(keys) > 0 {
+			values, err := engine.client.MGet(ctx, keys...).Result()
+			if err != nil {
+				return err
+			}
+			for index, value := range values {
+				if _, duplicate := seen[keys[index]]; duplicate {
+					continue
+				}
+				seen[keys[index]] = struct{}{}
+				if value == nil {
+					continue
+				}
+				bytes, ok := value.(string)
+				if !ok {
+					return fmt.Errorf("Redis MGET returned %T", value)
+				}
+				if err := visit([]byte(keys[index]), []byte(bytes)); err != nil {
+					return err
+				}
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return nil
+		}
+	}
+}
+
+func redisPrefixPattern(prefix []byte) string {
+	var pattern strings.Builder
+	for _, character := range prefix {
+		if strings.ContainsRune("\\*?[]", rune(character)) {
+			pattern.WriteByte('\\')
+		}
+		pattern.WriteByte(character)
+	}
+	pattern.WriteByte('*')
+	return pattern.String()
 }
 
 func (engine *redisEngine) Count(ctx context.Context) (int, error) {
@@ -160,6 +271,65 @@ func (engine *redisEngine) Validate(ctx context.Context) error {
 		return err
 	}
 	return engine.validatePool()
+}
+
+func (engine *redisEngine) StorageStats(ctx context.Context) (storageStats, error) {
+	persistence, err := engine.persistenceInfo(ctx)
+	if err != nil {
+		return storageStats{}, err
+	}
+	logBytes, err := parseRedisMetric(persistence, "aof_current_size")
+	if err != nil {
+		return storageStats{}, err
+	}
+	memory, err := engine.infoValues(ctx, "memory")
+	if err != nil {
+		return storageStats{}, err
+	}
+	memoryBytes, err := parseRedisMetric(memory, "used_memory_dataset")
+	if err != nil {
+		return storageStats{}, err
+	}
+	return storageStats{logBytes: logBytes, memoryBytes: memoryBytes}, nil
+}
+
+func (engine *redisEngine) PrepareCollections(_ context.Context, _ [][][]byte) error {
+	return nil
+}
+
+func (engine *redisEngine) PutCollectionBatch(ctx context.Context, path [][]byte, pairs []Pair) error {
+	prefix := redisCollectionPrefix(path)
+	_, err := engine.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		for _, pair := range pairs {
+			key := make([]byte, 0, len(prefix)+len(pair.Key))
+			key = append(key, prefix...)
+			key = append(key, pair.Key...)
+			pipe.Set(ctx, string(key), pair.Value, 0)
+		}
+		return nil
+	})
+	return err
+}
+
+func (engine *redisEngine) GetCollection(ctx context.Context, path [][]byte, key []byte) ([]byte, error) {
+	prefix := redisCollectionPrefix(path)
+	fullKey := make([]byte, 0, len(prefix)+len(key))
+	fullKey = append(fullKey, prefix...)
+	fullKey = append(fullKey, key...)
+	value, err := engine.client.Get(ctx, string(fullKey)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		return nil, ErrKeyNotFound
+	}
+	return value, err
+}
+
+func redisCollectionPrefix(path [][]byte) []byte {
+	prefix := []byte("collection/")
+	for _, name := range path {
+		prefix = append(prefix, name...)
+		prefix = append(prefix, '/')
+	}
+	return prefix
 }
 
 func (engine *redisEngine) Close() error { return engine.client.Close() }
@@ -255,7 +425,11 @@ func (engine *redisEngine) validatePersistenceIdle(ctx context.Context) error {
 }
 
 func (engine *redisEngine) persistenceInfo(ctx context.Context) (map[string]string, error) {
-	raw, err := engine.client.Info(ctx, "persistence").Result()
+	return engine.infoValues(ctx, "persistence")
+}
+
+func (engine *redisEngine) infoValues(ctx context.Context, section string) (map[string]string, error) {
+	raw, err := engine.client.Info(ctx, section).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -271,4 +445,16 @@ func (engine *redisEngine) persistenceInfo(ctx context.Context) (map[string]stri
 		}
 	}
 	return values, nil
+}
+
+func parseRedisMetric(values map[string]string, name string) (int64, error) {
+	value, found := values[name]
+	if !found {
+		return 0, fmt.Errorf("Redis INFO returned no %s", name)
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse Redis INFO %s: %w", name, err)
+	}
+	return parsed, nil
 }

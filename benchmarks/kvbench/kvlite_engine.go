@@ -1,6 +1,7 @@
 package kvbench
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -63,6 +64,28 @@ func (engine *kvliteEngine) Get(_ context.Context, key []byte) ([]byte, error) {
 	return value, err
 }
 
+func (engine *kvliteEngine) GetBatch(_ context.Context, keys [][]byte) ([][]byte, error) {
+	values := make([][]byte, len(keys))
+	err := engine.db.View(func(tx *kvlite.Tx) error {
+		bucket, err := tx.Bucket(benchmarkBucketName)
+		if err != nil {
+			return err
+		}
+		for index, key := range keys {
+			value, err := bucket.Get(key)
+			if errors.Is(err, kvlite.ErrKeyNotFound) {
+				return ErrKeyNotFound
+			}
+			if err != nil {
+				return err
+			}
+			values[index] = bytes.Clone(value)
+		}
+		return nil
+	})
+	return values, err
+}
+
 func (engine *kvliteEngine) Put(_ context.Context, key, value []byte) error {
 	return engine.db.Put(benchmarkBucketName, key, value)
 }
@@ -79,6 +102,79 @@ func (engine *kvliteEngine) PutBatch(_ context.Context, pairs []Pair) error {
 			}
 		}
 		return nil
+	})
+}
+
+func (engine *kvliteEngine) MixedBatch(_ context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
+	values := make([][]byte, len(keys))
+	err := engine.db.Update(func(tx *kvlite.Tx) error {
+		bucket, err := tx.Bucket(benchmarkBucketName)
+		if err != nil {
+			return err
+		}
+		for index, key := range keys {
+			value, err := bucket.Get(key)
+			if err != nil {
+				return err
+			}
+			values[index] = bytes.Clone(value)
+		}
+		for _, pair := range pairs {
+			if err := bucket.Put(pair.Key, pair.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return values, err
+}
+
+func (engine *kvliteEngine) ScanPrefix(_ context.Context, prefix []byte, visit func([]byte, []byte) error) error {
+	return engine.db.View(func(tx *kvlite.Tx) error {
+		bucket, err := tx.Bucket(benchmarkBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.ScanPrefix(prefix, visit)
+	})
+}
+
+func (engine *kvliteEngine) VisitOrdered(_ context.Context, start, end []byte, reverse bool, limit int, visit func([]byte, []byte) error) error {
+	return engine.db.View(func(tx *kvlite.Tx) error {
+		bucket, err := tx.Bucket(benchmarkBucketName)
+		if err != nil {
+			return err
+		}
+		cursor, err := bucket.Cursor()
+		if err != nil {
+			return err
+		}
+		var key, value []byte
+		if reverse {
+			key, value, err = cursor.Last()
+		} else {
+			key, value, err = cursor.Seek(start)
+		}
+		for visited := 0; err == nil && key != nil; visited++ {
+			if limit > 0 && visited >= limit {
+				break
+			}
+			if !reverse && len(end) > 0 && bytes.Compare(key, end) >= 0 {
+				break
+			}
+			if reverse && len(start) > 0 && bytes.Compare(key, start) < 0 {
+				break
+			}
+			if err := visit(key, value); err != nil {
+				return err
+			}
+			if reverse {
+				key, value, err = cursor.Prev()
+			} else {
+				key, value, err = cursor.Next()
+			}
+		}
+		return err
 	})
 }
 
@@ -113,6 +209,86 @@ func (engine *kvliteEngine) Validate(_ context.Context) error {
 		return fmt.Errorf("KVLite sync mode is %d, want %d", engine.synchronous, want)
 	}
 	return nil
+}
+
+func (engine *kvliteEngine) StorageStats(_ context.Context) (storageStats, error) {
+	primaryBytes, err := fileSize(engine.db.Path())
+	if err != nil {
+		return storageStats{}, err
+	}
+	logBytes, err := fileSize(engine.db.Path() + "-wal")
+	if err != nil {
+		return storageStats{}, err
+	}
+	return storageStats{primaryBytes: primaryBytes, logBytes: logBytes}, nil
+}
+
+func (engine *kvliteEngine) PrepareCollections(_ context.Context, paths [][][]byte) error {
+	return engine.db.Update(func(tx *kvlite.Tx) error {
+		for _, path := range paths {
+			bucket, err := tx.Bucket(benchmarkBucketName)
+			if err != nil {
+				return err
+			}
+			for _, name := range path {
+				child, err := bucket.Bucket(name)
+				if errors.Is(err, kvlite.ErrBucketNotFound) {
+					child, err = bucket.CreateBucket(name)
+				}
+				if err != nil {
+					return err
+				}
+				bucket = child
+			}
+		}
+		return nil
+	})
+}
+
+func (engine *kvliteEngine) PutCollectionBatch(_ context.Context, path [][]byte, pairs []Pair) error {
+	return engine.db.Update(func(tx *kvlite.Tx) error {
+		bucket, err := kvliteCollection(tx, path)
+		if err != nil {
+			return err
+		}
+		for _, pair := range pairs {
+			if err := bucket.Put(pair.Key, pair.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (engine *kvliteEngine) GetCollection(_ context.Context, path [][]byte, key []byte) ([]byte, error) {
+	var value []byte
+	err := engine.db.View(func(tx *kvlite.Tx) error {
+		bucket, err := kvliteCollection(tx, path)
+		if err != nil {
+			return err
+		}
+		found, err := bucket.Get(key)
+		if errors.Is(err, kvlite.ErrKeyNotFound) {
+			return ErrKeyNotFound
+		}
+		value = bytes.Clone(found)
+		return err
+	})
+	return value, err
+}
+
+func kvliteCollection(tx *kvlite.Tx, path [][]byte) (*kvlite.Bucket, error) {
+	bucket, err := tx.Bucket(benchmarkBucketName)
+	if err != nil {
+		return nil, err
+	}
+	for _, name := range path {
+		bucket, err = bucket.Bucket(name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return bucket, nil
 }
 
 func (engine *kvliteEngine) Close() error { return engine.db.Close() }

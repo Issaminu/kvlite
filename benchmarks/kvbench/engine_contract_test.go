@@ -1,6 +1,7 @@
 package kvbench
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestEmbeddedEngineContract(t *testing.T) {
@@ -69,6 +71,10 @@ func testEngineContract(t *testing.T, engine Engine) {
 			t.Fatalf("read result aliases engine data for %x", pair.Key)
 		}
 	}
+	batchValues, err := engine.GetBatch(ctx, [][]byte{pairs[2].Key, pairs[3].Key})
+	if err != nil || len(batchValues) != 2 || !bytes.Equal(batchValues[0], pairs[2].Value) || !bytes.Equal(batchValues[1], pairs[3].Value) {
+		t.Fatalf("batch read: got %q with error %v", batchValues, err)
+	}
 	if got, err := engine.Count(ctx); err != nil || got != len(pairs) {
 		t.Fatalf("count: got %d, want %d, error %v", got, len(pairs), err)
 	}
@@ -81,6 +87,65 @@ func testEngineContract(t *testing.T, engine Engine) {
 	}
 	if got, err := engine.Get(ctx, pairs[1].Key); err != nil || string(got) != "second" {
 		t.Fatalf("batch update: got %q, error %v", got, err)
+	}
+	mixedValues, err := engine.MixedBatch(ctx, [][]byte{pairs[2].Key}, []Pair{{Key: pairs[3].Key, Value: []byte("mixed")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mixedValues) != 1 || !bytes.Equal(mixedValues[0], pairs[2].Value) {
+		t.Fatalf("mixed transaction read: got %q, want %q", mixedValues, pairs[2].Value)
+	}
+	if got, err := engine.Get(ctx, pairs[3].Key); err != nil || string(got) != "mixed" {
+		t.Fatalf("mixed transaction: got %q, error %v", got, err)
+	}
+	visited := 0
+	if err := engine.ScanPrefix(ctx, nil, func(key, value []byte) error {
+		if len(key) == 0 || value == nil {
+			t.Fatalf("enumeration returned invalid entry %x=%x", key, value)
+		}
+		visited++
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if visited != len(pairs) {
+		t.Fatalf("enumeration visited %d entries, want %d", visited, len(pairs))
+	}
+	stats, err := engine.StorageStats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.primaryBytes < 0 || stats.logBytes < 0 || stats.memoryBytes < 0 {
+		t.Fatalf("storage statistics contain a negative size: %+v", stats)
+	}
+	collections, ok := engine.(collectionEngine)
+	if !ok {
+		t.Fatal("engine does not implement collections")
+	}
+	path := [][]byte{[]byte("parent"), []byte("child")}
+	if err := collections.PrepareCollections(ctx, [][][]byte{path}); err != nil {
+		t.Fatal(err)
+	}
+	collectionPair := Pair{Key: []byte("collection-key"), Value: []byte("collection-value")}
+	if err := collections.PutCollectionBatch(ctx, path, []Pair{collectionPair}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := collections.GetCollection(ctx, path, collectionPair.Key); err != nil || !bytes.Equal(got, collectionPair.Value) {
+		t.Fatalf("collection read: got %q, want %q, error %v", got, collectionPair.Value, err)
+	}
+	if ordered, ok := engine.(orderedEngine); ok {
+		orderedCount := 0
+		if err := ordered.VisitOrdered(ctx, nil, nil, false, 0, func(_, value []byte) error {
+			if value != nil {
+				orderedCount++
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if orderedCount != len(pairs) {
+			t.Fatalf("ordered visit returned %d entries, want %d", orderedCount, len(pairs))
+		}
 	}
 
 	key := []byte("owned-put-key")
@@ -142,17 +207,19 @@ func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
 		}
+		if os.Getenv("KVBENCH_CRASH_WAIT") == "1" {
+			fmt.Fprintln(os.Stdout, "ready")
+			for {
+				time.Sleep(time.Second)
+			}
+		}
 		os.Exit(0)
 	}
 
 	for _, kind := range []EngineKind{EngineKVLite, EngineBBolt} {
 		t.Run(string(kind), func(t *testing.T) {
 			dataDir := t.TempDir()
-			command := exec.Command(os.Args[0], "-test.run=^TestDurableEmbeddedEngineReopensWithoutCleanClose$")
-			command.Env = append(os.Environ(), "KVBENCH_CRASH_HELPER="+string(kind), "KVBENCH_CRASH_DIR="+dataDir)
-			if output, err := command.CombinedOutput(); err != nil {
-				t.Fatalf("crash helper: %v\n%s", err, output)
-			}
+			createKilledDatabase(t, kind, dataDir)
 			engine, err := openEngine(context.Background(), engineOpenOptions{
 				Kind:        kind,
 				Mode:        DurabilityDurable,
@@ -168,5 +235,31 @@ func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
 				t.Fatalf("recovered value: got %q, error %v", got, err)
 			}
 		})
+	}
+}
+
+func createKilledDatabase(tb testing.TB, kind EngineKind, dataDir string) {
+	tb.Helper()
+	command := exec.Command(os.Args[0], "-test.run=^TestDurableEmbeddedEngineReopensWithoutCleanClose$")
+	command.Env = append(os.Environ(), "KVBENCH_CRASH_HELPER="+string(kind), "KVBENCH_CRASH_DIR="+dataDir, "KVBENCH_CRASH_WAIT=1")
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		tb.Fatal(err)
+	}
+	scanner := bufio.NewScanner(stdout)
+	if !scanner.Scan() || scanner.Text() != "ready" {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		tb.Fatalf("crash helper did not become ready: %v", scanner.Err())
+	}
+	if err := command.Process.Kill(); err != nil {
+		tb.Fatal(err)
+	}
+	if err := command.Wait(); err == nil {
+		tb.Fatal("crash helper exited without a kill error")
 	}
 }

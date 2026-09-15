@@ -64,6 +64,22 @@ func (engine *bboltEngine) Get(_ context.Context, key []byte) ([]byte, error) {
 	return value, err
 }
 
+func (engine *bboltEngine) GetBatch(_ context.Context, keys [][]byte) ([][]byte, error) {
+	values := make([][]byte, len(keys))
+	err := engine.db.View(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(benchmarkBucketName)
+		for index, key := range keys {
+			value := bucket.Get(key)
+			if value == nil {
+				return ErrKeyNotFound
+			}
+			values[index] = bytes.Clone(value)
+		}
+		return nil
+	})
+	return values, err
+}
+
 func (engine *bboltEngine) Put(_ context.Context, key, value []byte) error {
 	if engine.useWriteBatch {
 		// Batch can run this callback more than once. Put is safe to repeat with the same key and value.
@@ -112,6 +128,71 @@ func (engine *bboltEngine) PutBatch(_ context.Context, pairs []Pair) error {
 	})
 }
 
+func (engine *bboltEngine) MixedBatch(_ context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
+	values := make([][]byte, len(keys))
+	err := engine.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(benchmarkBucketName)
+		for index, key := range keys {
+			value := bucket.Get(key)
+			if value == nil {
+				return ErrKeyNotFound
+			}
+			values[index] = bytes.Clone(value)
+		}
+		for _, pair := range pairs {
+			if err := bucket.Put(pair.Key, pair.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return values, err
+}
+
+func (engine *bboltEngine) ScanPrefix(_ context.Context, prefix []byte, visit func([]byte, []byte) error) error {
+	return engine.db.View(func(tx *bolt.Tx) error {
+		cursor := tx.Bucket(benchmarkBucketName).Cursor()
+		for key, value := cursor.Seek(prefix); key != nil && bytes.HasPrefix(key, prefix); key, value = cursor.Next() {
+			if err := visit(key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (engine *bboltEngine) VisitOrdered(_ context.Context, start, end []byte, reverse bool, limit int, visit func([]byte, []byte) error) error {
+	return engine.db.View(func(tx *bolt.Tx) error {
+		cursor := tx.Bucket(benchmarkBucketName).Cursor()
+		var key, value []byte
+		if reverse {
+			key, value = cursor.Last()
+		} else {
+			key, value = cursor.Seek(start)
+		}
+		for visited := 0; key != nil; visited++ {
+			if limit > 0 && visited >= limit {
+				break
+			}
+			if !reverse && len(end) > 0 && bytes.Compare(key, end) >= 0 {
+				break
+			}
+			if reverse && len(start) > 0 && bytes.Compare(key, start) < 0 {
+				break
+			}
+			if err := visit(key, value); err != nil {
+				return err
+			}
+			if reverse {
+				key, value = cursor.Prev()
+			} else {
+				key, value = cursor.Next()
+			}
+		}
+		return nil
+	})
+}
+
 func (engine *bboltEngine) Count(_ context.Context) (int, error) {
 	count := 0
 	err := engine.db.View(func(tx *bolt.Tx) error {
@@ -122,6 +203,73 @@ func (engine *bboltEngine) Count(_ context.Context) (int, error) {
 		return nil
 	})
 	return count, err
+}
+
+func (engine *bboltEngine) StorageStats(_ context.Context) (storageStats, error) {
+	primaryBytes, err := fileSize(engine.db.Path())
+	if err != nil {
+		return storageStats{}, err
+	}
+	return storageStats{primaryBytes: primaryBytes}, nil
+}
+
+func (engine *bboltEngine) PrepareCollections(_ context.Context, paths [][][]byte) error {
+	return engine.db.Update(func(tx *bolt.Tx) error {
+		for _, path := range paths {
+			bucket := tx.Bucket(benchmarkBucketName)
+			for _, name := range path {
+				var err error
+				bucket, err = bucket.CreateBucketIfNotExists(name)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+}
+
+func (engine *bboltEngine) PutCollectionBatch(_ context.Context, path [][]byte, pairs []Pair) error {
+	return engine.db.Update(func(tx *bolt.Tx) error {
+		bucket := bboltCollection(tx, path)
+		if bucket == nil {
+			return ErrKeyNotFound
+		}
+		for _, pair := range pairs {
+			if err := bucket.Put(pair.Key, pair.Value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (engine *bboltEngine) GetCollection(_ context.Context, path [][]byte, key []byte) ([]byte, error) {
+	var value []byte
+	err := engine.db.View(func(tx *bolt.Tx) error {
+		bucket := bboltCollection(tx, path)
+		if bucket == nil {
+			return ErrKeyNotFound
+		}
+		found := bucket.Get(key)
+		if found == nil {
+			return ErrKeyNotFound
+		}
+		value = bytes.Clone(found)
+		return nil
+	})
+	return value, err
+}
+
+func bboltCollection(tx *bolt.Tx, path [][]byte) *bolt.Bucket {
+	bucket := tx.Bucket(benchmarkBucketName)
+	for _, name := range path {
+		if bucket == nil {
+			return nil
+		}
+		bucket = bucket.Bucket(name)
+	}
+	return bucket
 }
 
 func (engine *bboltEngine) Close() error { return engine.db.Close() }

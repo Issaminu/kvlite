@@ -14,7 +14,21 @@ repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 readonly results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
 readonly measured_count="${KVBENCH_COUNT:-10}"
-readonly benchmark_filter="${KVBENCH_BENCH:-^BenchmarkAcknowledgedOperations$}"
+readonly benchmark_suite="${KVBENCH_SUITE:-core}"
+readonly large_suite="${KVBENCH_LARGE:-0}"
+case "${benchmark_suite}" in
+core) default_benchmark_filter='^BenchmarkAcknowledgedOperations$' ;;
+full) default_benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$' ;;
+*)
+	echo "KVBENCH_SUITE must be core or full." >&2
+	exit 1
+	;;
+esac
+readonly benchmark_filter="${KVBENCH_BENCH:-${default_benchmark_filter}}"
+if [[ "${large_suite}" != "0" && "${large_suite}" != "1" ]]; then
+	echo "KVBENCH_LARGE must be 0 or 1." >&2
+	exit 1
+fi
 if [[ ! "${measured_count}" =~ ^[1-9][0-9]*$ ]]; then
 	echo "KVBENCH_COUNT must be a positive integer." >&2
 	exit 1
@@ -92,6 +106,7 @@ run_go() {
 		--env KVBENCH_DURABILITY="${mode}" \
 		--env KVBENCH_ENGINE="${engine}" \
 		--env KVBENCH_FIXED_WORK=1 \
+		--env KVBENCH_LARGE="${large_suite}" \
 		--env KVBENCH_REDIS_ADDR="${redis_name}:6379" \
 		--env KVBENCH_REDIS_FLUSHDB=1 \
 		"${go_image}" \
@@ -151,6 +166,8 @@ verify_redis_reopen_after_kill() {
 	echo "Run date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 	echo "KVLite commit: $(git -C "${repository_dir}" rev-parse HEAD)"
 	echo "Measured count: ${measured_count}"
+	echo "Benchmark suite: ${benchmark_suite}"
+	echo "Large scale cases: ${large_suite}"
 	echo "Benchmark filter: ${benchmark_filter}"
 	echo "CPU set: ${cpu_set}"
 	echo "Working tree:"

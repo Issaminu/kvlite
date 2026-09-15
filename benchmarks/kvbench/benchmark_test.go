@@ -2,6 +2,7 @@ package kvbench
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
@@ -12,21 +13,25 @@ import (
 type benchmarkOperation string
 
 const (
-	benchmarkRead  benchmarkOperation = "read"
-	benchmarkWrite benchmarkOperation = "write"
-	benchmarkMixed benchmarkOperation = "mixed"
+	benchmarkRead   benchmarkOperation = "read"
+	benchmarkUpdate benchmarkOperation = "update"
+	benchmarkInsert benchmarkOperation = "insert"
+	benchmarkMixed  benchmarkOperation = "mixed"
 )
 
 type benchmarkCase struct {
-	name        string
-	operation   benchmarkOperation
-	operations  int
-	records     int
-	valueBytes  int
-	order       keyOrder
-	readPercent int
-	clients     int
-	batchSize   int
+	name            string
+	operation       benchmarkOperation
+	operations      int
+	records         int
+	valueBytes      int
+	setupValueBytes int
+	order           keyOrder
+	hitPercent      int
+	missPosition    string
+	readPercent     int
+	clients         int
+	batchSize       int
 }
 
 func benchmarkCases() []benchmarkCase {
@@ -47,12 +52,13 @@ func benchmarkCases() []benchmarkCase {
 				records:    records,
 				valueBytes: valueBytes,
 				order:      keyOrderRandom,
+				hitPercent: 100,
 				clients:    1,
 				batchSize:  1,
 			},
 			benchmarkCase{
-				name:       fmt.Sprintf("write/random/value=%d/clients=1", valueBytes),
-				operation:  benchmarkWrite,
+				name:       fmt.Sprintf("update/random/value=%d/clients=1", valueBytes),
+				operation:  benchmarkUpdate,
 				operations: pointWriteOperations,
 				records:    records,
 				valueBytes: valueBytes,
@@ -63,23 +69,61 @@ func benchmarkCases() []benchmarkCase {
 		)
 	}
 	cases = append(cases,
-		benchmarkCase{name: "read/sequential/value=128/clients=1", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderSequential, clients: 1, batchSize: 1},
-		benchmarkCase{name: "read/random/value=128/clients=8", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 8, batchSize: 1},
-		benchmarkCase{name: "write/random/value=128/clients=32", operation: benchmarkWrite, operations: concurrentOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 32, batchSize: 1},
+		benchmarkCase{name: "read/sequential/hits=100/value=128/clients=1", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderSequential, hitPercent: 100, clients: 1, batchSize: 1},
+		benchmarkCase{name: "read/random/hits=50/value=128/clients=1", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, hitPercent: 50, clients: 1, batchSize: 1},
+		benchmarkCase{name: "read/random/hits=0/misses=below/value=128/clients=1", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, hitPercent: 0, missPosition: "below", clients: 1, batchSize: 1},
+		benchmarkCase{name: "read/random/hits=0/misses=between/value=128/clients=1", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, hitPercent: 0, missPosition: "between", clients: 1, batchSize: 1},
+		benchmarkCase{name: "read/random/hits=0/misses=above/value=128/clients=1", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, hitPercent: 0, missPosition: "above", clients: 1, batchSize: 1},
+		benchmarkCase{name: "read/random/hits=100/value=128/clients=8", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, hitPercent: 100, clients: 8, batchSize: 1},
+		benchmarkCase{name: "read/random/hits=100/value=128/clients=32", operation: benchmarkRead, operations: pointReadOperations, records: records, valueBytes: 128, order: keyOrderRandom, hitPercent: 100, clients: 32, batchSize: 1},
+		benchmarkCase{name: "update/random/grow=32-1024/clients=1", operation: benchmarkUpdate, operations: pointWriteOperations, records: records, setupValueBytes: 32, valueBytes: 1024, order: keyOrderRandom, clients: 1, batchSize: 1},
+		benchmarkCase{name: "update/random/shrink=1024-32/clients=1", operation: benchmarkUpdate, operations: pointWriteOperations, records: records, setupValueBytes: 1024, valueBytes: 32, order: keyOrderRandom, clients: 1, batchSize: 1},
+		benchmarkCase{name: "insert/sequential/value=128/clients=1", operation: benchmarkInsert, operations: pointWriteOperations, records: records, valueBytes: 128, order: keyOrderSequential, clients: 1, batchSize: 1},
+		benchmarkCase{name: "insert/random/value=128/clients=1", operation: benchmarkInsert, operations: pointWriteOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 1, batchSize: 1},
+		benchmarkCase{name: "update/random/value=128/clients=8", operation: benchmarkUpdate, operations: concurrentOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 8, batchSize: 1},
+		benchmarkCase{name: "update/random/value=128/clients=32", operation: benchmarkUpdate, operations: concurrentOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 32, batchSize: 1},
+		benchmarkCase{name: "insert/random/value=128/clients=8", operation: benchmarkInsert, operations: concurrentOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 8, batchSize: 1},
+		benchmarkCase{name: "insert/random/value=128/clients=32", operation: benchmarkInsert, operations: concurrentOperations, records: records, valueBytes: 128, order: keyOrderRandom, clients: 32, batchSize: 1},
+		benchmarkCase{name: "mixed/read=95/value=128/clients=1", operation: benchmarkMixed, operations: mixedOperations, records: records, valueBytes: 128, order: keyOrderRandom, readPercent: 95, clients: 1, batchSize: 1},
 		benchmarkCase{name: "mixed/read=95/value=128/clients=8", operation: benchmarkMixed, operations: mixedOperations, records: records, valueBytes: 128, order: keyOrderRandom, readPercent: 95, clients: 8, batchSize: 1},
+		benchmarkCase{name: "mixed/read=95/value=128/clients=32", operation: benchmarkMixed, operations: mixedOperations, records: records, valueBytes: 128, order: keyOrderRandom, readPercent: 95, clients: 32, batchSize: 1},
+		benchmarkCase{name: "mixed/read=50/value=128/clients=1", operation: benchmarkMixed, operations: mixedOperations, records: records, valueBytes: 128, order: keyOrderRandom, readPercent: 50, clients: 1, batchSize: 1},
 		benchmarkCase{name: "mixed/read=50/value=128/clients=8", operation: benchmarkMixed, operations: mixedOperations, records: records, valueBytes: 128, order: keyOrderRandom, readPercent: 50, clients: 8, batchSize: 1},
+		benchmarkCase{name: "mixed/read=50/value=128/clients=32", operation: benchmarkMixed, operations: mixedOperations, records: records, valueBytes: 128, order: keyOrderRandom, readPercent: 50, clients: 32, batchSize: 1},
 	)
 	for _, batchSize := range []int{10, 100, 1000} {
-		cases = append(cases, benchmarkCase{
-			name:       fmt.Sprintf("write/random/value=128/clients=1/batch=%d", batchSize),
-			operation:  benchmarkWrite,
-			operations: records / batchSize,
-			records:    records,
-			valueBytes: 128,
-			order:      keyOrderRandom,
-			clients:    1,
-			batchSize:  batchSize,
-		})
+		for _, order := range []keyOrder{keyOrderSequential, keyOrderRandom} {
+			for _, operation := range []benchmarkOperation{benchmarkUpdate, benchmarkInsert} {
+				cases = append(cases, benchmarkCase{
+					name:       fmt.Sprintf("%s/%s/value=128/clients=1/batch=%d", operation, order, batchSize),
+					operation:  operation,
+					operations: records / batchSize,
+					records:    records,
+					valueBytes: 128,
+					order:      order,
+					clients:    1,
+					batchSize:  batchSize,
+				})
+			}
+		}
+	}
+	cases = append(cases,
+		benchmarkCase{name: "update/random/grow=32-1024/clients=1/batch=100", operation: benchmarkUpdate, operations: records / 100, records: records, setupValueBytes: 32, valueBytes: 1024, order: keyOrderRandom, clients: 1, batchSize: 100},
+		benchmarkCase{name: "update/random/shrink=1024-32/clients=1/batch=100", operation: benchmarkUpdate, operations: records / 100, records: records, setupValueBytes: 1024, valueBytes: 32, order: keyOrderRandom, clients: 1, batchSize: 100},
+	)
+	for _, clients := range []int{8, 32} {
+		for _, operation := range []benchmarkOperation{benchmarkUpdate, benchmarkInsert} {
+			cases = append(cases, benchmarkCase{
+				name:       fmt.Sprintf("%s/random/value=128/clients=%d/batch=100", operation, clients),
+				operation:  operation,
+				operations: records / 100,
+				records:    records,
+				valueBytes: 128,
+				order:      keyOrderRandom,
+				clients:    clients,
+				batchSize:  100,
+			})
+		}
 	}
 	return cases
 }
@@ -117,13 +161,32 @@ func BenchmarkAcknowledgedOperations(b *testing.B) {
 }
 
 func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redisAddress string, benchmarkCase benchmarkCase) {
-	setupPairs, err := makePairs(benchmarkCase.records, benchmarkCase.valueBytes, 1, keyOrderSequential, 1)
+	setupValueBytes := benchmarkCase.setupValueBytes
+	if setupValueBytes == 0 {
+		setupValueBytes = benchmarkCase.valueBytes
+	}
+	setupPairs, err := makePairs(benchmarkCase.records, setupValueBytes, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
-	operationPairs, err := makePairs(benchmarkCase.records, benchmarkCase.valueBytes, 1, benchmarkCase.order, 1)
+	workload := uint64(1)
+	if benchmarkCase.operation == benchmarkInsert {
+		workload = 2
+	}
+	operationPairs, err := makePairs(benchmarkCase.records, benchmarkCase.valueBytes, workload, benchmarkCase.order, 1)
 	if err != nil {
 		b.Fatal(err)
+	}
+	if benchmarkCase.operation == benchmarkRead && benchmarkCase.hitPercent < 100 {
+		for index := range operationPairs {
+			if index*37%100 >= benchmarkCase.hitPercent {
+				position := benchmarkCase.missPosition
+				if position == "" {
+					position = []string{"below", "between", "above"}[index%3]
+				}
+				operationPairs[index].Key = makeMissingKey(position, index)
+			}
+		}
 	}
 	if benchmarkCase.operation != benchmarkRead {
 		for index := range operationPairs {
@@ -160,14 +223,41 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	if err != nil {
 		b.Fatal(err)
 	}
-	if count != benchmarkCase.records {
-		b.Fatalf("database has %d keys, want %d", count, benchmarkCase.records)
+	wantCount := benchmarkCase.records
+	if benchmarkCase.operation == benchmarkInsert {
+		wantCount += uniqueWrittenKeys(operationPairs, benchmarkCase, schedule)
+	}
+	if count != wantCount {
+		b.Fatalf("database has %d keys, want %d", count, wantCount)
 	}
 	if err := validateStoredPairs(b, engine, setupPairs, operationPairs, benchmarkCase, schedule); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportMetric(float64(benchmarkCase.operations*benchmarkCase.batchSize)/b.Elapsed().Seconds(), "ack-keys/s")
 	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(benchmarkCase.operations), "ns/op")
+	stats, err := engine.StorageStats(b.Context())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportMetric(float64(stats.primaryBytes), "primary-B")
+	b.ReportMetric(float64(stats.logBytes), "log-B")
+	b.ReportMetric(float64(stats.primaryBytes+stats.logBytes), "persistent-B")
+	if stats.memoryBytes > 0 {
+		b.ReportMetric(float64(stats.memoryBytes), "dataset-memory-B")
+	}
+}
+
+func makeMissingKey(position string, index int) []byte {
+	switch position {
+	case "below":
+		return makeKey(0, uint64(index))
+	case "between":
+		return append(makeKey(1, uint64(index)), 0)
+	case "above":
+		return makeKey(2, uint64(index))
+	default:
+		panic("unknown missing-key position: " + position)
+	}
 }
 
 func prepareBenchmarkEngine(b *testing.B, kind EngineKind, mode DurabilityMode, redisAddress string, clients int, setupPairs []Pair) (Engine, error) {
@@ -209,7 +299,7 @@ func makeOperationSchedule(count, pairCount int, benchmarkCase benchmarkCase) []
 	schedule := make([]scheduledOperation, count)
 	for operation := range schedule {
 		pairIndex := operation % pairCount
-		write := benchmarkCase.operation == benchmarkWrite
+		write := benchmarkCase.operation == benchmarkUpdate || benchmarkCase.operation == benchmarkInsert
 		if benchmarkCase.operation == benchmarkMixed {
 			value := uint64(operation) + 0x9e3779b97f4a7c15
 			value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9
@@ -227,7 +317,10 @@ func makeOperationSchedule(count, pairCount int, benchmarkCase benchmarkCase) []
 
 func validateStoredPairs(b *testing.B, engine Engine, setupPairs, operationPairs []Pair, benchmarkCase benchmarkCase, schedule []scheduledOperation) error {
 	b.Helper()
-	written := make(map[string][]byte)
+	written := make(map[string][]byte, len(setupPairs)+len(schedule)*benchmarkCase.batchSize)
+	for _, pair := range setupPairs {
+		written[string(pair.Key)] = pair.Value
+	}
 	for _, operation := range schedule {
 		if !operation.write {
 			continue
@@ -237,20 +330,29 @@ func validateStoredPairs(b *testing.B, engine Engine, setupPairs, operationPairs
 			written[string(pair.Key)] = pair.Value
 		}
 	}
-	for _, pair := range setupPairs {
-		want := pair.Value
-		if value, ok := written[string(pair.Key)]; ok {
-			want = value
-		}
-		got, err := engine.Get(b.Context(), pair.Key)
+	for key, want := range written {
+		got, err := engine.Get(b.Context(), []byte(key))
 		if err != nil {
 			return err
 		}
 		if !bytes.Equal(got, want) {
-			return fmt.Errorf("stored value for key %x does not match", pair.Key)
+			return fmt.Errorf("stored value for key %x does not match", key)
 		}
 	}
 	return nil
+}
+
+func uniqueWrittenKeys(pairs []Pair, benchmarkCase benchmarkCase, schedule []scheduledOperation) int {
+	keys := make(map[string]struct{})
+	for _, operation := range schedule {
+		if !operation.write {
+			continue
+		}
+		for offset := range benchmarkCase.batchSize {
+			keys[string(pairs[operation.pairIndex+offset].Key)] = struct{}{}
+		}
+	}
+	return len(keys)
 }
 
 func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmarkCase benchmarkCase, schedule []scheduledOperation) error {
@@ -260,10 +362,18 @@ func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmark
 			pair := pairs[scheduled.pairIndex]
 			switch benchmarkCase.operation {
 			case benchmarkRead:
-				if _, err := engine.Get(b.Context(), pair.Key); err != nil {
+				_, err := engine.Get(b.Context(), pair.Key)
+				missing := len(pair.Key) != 16 || binary.BigEndian.Uint64(pair.Key[:8]) != 1
+				if missing && errors.Is(err, ErrKeyNotFound) {
+					continue
+				}
+				if err != nil {
 					return err
 				}
-			case benchmarkWrite:
+				if missing {
+					return fmt.Errorf("missing key %x was found", pair.Key)
+				}
+			case benchmarkUpdate, benchmarkInsert:
 				if benchmarkCase.batchSize == 1 {
 					if err := engine.Put(b.Context(), pair.Key, pair.Value); err != nil {
 						return err
