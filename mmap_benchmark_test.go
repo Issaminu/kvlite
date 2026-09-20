@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 )
 
@@ -23,6 +24,39 @@ func BenchmarkGet_LargeUniform(b *testing.B) {
 	defer db.Close()
 
 	benchmarkLargeUniformGets(b, db, keys)
+}
+
+// BenchmarkGet_LargeUniformParallelWarm measures parallel point reads after every key has been read once.
+func BenchmarkGet_LargeUniformParallelWarm(b *testing.B) {
+	path, db, keys := prepareLargeGetBenchmark(b)
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+
+	db, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+
+	for _, key := range keys {
+		if _, err := db.Get([]byte("bench"), key); err != nil {
+			b.Fatal(err)
+		}
+	}
+
+	var seed atomic.Int64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		random := rand.New(rand.NewSource(seed.Add(1)))
+		for pb.Next() {
+			if _, err := db.Get([]byte("bench"), keys[random.Intn(len(keys))]); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }
 
 // BenchmarkGet_LargeUniformWAL measures point reads from the WAL overlay.
