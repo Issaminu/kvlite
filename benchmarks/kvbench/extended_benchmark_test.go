@@ -305,7 +305,7 @@ func BenchmarkScaleAndAccessDistribution(b *testing.B) {
 		b.Skip("read results do not depend on commit sync mode")
 	}
 	sizes := []int{10_000, 100_000}
-	if os.Getenv("KVBENCH_LARGE") == "1" {
+	if os.Getenv("KVBENCH_PROFILE") == "heavy" {
 		sizes = append(sizes, 1_000_000)
 	}
 	for _, records := range sizes {

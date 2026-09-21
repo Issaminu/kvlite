@@ -1,6 +1,6 @@
 # KVLite benchmarks
 
-This report compares KVLite with bbolt and Redis at the caller API boundary. It presents the median of 10 fixed-work runs from the full KVLite benchmark suite.
+This report compares KVLite with bbolt and Redis at the caller API boundary. It presents the median of 10 fixed-work runs from what is now the large benchmark profile.
 
 | Item | Value |
 | --- | --- |
@@ -91,7 +91,7 @@ The runner used fixed work and one process per engine. It changed engine and dur
 
 The timed sections included the selected API operations and their required acknowledgements. Automatic checkpoint work can occur during a timed sequence. A later API operation waits for that work. The final automatic checkpoint can finish after the timer stops. The timed sections excluded setup, final validation, close, and deferred sync unless a life-cycle case names that work. The latency tables report the median p50, p95, p99, and maximum values from the 10 runs.
 
-The run used the full suite without the optional one-million-key cases. All 60 measured engine runs passed their runtime and data checks.
+The run used what is now the large profile. It did not include the one-million-key cases. All 60 measured engine runs passed their runtime and data checks.
 
 ## Interpretation
 
@@ -140,11 +140,8 @@ Run the same suite from the repository root:
 
 ```sh
 cd benchmarks/kvbench
-KVBENCH_SUITE=full \
-KVBENCH_LARGE=0 \
-KVBENCH_COUNT=10 \
-KVBENCH_RESULTS_DIR=/tmp/kvlite-kvbench-full-20260915 \
-./run-docker.sh
+KVBENCH_RESULTS_DIR=/tmp/kvlite-kvbench-large-20260915 \
+./run-docker.sh large
 ```
 
 The runner uses pinned Go and Redis container images. The Go module pins bbolt and the Redis client. Change the results directory for a new run.

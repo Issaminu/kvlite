@@ -11,28 +11,33 @@ The suite has three result groups:
 
 ## Run the suite
 
-Run the core suite:
+Run the light profile during normal development:
 
 ```sh
 cd benchmarks/kvbench
 ./run-docker.sh
 ```
 
-Run all supported cases except deletion:
+Select a more thorough profile when you need more stable results:
 
 ```sh
-KVBENCH_SUITE=full ./run-docker.sh
+./run-docker.sh medium
+./run-docker.sh large
+./run-docker.sh heavy
 ```
 
-Add the one-million-key scale cases:
+| Profile | Benchmark groups | Measured runs | One-million-key cases | Use |
+| --- | --- | ---: | --- | --- |
+| `light` | All | 1 | No | Common development work |
+| `medium` | All | 3 | No | A development check with repeated results |
+| `large` | All | 10 | No | Release reports and matched comparisons |
+| `heavy` | All | 10 | Yes | The widest supported scale coverage |
 
-```sh
-KVBENCH_SUITE=full KVBENCH_LARGE=1 ./run-docker.sh
-```
+Every profile runs acknowledged operations, transactions, enumeration, ordered operations, scale, latency, collections, and life-cycle cases. The light profile has no repetitions. A light result can show a large change, but it cannot prove a small performance change.
 
 The runner uses pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout. It runs all engines on Linux. It puts database files on one temporary Docker volume.
 
-The runner uses up to four Docker CPUs by default. Set `KVBENCH_CPUSET` to select another shared CPU set. Set `KVBENCH_RESULTS_DIR` to select the output directory. Set `KVBENCH_COUNT` to change the default ten repetitions. Set `KVBENCH_BENCH` to select exact benchmark functions or cases.
+The runner uses up to four Docker CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. They can set `KVBENCH_RESULTS_DIR` to select the output directory.
 
 ## Fairness contract
 
@@ -91,7 +96,7 @@ Each case starts with 10,000 keys. Point read cases run 100,000 operations. One-
 
 ### Scale and access distribution
 
-`BenchmarkScaleAndAccessDistribution` tests 10,000 and 100,000 keys. It tests uniform reads and an 80/20 hot set. `KVBENCH_LARGE=1` adds one million keys.
+`BenchmarkScaleAndAccessDistribution` tests 10,000 and 100,000 keys. It tests uniform reads and an 80/20 hot set. The heavy profile adds one million keys.
 
 These are warm operating-system-cache tests. A reopen does not make a reliable cold-cache test. Redis also keeps its data in memory. The suite does not label any case as cold unless the runner can enforce the same memory pressure for the complete Redis server and each embedded process.
 

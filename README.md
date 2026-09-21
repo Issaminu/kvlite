@@ -347,7 +347,7 @@ In [KVBench](benchmarks/kvbench), KVLite led every measured point-read case, eve
 
 The results apply only to the tested machine and workloads. Durable and no-commit-sync results have different guarantees. See the [complete benchmark report](BENCHMARKS.md) and the [benchmark suite guide](benchmarks/kvbench/README.md).
 
-Run the complete suite in its Linux containers:
+Run the light benchmark profile in its Linux containers:
 
 ```sh
 cd benchmarks/kvbench
