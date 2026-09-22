@@ -35,13 +35,11 @@ type benchmarkCase struct {
 }
 
 func benchmarkCases() []benchmarkCase {
-	const (
-		records              = 10_000
-		pointReadOperations  = 100_000
-		pointWriteOperations = 1_000
-		concurrentOperations = 3_200
-		mixedOperations      = 10_000
-	)
+	records := profileSizedValue(10_000, 3_000, 1_000)
+	pointReadOperations := profileSizedValue(100_000, 10_000, 1_000)
+	pointWriteOperations := profileSizedValue(1_000, 200, 100)
+	concurrentOperations := profileSizedValue(3_200, 640, 320)
+	mixedOperations := profileSizedValue(10_000, 2_000, 1_000)
 	var cases []benchmarkCase
 	for _, valueBytes := range []int{32, 128, 1024, 3072} {
 		cases = append(cases,
@@ -125,7 +123,56 @@ func benchmarkCases() []benchmarkCase {
 			})
 		}
 	}
-	return cases
+	var selected map[string]bool
+	if lightProfile() {
+		selected = map[string]bool{
+			"read/random/value=128/clients=1":             true,
+			"update/random/value=128/clients=1":           true,
+			"insert/random/value=128/clients=1":           true,
+			"mixed/read=95/value=128/clients=8":           true,
+			"update/random/value=128/clients=1/batch=100": true,
+		}
+	} else if mediumProfile() {
+		selected = map[string]bool{
+			"read/random/value=128/clients=1":                       true,
+			"read/random/value=3072/clients=1":                      true,
+			"read/sequential/hits=100/value=128/clients=1":          true,
+			"read/random/hits=0/misses=between/value=128/clients=1": true,
+			"read/random/hits=100/value=128/clients=8":              true,
+			"update/random/value=128/clients=1":                     true,
+			"update/random/grow=32-1024/clients=1":                  true,
+			"insert/random/value=128/clients=1":                     true,
+			"update/random/value=128/clients=8":                     true,
+			"insert/random/value=128/clients=8":                     true,
+			"mixed/read=95/value=128/clients=8":                     true,
+			"mixed/read=50/value=128/clients=8":                     true,
+			"update/random/value=128/clients=1/batch=100":           true,
+			"insert/random/value=128/clients=1/batch=100":           true,
+			"update/random/value=128/clients=8/batch=100":           true,
+		}
+	}
+	profileCases := cases[:0]
+	for _, benchmarkCase := range cases {
+		if (selected == nil || selected[benchmarkCase.name]) && workloadEnabled(benchmarkCase.operation) {
+			profileCases = append(profileCases, benchmarkCase)
+		}
+	}
+	return profileCases
+}
+
+func workloadEnabled(operation benchmarkOperation) bool {
+	switch os.Getenv("KVBENCH_WORKLOAD") {
+	case "", "all":
+		return true
+	case "reads":
+		return operation == benchmarkRead
+	case "writes":
+		return operation == benchmarkUpdate || operation == benchmarkInsert
+	case "mixed":
+		return operation == benchmarkMixed
+	default:
+		panic("unknown KVBENCH_WORKLOAD")
+	}
 }
 
 func BenchmarkAcknowledgedOperations(b *testing.B) {

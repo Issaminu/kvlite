@@ -1,13 +1,14 @@
 # KVLite benchmark suite
 
-This suite compares KVLite, bbolt, and Redis at the caller API boundary. It uses fixed work. It checks each durability mode before and after each timed write case.
+This suite compares KVLite, bbolt, and Redis at the caller API boundary. It uses fixed work and checks each durability mode before and after each timed write case.
 
 The suite has three result groups:
 
-- Matched three-engine tests cover point operations, transactions, enumeration, scale, latency, and storage size.
+- Matched three-engine tests cover point operations, transactions, enumeration, access distribution, latency, and storage size.
 - Ordered tests compare KVLite and bbolt. Redis does not provide the required ordered cursor API.
 - Life-cycle tests compare the two embedded engines. The Redis server life cycle does not fit inside the Go client benchmark.
 
+See the repository [benchmark report](../../BENCHMARKS.md) for the latest published run. The current report uses `medium --workloads=all` and includes every workload group in the medium decision set.
 
 ## Run the suite
 
@@ -18,26 +19,61 @@ cd benchmarks/kvbench
 ./run-docker.sh
 ```
 
-Select a more thorough profile when you need more stable results:
+Select another profile when you need repeated results or complete case coverage:
 
 ```sh
 ./run-docker.sh medium
 ./run-docker.sh large
-./run-docker.sh heavy
 ```
 
-| Profile | Benchmark groups | Measured runs | One-million-key cases | Use |
+All profiles run all three engines by default. Select a smaller engine set when needed:
+
+```sh
+./run-docker.sh light --engines=kvlite,bbolt
+./run-docker.sh light --engines=kvlite
+./run-docker.sh --engines=kvlite
+```
+
+When you omit the profile, the runner uses light.
+
+Select the measured workload when you do not need the complete suite:
+
+```sh
+./run-docker.sh light --workloads=reads
+./run-docker.sh medium --workloads=writes
+./run-docker.sh medium --workloads=mixed
+```
+
+The workload values have these meanings:
+
+- `reads` runs pure read workloads.
+- `writes` runs pure update and insert workloads.
+- `mixed` runs workloads that combine reads and writes.
+- `all` runs every workload, including life-cycle cases. It is the default.
+
+The modifier selects measured work. Read fixtures still use the same durable setup before measurement. Options can appear in any order.
+
+| Profile | Scope | Warm-up | Measurement | Use |
 | --- | --- | ---: | --- | --- |
-| `light` | All | 1 | No | Common development work |
-| `medium` | All | 3 | No | A development check with repeated results |
-| `large` | All | 10 | No | Release reports and matched comparisons |
-| `heavy` | All | 10 | Yes | The widest supported scale coverage |
+| `light` | One representative case from every comparison group | 0 | 1 fixed-work run | Fast directional development feedback |
+| `medium` | A selected decision set from every comparison group | 1 | 5 fixed-work runs | Repeated engineering comparisons |
+| `large` | Every case variant at the standard work size | 1 | 10 fixed-work runs | Release and publication results |
 
-Every profile runs acknowledged operations, transactions, enumeration, ordered operations, scale, latency, collections, and life-cycle cases. The light profile has no repetitions. A light result can show a large change, but it cannot prove a small performance change.
+The light profile compares the selected engines in Docker. It skips pre-run test passes. It uses 1,000 records, 1,000 point reads or mixed operations, 100 point writes, and 320 concurrent point writes. It is directional and cannot prove a small performance change.
 
-The runner uses pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout. It runs all engines on Linux. It puts database files on one temporary Docker volume.
+The medium profile uses 3,000 records for its main cases. It uses 10,000 point reads, 200 single-client point writes, 640 concurrent point writes, and 2,000 mixed operations. It keeps 15 core cases. These cases cover misses, sequential and random reads, large values, value growth, inserts, updates, concurrency, mixed work, and batches.
 
-The runner uses up to four Docker CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. They can set `KVBENCH_RESULTS_DIR` to select the output directory.
+The large profile uses the full case matrix. It uses 10,000 records, 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations.
+
+Medium and large run one unrecorded pass before measurement. Medium records five runs. Large records ten runs. The runner changes engine order and durability-mode order across the measured runs. Read-only runs do not repeat the no-sync mode because commit sync does not affect reads.
+
+A large run is suitable for environment-specific publication. Keep the raw values and environment record with every published report.
+
+All profiles use pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout, runs the selected engines on Linux, and puts database files on one temporary Docker volume. It keeps the Go module and build caches in the `kvlite-kvbench-go-cache` Docker volume. The cache reduces repeat-run setup time. It does not contain benchmark data.
+
+The full warm-up pass prepares the executable, container, and shared operating-system state. It does not reuse a measured database fixture. Read-latency cases also perform unrecorded operations against their own loaded fixture before they start the timer. Medium and large run the correctness tests before warm-up and measurement.
+
+The Docker profiles use up to four CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. All profiles can set `KVBENCH_RESULTS_DIR` to select the output directory.
 
 ## Fairness contract
 
@@ -53,7 +89,6 @@ The suite applies these rules:
 8. The suite checks the stored key count and values after each core case.
 9. Scan tests count every result and consume each key and value through a checksum.
 10. The runner saves the commit, working-tree patch, source hashes, versions, Docker details, CPU set, and raw output.
-
 
 ## Benchmark groups
 
@@ -75,7 +110,7 @@ The core group covers:
 - Concurrent 100-key update and insert batches at 8 and 32 clients.
 - Mixed work with 95% or 50% reads.
 
-Each case starts with 10,000 keys. Point read cases run 100,000 operations. One-client point write cases run 1,000 operations. Concurrent point write cases run 3,200 operations. Mixed cases run 10,000 operations. Batch cases process 10,000 keys.
+The medium profile uses the selected cases and work sizes listed above. Large uses every case and the standard work sizes. Light uses the smallest fixed workloads.
 
 ### Read and mixed transactions
 
@@ -94,9 +129,9 @@ Each case starts with 10,000 keys. Point read cases run 100,000 operations. One-
 - Full forward iteration.
 - Full reverse iteration.
 
-### Scale and access distribution
+### Access distribution
 
-`BenchmarkScaleAndAccessDistribution` tests 10,000 and 100,000 keys. It tests uniform reads and an 80/20 hot set. The heavy profile adds one million keys.
+`BenchmarkScaleAndAccessDistribution` tests 1,000 keys in light, 10,000 keys in medium, and 10,000 and 100,000 keys in large. Each profile tests uniform reads and an 80/20 hot set. Each distribution uses a separate fixture.
 
 These are warm operating-system-cache tests. A reopen does not make a reliable cold-cache test. Redis also keeps its data in memory. The suite does not label any case as cold unless the runner can enforce the same memory pressure for the complete Redis server and each embedded process.
 
@@ -104,7 +139,11 @@ These are warm operating-system-cache tests. A reopen does not make a reliable c
 
 `BenchmarkLatency` reports `p50-ns`, `p95-ns`, `p99-ns`, and `max-ns`. It tests reads, updates, and 95/5 mixed work at 1, 8, and 32 clients.
 
+Light measures 10,000 reads, 1,000 updates, and 1,000 mixed operations in each selected latency case. Medium measures 100,000 reads, 1,000 updates, and 10,000 mixed operations. Large measures 1,000,000 reads, 10,000 updates, and 100,000 mixed operations. Read-latency cases first run 100, 1,000, or 10,000 unrecorded operations for light, medium, or large.
+
 The latency timer calls `time.Now` for each operation. Use the core group for throughput. Use the latency group for the latency distribution. Do not use latency-group throughput as the primary throughput result.
+
+Point-read latency uses each engine's single-call caller boundary. KVLite uses `DB.Get`. bbolt uses one `DB.View` transaction for each read because bbolt does not provide a direct `DB.Get`. Redis uses one client request. Use `BenchmarkReadTransactions` when transaction setup must be amortized across several reads. State this boundary in every latency claim.
 
 ### Collections
 
@@ -114,30 +153,30 @@ The latency timer calls `time.Now` for each operation. Use the core group for th
 
 `BenchmarkLifecycle` compares KVLite and bbolt for:
 
-- Create, load 10,000 keys, and close.
+- Create, load keys, and close. Light uses 1,000 keys, medium uses 3,000 keys, and large uses 10,000 keys.
 - Open a clean database.
 - Close after fixed writes.
 - Open and verify a database after its writer process is killed.
 
-The last case measures recovery after acknowledged durable writes. It kills the writer process after the write returns. It does not simulate loss of operating-system cache or a power failure. Redis restart validation runs in the Docker runner, but it is not ranked against embedded open time. KVLite performs its final checkpoint during close, so the close-after-writes case includes that work.
+The last case measures recovery after acknowledged durable writes. It kills the writer process after the write returns. It does not simulate loss of operating-system cache or a power failure. The Docker runner checks Redis restart behavior, but it does not rank that check against embedded open time. KVLite performs its final checkpoint during close, so the close-after-writes case includes that work.
 
 Deletion and delete churn are not in this version.
 
 ## Metrics
 
-| Metric | Meaning |
-| --- | --- |
-| `ns/op` | Time for one logical benchmark iteration. Fixed-work subtests also report a named rate. |
-| `ack-keys/s` | Keys acknowledged each second. A write batch counts each key. |
-| `keys/s`, `reads/s`, `entries/s`, `operations/s` | Completed work for the named suite. |
-| `p50-ns`, `p95-ns`, `p99-ns`, `max-ns` | Caller-visible operation latency in the latency suite. |
-| `primary-B` | Main database-file bytes. Redis reports zero because AOF is its tested persistent file. |
-| `log-B` | KVLite WAL bytes or Redis AOF bytes. bbolt reports zero because it has no separate log file. |
-| `persistent-B` | `primary-B + log-B`. |
-| `wal-written-B` | Successful KVLite WAL transaction bytes since the benchmark opened the database. A checkpoint does not decrease this value. |
-| `checkpoints` | Completed KVLite checkpoints since the benchmark opened the database. The value excludes the final close. |
-| `dataset-memory-B` | Redis `used_memory_dataset`. It is an extra Redis-only value. |
-| `checksum` | A deterministic value that proves scan output was consumed. |
+| Metric                                           | Meaning                                                                                                                     |
+| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `ns/op`                                          | Time for one logical benchmark iteration. Fixed-work subtests also report a named rate.                                     |
+| `ack-keys/s`                                     | Keys acknowledged each second. A write batch counts each key.                                                               |
+| `keys/s`, `reads/s`, `entries/s`, `operations/s` | Completed work for the named suite.                                                                                         |
+| `p50-ns`, `p95-ns`, `p99-ns`, `max-ns`           | Caller-visible operation latency in the latency suite.                                                                      |
+| `primary-B`                                      | Main database-file bytes. Redis reports zero because AOF is its tested persistent file.                                     |
+| `log-B`                                          | KVLite WAL bytes or Redis AOF bytes. bbolt reports zero because it has no separate log file.                                |
+| `persistent-B`                                   | `primary-B + log-B`.                                                                                                        |
+| `wal-written-B`                                  | Successful KVLite WAL transaction bytes since the benchmark opened the database. A checkpoint does not decrease this value. |
+| `checkpoints`                                    | Completed KVLite checkpoints since the benchmark opened the database. The value excludes the final close.                   |
+| `dataset-memory-B`                               | Redis `used_memory_dataset`. It is an extra Redis-only value.                                                               |
+| `checksum`                                       | A deterministic value that proves scan output was consumed.                                                                 |
 
 The suite does not report cross-engine Go allocation values. Redis server allocations do not appear in the Go client process.
 
@@ -145,25 +184,25 @@ The suite does not report cross-engine Go allocation values. Redis server alloca
 
 ## Matched API boundaries
 
-| Logical operation | KVLite | bbolt | Redis |
-| --- | --- | --- | --- |
-| Point read | `DB.Get` | One read transaction | `GET` |
-| Grouped read | One read transaction | One read transaction | `MGET` |
-| Point write, one client | `DB.Put` | `DB.Update` | `SET` |
-| Point write, many clients | `DB.Put` | `DB.Batch` | `SET` |
-| Batch write | One write transaction | One write transaction | `MULTI` and `EXEC` |
-| Mixed transaction | One write transaction | One write transaction | `MULTI` and `EXEC` |
-| Prefix enumeration | Ordered prefix cursor | Ordered prefix cursor | `SCAN` and `MGET` |
-| Key count | Bucket cursor scan | Bucket cursor scan | `DBSIZE` |
+| Logical operation         | KVLite                | bbolt                 | Redis              |
+| ------------------------- | --------------------- | --------------------- | ------------------ |
+| Point read                | `DB.Get`              | One read transaction  | `GET`              |
+| Grouped read              | One read transaction  | One read transaction  | `MGET`             |
+| Point write, one client   | `DB.Put`              | `DB.Update`           | `SET`              |
+| Point write, many clients | `DB.Put`              | `DB.Batch`            | `SET`              |
+| Batch write               | One write transaction | One write transaction | `MULTI` and `EXEC` |
+| Mixed transaction         | One write transaction | One write transaction | `MULTI` and `EXEC` |
+| Prefix enumeration        | Ordered prefix cursor | Ordered prefix cursor | `SCAN` and `MGET`  |
+| Key count                 | Bucket cursor scan    | Bucket cursor scan    | `DBSIZE`           |
 
 KVLite groups concurrent `SyncFull` updates before one WAL sync. Redis can group AOF writes from several clients before one reply group. The bbolt adapter uses `DB.Batch` for concurrent durable point writes. These are native group-commit paths. Their group limits are not equal. The suite does not hide this engine behavior.
 
 ## Durability modes
 
-| Mode | KVLite | bbolt | Redis |
-| --- | --- | --- | --- |
-| `durable` | `SyncFull` | `NoSync=false`; `NoGrowSync=false`; `NoFreelistSync=false` | AOF on; `appendfsync always` |
-| `no-commit-sync` | `SyncNone` | `NoSync=true`; `NoGrowSync=true`; `NoFreelistSync=false` | AOF on; `appendfsync no` |
+| Mode             | KVLite     | bbolt                                                      | Redis                        |
+| ---------------- | ---------- | ---------------------------------------------------------- | ---------------------------- |
+| `durable`        | `SyncFull` | `NoSync=false`; `NoGrowSync=false`; `NoFreelistSync=false` | AOF on; `appendfsync always` |
+| `no-commit-sync` | `SyncNone` | `NoSync=true`; `NoGrowSync=true`; `NoFreelistSync=false`   | AOF on; `appendfsync no`     |
 
 On Linux, KVLite uses `fdatasync` for WAL and main-file data. bbolt uses `fdatasync` for transaction data and metadata. Redis uses its Linux data-sync path for AOF. bbolt can issue two data syncs for one transaction. The suite keeps that native design.
 
@@ -198,6 +237,6 @@ The contract tests check grouped reads, mixed transactions, enumeration, stored-
 
 ## Measured boundary
 
-Core timers include only selected API operations and required acknowledgements. They exclude open, fixture load, final validation, and close. The life-cycle group measures excluded work separately.
+Core timers include only selected API operations and required acknowledgements. They exclude open, fixture load, final stored-data checks, and close. The life-cycle group measures excluded work separately.
 
 Use raw files with `benchstat`. Keep hardware, CPU set, Docker system, source hashes, versions, suite, and benchmark filter unchanged.

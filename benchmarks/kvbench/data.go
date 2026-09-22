@@ -5,7 +5,33 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/rand"
+	"os"
 )
+
+func profileValue(standard, light int) int {
+	if lightProfile() {
+		return light
+	}
+	return standard
+}
+
+func lightProfile() bool {
+	return os.Getenv("KVBENCH_PROFILE") == "light"
+}
+
+func mediumProfile() bool {
+	return os.Getenv("KVBENCH_PROFILE") == "medium"
+}
+
+func profileSizedValue(full, medium, light int) int {
+	if lightProfile() {
+		return light
+	}
+	if mediumProfile() {
+		return medium
+	}
+	return full
+}
 
 type keyOrder string
 

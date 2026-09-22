@@ -9,19 +9,33 @@ import (
 )
 
 func BenchmarkCollections(b *testing.B) {
+	if !workloadEnabled(benchmarkRead) && !workloadEnabled(benchmarkUpdate) {
+		b.Skip("read and write workloads are not selected")
+	}
 	environment := readBenchmarkEnvironment(b)
-	for _, count := range []int{1, 100} {
-		for _, depth := range []int{1, 3} {
+	counts := []int{1, 100}
+	depths := []int{1, 3}
+	if lightProfile() {
+		counts = []int{100}
+		depths = []int{3}
+	}
+	for _, count := range counts {
+		for _, depth := range depths {
+			if mediumProfile() && !((count == 1 && depth == 1) || (count == 100 && depth == 3)) {
+				continue
+			}
 			paths := makeCollectionPaths(count, depth)
 			model := "native-buckets"
 			if environment.kind == EngineRedis {
 				model = "logical-prefixes"
 			}
 			name := fmt.Sprintf("collections=%d/depth=%d/model=%s/%s", count, depth, model, environment.kind)
-			b.Run(name, func(b *testing.B) {
-				benchmarkCollectionWrites(b, environment, paths)
-			})
-			if environment.mode == DurabilityDurable {
+			if workloadEnabled(benchmarkUpdate) {
+				b.Run(name, func(b *testing.B) {
+					benchmarkCollectionWrites(b, environment, paths)
+				})
+			}
+			if workloadEnabled(benchmarkRead) && environment.mode == DurabilityDurable {
 				b.Run("read/"+name, func(b *testing.B) {
 					benchmarkCollectionReads(b, environment, paths)
 				})
@@ -40,7 +54,7 @@ func benchmarkCollectionWrites(b *testing.B, environment benchmarkEnvironment, p
 	if !ok {
 		b.Fatalf("%s does not implement collections", environment.kind)
 	}
-	const totalKeys = 10_000
+	totalKeys := profileSizedValue(10_000, 3_000, 1_000)
 	const batchSize = 100
 	transactions := make([][]Pair, totalKeys/batchSize)
 	for transaction := range transactions {
@@ -55,7 +69,7 @@ func benchmarkCollectionWrites(b *testing.B, environment benchmarkEnvironment, p
 		}
 		transactions[transaction] = pairs
 	}
-	b.SetBytes(totalKeys * 128)
+	b.SetBytes(int64(totalKeys * 128))
 	b.ResetTimer()
 	for transaction, pairs := range transactions {
 		pathIndex := transaction % len(paths)
@@ -64,7 +78,7 @@ func benchmarkCollectionWrites(b *testing.B, environment benchmarkEnvironment, p
 		}
 	}
 	b.StopTimer()
-	b.ReportMetric(totalKeys/b.Elapsed().Seconds(), "keys/s")
+	b.ReportMetric(float64(totalKeys)/b.Elapsed().Seconds(), "keys/s")
 }
 
 func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, paths [][][]byte) {
@@ -77,7 +91,7 @@ func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, pa
 	if !ok {
 		b.Fatalf("%s does not implement collections", environment.kind)
 	}
-	const totalKeys = 10_000
+	totalKeys := profileSizedValue(10_000, 3_000, 1_000)
 	keysPerCollection := totalKeys / len(paths)
 	pairsByCollection := make([][]Pair, len(paths))
 	for pathIndex, path := range paths {
@@ -90,9 +104,9 @@ func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, pa
 		}
 		pairsByCollection[pathIndex] = pairs
 	}
-	const operations = 100_000
+	operations := profileSizedValue(100_000, 10_000, 1_000)
 	var checksum uint64
-	b.SetBytes(operations * 128)
+	b.SetBytes(int64(operations * 128))
 	b.ResetTimer()
 	for operation := range operations {
 		pathIndex := operation % len(paths)
@@ -104,7 +118,7 @@ func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, pa
 		checksum = consumePair(checksum, key, value)
 	}
 	b.StopTimer()
-	b.ReportMetric(operations/b.Elapsed().Seconds(), "reads/s")
+	b.ReportMetric(float64(operations)/b.Elapsed().Seconds(), "reads/s")
 	b.ReportMetric(checksumMetric(checksum), "checksum")
 }
 
@@ -155,6 +169,9 @@ func makeCollectionPaths(count, depth int) [][][]byte {
 }
 
 func BenchmarkLifecycle(b *testing.B) {
+	if workload := os.Getenv("KVBENCH_WORKLOAD"); workload != "" && workload != "all" {
+		b.Skip("life-cycle workloads run only with all workloads selected")
+	}
 	environment := readBenchmarkEnvironment(b)
 	if environment.kind == EngineRedis {
 		b.Skip("Redis server lifecycle work must run outside the client process")
@@ -163,7 +180,8 @@ func BenchmarkLifecycle(b *testing.B) {
 		b.Skip("recovery requires acknowledged durable writes")
 	}
 	b.Run("create-load-close/"+string(environment.kind), func(b *testing.B) {
-		pairs, err := makePairs(10_000, 128, 1, keyOrderSequential, 1)
+		records := profileSizedValue(10_000, 3_000, 1_000)
+		pairs, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -182,7 +200,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.ReportMetric(10_000/b.Elapsed().Seconds(), "loaded-keys/s")
+		b.ReportMetric(float64(records)/b.Elapsed().Seconds(), "loaded-keys/s")
 	})
 
 	b.Run("open-clean/"+string(environment.kind), func(b *testing.B) {
@@ -206,7 +224,7 @@ func BenchmarkLifecycle(b *testing.B) {
 	})
 
 	b.Run("close-after-writes/"+string(environment.kind), func(b *testing.B) {
-		pairs, err := makePairs(10_000, 128, 1, keyOrderSequential, 1)
+		pairs, err := makePairs(profileSizedValue(10_000, 3_000, 1_000), 128, 1, keyOrderSequential, 1)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -214,7 +232,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		updates := makeTextPairs(1_000, 128)
+		updates := makeTextPairs(profileSizedValue(1_000, 300, 100), 128)
 		if err := loadPairs(b.Context(), engine, updates, 100); err != nil {
 			b.Fatal(errors.Join(err, engine.Close()))
 		}

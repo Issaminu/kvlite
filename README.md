@@ -327,23 +327,19 @@ options := &kvlite.Options{
 db, err := kvlite.Open("app.db", 0o600, options)
 ```
 
-
-
 ## Benchmarks
 
-In [KVBench](benchmarks/kvbench), KVLite led every measured point-read case, every database-scale and access-distribution read case, and every collection-read case. In the highlighted cases, it delivered up to 3.88x the throughput and 25.76x lower p99 latency than the next-fastest engine. It also led durable 95%-read mixed work by 5.39x, no-commit-sync point updates by 2.02x, and clean-open latency by 21.22x.
+The current [KVBench](benchmarks/kvbench) report contains the median of five measured `medium --workloads=all` runs. At eight clients, KVLite delivered **6.60x the point-read throughput of bbolt** and **19.51x the throughput of Redis**. Its 1.88 µs p99 latency gave it a **3.27x tail-latency advantage over bbolt** and a **93.16x advantage over Redis**. KVLite also led durable and no-commit-sync acknowledged mixed point work.
 
 #### Highlights
 
-
-| Workload                           | Mode           | KVLite               | bbolt               | Redis               | KVLite lead over second place |
-| ---------------------------------- | -------------- | -------------------- | ------------------- | ------------------- | ----------------------------- |
-| Mixed work, 95% reads, 32 clients  | Durable        | 192,738 operations/s | 35,789 operations/s | 24,973 operations/s | **5.39x**                     |
-| Random point reads, 32 clients     | Read-only      | 3,122,208 keys/s     | 805,566 keys/s      | 196,172 keys/s      | **3.88x**                     |
-| Point-read p99 latency, 32 clients | Read-only      | 1.85 µs              | 47.65 µs            | 626.21 µs           | **25.76x lower**              |
-| Random point updates, one client   | No commit sync | 182,670 keys/s       | 64,873 keys/s       | 90,652 keys/s       | **2.02x**                     |
-| Open an existing clean database    | Life cycle     | 105.11 µs            | 2.23 ms             | Not comparable      | **21.22x lower**              |
-
+| Workload | KVLite | bbolt | Redis | Highlight |
+| --- | ---: | ---: | ---: | --- |
+| Random point reads, eight clients | 3,054,512 keys/s | 462,491 keys/s | 156,523 keys/s | **KVLite: 6.60x bbolt; 19.51x Redis** |
+| Point-read p99, eight clients | 1.88 µs | 6.13 µs | 174.67 µs | **KVLite: 3.27x advantage over bbolt; 93.16x over Redis** |
+| Durable mixed work, 95% reads | 29,951 operations/s | 10,128 operations/s | 19,527 operations/s | **KVLite: 1.53x Redis; 2.96x bbolt** |
+| No-commit-sync mixed work, 95% reads | 1,203,486 operations/s | 318,263 operations/s | 142,542 operations/s | **KVLite: 3.78x bbolt; 8.44x Redis** |
+| Open an existing clean database | 79.54 µs | 2.85 ms | Not comparable | **KVLite: 35.86x advantage** |
 
 The results apply only to the tested machine and workloads. Durable and no-commit-sync results have different guarantees. See the [complete benchmark report](BENCHMARKS.md) and the [benchmark suite guide](benchmarks/kvbench/README.md).
 
@@ -353,8 +349,6 @@ Run the light benchmark profile in its Linux containers:
 cd benchmarks/kvbench
 ./run-docker.sh
 ```
-
-
 
 ## Current limits
 
