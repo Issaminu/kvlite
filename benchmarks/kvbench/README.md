@@ -34,11 +34,12 @@ All profiles run all three engines by default. Select a smaller engine set when 
 ./run-docker.sh --engines=kvlite
 ```
 
-When you omit the profile, the runner uses light.
+When you omit the profile, the runner uses light. Light uses the focused workload and tmpfs by default.
 
 Select the measured workload when you do not need the complete suite:
 
 ```sh
+./run-docker.sh light --workloads=focused
 ./run-docker.sh light --workloads=reads
 ./run-docker.sh medium --workloads=writes
 ./run-docker.sh medium --workloads=mixed
@@ -46,32 +47,45 @@ Select the measured workload when you do not need the complete suite:
 
 The workload values have these meanings:
 
+- `focused` runs point reads and a combined point-update, point-insert, and 10-key batch-update cycle in both durability modes. It is the light default.
 - `reads` runs pure read workloads.
 - `writes` runs pure update and insert workloads.
 - `mixed` runs workloads that combine reads and writes.
-- `all` runs every workload, including life-cycle cases. It is the default.
+- `all` runs every workload, including life-cycle cases. It is the medium and large default.
 
 The modifier selects measured work. Read fixtures still use the same durable setup before measurement. Options can appear in any order.
 
-| Profile | Scope | Warm-up | Measurement | Use |
-| --- | --- | ---: | --- | --- |
-| `light` | One representative case from every comparison group | 0 | 1 fixed-work run | Fast directional development feedback |
-| `medium` | A selected decision set from every comparison group | 1 | 5 fixed-work runs | Repeated engineering comparisons |
-| `large` | Every case variant at the standard work size | 1 | 10 fixed-work runs | Release and publication results |
+Select where the runner stores benchmark data:
 
-The light profile compares the selected engines in Docker. It skips pre-run test passes. It uses 1,000 records, 1,000 point reads or mixed operations, 100 point writes, and 320 concurrent point writes. It is directional and cannot prove a small performance change.
+```sh
+./run-docker.sh light --workloads=focused --storage=tmpfs
+./run-docker.sh light --workloads=focused --storage=volume
+./run-docker.sh medium --workloads=all --storage=tmpfs
+```
+
+The `storage` modifier is independent of the profile and workload. `tmpfs` uses container memory. It reduces host storage variation, but it does not measure physical-device sync latency or survive a container restart. The runner therefore skips the Redis restart durability probe when it uses tmpfs. `volume` uses a temporary Docker volume. It includes the Docker host or virtual-machine storage path. It is still specific to that environment.
+
+| Profile | Scope | Warm-up | Measurement | Default workload | Default storage | Use |
+| --- | --- | ---: | --- | --- | --- | --- |
+| `light` | One representative case from every comparison group | 1 | 3 rounds with 2 samples each | `focused` | `tmpfs` | Quick repeated comparison |
+| `medium` | A selected decision set from every comparison group | 1 | 10 fixed-work runs | `all` | `volume` | Repeated engineering comparisons |
+| `large` | Every case variant at the standard work size | 1 | 15 fixed-work runs | `all` | `volume` | Release and publication results |
+
+The light profile compares the selected engines in Docker. It skips pre-run test passes. Its wider workloads use 1,000 records, 1,000 point reads, 100 point writes, 1,000 mixed operations, and 320 concurrent point writes. It runs one warm-up and records six samples for each selected engine and durability mode.
+
+The focused workload selects the four critical data paths: random point read, random point update, random point insert, and random 10-key batch update. Each sample uses at least 100,000 reads and 1,000 fixed write cycles. The three write paths run in one cycle. This cycle gives each write sample enough work and reports one combined signal. The cases run in durable and no-sync modes. KVLite, bbolt, and Redis run the same operations. Focused uses one CPU by default. `KVBENCH_CPUSET` can select a different CPU set. Mixed, scan, lifecycle, and collection work remain in the wider workloads. Use `light --workloads=focused` for quick repeated code-regression comparisons.
 
 The medium profile uses 3,000 records for its main cases. It uses 10,000 point reads, 200 single-client point writes, 640 concurrent point writes, and 2,000 mixed operations. It keeps 15 core cases. These cases cover misses, sequential and random reads, large values, value growth, inserts, updates, concurrency, mixed work, and batches.
 
 The large profile uses the full case matrix. It uses 10,000 records, 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations.
 
-Medium and large run one unrecorded pass before measurement. Medium records five runs. Large records ten runs. The runner changes engine order and durability-mode order across the measured runs. Read-only runs do not repeat the no-sync mode because commit sync does not affect reads.
+All profiles run one unrecorded pass before measurement. Light records two samples in each of three rounds. Medium records ten runs. Large records fifteen runs. The runner changes engine order and durability-mode order across the measured rounds. The focused workload runs reads in both modes. Other read workloads do not repeat the no-sync mode because commit sync does not affect reads.
 
 A large run is suitable for environment-specific publication. Keep the raw values and environment record with every published report.
 
-All profiles use pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout, runs the selected engines on Linux, and puts database files on one temporary Docker volume. It keeps the Go module and build caches in the `kvlite-kvbench-go-cache` Docker volume. The cache reduces repeat-run setup time. It does not contain benchmark data.
+All profiles use pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout and runs the selected engines on Linux. Light uses `tmpfs` by default for quick development feedback. Medium and large use a Docker volume by default for storage-sensitive results. An explicit `--storage` value overrides these defaults. The runner keeps the Go module and build caches in the `kvlite-kvbench-go-cache` Docker volume. The cache reduces repeat-run setup time. It does not contain benchmark data.
 
-The full warm-up pass prepares the executable, container, and shared operating-system state. It does not reuse a measured database fixture. Read-latency cases also perform unrecorded operations against their own loaded fixture before they start the timer. Medium and large run the correctness tests before warm-up and measurement.
+The full warm-up pass prepares the executable, container, and shared operating-system state. It does not reuse a measured database fixture. Read-latency cases also perform unrecorded operations against their own loaded fixture before they start the timer. Medium and large run the correctness tests before warm-up and measurement. Light skips these tests.
 
 The Docker profiles use up to four CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. All profiles can set `KVBENCH_RESULTS_DIR` to select the output directory.
 

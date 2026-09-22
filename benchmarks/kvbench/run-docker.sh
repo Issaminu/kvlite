@@ -15,13 +15,15 @@ readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 readonly results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=reads|writes|mixed|all]"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|mixed|all] [--storage=tmpfs|volume]"
 benchmark_profile="light"
 engine_option="--engines=kvlite,bbolt,redis"
-workload_option="--workloads=all"
+workload_option=""
+storage_option=""
 profile_set=0
 engine_set=0
 workload_set=0
+storage_set=0
 for argument in "$@"; do
 	case "${argument}" in
 	light | medium | large)
@@ -48,6 +50,14 @@ for argument in "$@"; do
 		workload_option="${argument}"
 		workload_set=1
 		;;
+	--storage=*)
+		if ((storage_set)); then
+			echo "select the storage once" >&2
+			exit 1
+		fi
+		storage_option="${argument}"
+		storage_set=1
+		;;
 	*)
 		echo "${usage}" >&2
 		exit 1
@@ -56,18 +66,20 @@ for argument in "$@"; do
 done
 readonly benchmark_profile
 readonly engine_option
-readonly workload_option
 case "${benchmark_profile}" in
 light)
-	readonly measured_count=1
-	readonly warmup_count=0
+	readonly measured_count=3
+	readonly samples_per_round=2
+	readonly warmup_count=1
 	;;
 medium)
-	readonly measured_count=5
+	readonly measured_count=10
+	readonly samples_per_round=1
 	readonly warmup_count=1
 	;;
 large)
-	readonly measured_count=10
+	readonly measured_count=15
+	readonly samples_per_round=1
 	readonly warmup_count=1
 	;;
 *)
@@ -75,11 +87,35 @@ large)
 	exit 1
 	;;
 esac
+if [[ -z "${workload_option}" ]]; then
+	if [[ "${benchmark_profile}" == "light" ]]; then
+		workload_option="--workloads=focused"
+	else
+		workload_option="--workloads=all"
+	fi
+fi
+readonly workload_option
+if [[ -z "${storage_option}" ]]; then
+	if [[ "${benchmark_profile}" == "light" ]]; then
+		storage_option="--storage=tmpfs"
+	else
+		storage_option="--storage=volume"
+	fi
+fi
+readonly storage_option
+readonly benchmark_storage="${storage_option#--storage=}"
+case "${benchmark_storage}" in
+tmpfs | volume) ;;
+*)
+	echo "storage must be tmpfs or volume" >&2
+	exit 1
+	;;
+esac
 readonly benchmark_workload="${workload_option#--workloads=}"
 case "${benchmark_workload}" in
-reads | writes | mixed | all) ;;
+focused | reads | writes | mixed | all) ;;
 *)
-	echo "workloads must be reads, writes, mixed, or all" >&2
+	echo "workloads must be focused, reads, writes, mixed, or all" >&2
 	exit 1
 	;;
 esac
@@ -116,27 +152,33 @@ fi
 readonly selected_engines
 readonly uses_redis
 
-case "${benchmark_workload}" in
-reads)
-	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections)$'
-	;;
-writes)
-	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|Latency|Collections)$'
-	;;
-mixed)
-	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
-	;;
-all)
-	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
-	;;
-esac
+if [[ "${benchmark_workload}" == "focused" ]]; then
+	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|FocusedWrites)$'
+else
+	case "${benchmark_workload}" in
+	reads)
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections)$'
+		;;
+	writes)
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|Latency|Collections)$'
+		;;
+	mixed)
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
+		;;
+	all)
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
+		;;
+	esac
+fi
 docker_cpu_count="$(docker info --format '{{.NCPU}}')"
 if [[ ! "${docker_cpu_count}" =~ ^[1-9][0-9]*$ ]]; then
 	echo "Docker reported an invalid CPU count: ${docker_cpu_count}" >&2
 	exit 1
 fi
 cpu_last=$((docker_cpu_count - 1))
-if ((cpu_last > 3)); then
+if [[ "${benchmark_workload}" == "focused" ]]; then
+	cpu_last=0
+elif ((cpu_last > 3)); then
 	cpu_last=3
 fi
 if ((cpu_last == 0)); then
@@ -145,6 +187,12 @@ else
 	default_cpu_set="0-${cpu_last}"
 fi
 readonly cpu_set="${KVBENCH_CPUSET:-${default_cpu_set}}"
+declare -a benchmark_data_mount
+if [[ "${benchmark_storage}" == "tmpfs" ]]; then
+	benchmark_data_mount=(--tmpfs "/benchmark-data:rw,exec,size=512m")
+else
+	benchmark_data_mount=(--volume "${volume_name}:/benchmark-data")
+fi
 
 cleanup() {
 	docker rm --force "${go_name}" >/dev/null 2>&1 || true
@@ -158,7 +206,7 @@ start_go() {
 	docker run --detach --name "${go_name}" \
 		--cpuset-cpus "${cpu_set}" \
 		--network "${network_name}" \
-		--volume "${volume_name}:/benchmark-data" \
+		"${benchmark_data_mount[@]}" \
 		--volume "${cache_volume_name}:/go-cache" \
 		--mount "type=bind,source=${repository_dir},target=/workspace,readonly" \
 		--workdir /workspace/benchmarks/kvbench \
@@ -183,7 +231,7 @@ start_redis() {
 	docker run --detach --name "${redis_name}" \
 		--cpuset-cpus "${cpu_set}" \
 		--network "${network_name}" \
-		--volume "${volume_name}:/benchmark-data" \
+		"${benchmark_data_mount[@]}" \
 		"${redis_image}" \
 		redis-server \
 		--dir /benchmark-data \
@@ -197,7 +245,9 @@ start_redis() {
 
 mkdir -p "${results_dir}"
 docker network create "${network_name}" >/dev/null
-docker volume create "${volume_name}" >/dev/null
+if [[ "${benchmark_storage}" == "volume" ]]; then
+	docker volume create "${volume_name}" >/dev/null
+fi
 docker volume create "${cache_volume_name}" >/dev/null
 start_go
 docker exec "${go_name}" chmod 0777 /benchmark-data
@@ -253,7 +303,7 @@ run_round() {
 	local output_file="${results_dir}/${mode}.txt"
 	local engine
 	for engine in $(engine_order "${round}"); do
-		run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count=1 | tee -a "${output_file}"
+		run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count="${samples_per_round}" | tee -a "${output_file}"
 	done
 }
 
@@ -261,8 +311,12 @@ run_warmup_round() {
 	local mode="$1"
 	local round="$2"
 	local engine
+	local output
 	for engine in $(engine_order "${round}"); do
-		run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count=1 >/dev/null
+		if ! output="$(run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count=1)"; then
+			echo "${output}" >&2
+			return 1
+		fi
 	done
 }
 
@@ -307,9 +361,12 @@ verify_redis_reopen_after_kill() {
 	echo "Engines: ${selected_engines}"
 	echo "Workloads: ${benchmark_workload}"
 	echo "Warm-up count: ${warmup_count}"
-	echo "Measured count: ${measured_count}"
+	echo "Measured rounds: ${measured_count}"
+	echo "Samples per round: ${samples_per_round}"
+	echo "Measured samples: $((measured_count * samples_per_round))"
 	echo "Benchmark filter: ${benchmark_filter}"
 	echo "CPU set: ${cpu_set}"
+	echo "Benchmark data storage: ${benchmark_storage}"
 	echo "Working tree:"
 	git -C "${repository_dir}" status --short
 	docker exec "${go_name}" go version
@@ -341,7 +398,11 @@ if [[ "${benchmark_profile}" != "light" ]]; then
 	run_root_tests
 	run_go durable "" -count=1 ./...
 	if ((uses_redis)) && [[ "${benchmark_workload}" != "reads" ]]; then
-		verify_redis_reopen_after_kill
+		if [[ "${benchmark_storage}" == "volume" ]]; then
+			verify_redis_reopen_after_kill
+		else
+			echo "Skip the Redis restart durability probe because tmpfs does not survive a container restart."
+		fi
 	fi
 fi
 

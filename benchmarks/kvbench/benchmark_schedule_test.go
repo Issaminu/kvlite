@@ -182,6 +182,7 @@ func TestWorkloadSelectsMatchingCases(t *testing.T) {
 		{workload: "reads", want: 5},
 		{workload: "writes", want: 8},
 		{workload: "mixed", want: 2},
+		{workload: "focused", want: 1},
 		{workload: "all", want: 15},
 	}
 	for _, test := range tests {
@@ -211,6 +212,44 @@ func TestLightProfileSelectsRepresentativeCoreCases(t *testing.T) {
 	for _, benchmarkCase := range cases {
 		if !want[benchmarkCase.name] {
 			t.Errorf("unexpected light case %q", benchmarkCase.name)
+		}
+	}
+}
+
+func TestFocusedWorkloadSelectsCriticalCases(t *testing.T) {
+	t.Setenv("KVBENCH_PROFILE", "light")
+	t.Setenv("KVBENCH_WORKLOAD", "focused")
+	want := map[string]bool{
+		"read/random/value=128/clients=1": true,
+	}
+	cases := benchmarkCases()
+	if len(cases) != len(want) {
+		t.Fatalf("focused cases are %d, want %d", len(cases), len(want))
+	}
+	for _, benchmarkCase := range cases {
+		if !want[benchmarkCase.name] {
+			t.Errorf("unexpected focused case %q", benchmarkCase.name)
+		}
+		if benchmarkCase.operations != 100_000 {
+			t.Errorf("focused read operations are %d, want 100000", benchmarkCase.operations)
+		}
+	}
+}
+
+func TestFocusedWorkloadUsesStableDurabilityModes(t *testing.T) {
+	tests := []struct {
+		operation benchmarkOperation
+		mode      DurabilityMode
+		want      bool
+	}{
+		{operation: benchmarkRead, mode: DurabilityDurable, want: true},
+		{operation: benchmarkRead, mode: DurabilityNoCommitSync, want: true},
+		{operation: benchmarkUpdate, mode: DurabilityDurable, want: true},
+		{operation: benchmarkUpdate, mode: DurabilityNoCommitSync, want: true},
+	}
+	for _, test := range tests {
+		if got := benchmarkModeEnabled("focused", test.operation, test.mode); got != test.want {
+			t.Errorf("benchmarkModeEnabled(focused, %q, %q) = %t, want %t", test.operation, test.mode, got, test.want)
 		}
 	}
 }

@@ -35,6 +35,7 @@ type benchmarkCase struct {
 }
 
 func benchmarkCases() []benchmarkCase {
+	focused := os.Getenv("KVBENCH_WORKLOAD") == "focused"
 	records := profileSizedValue(10_000, 3_000, 1_000)
 	pointReadOperations := profileSizedValue(100_000, 10_000, 1_000)
 	pointWriteOperations := profileSizedValue(1_000, 200, 100)
@@ -124,7 +125,11 @@ func benchmarkCases() []benchmarkCase {
 		}
 	}
 	var selected map[string]bool
-	if lightProfile() {
+	if focused {
+		selected = map[string]bool{
+			"read/random/value=128/clients=1": true,
+		}
+	} else if lightProfile() {
 		selected = map[string]bool{
 			"read/random/value=128/clients=1":             true,
 			"update/random/value=128/clients=1":           true,
@@ -153,6 +158,9 @@ func benchmarkCases() []benchmarkCase {
 	}
 	profileCases := cases[:0]
 	for _, benchmarkCase := range cases {
+		if focused && benchmarkCase.operation == benchmarkRead {
+			benchmarkCase.operations = max(benchmarkCase.operations, 100_000)
+		}
 		if (selected == nil || selected[benchmarkCase.name]) && workloadEnabled(benchmarkCase.operation) {
 			profileCases = append(profileCases, benchmarkCase)
 		}
@@ -170,6 +178,8 @@ func workloadEnabled(operation benchmarkOperation) bool {
 		return operation == benchmarkUpdate || operation == benchmarkInsert
 	case "mixed":
 		return operation == benchmarkMixed
+	case "focused":
+		return true
 	default:
 		panic("unknown KVBENCH_WORKLOAD")
 	}
@@ -198,13 +208,88 @@ func BenchmarkAcknowledgedOperations(b *testing.B) {
 		b.Fatal("KVBENCH_REDIS_ADDR is empty")
 	}
 	for _, benchmarkCase := range benchmarkCases() {
-		if mode == DurabilityNoCommitSync && benchmarkCase.operation == benchmarkRead {
+		if !benchmarkModeEnabled(os.Getenv("KVBENCH_WORKLOAD"), benchmarkCase.operation, mode) {
 			continue
 		}
 		b.Run(string(mode)+"/"+benchmarkCase.name+"/"+string(engine), func(b *testing.B) {
 			benchmarkDatabase(b, engine, mode, redisAddress, benchmarkCase)
 		})
 	}
+}
+
+func benchmarkModeEnabled(workload string, operation benchmarkOperation, mode DurabilityMode) bool {
+	if workload == "focused" {
+		return true
+	}
+	if mode == DurabilityNoCommitSync && operation == benchmarkRead {
+		return false
+	}
+	return true
+}
+
+func BenchmarkFocusedWrites(b *testing.B) {
+	if os.Getenv("KVBENCH_WORKLOAD") != "focused" {
+		b.Skip("focused writes are not selected")
+	}
+	environment := readBenchmarkEnvironment(b)
+	records := profileSizedValue(10_000, 3_000, 1_000)
+	cycles := profileSizedValue(1_000, 200, 1_000)
+	setupPairs, err := makePairs(records, 128, 1, keyOrderSequential, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	updates, err := makePairs(records, 128, 1, keyOrderRandom, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for index := range updates {
+		updates[index].Value[0] ^= 0xff
+	}
+	inserts, err := makePairs(cycles, 128, 2, keyOrderRandom, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run(string(environment.mode)+"/update-insert-batch=10/"+string(environment.kind), func(b *testing.B) {
+		engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setupPairs)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
+		b.SetBytes(int64(cycles * 12 * 128))
+		b.ResetTimer()
+		for cycle := range cycles {
+			update := updates[cycle%len(updates)]
+			if err := engine.Put(b.Context(), update.Key, update.Value); err != nil {
+				b.Fatal(err)
+			}
+			if err := engine.Put(b.Context(), inserts[cycle].Key, inserts[cycle].Value); err != nil {
+				b.Fatal(err)
+			}
+			batchStart := cycle * 10 % (len(updates) - 9)
+			if err := engine.PutBatch(b.Context(), updates[batchStart:batchStart+10]); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StopTimer()
+		b.ReportMetric(float64(cycles*12)/b.Elapsed().Seconds(), "ack-keys/s")
+		b.ReportMetric(float64(cycles*3)/b.Elapsed().Seconds(), "transactions/s")
+		if err := engine.Validate(b.Context()); err != nil {
+			b.Fatal(err)
+		}
+		count, err := engine.Count(b.Context())
+		if err != nil {
+			b.Fatal(err)
+		}
+		if want := records + cycles; count != want {
+			b.Fatalf("database has %d keys, want %d", count, want)
+		}
+		for _, pair := range []Pair{updates[0], inserts[0], inserts[len(inserts)-1]} {
+			value, err := engine.Get(b.Context(), pair.Key)
+			if err != nil || !bytes.Equal(value, pair.Value) {
+				b.Fatalf("stored value for key %x does not match: %v", pair.Key, err)
+			}
+		}
+	})
 }
 
 func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redisAddress string, benchmarkCase benchmarkCase) {
@@ -257,7 +342,6 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	if err != nil || !bytes.Equal(value, setupPairs[0].Value) {
 		b.Fatalf("initial read returned %d bytes and error %v", len(value), err)
 	}
-
 	b.SetBytes(int64(benchmarkCase.valueBytes * benchmarkCase.batchSize * benchmarkCase.operations))
 	err = runBenchmarkOperations(b, engine, operationPairs, benchmarkCase, schedule)
 	if err != nil {
