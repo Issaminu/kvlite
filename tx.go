@@ -34,15 +34,15 @@ func newTx(db *DB, readOnly bool) *Tx {
 	return tx
 }
 
-// newWriteTx starts one private write transaction from baseMeta, baseRoot, and any page images prepared by earlier callbacks in the same write batch.
-func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseNodes map[page.ID]*btree.Node) *Tx {
+// newWriteTx starts one private write transaction from baseMeta, baseRoot, and changes prepared by earlier callbacks in the same write batch.
+func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map[page.ID]dirtyNode) *Tx {
 	meta := *baseMeta
 	tx := &Tx{db: db, meta: &meta, rootNode: baseRoot}
 	tx.store = txTreeStore{
 		tx:        tx,
-		baseNodes: baseNodes,
+		baseDirty: baseDirty,
 		nodes:     make(map[page.ID]*btree.Node),
-		dirty:     make(map[page.ID]*btree.Node),
+		dirty:     make(map[page.ID]dirtyNode),
 	}
 	tx.tree = btree.NewTree(&tx.store)
 
@@ -84,19 +84,19 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		return err
 	}
 
-	records := tx.walRecords()
-	if len(records) == 0 {
+	nodes, encodedMeta := tx.walCommitData()
+	if len(nodes) == 0 && len(encodedMeta) == 0 {
 		return nil
 	}
 
-	needsCheckpoint, err := db.wal.Commit(records)
+	needsCheckpoint, err := db.wal.Commit(nodes, encodedMeta)
 	if err != nil {
 		return err
 	}
 	db.meta = tx.meta
 	db.rootNode = tx.rootNode
-	for _, node := range tx.store.dirty {
-		db.cacheWriteNode(node)
+	for _, dirty := range tx.store.dirty {
+		db.cacheWriteNode(dirty.final)
 	}
 	if needsCheckpoint {
 		// The WAL is already durable. A checkpoint failure must not turn this
@@ -107,41 +107,30 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	return nil
 }
 
-// walRecords encodes one final image for each changed node page and two metadata copies when metadata changed.
-// Update calls it after the transaction callback succeeds, so callback failure does no encoding or WAL work.
-func (tx *Tx) walRecords() []wal.Record {
-	return encodeWALRecords(tx.store.dirty, tx.meta, tx.metaDirty)
+// walCommitData returns the changed data nodes and encoded metadata for this transaction.
+// Update calls it after the transaction callback succeeds, so callback failure does no WAL work.
+func (tx *Tx) walCommitData() ([]wal.NodeRecord, []byte) {
+	return makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
 }
 
-// encodeWALRecords encodes the final private image of each changed node page. Repeated node changes produce one record, while changed metadata produces one record for each metadata page.
-func encodeWALRecords(dirty map[page.ID]*btree.Node, meta *page.Meta, metaDirty bool) []wal.Record {
+// makeWALCommitData returns one original and final node pair for each changed data page.
+// Repeated node changes produce one node record.
+// When metadata changed, encodedMeta contains its new image. Otherwise, encodedMeta is nil.
+func makeWALCommitData(dirty map[page.ID]dirtyNode, meta *page.Meta, metaDirty bool) (nodes []wal.NodeRecord, encodedMeta []byte) {
 	if len(dirty) == 0 && !metaDirty {
-		return nil
+		return nil, nil
 	}
 
-	recordCapacity := len(dirty)
-	if metaDirty {
-		recordCapacity += 2
-	}
-	records := make([]wal.Record, 0, recordCapacity)
-	for pageID, node := range dirty {
-		records = append(records, wal.Record{
-			Header: wal.RecordHeader{Type: wal.RecordTypeData, PageID: pageID},
-			Node:   node,
-		})
+	nodes = make([]wal.NodeRecord, 0, len(dirty))
+	for _, dirtyNode := range dirty {
+		nodes = append(nodes, wal.NodeRecord{Original: dirtyNode.original, Final: dirtyNode.final})
 	}
 	if metaDirty {
 		meta.AdvanceGeneration()
 		meta.RefreshChecksum()
-		encodedMeta := page.EncodeMeta(meta)
-		for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
-			records = append(records, wal.Record{
-				Header:      wal.RecordHeader{Type: wal.RecordTypeMeta, PageID: pageID},
-				PageContent: encodedMeta,
-			})
-		}
+		encodedMeta = page.EncodeMeta(meta)
 	}
-	return records
+	return nodes, encodedMeta
 }
 
 // View runs fn in one read-only transaction. Every read in fn sees the same database state. Writes through the Tx or its buckets return [ErrTxNotWritable].

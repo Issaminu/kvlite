@@ -20,10 +20,10 @@ func TestMetaFromCommittedWAL_RejectsInvalidPageSize(t *testing.T) {
 	meta.RefreshChecksum()
 
 	const txID wal.TxID = 1
-	records := []wal.Record{
+	records := []wal.WALRecord{
 		{
-			Header:      wal.RecordHeader{Type: wal.RecordTypeMeta, PageID: page.Meta0ID, TxID: txID},
-			PageContent: page.EncodeMeta(meta),
+			Header:  wal.RecordHeader{Type: wal.RecordTypeMeta, PageID: page.Meta0ID, TxID: txID},
+			Payload: page.EncodeMeta(meta),
 		},
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
@@ -42,10 +42,10 @@ func TestLoadCommittedIntoOverlay_RejectsInvalidNodeDirectory(t *testing.T) {
 	const firstLeafEntryOffsetField = btree.NodeHeaderSize + 4
 	binary.LittleEndian.PutUint32(image[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
 	const txID wal.TxID = 1
-	records := []wal.Record{
+	records := []wal.WALRecord{
 		{
-			Header:      wal.RecordHeader{Type: wal.RecordTypeData, PageID: node.PageID(), TxID: txID},
-			PageContent: image,
+			Header:  wal.RecordHeader{Type: wal.RecordTypeNode, PageID: node.PageID(), TxID: txID},
+			Payload: image,
 		},
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}

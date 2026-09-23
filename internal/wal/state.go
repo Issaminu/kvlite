@@ -24,6 +24,15 @@ type Config struct {
 	CheckpointThresholdBytes uint64
 }
 
+// CommittedPage is the latest committed state of one page that is not yet checkpointed. A data page can hold Node or Payload. A metadata page holds Payload.
+type CommittedPage struct {
+	Header RecordHeader
+	// Payload holds a recovered node image or encoded metadata.
+	Payload []byte
+	// Node holds a data node from the current process. A page must not hold both Node and Payload.
+	Node *btree.Node
+}
+
 func New(config Config) *WAL {
 	return &WAL{
 		path:                     config.Path,
@@ -32,7 +41,7 @@ func New(config Config) *WAL {
 		syncOnCommit:             config.SyncOnCommit,
 		syncOnCheckpoint:         config.SyncOnCheckpoint,
 		checkpointThresholdBytes: config.CheckpointThresholdBytes,
-		overlay:                  make(map[page.ID]Record),
+		overlay:                  make(map[page.ID]CommittedPage),
 		nextTxid:                 1,
 	}
 }
@@ -51,12 +60,12 @@ func (wal *WAL) Checkpoint(mainFile *os.File) error {
 			return err
 		}
 	}
-	records := make([]Record, 0, len(wal.overlay))
+	records := make([]CommittedPage, 0, len(wal.overlay))
 	for _, record := range wal.overlay {
 		records = append(records, record)
 	}
 	// Sorting lets the writer combine adjacent pages into one I/O operation.
-	slices.SortFunc(records, func(left, right Record) int {
+	slices.SortFunc(records, func(left, right CommittedPage) int {
 		switch {
 		case left.Header.PageID < right.Header.PageID:
 			return -1
@@ -87,24 +96,24 @@ func (wal *WAL) Checkpoint(mainFile *os.File) error {
 // writeCheckpointRecordRuns combines adjacent, page-ID-ordered records into bounded writes.
 // records must contain unique page IDs in ascending order.
 // It pads each WAL image to pageSize because the WAL omits unused page bytes but the main file stores fixed-size pages.
-func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize int64) error {
+func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pageSize int64) error {
 	if len(records) == 0 {
 		return nil
 	}
 	for index := range records {
 		record := &records[index]
-		contentSize := len(record.PageContent)
+		payloadSize := len(record.Payload)
 		if record.Node != nil {
-			if record.Header.Type != RecordTypeData || record.Header.PageID != record.Node.PageID() || record.PageContent != nil {
+			if record.Header.Type != RecordTypeNode || record.Header.PageID != record.Node.PageID() || record.Payload != nil {
 				return page.ErrInvalid
 			}
-			contentSize = btree.WALNodeEncodedSize(record.Node)
+			payloadSize = btree.WALNodeEncodedSize(record.Node)
 		}
-		if int64(contentSize) > pageSize {
+		if int64(payloadSize) > pageSize {
 			return page.ErrInvalid
 		}
-		if record.Header.Type == RecordTypeData && record.Node == nil {
-			if err := btree.ValidateWALNode(record.PageContent, record.Header.PageID); err != nil {
+		if record.Header.Type == RecordTypeNode && record.Node == nil {
+			if err := btree.ValidateWALNode(record.Payload, record.Header.PageID); err != nil {
 				return err
 			}
 		}
@@ -147,7 +156,7 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 		pageStart := len(buffer)
 		pageEnd := pageStart + int(pageSize)
 
-		// resize buffer to fit the new pageContent
+		// Resize the buffer to hold the next page.
 		buffer = buffer[:pageEnd]
 
 		pageData := buffer[pageStart:pageEnd]
@@ -155,9 +164,9 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 		if record.Node != nil {
 			btree.AppendEncodedWALNode(pageData[:0], record.Node)
 		} else {
-			copy(pageData, record.PageContent)
+			copy(pageData, record.Payload)
 		}
-		if record.Header.Type == RecordTypeData {
+		if record.Header.Type == RecordTypeNode {
 			if err := btree.VerifyNodeIDAndSetChecksum(pageData, pageID); err != nil {
 				return err
 			}
@@ -167,16 +176,16 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []Record, pageSize 
 	return flush()
 }
 
-func (wal *WAL) Lookup(pageID page.ID) (Record, bool) {
+func (wal *WAL) Lookup(pageID page.ID) (CommittedPage, bool) {
 	record, ok := wal.overlay[pageID]
 	return record, ok
 }
 
-func (wal *WAL) LoadCommittedRecord(record Record) {
-	wal.overlay[record.Header.PageID] = record
+func (wal *WAL) LoadCommittedRecord(record WALRecord) {
+	wal.overlay[record.Header.PageID] = CommittedPage{Header: record.Header, Payload: record.Payload}
 }
 
-func (wal *WAL) CommittedRecord(pageID page.ID) (Record, bool) {
+func (wal *WAL) CommittedRecord(pageID page.ID) (CommittedPage, bool) {
 	record, ok := wal.overlay[pageID]
 	return record, ok
 }
@@ -201,7 +210,7 @@ func (wal *WAL) Stats() Stats {
 	}
 }
 
-func (wal *WAL) CommittedRecords() map[page.ID]Record {
+func (wal *WAL) CommittedRecords() map[page.ID]CommittedPage {
 	return maps.Clone(wal.overlay)
 }
 

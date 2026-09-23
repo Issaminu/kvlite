@@ -29,58 +29,147 @@ import (
 var testBucketName = []byte("test-data")
 var errDiscardTx = errors.New("discard transaction")
 
-func TestEncodeWALRecords_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
+func TestMakeWALCommitData_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 	meta := page.NewMeta(4096)
 	node := btree.NewLeafNode(1)
 	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
 
-	records := encodeWALRecords(map[page.ID]*btree.Node{node.PageID(): node}, meta, false)
-	if len(records) != 1 {
-		t.Fatalf("WAL records: got %d, want 1", len(records))
+	nodes, encodedMeta := makeWALCommitData(map[page.ID]dirtyNode{node.PageID(): {final: node}}, meta, false)
+	if len(nodes) != 1 || encodedMeta != nil {
+		t.Fatalf("WAL inputs: got %d node records and %d metadata bytes, want 1 and 0", len(nodes), len(encodedMeta))
 	}
-	if records[0].Node != node || records[0].PageContent != nil {
-		t.Fatal("WAL record did not keep the changed node for direct encoding")
+	if nodes[0].Original != nil || nodes[0].Final != node {
+		t.Fatal("node record did not keep the final node for direct encoding")
 	}
-	encoded, err := wal.EncodeRecord(&records[0], meta.PageSize())
-	if err != nil {
-		t.Fatal(err)
-	}
-	decoded, err := wal.DecodeRecord(bytes.NewReader(encoded), meta.PageSize())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := binary.LittleEndian.Uint32(decoded.PageContent[btree.NodeHeaderSize-4 : btree.NodeHeaderSize]); got != 0 {
+	payload := btree.EncodeWALNode(nodes[0].Final)
+	if got := binary.LittleEndian.Uint32(payload[btree.NodeHeaderSize-4 : btree.NodeHeaderSize]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
 }
 
-func TestEncodeWALRecords_ReplicatesChangedMetadata(t *testing.T) {
+func TestMakeWALCommitData_EncodesChangedMetadata(t *testing.T) {
 	meta := page.NewMeta(4096)
-	records := encodeWALRecords(nil, meta, true)
-	if len(records) != 2 {
-		t.Fatalf("metadata WAL records: got %d, want 2", len(records))
+	nodes, encodedMeta := makeWALCommitData(nil, meta, true)
+	if len(nodes) != 0 || len(encodedMeta) == 0 {
+		t.Fatalf("WAL inputs: got %d node records and %d metadata bytes, want 0 and encoded metadata", len(nodes), len(encodedMeta))
 	}
 
-	for index, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
-		record := records[index]
-		if record.Header.Type != wal.RecordTypeMeta || record.Header.PageID != pageID {
-			t.Fatalf("metadata WAL record %d header: got %+v, want page %d metadata", index, record.Header, pageID)
-		}
-		decoded, err := page.DecodeMeta(record.PageContent)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := decoded.Validate(); err != nil {
-			t.Fatalf("validate metadata WAL record %d: %v", index, err)
-		}
-		if got := decoded.Generation(); got != 1 {
-			t.Fatalf("metadata WAL record %d generation: got %d, want 1", index, got)
-		}
+	decoded, err := page.DecodeMeta(encodedMeta)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !bytes.Equal(records[0].PageContent, records[1].PageContent) {
-		t.Fatal("metadata WAL records contain different copies")
+	if err := decoded.Validate(); err != nil {
+		t.Fatalf("validate encoded metadata: %v", err)
+	}
+	if got := decoded.Generation(); got != 1 {
+		t.Fatalf("metadata generation: got %d, want 1", got)
+	}
+}
+
+func TestWriteTx_PreservesOriginalNodeAcrossWriteBatchCallbacks(t *testing.T) {
+	meta := page.NewMeta(4096)
+	root := btree.NewLeafNode(meta.Root())
+	db := &DB{meta: meta, rootNode: root}
+	base := btree.NewLeafNode(10)
+	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("old"))); err != nil {
+		t.Fatal(err)
+	}
+
+	first := newWriteTx(db, meta, root, nil)
+	middle := first.store.WritableNode(base)
+	if err := middle.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("mid"))); err != nil {
+		t.Fatal(err)
+	}
+
+	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty)
+	middle, err := second.store.ReadNode(base.PageID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	latest := second.store.WritableNode(middle)
+	if err := latest.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("new"))); err != nil {
+		t.Fatal(err)
+	}
+
+	nodes, encodedMeta := makeWALCommitData(second.store.dirty, second.meta, second.metaDirty)
+	if len(nodes) != 1 || encodedMeta != nil {
+		t.Fatalf("WAL inputs: got %d node records and %d metadata bytes, want 1 and 0", len(nodes), len(encodedMeta))
+	}
+	if nodes[0].Original != base || nodes[0].Final != latest {
+		t.Fatal("node record did not preserve the original and final nodes")
+	}
+}
+
+func TestOpen_RecoversPagePatch(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("old-value")); err != nil {
+		t.Fatal(err)
+	}
+	db.operationMu.Lock()
+	if err := db.checkpointWAL(); err != nil {
+		db.operationMu.Unlock()
+		t.Fatal(err)
+	}
+	db.operationMu.Unlock()
+	if err := db.Put(testBucketName, []byte("key"), []byte("mid-value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("new-value")); err != nil {
+		t.Fatal(err)
+	}
+	records, err := db.wal.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundPatch := false
+	for _, record := range records {
+		foundPatch = foundPatch || record.Header.Type == wal.RecordTypePatch
+	}
+	if !foundPatch {
+		t.Fatal("update did not write a page patch")
+	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.closeFiles(); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := readOnly.Get(testBucketName, []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("new-value")) {
+		t.Fatalf("read-only recovered value: got %q, want %q", got, "new-value")
+	}
+	if err := readOnly.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	got, err = reopened.Get(testBucketName, []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, []byte("new-value")) {
+		t.Fatalf("recovered value: got %q, want %q", got, "new-value")
 	}
 }
 
@@ -3998,7 +4087,7 @@ func TestBucket_Nested(t *testing.T) {
 // is 0 — the left node becomes EMPTY and the right node keeps the whole (over-page)
 // content. The split loop in _put then advances to the parent and never re-checks
 // that oversized right node. Result: two ~0.6-page values (which fit fine at one
-// entry per node) are rejected with "record page content exceeds page size", or a
+// entry per node) are rejected with "record payload exceeds page size", or a
 // corrupt empty leaf is wired under a branch separator.
 func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	path := tempfile()
@@ -5405,7 +5494,7 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 	transactionIDs := make(map[wal.TxID]struct{})
 	commitMarkers := 0
 	for {
-		record, err := wal.DecodeRecord(reader, db.meta.PageSize())
+		record, err := wal.DecodeWALRecord(reader, db.meta.PageSize())
 		if errors.Is(err, io.EOF) {
 			break
 		}

@@ -4,13 +4,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-func (db *DB) replayWAL(records []wal.Record) error {
+func (db *DB) replayWAL(records []wal.WALRecord) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -20,7 +21,7 @@ func (db *DB) replayWAL(records []wal.Record) error {
 	return db.ingestWalRecords(records)
 }
 
-func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.Record, error) {
+func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.WALRecord, error) {
 	walPath := db.path + "-wal"
 	var walFile *os.File
 	var err error
@@ -60,8 +61,12 @@ func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.Record, error) {
 	return log, records, nil
 }
 
-func (db *DB) ingestWalRecords(records []wal.Record) error {
+func (db *DB) ingestWalRecords(records []wal.WALRecord) error {
 	committed, err := committedWALRecords(records)
+	if err != nil {
+		return err
+	}
+	committed, err = db.materializeWALPagePatches(committed)
 	if err != nil {
 		return err
 	}
@@ -71,9 +76,9 @@ func (db *DB) ingestWalRecords(records []wal.Record) error {
 	return db.wal.Checkpoint(db.file)
 }
 
-func committedWALRecords(records []wal.Record) ([]wal.Record, error) {
-	committed := make([]wal.Record, 0, len(records))
-	pending := make([]wal.Record, 0)
+func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
+	committed := make([]wal.WALRecord, 0, len(records))
+	pending := make([]wal.WALRecord, 0)
 
 	for index, record := range records {
 		if !wal.IsCommitMarker(&record) {
@@ -103,7 +108,7 @@ func committedWALRecords(records []wal.Record) ([]wal.Record, error) {
 }
 
 // metaFromCommittedWAL returns the newest valid metadata from a complete WAL transaction.
-func metaFromCommittedWAL(records []wal.Record) (*page.Meta, error) {
+func metaFromCommittedWAL(records []wal.WALRecord) (*page.Meta, error) {
 	committed, err := committedWALRecords(records)
 	if err != nil {
 		return nil, err
@@ -114,7 +119,7 @@ func metaFromCommittedWAL(records []wal.Record) (*page.Meta, error) {
 		if record.Header.Type != wal.RecordTypeMeta || !page.IsMetaID(record.Header.PageID) {
 			continue
 		}
-		meta, err := page.DecodeMeta(record.PageContent)
+		meta, err := page.DecodeMeta(record.Payload)
 		if err != nil {
 			return nil, err
 		}
@@ -127,17 +132,21 @@ func metaFromCommittedWAL(records []wal.Record) (*page.Meta, error) {
 }
 
 // loadCommittedIntoOverlay makes committed WAL pages visible to a read-only database. It does not change the main file. Validated WAL metadata replaces db.meta when a committed transaction includes metadata.
-func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
+func (db *DB) loadCommittedIntoOverlay(records []wal.WALRecord) error {
 	committed, err := committedWALRecords(records)
+	if err != nil {
+		return err
+	}
+	committed, err = db.materializeWALPagePatches(committed)
 	if err != nil {
 		return err
 	}
 	// Check all data before any record becomes visible.
 	for _, record := range committed {
-		if record.Header.Type != wal.RecordTypeData {
+		if record.Header.Type != wal.RecordTypeNode {
 			continue
 		}
-		if err := btree.ValidateWALNode(record.PageContent, record.Header.PageID); err != nil {
+		if err := btree.ValidateWALNode(record.Payload, record.Header.PageID); err != nil {
 			return err
 		}
 	}
@@ -161,4 +170,56 @@ func (db *DB) loadCommittedIntoOverlay(records []wal.Record) error {
 	}
 	db.meta = meta
 	return nil
+}
+
+// materializeWALPagePatches rebuilds the latest complete image for each data page.
+// Absolute patch ranges can run again after an interrupted checkpoint because later ranges restore the latest committed bytes.
+func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecord, error) {
+	pageImages := make(map[page.ID][]byte)
+	lastRecord := make(map[page.ID]int)
+	for index, record := range records {
+		var image []byte
+		switch record.Header.Type {
+		case wal.RecordTypeNode:
+			image = record.Payload
+		case wal.RecordTypePatch:
+			base, ok := pageImages[record.Header.PageID]
+			if !ok {
+				mainPage, err := db.readMainPage(record.Header.PageID)
+				if err != nil {
+					return nil, fmt.Errorf("read page %d for WAL patch: %w", record.Header.PageID, err)
+				}
+				node, err := btree.DecodeNode(slices.Clone(mainPage), record.Header.PageID, db.meta.PageSize())
+				if err != nil {
+					return nil, fmt.Errorf("decode page %d for WAL patch: %w", record.Header.PageID, err)
+				}
+				base = btree.EncodeWALNode(node)
+			}
+			var err error
+			image, err = wal.ApplyPagePatch(base, record.Payload, db.meta.PageSize())
+			if err != nil {
+				return nil, fmt.Errorf("apply WAL patch for page %d: %w", record.Header.PageID, err)
+			}
+		default:
+			continue
+		}
+		pageImages[record.Header.PageID] = image
+		lastRecord[record.Header.PageID] = index
+	}
+
+	materialized := make([]wal.WALRecord, 0, len(records))
+	for index, record := range records {
+		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch {
+			if lastRecord[record.Header.PageID] != index {
+				continue
+			}
+			record.Header.Type = wal.RecordTypeNode
+			record.Payload = pageImages[record.Header.PageID]
+			if err := btree.ValidateWALNode(record.Payload, record.Header.PageID); err != nil {
+				return nil, err
+			}
+		}
+		materialized = append(materialized, record)
+	}
+	return materialized, nil
 }

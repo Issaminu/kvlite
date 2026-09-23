@@ -44,7 +44,7 @@ type writeResult struct {
 type writeBatchState struct {
 	meta      *page.Meta
 	rootNode  *btree.Node
-	dirty     map[page.ID]*btree.Node
+	dirty     map[page.ID]dirtyNode
 	metaDirty bool
 }
 
@@ -124,7 +124,7 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	state := writeBatchState{
 		meta:     db.meta,
 		rootNode: db.rootNode,
-		dirty:    make(map[page.ID]*btree.Node),
+		dirty:    make(map[page.ID]dirtyNode),
 	}
 	results := make([]writeResult, len(requests))
 	hasPendingWrites := false
@@ -148,8 +148,8 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		state.meta = tx.meta
 		state.rootNode = tx.rootNode
 		state.metaDirty = state.metaDirty || tx.metaDirty
-		for pageID, node := range tx.store.dirty {
-			state.dirty[pageID] = node
+		for pageID, dirty := range tx.store.dirty {
+			state.dirty[pageID] = dirty
 		}
 		hasPendingWrites = true
 	}
@@ -157,15 +157,15 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	var commitErr error
 	needsCheckpoint := false
 	if hasPendingWrites {
-		// state.dirty contains one final image for each changed page. One WAL transaction gives all dependent callbacks the same commit result.
-		records := encodeWALRecords(state.dirty, state.meta, state.metaDirty)
-		needsCheckpoint, commitErr = db.wal.Commit(records)
+		// state.dirty contains the original and final image of each changed page. One WAL transaction gives all dependent callbacks the same commit result.
+		nodes, encodedMeta := makeWALCommitData(state.dirty, state.meta, state.metaDirty)
+		needsCheckpoint, commitErr = db.wal.Commit(nodes, encodedMeta)
 		if commitErr == nil {
 			// Publish the new state only after the WAL append and required synchronization succeed.
 			db.meta = state.meta
 			db.rootNode = state.rootNode
-			for _, node := range state.dirty {
-				db.cacheWriteNode(node)
+			for _, dirty := range state.dirty {
+				db.cacheWriteNode(dirty.final)
 			}
 		}
 	}

@@ -26,8 +26,8 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
-	records := []Record{{
-		Header: RecordHeader{Type: RecordTypeData, PageID: node.PageID()},
+	records := []CommittedPage{{
+		Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID()},
 		Node:   node,
 	}}
 	writer := &checkpointWriter{}
@@ -50,19 +50,19 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 
 func TestWriteCheckpointRecordRuns_ValidatesAllNodesBeforeWriting(t *testing.T) {
 	const pageSize int64 = 600_000
-	records := make([]Record, 0, 3)
+	records := make([]CommittedPage, 0, 3)
 	for pageID := page.ID(2); pageID <= 4; pageID++ {
 		node := btree.NewLeafNode(pageID)
 		if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 			t.Fatal(err)
 		}
-		records = append(records, Record{
-			Header:      RecordHeader{Type: RecordTypeData, PageID: pageID},
-			PageContent: btree.EncodeWALNode(node),
+		records = append(records, CommittedPage{
+			Header:  RecordHeader{Type: RecordTypeNode, PageID: pageID},
+			Payload: btree.EncodeWALNode(node),
 		})
 	}
 	const firstLeafEntryOffsetField = btree.NodeHeaderSize + 4
-	binary.LittleEndian.PutUint32(records[2].PageContent[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
+	binary.LittleEndian.PutUint32(records[2].Payload[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
 
 	writer := &checkpointWriter{}
 	if err := writeCheckpointRecordRuns(writer, records, pageSize); !errors.Is(err, btree.ErrInvalid) {
@@ -79,11 +79,11 @@ func (writer *checkpointWriter) WriteAt(data []byte, offset int64) (int, error) 
 }
 
 func TestWriteCheckpointRecordRuns_CombinesAdjacentPages(t *testing.T) {
-	records := []Record{
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 1}, PageContent: []byte("a")},
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 2}, PageContent: []byte("bb")},
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 4}, PageContent: []byte("d")},
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 5}, PageContent: []byte("ee")},
+	records := []CommittedPage{
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 1}, Payload: []byte("a")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 2}, Payload: []byte("bb")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 4}, Payload: []byte("d")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 5}, Payload: []byte("ee")},
 	}
 	writer := &checkpointWriter{}
 
@@ -107,7 +107,7 @@ func TestWriteCheckpointRecordRuns_CombinesAdjacentPages(t *testing.T) {
 
 func TestWriteCheckpointRecordRuns_LimitsContiguousWriteSize(t *testing.T) {
 	const pageSize int64 = 4096
-	records := make([]Record, 257)
+	records := make([]CommittedPage, 257)
 	for index := range records {
 		records[index].Header.Type = RecordTypeMeta
 		records[index].Header.PageID = page.ID(index + 1)

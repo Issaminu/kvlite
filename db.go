@@ -423,7 +423,7 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
-		node, err := wal.RecordToNode(&record)
+		node, err := wal.CommittedPageToNode(&record)
 		if err != nil {
 			return nil, err
 		}
@@ -494,7 +494,7 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool
 		if record.Node != nil {
 			return btree.LookupDecodedNode(record.Node, key)
 		}
-		return btree.LookupEncodedWALNode(record.PageContent, pageID, key)
+		return btree.LookupEncodedWALNode(record.Payload, pageID, key)
 	}
 	data, err := db.readMainPage(pageID)
 	if err != nil {

@@ -130,6 +130,22 @@ func (n *Node) EntryCount() int {
 	return len(n.entries)
 }
 
+// EntryAt returns the entry at index without copying it.
+// The returned entry refers to storage owned by the node.
+// It remains valid until the node changes its entry list.
+func (n *Node) EntryAt(index int) *Entry {
+	return &n.entries[index]
+}
+
+// WALBodyOffset returns the first byte after the entry descriptor directory in a compact WAL node image.
+func (n *Node) WALBodyOffset() int {
+	descriptorSize := leafEntryDescriptorSize
+	if !n.IsLeaf() {
+		descriptorSize = branchEntryDescriptorSize
+	}
+	return NodeHeaderSize + len(n.entries)*descriptorSize
+}
+
 // Clone returns a structural copy of n with the same page ID.
 // The clone owns its entry and child lists but shares the immutable key and value bytes with n.
 // Node changes must replace an entry or byte slice instead of changing shared bytes in place.

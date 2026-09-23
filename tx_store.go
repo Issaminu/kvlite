@@ -5,19 +5,24 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+// dirtyNode keeps the original committed image and the final private image of one changed page. original is nil for a new page.
+type dirtyNode struct {
+	original *btree.Node
+	final    *btree.Node
+}
+
 // txTreeStore reads committed nodes for both transaction modes and owns private nodes only for a write transaction.
 // Discarding a write store discards uncommitted node and metadata changes without restoring shared database state.
 type txTreeStore struct {
 	tx *Tx
-	// baseNodes contains page images from earlier callbacks in the same write batch. They remain private until the full batch commits to the WAL.
-	baseNodes map[page.ID]*btree.Node
+	// baseDirty contains changes from earlier callbacks in the same write batch. They remain private until the full batch commits to the WAL.
+	baseDirty map[page.ID]dirtyNode
 	// nodes is a write transaction's complete page view. It contains committed
 	// nodes read by the transaction and private nodes staged by the transaction.
 	// It stays nil for a read transaction.
 	nodes map[page.ID]*btree.Node
-	// dirty is the changed subset of nodes whose final images walRecords must encode.
-	// StageNode stores the same private node in both maps.
-	dirty map[page.ID]*btree.Node
+	// dirty contains one original and final image for each changed page. A nil original means that the transaction created the page.
+	dirty map[page.ID]dirtyNode
 }
 
 func (store *txTreeStore) PageSize() int64 {
@@ -46,9 +51,9 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 		return node, nil
 	}
 	// WritableNode clones this shared batch image before it changes the node. This keeps an unsuccessful callback from changing an earlier result.
-	if node, ok := store.baseNodes[pageID]; ok {
-		store.nodes[pageID] = node
-		return node, nil
+	if dirty, ok := store.baseDirty[pageID]; ok {
+		store.nodes[pageID] = dirty.final
+		return dirty.final, nil
 	}
 
 	node, err := store.tx.db.readNode(pageID)
@@ -71,15 +76,25 @@ func (store *txTreeStore) AllocatePage() page.ID {
 // copies a committed node. Later writes reuse the same dirty node.
 func (store *txTreeStore) WritableNode(node *btree.Node) *btree.Node {
 	if dirty, ok := store.dirty[node.PageID()]; ok {
-		return dirty
+		return dirty.final
+	}
+	original := node
+	if batchDirty, ok := store.baseDirty[node.PageID()]; ok {
+		original = batchDirty.original
 	}
 	private := node.Clone()
-	store.StageNode(private)
+	store.nodes[node.PageID()] = private
+	store.dirty[node.PageID()] = dirtyNode{original: original, final: private}
 	return private
 }
 
 func (store *txTreeStore) StageNode(node *btree.Node) {
+	dirty := store.dirty[node.PageID()]
+	dirty.final = node
+	if baseDirty, ok := store.baseDirty[node.PageID()]; ok {
+		dirty.original = baseDirty.original
+	}
 	// Keep the mutable node here. The commit path encodes its final state once after the callback succeeds.
 	store.nodes[node.PageID()] = node
-	store.dirty[node.PageID()] = node
+	store.dirty[node.PageID()] = dirty
 }

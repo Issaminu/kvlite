@@ -11,105 +11,144 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+// RecordType tells recovery how to read a WAL record payload.
 type RecordType uint8
 
+// WAL record type values define the file format.
 const (
-	RecordTypeData   RecordType = 0
-	RecordTypeMeta   RecordType = 1
-	RecordTypeCommit RecordType = 2
+	// RecordTypeCommit ends one WAL transaction. Its payload is empty.
+	RecordTypeCommit RecordType = 0
+	// RecordTypeMeta stores one complete metadata image.
+	RecordTypeMeta RecordType = 1
+	// RecordTypeNode stores one complete compact data-node image.
+	RecordTypeNode RecordType = 2
+	// RecordTypePatch stores replacement ranges for one existing data node.
+	RecordTypePatch RecordType = 3
 
 	recordTypeSize          = 1 // A record type uses one byte.
 	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
-	recordContentLengthSize = 4 // A content length uses one uint32 value.
+	recordPayloadLengthSize = 4 // A payload length uses one uint32 value.
 	ChecksumSize            = 4 // A CRC32C checksum uses one uint32 value.
-	HeaderSize              = recordTypeSize + page.IDSize + recordTransactionIDSize + recordContentLengthSize
+	HeaderSize              = recordTypeSize + page.IDSize + recordTransactionIDSize + recordPayloadLengthSize
 )
 
 type TxID uint64
 
-// RecordHeader is the fixed-size head of every WAL record.
+// RecordHeader is the fixed-size header of every WAL record.
 type RecordHeader struct {
 	Type   RecordType
 	PageID page.ID
 	TxID   TxID
 }
 
-// Record contains one WAL header and its content. An in-memory data record can hold Node instead of PageContent. A decoded record holds PageContent. A record must not hold both forms.
-type Record struct {
-	Header      RecordHeader
-	PageContent []byte
-	Node        *btree.Node
+// NodeRecord carries one changed data node from a write transaction to [WAL.Commit].
+// WAL.Commit compares Original and Final and writes a page patch when it is smaller than the complete final image.
+// NodeRecord exists only in memory. The WAL file does not store this structure.
+type NodeRecord struct {
+	// Original is the committed node before the transaction.
+	// It is nil for a new page.
+	Original *btree.Node
+	// Final is the private node image to commit.
+	Final *btree.Node
 }
 
-func EncodeRecord(record *Record, pageSize int64) ([]byte, error) {
-	size, err := EncodedRecordSize(record, pageSize)
+// WALRecord represents one record in the WAL file format.
+// [WAL.ReadRecords] returns WALRecord values during recovery.
+// Header.Type defines whether Payload contains a complete node image, page-patch ranges, encoded metadata, or no bytes for a commit marker.
+type WALRecord struct {
+	Header RecordHeader
+	// Payload contains bytes that can be written to the WAL file.
+	Payload []byte
+}
+
+// EncodeWALRecord returns one encoded WAL record.
+// It returns an error when Payload is larger than pageSize.
+func EncodeWALRecord(record *WALRecord, pageSize int64) ([]byte, error) {
+	size, err := EncodedWALRecordSize(record, pageSize)
 	if err != nil {
 		return nil, err
 	}
 
-	return AppendEncodedRecord(make([]byte, 0, size), record), nil
+	return AppendEncodedWALRecord(make([]byte, 0, size), record), nil
 }
 
-func EncodedRecordSize(record *Record, pageSize int64) (int, error) {
-	contentSize := len(record.PageContent)
-	if record.Node != nil {
-		if record.Header.Type != RecordTypeData || record.Header.PageID != record.Node.PageID() || record.PageContent != nil {
-			return 0, fmt.Errorf("invalid WAL node record")
-		}
-		contentSize = btree.WALNodeEncodedSize(record.Node)
+// EncodedWALRecordSize returns the encoded size of record.
+// It returns an error when Payload is larger than pageSize.
+func EncodedWALRecordSize(record *WALRecord, pageSize int64) (int, error) {
+	payloadSize := len(record.Payload)
+	if int64(payloadSize) > pageSize {
+		return 0, fmt.Errorf("record payload exceeds page size (%d > %d)", payloadSize, pageSize)
 	}
-	if int64(contentSize) > pageSize {
-		return 0, fmt.Errorf("record page content exceeds page size (%d > %d)", contentSize, pageSize)
-	}
-	return HeaderSize + contentSize + ChecksumSize, nil
+	return HeaderSize + payloadSize + ChecksumSize, nil
 }
 
-func AppendEncodedRecord(data []byte, record *Record) []byte {
-	contentSize := len(record.PageContent)
-	if record.Node != nil {
-		contentSize = btree.WALNodeEncodedSize(record.Node)
-	}
+// AppendEncodedWALRecord appends one encoded WAL record to data.
+// It does not validate the payload size.
+func AppendEncodedWALRecord(data []byte, record *WALRecord) []byte {
+	return appendEncodedPayloadRecord(data, record.Header, record.Payload)
+}
+
+func appendEncodedPayloadRecord(data []byte, header RecordHeader, payload []byte) []byte {
 	headerStart := len(data)
-	data = append(data, byte(record.Header.Type))
-	data = binary.LittleEndian.AppendUint64(data, uint64(record.Header.PageID))
-	data = binary.LittleEndian.AppendUint64(data, uint64(record.Header.TxID))
-	data = binary.LittleEndian.AppendUint32(data, uint32(contentSize))
-	headerEnd := len(data)
-	contentStart := len(data)
-	if record.Node != nil {
-		data = btree.AppendEncodedWALNode(data, record.Node)
-	} else {
-		data = append(data, record.PageContent...)
-	}
-	checksum := computeRecordChecksum(data[headerStart:headerEnd], data[contentStart:])
-	data = binary.LittleEndian.AppendUint32(data, checksum)
+	data = appendRecordHeader(data, header, len(payload))
+	payloadStart := len(data)
+	data = append(data, payload...)
+	return appendRecordChecksum(data, headerStart, payloadStart)
+}
 
+func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.Node) []byte {
+	headerStart := len(data)
+	data = appendRecordHeader(data, header, btree.WALNodeEncodedSize(node))
+	payloadStart := len(data)
+	data = btree.AppendEncodedWALNode(data, node)
+	return appendRecordChecksum(data, headerStart, payloadStart)
+}
+
+func appendEncodedPagePatchRecord(data []byte, header RecordHeader, patch *PagePatch) []byte {
+	headerStart := len(data)
+	data = appendRecordHeader(data, header, patch.encodedSize())
+	payloadStart := len(data)
+	data = patch.appendEncoded(data)
+	return appendRecordChecksum(data, headerStart, payloadStart)
+}
+
+func appendRecordHeader(data []byte, header RecordHeader, payloadSize int) []byte {
+	data = append(data, byte(header.Type))
+	data = binary.LittleEndian.AppendUint64(data, uint64(header.PageID))
+	data = binary.LittleEndian.AppendUint64(data, uint64(header.TxID))
+	return binary.LittleEndian.AppendUint32(data, uint32(payloadSize))
+}
+
+func appendRecordChecksum(data []byte, headerStart, payloadStart int) []byte {
+	checksum := computeRecordChecksum(data[headerStart:payloadStart], data[payloadStart:])
+	data = binary.LittleEndian.AppendUint32(data, checksum)
 	return data
 }
 
-func DecodeRecord(r io.Reader, pageSize int64) (*Record, error) {
+// DecodeWALRecord reads and validates one WAL record from r.
+func DecodeWALRecord(r io.Reader, pageSize int64) (*WALRecord, error) {
 	headerData := make([]byte, HeaderSize)
 	if err := fileio.ReadFull(r, headerData); err != nil {
 		return nil, err // io.EOF at a clean boundary; io.ErrUnexpectedEOF on a torn tail
 	}
 
 	data := headerData
-	record := &Record{}
+	record := &WALRecord{}
 	record.Header.Type = RecordType(data[0])
 	data = data[recordTypeSize:]
 	record.Header.PageID = page.ID(binary.LittleEndian.Uint64(data[:page.IDSize]))
 	data = data[page.IDSize:]
 	record.Header.TxID = TxID(binary.LittleEndian.Uint64(data[:recordTransactionIDSize]))
 	data = data[recordTransactionIDSize:]
-	contentSize := binary.LittleEndian.Uint32(data[:recordContentLengthSize])
-	if int64(contentSize) > pageSize {
+	payloadSize := binary.LittleEndian.Uint32(data[:recordPayloadLengthSize])
+	if int64(payloadSize) > pageSize {
 		// A torn tail can leave a bogus length prefix. Treat it as an integrity
 		// failure so the caller does not allocate more than one page.
-		return nil, fmt.Errorf("record content_size %d exceeds page size %d: %w", contentSize, pageSize, page.ErrChecksum)
+		return nil, fmt.Errorf("record payload size %d exceeds page size %d: %w", payloadSize, pageSize, page.ErrChecksum)
 	}
 
-	record.PageContent = make([]byte, contentSize)
-	if err := fileio.ReadFull(r, record.PageContent); err != nil {
+	record.Payload = make([]byte, payloadSize)
+	if err := fileio.ReadFull(r, record.Payload); err != nil {
 		return nil, err
 	}
 
@@ -118,17 +157,18 @@ func DecodeRecord(r io.Reader, pageSize int64) (*Record, error) {
 		return nil, err
 	}
 	checksum := binary.LittleEndian.Uint32(checksumData[:])
-	if computeRecordChecksum(headerData, record.PageContent) != checksum {
+	if computeRecordChecksum(headerData, record.Payload) != checksum {
 		return nil, page.ErrChecksum
 	}
 
 	return record, nil
 }
 
-func IsCommitMarker(record *Record) bool {
+// IsCommitMarker reports whether record ends one WAL transaction.
+func IsCommitMarker(record *WALRecord) bool {
 	return record.Header.Type == RecordTypeCommit
 }
 
-func computeRecordChecksum(header, content []byte) uint32 {
-	return checksum.Sum32(header, content)
+func computeRecordChecksum(header, payload []byte) uint32 {
+	return checksum.Sum32(header, payload)
 }
