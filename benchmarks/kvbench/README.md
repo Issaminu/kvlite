@@ -8,7 +8,7 @@ The suite has three result groups:
 - Ordered tests compare KVLite and bbolt. Redis does not provide the required ordered cursor API.
 - Life-cycle tests compare the two embedded engines. The Redis server life cycle does not fit inside the Go client benchmark.
 
-See the repository [benchmark report](../../BENCHMARKS.md) for the latest published run. The current report uses `medium --workloads=all` and includes every workload group in the medium decision set.
+See the repository [benchmark report](../../BENCHMARKS.md) for the latest published run. The current report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
 
 ## Run the suite
 
