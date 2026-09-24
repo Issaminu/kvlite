@@ -133,6 +133,57 @@ func LookupMappedNode(data []byte, expectedPageID page.ID, key []byte) (Entry, b
 	return entry, found, child, err
 }
 
+// VisitMappedLeafRange visits entries in the half-open range [start, end).
+// It checks descriptor offsets and byte bounds. It does not check the page checksum or unused padding.
+// The key and value passed to visit refer to data.
+func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
+	if len(data) < NodeHeaderSize {
+		return fmt.Errorf("read leaf page: %w", ErrInvalid)
+	}
+	if version := binary.LittleEndian.Uint16(data[nodeVersionOffset:nodeTypeOffset]); version != nodeFormatVersion {
+		return fmt.Errorf("read leaf format version %d: %w", version, page.ErrVersionMismatch)
+	}
+	if nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset])); nodeType != NodeTypeLeaf {
+		if nodeType == NodeTypeBranch {
+			return ErrNotLeafNode
+		}
+		return fmt.Errorf("read leaf type %d: %w", nodeType, ErrInvalid)
+	}
+	if pageID := page.ID(binary.LittleEndian.Uint64(data[nodePageIDOffset:nodeEntryCountOffset])); pageID != expectedPageID {
+		return fmt.Errorf("read leaf page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
+	}
+
+	entryCount := int(binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset]))
+	if entryCount > (len(data)-NodeHeaderSize)/leafEntryDescriptorSize {
+		return fmt.Errorf("read leaf entry count: %w", ErrInvalid)
+	}
+	payloadStart := NodeHeaderSize + entryCount*leafEntryDescriptorSize
+	nextOffset := payloadStart
+	for index := 0; index < entryCount; index++ {
+		descriptorStart := NodeHeaderSize + index*leafEntryDescriptorSize
+		descriptor := data[descriptorStart : descriptorStart+leafEntryDescriptorSize]
+		flags := binary.LittleEndian.Uint32(descriptor[:encodedUint32Size])
+		offset := uint64(binary.LittleEndian.Uint32(descriptor[encodedUint32Size : 2*encodedUint32Size]))
+		keyEnd := offset + uint64(binary.LittleEndian.Uint32(descriptor[2*encodedUint32Size:3*encodedUint32Size]))
+		valueEnd := keyEnd + uint64(binary.LittleEndian.Uint32(descriptor[3*encodedUint32Size:]))
+		if offset != uint64(nextOffset) || valueEnd > uint64(len(data)) {
+			return fmt.Errorf("read leaf entry %d: %w", index, ErrInvalid)
+		}
+		nextOffset = int(valueEnd)
+		key := data[int(offset):int(keyEnd):int(keyEnd)]
+		if len(start) > 0 && bytes.Compare(key, start) < 0 {
+			continue
+		}
+		if len(end) > 0 && bytes.Compare(key, end) >= 0 {
+			return nil
+		}
+		if err := visit(flags, key, data[int(keyEnd):int(valueEnd):int(valueEnd)]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // LookupEncodedWALNode finds key in one compact node from a verified WAL record.
 // It checks each field that it reads.
 // It requires a zero node checksum.
@@ -164,8 +215,6 @@ func LookupEncodedWALNode(data []byte, expectedPageID page.ID, key []byte) (Entr
 // Node entries and returned entry bytes refer to data. The caller must keep data unchanged while it uses these results.
 //
 // The caller must check the header length and the source checksum before this call. allowPadding applies only to complete-body validation.
-//
-// @TODO: This function does too many things (it has a horrible signature with a billion params and returns), but the alternative is worse (defining 2 traversal paths for encoded/decoded reading like we did before). We need to find a way to minimize the cognitive load here without reintroducing the duplicated logic for traversal (and without read perf regressions!)
 func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool) (*Node, Entry, bool, page.ID, error) {
 	formatVersion := binary.LittleEndian.Uint16(data[nodeVersionOffset:nodeTypeOffset])
 	if formatVersion != nodeFormatVersion {

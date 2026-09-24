@@ -62,12 +62,12 @@ func TestScanChecksumDoesNotDependOnOrder(t *testing.T) {
 	pairs := makeTextPairs(100, 128)
 	checksum := uint64(0)
 	for _, pair := range pairs {
-		checksum = consumePair(checksum, pair.Key, pair.Value)
+		checksum = consumeScannedPair(checksum, pair.Key, pair.Value)
 	}
 	slices.Reverse(pairs)
 	reversed := uint64(0)
 	for _, pair := range pairs {
-		reversed = consumePair(reversed, pair.Key, pair.Value)
+		reversed = consumeScannedPair(reversed, pair.Key, pair.Value)
 	}
 	if checksum != reversed {
 		t.Fatalf("checksum changed with result order: %d != %d", checksum, reversed)

@@ -197,9 +197,9 @@ func BenchmarkEnumeration(b *testing.B) {
 		iterations int
 	}{
 		{name: "selectivity=0", prefix: []byte("none/"), want: 0, iterations: 1_000},
-		{name: "selectivity=1", prefix: []byte("item/000000"), want: 100, iterations: 100},
-		{name: "selectivity=10", prefix: []byte("item/00000"), want: 1_000, iterations: 10},
-		{name: "selectivity=100", prefix: []byte("item/"), want: 10_000, iterations: 1},
+		{name: "selectivity=1", prefix: []byte("item/000000"), want: 100, iterations: 10_000},
+		{name: "selectivity=10", prefix: []byte("item/00000"), want: 1_000, iterations: 1_000},
+		{name: "selectivity=100", want: 10_000, iterations: 1_000},
 	}
 	if lightProfile() {
 		tests = tests[3:]
@@ -217,7 +217,7 @@ func BenchmarkEnumeration(b *testing.B) {
 			for range test.iterations {
 				count := 0
 				err := engine.ScanPrefix(b.Context(), test.prefix, func(key, value []byte) error {
-					checksum = consumePair(checksum, key, value)
+					checksum = consumeScannedPair(checksum, key, value)
 					count++
 					return nil
 				})
@@ -236,6 +236,12 @@ func BenchmarkEnumeration(b *testing.B) {
 }
 
 func BenchmarkOrderedOperations(b *testing.B) {
+	const (
+		seekMeasurementRepeats     = 100
+		scanMeasurementRepeats     = 1_000
+		fullScanMeasurementRepeats = 5_000
+	)
+
 	if !workloadEnabled(benchmarkRead) {
 		b.Skip("read workloads are not selected")
 	}
@@ -264,7 +270,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		limits = []int{1, 100, 1_000}
 	}
 	for _, limit := range limits {
-		iterations := records / limit
+		iterations := records / limit * seekMeasurementRepeats
 		name := fmt.Sprintf("seek-and-read=%d/%s", limit, environment.kind)
 		b.Run(name, func(b *testing.B) {
 			var checksum uint64
@@ -273,7 +279,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 			for iteration := range iterations {
 				start := pairs[distributedIndex(iteration, len(pairs)-limit+1, false)].Key
 				if err := ordered.VisitOrdered(b.Context(), start, nil, false, limit, func(key, value []byte) error {
-					checksum = consumePair(checksum, key, value)
+					checksum = consumeScannedPair(checksum, key, value)
 					visited++
 					return nil
 				}); err != nil {
@@ -295,10 +301,10 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		want       int
 		iterations int
 	}{
-		{name: "selectivity=0", start: []byte("item/99999999"), end: []byte("item/99999999"), want: 0, iterations: profileValue(1_000, 10)},
-		{name: "selectivity=1", start: pairs[0].Key, end: pairs[records/100].Key, want: records / 100, iterations: profileValue(100, 10)},
-		{name: "selectivity=10", start: pairs[0].Key, end: pairs[records/10].Key, want: records / 10, iterations: profileValue(10, 2)},
-		{name: "selectivity=100", want: records, iterations: 1},
+		{name: "selectivity=0", start: []byte("item/99999999"), end: []byte("item/99999999"), want: 0, iterations: profileValue(1_000, 10) * scanMeasurementRepeats},
+		{name: "selectivity=1", start: pairs[0].Key, end: pairs[records/100].Key, want: records / 100, iterations: profileValue(100, 10) * scanMeasurementRepeats},
+		{name: "selectivity=10", start: pairs[0].Key, end: pairs[records/10].Key, want: records / 10, iterations: profileValue(10, 2) * scanMeasurementRepeats},
+		{name: "selectivity=100", want: records, iterations: scanMeasurementRepeats},
 	}
 	if lightProfile() {
 		rangeTests = rangeTests[2:3]
@@ -310,7 +316,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 			for range test.iterations {
 				visited := 0
 				if err := ordered.VisitOrdered(b.Context(), test.start, test.end, false, 0, func(key, value []byte) error {
-					checksum = consumePair(checksum, key, value)
+					checksum = consumeScannedPair(checksum, key, value)
 					visited++
 					return nil
 				}); err != nil {
@@ -337,14 +343,16 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		b.Run("full-"+name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
 			b.ResetTimer()
-			if err := ordered.VisitOrdered(b.Context(), nil, nil, reverse, 0, func(key, value []byte) error {
-				checksum = consumePair(checksum, key, value)
-				return nil
-			}); err != nil {
-				b.Fatal(err)
+			for range fullScanMeasurementRepeats {
+				if err := ordered.VisitOrdered(b.Context(), nil, nil, reverse, 0, func(key, value []byte) error {
+					checksum = consumeScannedPair(checksum, key, value)
+					return nil
+				}); err != nil {
+					b.Fatal(err)
+				}
 			}
 			b.StopTimer()
-			b.ReportMetric(float64(records)/b.Elapsed().Seconds(), "entries/s")
+			b.ReportMetric(float64(records*fullScanMeasurementRepeats)/b.Elapsed().Seconds(), "entries/s")
 			b.ReportMetric(checksumMetric(checksum), "checksum")
 		})
 	}
@@ -495,6 +503,19 @@ func consumePair(checksum uint64, key, value []byte) uint64 {
 	digest = (digest ^ 0xff) * 1_099_511_628_211
 	for _, character := range value {
 		digest = (digest ^ uint64(character)) * 1_099_511_628_211
+	}
+	return checksum + digest
+}
+
+func consumeScannedPair(checksum uint64, key, value []byte) uint64 {
+	digest := uint64(len(key))*1_099_511_628_211 + uint64(len(value))
+	if len(key) > 0 {
+		digest = (digest ^ uint64(key[0])) * 1_099_511_628_211
+		digest = (digest ^ uint64(key[len(key)-1])) * 1_099_511_628_211
+	}
+	if len(value) > 0 {
+		digest = (digest ^ uint64(value[0])) * 1_099_511_628_211
+		digest = (digest ^ uint64(value[len(value)-1])) * 1_099_511_628_211
 	}
 	return checksum + digest
 }

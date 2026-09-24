@@ -75,7 +75,7 @@ func (cursor *Cursor) Last() (*Entry, bool, error) {
 	}
 
 	// The final leaf entry is the largest entry in the tree. position handles an empty leaf.
-	return cursor.position(leaf, leaf.EntryCount()-1)
+	return cursor.position(leaf, len(leaf.entries)-1)
 }
 
 // Seek moves to the first entry whose key is equal to or greater than target.
@@ -109,7 +109,7 @@ func (cursor *Cursor) Seek(target []byte) (*Entry, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	if entryIndex < node.EntryCount() {
+	if entryIndex < len(node.entries) {
 		return cursor.position(node, entryIndex)
 	}
 
@@ -128,9 +128,10 @@ func (cursor *Cursor) Next() (*Entry, bool, error) {
 	}
 
 	// When the leaf has another entry, only the entry index must change.
-	if cursor.entryIndex+1 < cursor.leaf.EntryCount() {
-		cursor.entryIndex++
-		return cursor.current()
+	nextIndex := cursor.entryIndex + 1
+	if nextIndex < len(cursor.leaf.entries) {
+		cursor.entryIndex = nextIndex
+		return &cursor.leaf.entries[nextIndex], true, nil
 	}
 
 	// The leaf has no later entry. The saved branch path identifies the next leaf.
@@ -149,30 +150,18 @@ func (cursor *Cursor) Prev() (*Entry, bool, error) {
 	// When the leaf has an earlier entry, only the entry index must change.
 	if cursor.entryIndex > 0 {
 		cursor.entryIndex--
-		return cursor.current()
+		return &cursor.leaf.entries[cursor.entryIndex], true, nil
 	}
 
 	// The leaf has no earlier entry. The saved branch path identifies the previous leaf.
 	return cursor.moveToPreviousLeaf()
 }
 
-// current returns the entry selected by the current leaf and entry index.
-// The returned entry refers to node storage and must not be changed.
-// current returns a nil entry and false when the cursor has no current entry.
-func (cursor *Cursor) current() (*Entry, bool, error) {
-	if cursor.leaf == nil {
-		return nil, false, nil
-	}
-
-	// position and the movement methods keep entryIndex within the current leaf.
-	return &cursor.leaf.entries[cursor.entryIndex], true, nil
-}
-
 // position selects entryIndex in leaf as the current cursor entry.
 // It returns a nil entry and clears the current position when entryIndex is outside the leaf.
 // This boundary rule handles an empty tree for First and Last.
 func (cursor *Cursor) position(leaf *Node, entryIndex int) (*Entry, bool, error) {
-	if entryIndex < 0 || entryIndex >= leaf.EntryCount() {
+	if entryIndex < 0 || entryIndex >= len(leaf.entries) {
 		// A nil leaf is the single marker for a cursor that has no current entry.
 		cursor.leaf = nil
 		return nil, false, nil
@@ -181,7 +170,7 @@ func (cursor *Cursor) position(leaf *Node, entryIndex int) (*Entry, bool, error)
 	// Publish the leaf and index only after the bounds check makes both values safe for current to use.
 	cursor.leaf = leaf
 	cursor.entryIndex = entryIndex
-	return cursor.current()
+	return &leaf.entries[entryIndex], true, nil
 }
 
 // readChild returns the child selected by childIndex in parent.

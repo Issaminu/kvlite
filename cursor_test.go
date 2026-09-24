@@ -358,6 +358,74 @@ func TestBucketScan_Prefix(t *testing.T) {
 			return err
 		}
 		requireScanKeys(t, keys, "acct/001", "acct/002", "acct/010", "event/001", "event/002", "user/001")
+
+		keys = nil
+		if err := bucket.ScanPrefix([]byte("acct/"), func(key, value []byte) error {
+			return collectScanKey(key, value, &keys)
+		}); err != nil {
+			return err
+		}
+		requireScanKeys(t, keys, "acct/001", "acct/002", "acct/010")
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBucketScan_FullPrefixPersistsAfterReopen(t *testing.T) {
+	path := t.TempDir() + "/database"
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareScanBucket(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if _, err := bucket.Cursor(); err != nil {
+			return err
+		}
+		var keys [][]byte
+		if err := bucket.ScanPrefix(nil, func(key, value []byte) error {
+			return collectScanKey(key, value, &keys)
+		}); err != nil {
+			return err
+		}
+		requireScanKeys(t, keys, "acct/001", "acct/002", "acct/010", "event/001", "event/002", "user/001")
+
+		keys = nil
+		if err := bucket.ScanRange([]byte("acct/002"), []byte("event/002"), func(key, value []byte) error {
+			return collectScanKey(key, value, &keys)
+		}); err != nil {
+			return err
+		}
+		requireScanKeys(t, keys, "acct/002", "acct/010", "event/001")
+
+		errStop := errors.New("stop mapped scan")
+		calls := 0
+		err = bucket.ScanPrefix(nil, func(_, _ []byte) error {
+			calls++
+			if calls == 2 {
+				return errStop
+			}
+			return nil
+		})
+		if !errors.Is(err, errStop) || calls != 2 {
+			t.Fatalf("mapped callback stop: calls=%d err=%v", calls, err)
+		}
 		return nil
 	})
 	if err != nil {
@@ -462,6 +530,26 @@ func TestBucketScan_ClosedTransactionPrecedesBounds(t *testing.T) {
 	err = bucket.ScanRange([]byte("z"), []byte("a"), func(_, _ []byte) error { return nil })
 	if !errors.Is(err, ErrTxClosed) {
 		t.Fatalf("closed invalid range: got %v, want ErrTxClosed", err)
+	}
+}
+
+func TestPrefixRangeEnd(t *testing.T) {
+	tests := []struct {
+		name   string
+		prefix []byte
+		want   []byte
+	}{
+		{name: "empty"},
+		{name: "text", prefix: []byte("acct/"), want: []byte("acct0")},
+		{name: "carry", prefix: []byte{0x01, 0xff}, want: []byte{0x02}},
+		{name: "no upper bound", prefix: []byte{0xff}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := prefixRangeEnd(test.prefix); !bytes.Equal(got, test.want) {
+				t.Fatalf("prefixRangeEnd(%x) = %x, want %x", test.prefix, got, test.want)
+			}
+		})
 	}
 }
 

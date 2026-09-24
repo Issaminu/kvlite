@@ -128,6 +128,62 @@ func TestDecodeNode_RejectsHeaderForWrongPage(t *testing.T) {
 	}
 }
 
+func TestVisitMappedLeafRange(t *testing.T) {
+	node := NewLeafNode(page.ID(7))
+	for _, entry := range []Entry{
+		NewEntry(0, []byte("acct/001"), []byte("one")),
+		NewEntry(0, []byte("acct/002"), []byte("two")),
+		NewEntry(0, []byte("event/001"), []byte("three")),
+	} {
+		if err := node.InsertEntry(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	data := make([]byte, testNodePageSize)
+	copy(data, EncodeNode(node, testNodePageSize))
+	var keys [][]byte
+	err := VisitMappedLeafRange(data, node.PageID(), nil, nil, func(_ uint32, key, _ []byte) error {
+		keys = append(keys, bytes.Clone(key))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 3 || !bytes.Equal(keys[0], []byte("acct/001")) || !bytes.Equal(keys[1], []byte("acct/002")) || !bytes.Equal(keys[2], []byte("event/001")) {
+		t.Fatalf("scan keys: got %q", keys)
+	}
+
+	keys = nil
+	err = VisitMappedLeafRange(data, node.PageID(), []byte("acct/002"), []byte("event/001"), func(_ uint32, key, _ []byte) error {
+		keys = append(keys, bytes.Clone(key))
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(keys) != 1 || !bytes.Equal(keys[0], []byte("acct/002")) {
+		t.Fatalf("range keys: got %q", keys)
+	}
+}
+
+func TestVisitMappedLeafRange_RejectsInvalidInput(t *testing.T) {
+	leaf := NewLeafNode(page.ID(7))
+	data := EncodeNode(leaf, testNodePageSize)
+	data[0] ^= 0xff
+	if err := VisitMappedLeafRange(data, leaf.PageID(), nil, nil, func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, page.ErrVersionMismatch) {
+		t.Fatalf("corrupt leaf error: got %v, want ErrVersionMismatch", err)
+	}
+
+	left := NewLeafNode(page.ID(8))
+	right := NewLeafNode(page.ID(9))
+	branch := NewRootNode(page.ID(10), left, right, []byte("middle"))
+	data = EncodeNode(branch, testNodePageSize)
+	if err := VisitMappedLeafRange(data, branch.PageID(), nil, nil, func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, ErrNotLeafNode) {
+		t.Fatalf("branch error: got %v, want ErrNotLeafNode", err)
+	}
+}
+
 func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
 	node := NewLeafNode(page.ID(7))
 
