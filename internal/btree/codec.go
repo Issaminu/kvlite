@@ -46,7 +46,7 @@ var checksumZeroBlock [checksumZeroBlockSize]byte
 //
 // DecodeNode returns [page.ErrChecksum] if the checksum does not match.
 // It returns [page.ErrVersionMismatch] if the format version is not supported.
-// It returns [page.ErrInvalid] if the size, type, page ID, body, or padding is not valid.
+// It returns [page.ErrInvalid] if the size, type, page ID, or body is not valid.
 func DecodeNode(data []byte, expectedPageID page.ID, pageSize int64) (*Node, error) {
 	if len(data) < NodeHeaderSize {
 		return nil, fmt.Errorf("read node header: %w", ErrInvalid)
@@ -308,11 +308,7 @@ func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32,
 			}
 		}
 
-		if allowPadding {
-			if !allZero(data[nextOffset:]) {
-				return nil, Entry{}, false, 0, fmt.Errorf("read node padding: %w", ErrInvalid)
-			}
-		} else if nextOffset != len(data) {
+		if !allowPadding && nextOffset != len(data) {
 			return nil, Entry{}, false, 0, fmt.Errorf("read WAL node size: %w", ErrInvalid)
 		}
 		return node, Entry{}, false, 0, nil
@@ -508,13 +504,4 @@ func nodePageChecksum(data []byte, pageSize int64) uint32 {
 		remaining -= chunkSize
 	}
 	return sum
-}
-
-func allZero(data []byte) bool {
-	for _, value := range data {
-		if value != 0 {
-			return false
-		}
-	}
-	return true
 }

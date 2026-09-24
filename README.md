@@ -257,7 +257,7 @@ A writable open creates the log. A clean writable close removes it. An applicati
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SyncFull`   | Default. A non-empty update returns after KVLite synchronizes its log data to storage. Concurrent updates can share this work.                            |
 | `SyncNormal` | Synchronizes at a checkpoint or clean close. A system failure can lose recent committed updates from the operating-system cache.                          |
-| `SyncNone`   | Does not synchronize at commit, checkpoint, or close. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
+| `SyncNone`   | Does not synchronize a new database or synchronize at commit, checkpoint, or close. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
 
 
 These modes do not change transaction atomicity. They change when committed log data reaches storage.

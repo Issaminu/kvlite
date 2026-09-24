@@ -6382,12 +6382,16 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 	if records == nil {
 		t.Fatal("committed WAL has no records")
 	}
+	committed, err := committedWALRecords(records)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	db.wal.ClearCommittedRecordsForTesting()
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.ingestWalRecords(records); err == nil {
+	if err := db.ingestWalRecords(committed); err == nil {
 		t.Fatal("expected WAL replay to fail on the closed main file")
 	}
 	_ = db.closeFiles()

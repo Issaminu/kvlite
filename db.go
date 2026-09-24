@@ -144,16 +144,22 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	db.wal = wal
-	if mainMetaErr != nil {
-		// Main-file metadata is not trusted here. Only validated metadata from a complete WAL transaction can establish db.meta.
-		if len(records) == 0 {
+	committed, err := committedWALRecords(records)
+	if err != nil {
+		return db.failOpen(err)
+	}
+	if mainMetaErr != nil || db.options.ReadOnly {
+		committedMeta, committedMetaErr := metaFromCommittedRecords(committed)
+		if mainMetaErr != nil && (len(records) == 0 || committedMetaErr != nil || committedMeta == nil) {
+			// Only validated metadata from a complete WAL transaction can replace invalid main-file metadata.
 			return db.failOpen(mainMetaErr)
 		}
-		meta, err := metaFromCommittedWAL(records)
-		if err != nil {
-			return db.failOpen(mainMetaErr)
+		if committedMetaErr != nil {
+			return db.failOpen(fmt.Errorf("read committed meta from WAL: %w", committedMetaErr))
 		}
-		db.meta = meta
+		if committedMeta != nil {
+			db.meta = committedMeta
+		}
 	}
 
 	if isNew {
@@ -163,10 +169,9 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	}
 
 	// A remaining WAL can contain committed data from an unclean close, an interrupted checkpoint, or failed cleanup. Writable recovery copies committed records to the main file. Read-only recovery keeps them in the WAL overlay.
-	if err := db.replayWAL(records); err != nil {
+	if err := db.replayWAL(committed); err != nil {
 		return db.failOpen(err)
 	}
-
 	// Writable recovery can replace either main-file metadata copy. Select and validate the copies again before a root page is read. Read-only recovery already selected main-file metadata or adopted validated WAL metadata.
 	if !db.options.ReadOnly {
 		db.meta, _, err = db.readValidMainMeta()
@@ -200,8 +205,10 @@ func (db *DB) initializeNewDatabase() error {
 	if err := db.persistNode(db.rootNode); err != nil {
 		return fmt.Errorf("init root node: %w", err)
 	}
-	if err := fileio.SyncData(db.file); err != nil {
-		return fmt.Errorf("sync new database: %w", err)
+	if db.options.Synchronous != SyncNone {
+		if err := fileio.SyncData(db.file); err != nil {
+			return fmt.Errorf("sync new database: %w", err)
+		}
 	}
 	return nil
 }

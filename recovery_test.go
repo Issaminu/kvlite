@@ -10,7 +10,7 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-func TestMetaFromCommittedWAL_RejectsInvalidPageSize(t *testing.T) {
+func TestMetaFromCommittedRecords_RejectsInvalidPageSize(t *testing.T) {
 	encoded := page.EncodeMeta(page.NewMeta(4096))
 	binary.LittleEndian.PutUint64(encoded[8:16], uint64(MaxValueSize+1))
 	meta, err := page.DecodeMeta(encoded)
@@ -28,8 +28,19 @@ func TestMetaFromCommittedWAL_RejectsInvalidPageSize(t *testing.T) {
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
 
-	if _, err := metaFromCommittedWAL(records); !errors.Is(err, ErrInvalid) {
+	committed, err := committedWALRecords(records)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := metaFromCommittedRecords(committed); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("metadata error: got %v, want ErrInvalid", err)
+	}
+}
+
+func TestMetaFromCommittedRecords_NoMetadata(t *testing.T) {
+	meta, err := metaFromCommittedRecords([]wal.WALRecord{{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 2, TxID: 1}}})
+	if err != nil || meta != nil {
+		t.Fatalf("metadata without metadata record: meta=%v err=%v", meta, err)
 	}
 }
 
@@ -50,8 +61,12 @@ func TestLoadCommittedIntoOverlay_RejectsInvalidNodeDirectory(t *testing.T) {
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
 	db := &DB{wal: wal.New(wal.Config{})}
+	committed, err := committedWALRecords(records)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	if err := db.loadCommittedIntoOverlay(records); !errors.Is(err, ErrInvalid) {
+	if err := db.loadCommittedIntoOverlay(committed); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("read-only recovery error: got %v, want ErrInvalid", err)
 	}
 	if db.wal.Stats().CommittedRecordCount != 0 {

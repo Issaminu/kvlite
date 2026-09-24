@@ -11,14 +11,14 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-func (db *DB) replayWAL(records []wal.WALRecord) error {
-	if len(records) == 0 {
+func (db *DB) replayWAL(committed []wal.WALRecord) error {
+	if len(committed) == 0 {
 		return nil
 	}
 	if db.options.ReadOnly {
-		return db.loadCommittedIntoOverlay(records)
+		return db.loadCommittedIntoOverlay(committed)
 	}
-	return db.ingestWalRecords(records)
+	return db.ingestWalRecords(committed)
 }
 
 func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.WALRecord, error) {
@@ -61,12 +61,8 @@ func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.WALRecord, error)
 	return log, records, nil
 }
 
-func (db *DB) ingestWalRecords(records []wal.WALRecord) error {
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		return err
-	}
-	committed, err = db.materializeWALPagePatches(committed)
+func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
+	committed, err := db.materializeWALPagePatches(committed)
 	if err != nil {
 		return err
 	}
@@ -107,12 +103,8 @@ func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
 	return committed, nil
 }
 
-// metaFromCommittedWAL returns the newest valid metadata from a complete WAL transaction.
-func metaFromCommittedWAL(records []wal.WALRecord) (*page.Meta, error) {
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		return nil, err
-	}
+// metaFromCommittedRecords returns the newest valid metadata from committed WAL records. It returns nil when the records do not contain metadata.
+func metaFromCommittedRecords(committed []wal.WALRecord) (*page.Meta, error) {
 	// Scan backward because the newest committed transaction contains the latest metadata generation.
 	for index := len(committed) - 1; index >= 0; index-- {
 		record := committed[index]
@@ -128,16 +120,12 @@ func metaFromCommittedWAL(records []wal.WALRecord) (*page.Meta, error) {
 		}
 		return meta, nil
 	}
-	return nil, ErrInvalid
+	return nil, nil
 }
 
-// loadCommittedIntoOverlay makes committed WAL pages visible to a read-only database. It does not change the main file. Validated WAL metadata replaces db.meta when a committed transaction includes metadata.
-func (db *DB) loadCommittedIntoOverlay(records []wal.WALRecord) error {
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		return err
-	}
-	committed, err = db.materializeWALPagePatches(committed)
+// loadCommittedIntoOverlay makes committed WAL pages visible to a read-only database. It does not change the main file.
+func (db *DB) loadCommittedIntoOverlay(committed []wal.WALRecord) error {
+	committed, err := db.materializeWALPagePatches(committed)
 	if err != nil {
 		return err
 	}
@@ -153,22 +141,6 @@ func (db *DB) loadCommittedIntoOverlay(records []wal.WALRecord) error {
 	for _, record := range committed {
 		db.wal.LoadCommittedRecord(record)
 	}
-
-	hasMetaRecord := false
-	for _, record := range committed {
-		if record.Header.Type == wal.RecordTypeMeta && page.IsMetaID(record.Header.PageID) {
-			hasMetaRecord = true
-			break
-		}
-	}
-	if !hasMetaRecord {
-		return nil
-	}
-	meta, metaErr := metaFromCommittedWAL(records)
-	if metaErr != nil {
-		return fmt.Errorf("read committed meta from WAL: %w", metaErr)
-	}
-	db.meta = meta
 	return nil
 }
 
@@ -215,9 +187,6 @@ func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecor
 			}
 			record.Header.Type = wal.RecordTypeNode
 			record.Payload = pageImages[record.Header.PageID]
-			if err := btree.ValidateWALNode(record.Payload, record.Header.PageID); err != nil {
-				return nil, err
-			}
 		}
 		materialized = append(materialized, record)
 	}
