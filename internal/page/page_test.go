@@ -81,8 +81,8 @@ func TestMetaChecksum_UsesCRC32C(t *testing.T) {
 func TestMeta_TracksRootAndAllocatedPages(t *testing.T) {
 	const pageSize int64 = 4096 // The page size does not affect page ID allocation.
 	const (
-		initialRoot ID = 2 // Pages zero and one hold metadata, so the first node uses page two.
-		nextPage    ID = 3 // The next allocation follows the initial root page.
+		initialRoot ID = 3 // Metadata uses pages zero and one. The allocator uses page two.
+		nextPage    ID = 4 // The next allocation follows the initial root page.
 	)
 
 	meta := NewMeta(pageSize)
@@ -95,10 +95,10 @@ func TestMeta_TracksRootAndAllocatedPages(t *testing.T) {
 	if got := meta.Generation(); got != 0 {
 		t.Fatalf("initial generation: got %d, want 0", got)
 	}
-	if got := meta.Allocate(); got != nextPage {
-		t.Fatalf("allocated page: got %d, want %d", got, nextPage)
+	if got := meta.LastPage(); got != initialRoot {
+		t.Fatalf("initial last page: got %d, want %d", got, initialRoot)
 	}
-
+	meta.SetLastPage(nextPage)
 	meta.SetRoot(nextPage)
 	meta.AdvanceGeneration()
 	meta.RefreshChecksum()
@@ -107,6 +107,9 @@ func TestMeta_TracksRootAndAllocatedPages(t *testing.T) {
 	}
 	if got := meta.Generation(); got != 1 {
 		t.Fatalf("advanced generation: got %d, want 1", got)
+	}
+	if got := meta.LastPage(); got != nextPage {
+		t.Fatalf("last page: got %d, want %d", got, nextPage)
 	}
 	if err := meta.Validate(); err != nil {
 		t.Fatalf("validate advanced metadata: %v", err)

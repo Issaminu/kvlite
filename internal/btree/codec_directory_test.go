@@ -18,9 +18,8 @@ func fixedLeafImageForTest() []byte {
 		firstDataOffset = directoryStart + entryCount*descriptorSize
 	)
 	data := make([]byte, firstDataOffset+4)
-	binary.LittleEndian.PutUint16(data[0:2], nodeFormatVersion)
-	binary.LittleEndian.PutUint16(data[2:4], uint16(NodeTypeLeaf))
-	binary.LittleEndian.PutUint64(data[4:12], 7)
+	binary.LittleEndian.PutUint16(data[nodeTypeOffset:nodePageIDOffset], uint16(NodeTypeLeaf))
+	binary.LittleEndian.PutUint64(data[nodePageIDOffset:nodeEntryCountOffset], 7)
 	binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], entryCount)
 
 	first := data[directoryStart : directoryStart+descriptorSize]
@@ -44,9 +43,8 @@ func fixedBranchImageForTest() []byte {
 		firstDataOffset = childrenStart + (entryCount+1)*page.IDSize
 	)
 	data := make([]byte, firstDataOffset+2)
-	binary.LittleEndian.PutUint16(data[0:2], nodeFormatVersion)
-	binary.LittleEndian.PutUint16(data[2:4], uint16(NodeTypeBranch))
-	binary.LittleEndian.PutUint64(data[4:12], 7)
+	binary.LittleEndian.PutUint16(data[nodeTypeOffset:nodePageIDOffset], uint16(NodeTypeBranch))
+	binary.LittleEndian.PutUint64(data[nodePageIDOffset:nodeEntryCountOffset], 7)
 	binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], entryCount)
 
 	first := data[directoryStart : directoryStart+descriptorSize]
@@ -90,6 +88,7 @@ func TestDecodeWALNode_RejectsInvalidFixedDirectory(t *testing.T) {
 		branchDirectoryStart = NodeHeaderSize
 		leafDescriptorSize   = 16
 		branchDescriptorSize = 8
+		leafPayloadStart     = leafDirectoryStart + 2*leafDescriptorSize
 		branchChildrenStart  = branchDirectoryStart + 2*branchDescriptorSize
 	)
 	testCases := []struct {
@@ -108,7 +107,7 @@ func TestDecodeWALNode_RejectsInvalidFixedDirectory(t *testing.T) {
 			name:  "leaf offset before payload",
 			image: fixedLeafImageForTest,
 			change: func(data []byte) {
-				binary.LittleEndian.PutUint32(data[leafDirectoryStart+4:leafDirectoryStart+8], 51)
+				binary.LittleEndian.PutUint32(data[leafDirectoryStart+4:leafDirectoryStart+8], leafPayloadStart-1)
 			},
 		},
 		{
@@ -116,7 +115,7 @@ func TestDecodeWALNode_RejectsInvalidFixedDirectory(t *testing.T) {
 			image: fixedLeafImageForTest,
 			change: func(data []byte) {
 				second := leafDirectoryStart + leafDescriptorSize
-				binary.LittleEndian.PutUint32(data[second+4:second+8], 55)
+				binary.LittleEndian.PutUint32(data[second+4:second+8], leafPayloadStart+3)
 			},
 		},
 		{
@@ -130,14 +129,14 @@ func TestDecodeWALNode_RejectsInvalidFixedDirectory(t *testing.T) {
 			name:  "leaf keys out of order",
 			image: fixedLeafImageForTest,
 			change: func(data []byte) {
-				data[52] = 'z'
+				data[leafPayloadStart] = 'z'
 			},
 		},
 		{
 			name:  "leaf duplicate keys",
 			image: fixedLeafImageForTest,
 			change: func(data []byte) {
-				data[54] = 'a'
+				data[leafPayloadStart+2] = 'a'
 			},
 		},
 		{

@@ -13,6 +13,74 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+func TestWALCommit_WritesDatabaseFormatHeader(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	log := New(Config{File: walFile, PageSize: 64})
+	if _, err := log.Commit(nil, []byte("metadata")); err != nil {
+		t.Fatal(err)
+	}
+
+	var header [walFileHeaderSize]byte
+	if _, err := walFile.ReadAt(header[:], 0); err != nil {
+		t.Fatal(err)
+	}
+	if got := binary.LittleEndian.Uint32(header[0:4]); got != walFileMagic {
+		t.Fatalf("WAL magic: got %x, want %x", got, walFileMagic)
+	}
+	if got := binary.LittleEndian.Uint32(header[4:8]); got != page.FormatVersion {
+		t.Fatalf("WAL format version: got %d, want %d", got, page.FormatVersion)
+	}
+}
+
+func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
+	testCases := []struct {
+		name    string
+		change  func([]byte)
+		wantErr error
+	}{
+		{
+			name: "magic",
+			change: func(header []byte) {
+				header[0] ^= 0xff
+			},
+			wantErr: page.ErrInvalid,
+		},
+		{
+			name: "version",
+			change: func(header []byte) {
+				binary.LittleEndian.PutUint32(header[4:8], page.FormatVersion+1)
+			},
+			wantErr: page.ErrVersionMismatch,
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			walFile, err := os.CreateTemp(t.TempDir(), "wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer walFile.Close()
+
+			header := encodeWALFileHeader()
+			testCase.change(header[:])
+			if _, err := walFile.Write(header[:]); err != nil {
+				t.Fatal(err)
+			}
+
+			log := New(Config{File: walFile, PageSize: 64})
+			if _, err := log.ReadRecords(); !errors.Is(err, testCase.wantErr) {
+				t.Fatalf("ReadRecords error: got %v, want %v", err, testCase.wantErr)
+			}
+		})
+	}
+}
+
 func TestWALCommit_DoesNotUseCurrentFilePosition(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {

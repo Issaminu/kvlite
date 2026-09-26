@@ -7,13 +7,15 @@ import (
 	"github.com/Issaminu/kvlite/internal/checksum"
 )
 
-const version uint32 = 1        // format version, bumps only when making a breaking change to the DB file format itself
+// FormatVersion identifies the database and WAL format.
+const FormatVersion uint32 = 1
+
 const magic uint32 = 0x7317DC29 // The hexadecimal value encodes the KVLite file marker ("KVLT").
 
 const (
 	// Meta0ID identifies the first metadata page.
 	Meta0ID ID = 0
-	// Meta1ID identifies the second metadata page. Node pages start after it.
+	// Meta1ID identifies the second metadata page. Allocation pages follow it.
 	Meta1ID ID = 1
 )
 
@@ -35,11 +37,11 @@ type Meta struct {
 }
 
 func NewMeta(pageSize int64) *Meta {
-	const firstNodeID ID = Meta1ID + 1
+	const firstNodeID ID = Meta1ID + 2
 
 	meta := &Meta{
 		magic:    magic,
-		version:  version,
+		version:  FormatVersion,
 		pageSize: pageSize,
 		pgid:     firstNodeID,
 		root:     firstNodeID,
@@ -101,9 +103,14 @@ func (m *Meta) SetRoot(root ID) {
 	m.root = root
 }
 
-func (m *Meta) Allocate() ID {
-	m.pgid++
+// LastPage returns the highest page ID that can contain stored data.
+func (m *Meta) LastPage() ID {
 	return m.pgid
+}
+
+// SetLastPage changes the highest page ID after KVLite releases a free suffix.
+func (m *Meta) SetLastPage(pageID ID) {
+	m.pgid = pageID
 }
 
 func (m *Meta) RefreshChecksum() {
@@ -114,7 +121,7 @@ func (m *Meta) Validate() error {
 	if m.magic != magic {
 		return ErrInvalid
 	}
-	if m.version != version {
+	if m.version != FormatVersion {
 		return ErrVersionMismatch
 	}
 	if m.checksum != m.generateChecksum() {

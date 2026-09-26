@@ -13,9 +13,19 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// maxRetainedEncodingBufferBytes is the largest transaction encoding buffer kept across commits.
-// Larger buffers are dropped after [WAL.Commit] returns so one large transaction does not retain memory.
-const maxRetainedEncodingBufferBytes = 2 << 20
+const (
+	// maxRetainedEncodingBufferBytes is the largest transaction encoding buffer kept across commits.
+	// Larger buffers are dropped after [WAL.Commit] returns so one large transaction does not retain memory.
+	maxRetainedEncodingBufferBytes = 2 << 20
+
+	walFileMagic      uint32 = 0x4c57564b // The little-endian bytes spell "KVWL".
+	walFileHeaderSize        = 8
+)
+
+// A non-empty WAL file starts with this header:
+//
+//	[0:4] magic number
+//	[4:8] database format version
 
 type WAL struct {
 	path                     string
@@ -71,7 +81,7 @@ func (wal *WAL) Commit(nodes []NodeRecord, encodedMeta []byte) (bool, error) {
 		rollbackErr := wal.rollbackAppend(startOffset, bytesBefore, unsyncedBefore)
 		return false, errors.Join(err, rollbackErr)
 	}
-	wal.totalBytesWritten += uint64(len(transaction))
+	wal.totalBytesWritten += uint64(wal.appendOffset - startOffset)
 
 	for _, node := range nodes {
 		header := RecordHeader{Type: RecordTypeNode, PageID: node.Final.PageID(), TxID: wal.nextTxid}
@@ -247,7 +257,7 @@ func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUns
 	return nil
 }
 
-// ReadRecords decodes every record currently stored in the WAL file.
+// ReadRecords validates the WAL header and decodes every stored record.
 // It returns nil, nil when no WAL file is configured or the file is empty.
 // On success it sets [WAL.appendOffset] to the file size so a later [WAL.Commit] appends after the recovered prefix.
 func (wal *WAL) ReadRecords() ([]WALRecord, error) {
@@ -261,11 +271,24 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 	if info.Size() == 0 {
 		return nil, nil
 	}
+	if info.Size() < walFileHeaderSize {
+		// A partial header cannot contain a complete transaction.
+		return nil, nil
+	}
+
+	var header [walFileHeaderSize]byte
+	if _, err := wal.file.ReadAt(header[:], 0); err != nil {
+		return nil, fmt.Errorf("read WAL header: %w", err)
+	}
+	if err := validateWALFileHeader(header[:]); err != nil {
+		return nil, err
+	}
 	wal.appendOffset = info.Size()
 
+	reader := io.NewSectionReader(wal.file, walFileHeaderSize, info.Size()-walFileHeaderSize)
 	var records []WALRecord
 	for {
-		record, err := DecodeWALRecord(wal.file, wal.pageSize)
+		record, err := DecodeWALRecord(reader, wal.pageSize)
 		if err != nil {
 			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
@@ -327,14 +350,25 @@ func (wal *WAL) Delete() error {
 	return err
 }
 
-// appendTransaction persists transaction with [fileio.WriteFullAt] at [WAL.appendOffset] and advances WAL size counters.
+// appendTransaction writes the file header before the first transaction.
+// It writes at [WAL.appendOffset] and advances the WAL size counters.
 func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
-	if err := fileio.WriteFullAt(wal.file, transaction, wal.appendOffset); err != nil {
+	writeOffset := wal.appendOffset
+	bytesWritten := len(transaction)
+	if writeOffset == 0 {
+		header := encodeWALFileHeader()
+		if err := fileio.WriteFullAt(wal.file, header[:], 0); err != nil {
+			return false, fmt.Errorf("persist WAL header: %w", err)
+		}
+		writeOffset = walFileHeaderSize
+		bytesWritten += walFileHeaderSize
+	}
+	if err := fileio.WriteFullAt(wal.file, transaction, writeOffset); err != nil {
 		return false, fmt.Errorf("persist multiple records: %w", err)
 	}
-	wal.appendOffset += int64(len(transaction))
+	wal.appendOffset = writeOffset + int64(len(transaction))
 	wal.hasUnsyncedWrites = true
-	wal.bytesSinceCheckpoint += uint64(len(transaction))
+	wal.bytesSinceCheckpoint += uint64(bytesWritten)
 
 	needsCheckpoint := wal.reachedCheckpointThreshold()
 	if wal.syncOnCommit || (needsCheckpoint && wal.syncOnCheckpoint) {
@@ -344,6 +378,23 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	}
 
 	return needsCheckpoint, nil
+}
+
+func encodeWALFileHeader() [walFileHeaderSize]byte {
+	var header [walFileHeaderSize]byte
+	binary.LittleEndian.PutUint32(header[0:4], walFileMagic)
+	binary.LittleEndian.PutUint32(header[4:8], page.FormatVersion)
+	return header
+}
+
+func validateWALFileHeader(header []byte) error {
+	if binary.LittleEndian.Uint32(header[0:4]) != walFileMagic {
+		return fmt.Errorf("read WAL magic: %w", page.ErrInvalid)
+	}
+	if version := binary.LittleEndian.Uint32(header[4:8]); version != page.FormatVersion {
+		return fmt.Errorf("read WAL format version %d: %w", version, page.ErrVersionMismatch)
+	}
+	return nil
 }
 
 func (wal *WAL) reachedCheckpointThreshold() bool {

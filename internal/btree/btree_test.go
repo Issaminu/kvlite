@@ -31,16 +31,13 @@ func TestNodeCodec_UsesProtectedNodeHeader(t *testing.T) {
 	if len(encoded) != int(pageSize) {
 		t.Fatalf("encoded page size: got %d, want %d", len(encoded), pageSize)
 	}
-	if got, want := binary.LittleEndian.Uint16(encoded[0:2]), nodeFormatVersion; got != want {
-		t.Fatalf("node format version: got %d, want %d", got, want)
-	}
-	if got, want := binary.LittleEndian.Uint16(encoded[2:4]), uint16(1); got != want {
+	if got, want := binary.LittleEndian.Uint16(encoded[0:2]), uint16(1); got != want {
 		t.Fatalf("node type: got %d, want leaf type %d", got, want)
 	}
-	if got, want := page.ID(binary.LittleEndian.Uint64(encoded[4:12])), node.PageID(); got != want {
+	if got, want := page.ID(binary.LittleEndian.Uint64(encoded[2:10])), node.PageID(); got != want {
 		t.Fatalf("node page ID: got %d, want %d", got, want)
 	}
-	if got, want := binary.LittleEndian.Uint32(encoded[12:16]), uint32(1); got != want {
+	if got, want := binary.LittleEndian.Uint32(encoded[10:14]), uint32(1); got != want {
 		t.Fatalf("entry count: got %d, want %d", got, want)
 	}
 
@@ -171,8 +168,8 @@ func TestVisitMappedLeafRange_RejectsInvalidInput(t *testing.T) {
 	leaf := NewLeafNode(page.ID(7))
 	data := EncodeNode(leaf, testNodePageSize)
 	data[0] ^= 0xff
-	if err := VisitMappedLeafRange(data, leaf.PageID(), nil, nil, func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, page.ErrVersionMismatch) {
-		t.Fatalf("corrupt leaf error: got %v, want ErrVersionMismatch", err)
+	if err := VisitMappedLeafRange(data, leaf.PageID(), nil, nil, func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("corrupt leaf error: got %v, want ErrInvalid", err)
 	}
 
 	left := NewLeafNode(page.ID(8))
@@ -186,38 +183,11 @@ func TestVisitMappedLeafRange_RejectsInvalidInput(t *testing.T) {
 
 func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
 	node := NewLeafNode(page.ID(7))
-
-	testCases := []struct {
-		name    string
-		change  func([]byte)
-		wantErr error
-	}{
-		{
-			name: "unsupported node format version",
-			change: func(data []byte) {
-				binary.LittleEndian.PutUint16(data[0:2], nodeFormatVersion+1)
-				resealNodeForTest(data, testNodePageSize)
-			},
-			wantErr: page.ErrVersionMismatch,
-		},
-		{
-			name: "unknown node type",
-			change: func(data []byte) {
-				binary.LittleEndian.PutUint16(data[2:4], 3)
-				resealNodeForTest(data, testNodePageSize)
-			},
-			wantErr: page.ErrInvalid,
-		},
-	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			encoded := EncodeNode(node, testNodePageSize)
-			testCase.change(encoded)
-			if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize); !errors.Is(err, testCase.wantErr) {
-				t.Fatalf("DecodeNode error: got %v, want %v", err, testCase.wantErr)
-			}
-		})
+	encoded := EncodeNode(node, testNodePageSize)
+	binary.LittleEndian.PutUint16(encoded[nodeTypeOffset:nodePageIDOffset], 3)
+	resealNodeForTest(encoded, testNodePageSize)
+	if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("DecodeNode error: got %v, want %v", err, page.ErrInvalid)
 	}
 }
 
@@ -238,7 +208,7 @@ func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
 	// Payload layout: one 16-byte descriptor, then the key and value.
 	want := []byte{
 		0, 0, 0, 0,
-		36, 0, 0, 0,
+		34, 0, 0, 0,
 		1, 0, 0, 0,
 		1, 0, 0, 0,
 		'k', 'v',
@@ -278,7 +248,7 @@ func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
 	}
 	// Payload layout: one 8-byte descriptor, two child page IDs, then the key.
 	want := []byte{
-		44, 0, 0, 0,
+		42, 0, 0, 0,
 		1, 0, 0, 0,
 		2, 0, 0, 0, 0, 0, 0, 0,
 		3, 0, 0, 0, 0, 0, 0, 0,
@@ -403,7 +373,7 @@ func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
 	}); got != 1 {
 		t.Fatalf("EncodeNode allocations: got %v, want 1", got)
 	}
-	if got, want := len(encoded), 317; got != want {
+	if got, want := len(encoded), node.EncodedSize(); got != want {
 		t.Fatalf("encoded length: got %d, want %d", got, want)
 	}
 }

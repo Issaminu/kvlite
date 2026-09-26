@@ -13,11 +13,10 @@ import (
 )
 
 const (
-	nodeVersionOffset    = 0
-	nodeTypeOffset       = 2
-	nodePageIDOffset     = 4
-	nodeEntryCountOffset = 12
-	nodeChecksumOffset   = 16
+	nodeTypeOffset       = 0
+	nodePageIDOffset     = 2
+	nodeEntryCountOffset = 10
+	nodeChecksumOffset   = 14
 
 	// encodedUint32Size is the size of each uint32 field.
 	encodedUint32Size = 4
@@ -45,7 +44,6 @@ var checksumZeroBlock [checksumZeroBlockSize]byte
 // The caller must not change or reuse data.
 //
 // DecodeNode returns [page.ErrChecksum] if the checksum does not match.
-// It returns [page.ErrVersionMismatch] if the format version is not supported.
 // It returns [page.ErrInvalid] if the size, type, page ID, or body is not valid.
 func DecodeNode(data []byte, expectedPageID page.ID, pageSize int64) (*Node, error) {
 	if len(data) < NodeHeaderSize {
@@ -77,7 +75,6 @@ func DecodeNode(data []byte, expectedPageID page.ID, pageSize int64) (*Node, err
 // Its keys and values refer to data.
 // The caller must not change or reuse data.
 //
-// DecodeWALNode returns [page.ErrVersionMismatch] if the format version is not supported.
 // It returns [page.ErrInvalid] if the node is not valid.
 func DecodeWALNode(data []byte, expectedPageID page.ID) (*Node, error) {
 	if len(data) < NodeHeaderSize {
@@ -139,9 +136,6 @@ func LookupMappedNode(data []byte, expectedPageID page.ID, key []byte) (Entry, b
 func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
 	if len(data) < NodeHeaderSize {
 		return fmt.Errorf("read leaf page: %w", ErrInvalid)
-	}
-	if version := binary.LittleEndian.Uint16(data[nodeVersionOffset:nodeTypeOffset]); version != nodeFormatVersion {
-		return fmt.Errorf("read leaf format version %d: %w", version, page.ErrVersionMismatch)
 	}
 	if nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset])); nodeType != NodeTypeLeaf {
 		if nodeType == NodeTypeBranch {
@@ -216,10 +210,6 @@ func LookupEncodedWALNode(data []byte, expectedPageID page.ID, key []byte) (Entr
 //
 // The caller must check the header length and the source checksum before this call. allowPadding applies only to complete-body validation.
 func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool) (*Node, Entry, bool, page.ID, error) {
-	formatVersion := binary.LittleEndian.Uint16(data[nodeVersionOffset:nodeTypeOffset])
-	if formatVersion != nodeFormatVersion {
-		return nil, Entry{}, false, 0, fmt.Errorf("read node format version %d: %w", formatVersion, page.ErrVersionMismatch)
-	}
 	nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset]))
 	if nodeType != NodeTypeLeaf && nodeType != NodeTypeBranch {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node type %d: %w", nodeType, ErrInvalid)
@@ -311,11 +301,10 @@ func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32,
 	if createNode {
 		node = &Node{
 			header: &NodeHeader{
-				FormatVersion: nodeFormatVersion,
-				Type:          nodeType,
-				PageID:        expectedPageID,
-				EntryCount:    entryCount,
-				Checksum:      storedChecksum,
+				Type:       nodeType,
+				PageID:     expectedPageID,
+				EntryCount: entryCount,
+				Checksum:   storedChecksum,
 			},
 			entries: make([]Entry, 0, int(entryCount)),
 		}
@@ -471,7 +460,6 @@ func AppendEncodedWALNode(data []byte, node *Node) []byte {
 
 func encodeWALNode(data []byte, node *Node) {
 	clear(data)
-	binary.LittleEndian.PutUint16(data[nodeVersionOffset:nodeTypeOffset], node.header.FormatVersion)
 	binary.LittleEndian.PutUint16(data[nodeTypeOffset:nodePageIDOffset], uint16(node.header.Type))
 	binary.LittleEndian.PutUint64(data[nodePageIDOffset:nodeEntryCountOffset], uint64(node.header.PageID))
 	binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], uint32(len(node.entries)))

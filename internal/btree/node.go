@@ -12,10 +12,8 @@ const (
 	MaxKeySize   = 32768         // 32 KiB
 	MaxValueSize = (1 << 31) - 2 // ~2 GiB
 
-	// NodeHeaderSize is the 20-byte encoded size of a B+tree node header.
-	NodeHeaderSize = 20
-
-	nodeFormatVersion uint16 = 1
+	// NodeHeaderSize is the 18-byte encoded size of a B+tree node header.
+	NodeHeaderSize = 18
 )
 
 // NodeType identifies the body layout of a B+tree node.
@@ -31,20 +29,18 @@ const (
 // NodeHeader contains the fixed fields that identify and protect one B+tree node.
 // All fields use little-endian encoding:
 //
-//	[0:2]   format version, uint16
-//	[2:4]   node type, uint16
-//	[4:12]  page ID, uint64
-//	[12:16] entry count, uint32
-//	[16:20] CRC32C checksum, uint32
+//	[0:2]  node type, uint16
+//	[2:10] page ID, uint64
+//	[10:14] entry count, uint32
+//	[14:18] CRC32C checksum, uint32
 //
-// Checksum covers bytes [0:16] and [20:pageSize]. It includes the node body and zero padding.
+// Checksum covers bytes [0:14] and [18:pageSize]. It includes the node body and zero padding.
 // A node change can make Checksum and EntryCount stale. [EncodeNode] and [EncodeWALNode] write the current entry count. [EncodeNode] also calculates a new checksum before it returns encoded bytes.
 type NodeHeader struct {
-	FormatVersion uint16
-	Type          NodeType
-	PageID        page.ID
-	EntryCount    uint32
-	Checksum      uint32
+	Type       NodeType
+	PageID     page.ID
+	EntryCount uint32
+	Checksum   uint32
 }
 
 type Entry struct {
@@ -106,9 +102,8 @@ func NewRootNode(pgid page.ID, leftNode, rightNode *Node, separator []byte) *Nod
 
 func newNodeHeader(nodeType NodeType, pgid page.ID) *NodeHeader {
 	return &NodeHeader{
-		FormatVersion: nodeFormatVersion,
-		Type:          nodeType,
-		PageID:        pgid,
+		Type:   nodeType,
+		PageID: pgid,
 	}
 }
 
