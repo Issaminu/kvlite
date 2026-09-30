@@ -67,9 +67,10 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 }
 
 func (store *txTreeStore) AllocatePage() page.ID {
-	// The allocation changes the metadata copy even if the new page later becomes the tree root.
+	pageID := store.tx.meta.LastPage() + 1
+	store.tx.meta.SetLastPage(pageID)
 	store.tx.metaDirty = true
-	return store.tx.meta.Allocate()
+	return pageID
 }
 
 // WritableNode returns the transaction-owned version of node. The first write
