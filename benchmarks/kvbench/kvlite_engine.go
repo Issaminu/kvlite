@@ -105,6 +105,25 @@ func (engine *kvliteEngine) PutBatch(_ context.Context, pairs []Pair) error {
 	})
 }
 
+func (engine *kvliteEngine) Delete(_ context.Context, key []byte) error {
+	return engine.db.Delete(benchmarkBucketName, key)
+}
+
+func (engine *kvliteEngine) DeleteBatch(_ context.Context, keys [][]byte) error {
+	return engine.db.Update(func(tx *kvlite.Tx) error {
+		bucket, err := tx.Bucket(benchmarkBucketName)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			if err := bucket.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (engine *kvliteEngine) MixedBatch(_ context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
 	values := make([][]byte, len(keys))
 	err := engine.db.Update(func(tx *kvlite.Tx) error {

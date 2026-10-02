@@ -172,6 +172,26 @@ func testEngineContract(t *testing.T, engine Engine) {
 	if got, err := engine.Get(ctx, wantBatchKey); err != nil || !bytes.Equal(got, wantBatchValue) {
 		t.Fatalf("PutBatch retained input memory: got %q, want %q, error %v", got, wantBatchValue, err)
 	}
+
+	beforeDeleteCount, err := engine.Count(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := engine.Delete(ctx, pairs[0].Key); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Get(ctx, pairs[0].Key); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("deleted read: got %v, want ErrKeyNotFound", err)
+	}
+	if err := engine.Delete(ctx, pairs[0].Key); err != nil {
+		t.Fatalf("repeated delete: %v", err)
+	}
+	if err := engine.DeleteBatch(ctx, [][]byte{pairs[1].Key, pairs[2].Key}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := engine.Count(ctx); err != nil || got != beforeDeleteCount-3 {
+		t.Fatalf("count after delete: got %d, want %d, error %v", got, beforeDeleteCount-3, err)
+	}
 }
 
 func openTestKVLiteEngine(t *testing.T, mode DurabilityMode) Engine {

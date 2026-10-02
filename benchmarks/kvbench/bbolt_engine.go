@@ -128,6 +128,29 @@ func (engine *bboltEngine) PutBatch(_ context.Context, pairs []Pair) error {
 	})
 }
 
+func (engine *bboltEngine) Delete(_ context.Context, key []byte) error {
+	if engine.useWriteBatch {
+		return engine.db.Batch(func(tx *bolt.Tx) error {
+			return tx.Bucket(benchmarkBucketName).Delete(key)
+		})
+	}
+	return engine.db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(benchmarkBucketName).Delete(key)
+	})
+}
+
+func (engine *bboltEngine) DeleteBatch(_ context.Context, keys [][]byte) error {
+	return engine.db.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(benchmarkBucketName)
+		for _, key := range keys {
+			if err := bucket.Delete(key); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (engine *bboltEngine) MixedBatch(_ context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
 	values := make([][]byte, len(keys))
 	err := engine.db.Update(func(tx *bolt.Tx) error {

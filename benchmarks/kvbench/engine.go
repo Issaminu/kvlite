@@ -38,6 +38,8 @@ type Engine interface {
 	GetBatch(context.Context, [][]byte) ([][]byte, error)
 	Put(context.Context, []byte, []byte) error
 	PutBatch(context.Context, []Pair) error
+	Delete(context.Context, []byte) error
+	DeleteBatch(context.Context, [][]byte) error
 	MixedBatch(context.Context, [][]byte, []Pair) ([][]byte, error)
 	ScanPrefix(context.Context, []byte, func([]byte, []byte) error) error
 	Count(context.Context) (int, error)

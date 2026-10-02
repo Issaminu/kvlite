@@ -171,6 +171,18 @@ func (engine *redisEngine) PutBatch(ctx context.Context, pairs []Pair) error {
 	return err
 }
 
+func (engine *redisEngine) Delete(ctx context.Context, key []byte) error {
+	return engine.client.Del(ctx, string(key)).Err()
+}
+
+func (engine *redisEngine) DeleteBatch(ctx context.Context, keys [][]byte) error {
+	arguments := make([]string, len(keys))
+	for index, key := range keys {
+		arguments[index] = string(key)
+	}
+	return engine.client.Del(ctx, arguments...).Err()
+}
+
 func (engine *redisEngine) MixedBatch(ctx context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
 	commands, err := engine.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 		for _, key := range keys {
