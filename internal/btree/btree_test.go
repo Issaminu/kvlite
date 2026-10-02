@@ -531,10 +531,12 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 }
 
 type memoryTreeStore struct {
-	pageSize int64
-	nextID   page.ID
-	nodes    map[page.ID]*Node
-	dirty    map[page.ID]*Node
+	pageSize    int64
+	nextID      page.ID
+	nodes       map[page.ID]*Node
+	dirty       map[page.ID]*Node
+	freed       []page.ID
+	allocateErr error
 }
 
 func (store *memoryTreeStore) PageSize() int64 {
@@ -553,10 +555,20 @@ func (store *memoryTreeStore) ReadNode(pageID page.ID) (*Node, error) {
 	return store.nodes[pageID], nil
 }
 
-func (store *memoryTreeStore) AllocatePage() page.ID {
+func (store *memoryTreeStore) AllocatePage() (page.ID, error) {
+	if store.allocateErr != nil {
+		return 0, store.allocateErr
+	}
 	pageID := store.nextID
 	store.nextID++
-	return pageID
+	return pageID, nil
+}
+
+func (store *memoryTreeStore) FreePage(pageID page.ID) error {
+	store.freed = append(store.freed, pageID)
+	delete(store.nodes, pageID)
+	delete(store.dirty, pageID)
+	return nil
 }
 
 func (store *memoryTreeStore) WritableNode(node *Node) *Node {
@@ -574,6 +586,23 @@ func (store *memoryTreeStore) StageNode(node *Node) {
 	}
 	store.nodes[node.PageID()] = node
 	store.dirty[node.PageID()] = node
+}
+
+func TestTreePutEntryReturnsAllocationError(t *testing.T) {
+	allocationErr := errors.New("no page available")
+	store := &memoryTreeStore{pageSize: 64, nextID: 3, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	root := NewLeafNode(2)
+	store.StageNode(root)
+
+	root, err := tree.PutEntry(root, NewEntry(0, []byte("a"), bytes.Repeat([]byte("v"), 16)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.allocateErr = allocationErr
+	if _, err := tree.PutEntry(root, NewEntry(0, []byte("b"), bytes.Repeat([]byte("v"), 16))); !errors.Is(err, allocationErr) {
+		t.Fatalf("PutEntry error: got %v, want allocation error", err)
+	}
 }
 
 // TestTreePutEntry_RejectsKeyThatCannotFitBranch checks the branch separator

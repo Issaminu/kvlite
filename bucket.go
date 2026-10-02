@@ -88,7 +88,10 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 		return nil, ErrBucketExists
 	}
 
-	newPgid := tx.store.AllocatePage()
+	newPgid, err := tx.store.AllocatePage()
+	if err != nil {
+		return nil, err
+	}
 	rootNode := btree.NewLeafNode(newPgid)
 	tx.store.StageNode(rootNode)
 
@@ -263,6 +266,28 @@ func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 	oldRootPageID := bucket.rootNode.PageID()
 	newRoot, err := bucket.tx.tree.PutEntry(bucket.rootNode, entry)
 	if err != nil {
+		return err
+	}
+	bucket.rootNode = newRoot
+	if newRoot.PageID() != oldRootPageID {
+		bucket.writeBackRoot()
+	}
+	bucket.treeVersion++
+	return nil
+}
+
+// Delete removes one plain key and value from this bucket in the current write transaction.
+// Other database operations see the change after [DB.Update] commits it.
+// A missing key returns nil. A key that names a nested bucket returns [ErrIncompatibleValue].
+// Delete returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the callback returns.
+// It returns [ErrKeyRequired] for an empty key and [ErrKeyTooLarge] for a large key.
+func (bucket *Bucket) Delete(key []byte) error {
+	if err := bucket.tx.writableError(); err != nil {
+		return err
+	}
+	oldRootPageID := bucket.rootNode.PageID()
+	newRoot, deleted, err := bucket.tx.tree.DeleteEntry(bucket.rootNode, key)
+	if err != nil || !deleted {
 		return err
 	}
 	bucket.rootNode = newRoot

@@ -77,13 +77,13 @@ func TestWriteTx_PreservesOriginalNodeAcrossWriteBatchCallbacks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	first := newWriteTx(db, meta, root, nil)
+	first := newWriteTx(db, meta, root, nil, nil)
 	middle := first.store.WritableNode(base)
 	if err := middle.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("mid"))); err != nil {
 		t.Fatal(err)
 	}
 
-	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty)
+	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, nil)
 	middle, err := second.store.ReadNode(base.PageID())
 	if err != nil {
 		t.Fatal(err)
@@ -296,6 +296,10 @@ func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
 		if _, err := file.WriteAt(encodedMeta, int64(pageID)*pageSize); err != nil {
 			t.Fatal(err)
 		}
+	}
+	allocation := newAllocationBitmap(pageSize)
+	if _, err := file.WriteAt(allocation.encodeSegment(0), int64(firstAllocationSegmentID)*pageSize); err != nil {
+		t.Fatal(err)
 	}
 	root := btree.NewLeafNode(meta.Root())
 	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true); err != nil {
@@ -729,7 +733,7 @@ func TestPutGet_Stress(t *testing.T) {
 // so they stay <= a page is Rung 3b.)
 // -----------------------------------------------------------------------------
 
-// TestFile_SinglePage: a small bucket uses one catalog leaf and one data leaf.
+// TestFile_SinglePage: a small bucket uses one allocation page, one catalog leaf, and one data leaf.
 func TestFile_SinglePage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -748,9 +752,9 @@ func TestFile_SinglePage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pages 0 and 1 are metadata, page 2 is the bucket catalog, and page 3 is the data leaf.
-	if size := fileSize(t, path); size != 4*pageBytes {
-		t.Fatalf("a small bucket should occupy exactly four %d-byte pages (two metadata + catalog + data leaf), got %d bytes "+
+	// Pages 0 and 1 are metadata, page 2 is allocation, page 3 is the bucket catalog, and page 4 is the data leaf.
+	if size := fileSize(t, path); size != 5*pageBytes {
+		t.Fatalf("a small bucket should occupy exactly five %d-byte pages (two metadata + allocation + catalog + data leaf), got %d bytes "+
 			"(nodes must be padded to page boundaries)", pageBytes, size)
 	}
 }
@@ -1876,8 +1880,21 @@ func TestOpen_NewDatabaseUsesOperatingSystemPageSize(t *testing.T) {
 	if db.meta.PageSize() != pageSize {
 		t.Fatalf("new database page size: got %d, want %d", db.meta.PageSize(), pageSize)
 	}
-	if got := fileSize(t, path); got != 3*pageSize {
-		t.Fatalf("new database file size: got %d, want three %d-byte pages", got, pageSize)
+	if got := fileSize(t, path); got != 4*pageSize {
+		t.Fatalf("new database file size: got %d, want four %d-byte pages", got, pageSize)
+	}
+	data := make([]byte, pageSize)
+	if _, err := db.file.ReadAt(data, int64(firstAllocationSegmentID)*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	segment, err := decodeAllocationSegment(data, pageSize, firstAllocationSegmentID)
+	if err != nil {
+		t.Fatalf("new database allocation page: %v", err)
+	}
+	for pageID := page.ID(0); pageID <= firstTreePageID; pageID++ {
+		if !allocationBitIsSet(segment.bitmapBits(), pageID) {
+			t.Fatalf("initial allocation page marks page %d free", pageID)
+		}
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
@@ -5486,23 +5503,15 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 	if got := syncCalls.Load(); got > 4 {
 		t.Fatalf("WAL sync calls for %d concurrent writes: got %d, want at most 4", writeCount, got)
 	}
-	walBytes, err := os.ReadFile(path + "-wal")
+	records, err := db.wal.ReadRecords()
 	if err != nil {
 		t.Fatal(err)
 	}
-	reader := bytes.NewReader(walBytes)
 	transactionIDs := make(map[wal.TxID]struct{})
 	commitMarkers := 0
-	for {
-		record, err := wal.DecodeWALRecord(reader, db.meta.PageSize())
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			t.Fatal(err)
-		}
+	for _, record := range records {
 		transactionIDs[record.Header.TxID] = struct{}{}
-		if wal.IsCommitMarker(record) {
+		if wal.IsCommitMarker(&record) {
 			commitMarkers++
 		}
 	}

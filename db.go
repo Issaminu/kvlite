@@ -40,6 +40,7 @@ type DB struct {
 	file              *os.File
 	meta              *page.Meta
 	rootNode          *btree.Node
+	allocation        *allocationBitmap
 	writeNodes        map[page.ID]*writeNodeCacheEntry // Each committed node refers only to stable heap bytes that later write clones can share.
 	writeNodeSlots    []page.ID
 	nextWriteNodeSlot int
@@ -148,24 +149,27 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if err != nil {
 		return db.failOpen(err)
 	}
-	if mainMetaErr != nil || db.options.ReadOnly {
-		committedMeta, committedMetaErr := metaFromCommittedRecords(committed)
-		if mainMetaErr != nil && (len(records) == 0 || committedMetaErr != nil || committedMeta == nil) {
-			// Only validated metadata from a complete WAL transaction can replace invalid main-file metadata.
-			return db.failOpen(mainMetaErr)
-		}
-		if committedMetaErr != nil {
-			return db.failOpen(fmt.Errorf("read committed meta from WAL: %w", committedMetaErr))
-		}
-		if committedMeta != nil {
-			db.meta = committedMeta
-		}
+	committedMeta, committedMetaErr := metaFromCommittedRecords(committed)
+	if mainMetaErr != nil && (len(records) == 0 || committedMetaErr != nil || committedMeta == nil) {
+		// Only validated metadata from a complete WAL transaction can replace invalid main-file metadata.
+		return db.failOpen(mainMetaErr)
+	}
+	if committedMetaErr != nil {
+		return db.failOpen(fmt.Errorf("read committed meta from WAL: %w", committedMetaErr))
+	}
+	if committedMeta != nil {
+		db.meta = committedMeta
 	}
 
 	if isNew {
 		if err := db.initializeNewDatabase(); err != nil {
 			return db.failOpen(err)
 		}
+	}
+	// Check the final allocation view before writable recovery can copy WAL pages into the main file and clear the WAL.
+	db.allocation, err = db.readAllocationBitmap(db.meta, committed)
+	if err != nil {
+		return db.failOpen(err)
 	}
 
 	// A remaining WAL can contain committed data from an unclean close, an interrupted checkpoint, or failed cleanup. Writable recovery copies committed records to the main file. Read-only recovery keeps them in the WAL overlay.
@@ -179,7 +183,6 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			return db.failOpen(err)
 		}
 	}
-
 	if err := db.loadRootNode(); err != nil {
 		return db.failOpen(err)
 	}
@@ -200,6 +203,11 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 func (db *DB) initializeNewDatabase() error {
 	if err := db.persistMeta(); err != nil {
 		return fmt.Errorf("init meta: %w", err)
+	}
+	allocation := newAllocationBitmap(db.meta.PageSize())
+	pageID := allocation.segmentPageID(0)
+	if err := fileio.WriteFullAt(db.file, allocation.encodeSegment(0), int64(pageID)*db.meta.PageSize()); err != nil {
+		return fmt.Errorf("init allocation page %d: %w", pageID, err)
 	}
 	db.rootNode = btree.NewLeafNode(db.meta.Root())
 	if err := db.persistNode(db.rootNode); err != nil {
@@ -359,6 +367,21 @@ func (db *DB) Put(bucketName, key, value []byte) error {
 			return err
 		}
 		return bucket.Put(key, value)
+	})
+}
+
+// Delete removes one plain key from a top-level bucket in one write transaction.
+// A missing key returns nil. A missing bucket returns [ErrBucketNotFound].
+// Delete returns [ErrIncompatibleValue] when key names a nested bucket.
+// An empty bucket name returns [ErrBucketNameRequired]. See [Bucket.Delete] for key errors.
+// A read-only database returns [ErrDatabaseReadOnly].
+func (db *DB) Delete(bucketName, key []byte) error {
+	return db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Delete(key)
 	})
 }
 

@@ -256,3 +256,31 @@ func (n *Node) InsertEntry(entry Entry) error {
 	n.applyInsert(prepared)
 	return nil
 }
+
+func (n *Node) prepareDelete(key []byte) (int, bool, error) {
+	index, found, err := n.findKeyIndex(key)
+	if err != nil || !found {
+		return 0, found, err
+	}
+	if n.entries[index].flags&BucketLeafFlag != 0 {
+		return 0, false, ErrIncompatibleValue
+	}
+	return index, true, nil
+}
+
+func (n *Node) applyDelete(index int) {
+	n.entries = slices.Delete(n.entries, index, index+1)
+	n.header.Checksum = 0
+}
+
+func (n *Node) setSeparator(index int, key []byte) {
+	n.entries[index].key = slices.Clone(key)
+	n.header.Checksum = 0
+}
+
+func (n *Node) firstKey() []byte {
+	if len(n.entries) == 0 {
+		return nil
+	}
+	return n.entries[0].key
+}

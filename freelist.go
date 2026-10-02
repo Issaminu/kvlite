@@ -65,6 +65,7 @@ type allocationChanges struct {
 	segmentCount     int                        // private count after segment additions or removals
 	firstFreeSegment int                        // private search cursor
 	retired          map[page.ID]struct{}       // tree pages that become free during commit preparation
+	obsoleteWALPages map[page.ID]struct{}       // allocation pages removed from the file tail
 }
 
 // newAllocationChanges starts an empty transaction overlay on bitmap.
@@ -90,6 +91,7 @@ func (changes *allocationChanges) clone() *allocationChanges {
 		segmentCount:     changes.segmentCount,
 		firstFreeSegment: changes.firstFreeSegment,
 		retired:          maps.Clone(changes.retired),
+		obsoleteWALPages: maps.Clone(changes.obsoleteWALPages),
 	}
 }
 
@@ -162,7 +164,16 @@ func (changes *allocationChanges) finalize(meta *page.Meta) bool {
 	for pageID := range changes.retired {
 		changes.release(pageID)
 	}
+	segmentCount := changes.segmentCount
 	changes.dropEmptyTailSegments()
+	// A removed segment can still have an old page image in the WAL overlay.
+	// Record its page ID so the commit can remove that image.
+	for index := changes.segmentCount; index < segmentCount; index++ {
+		if changes.obsoleteWALPages == nil {
+			changes.obsoleteWALPages = make(map[page.ID]struct{})
+		}
+		changes.obsoleteWALPages[changes.base.segmentPageID(index)] = struct{}{}
+	}
 
 	highest := changes.highestAllocated()
 	if highest >= meta.LastPage() {
@@ -170,6 +181,22 @@ func (changes *allocationChanges) finalize(meta *page.Meta) bool {
 	}
 	meta.SetLastPage(highest)
 	return true
+}
+
+// walRetiredPages names tree and allocation pages that must leave the WAL view at commit.
+// A removed tail segment can still have an older WAL image even though it is no longer in the bitmap.
+func (changes *allocationChanges) walRetiredPages() map[page.ID]struct{} {
+	if len(changes.obsoleteWALPages) == 0 {
+		return changes.retired
+	}
+	retired := maps.Clone(changes.retired)
+	if retired == nil {
+		retired = make(map[page.ID]struct{}, len(changes.obsoleteWALPages))
+	}
+	for pageID := range changes.obsoleteWALPages {
+		retired[pageID] = struct{}{}
+	}
+	return retired
 }
 
 // segment returns the transaction's private segment when one exists.

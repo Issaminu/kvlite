@@ -11,10 +11,30 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+// replayWAL makes committed WAL pages visible in the selected open mode.
+// It omits old allocation segments that a later commit removed from the file tail.
 func (db *DB) replayWAL(committed []wal.WALRecord) error {
 	if len(committed) == 0 {
 		return nil
 	}
+	var latestMetaTxID wal.TxID
+	for _, record := range committed {
+		if record.Header.Type == wal.RecordTypeMeta {
+			latestMetaTxID = record.Header.TxID
+		}
+	}
+	visible := committed[:0]
+	for _, record := range committed {
+		if record.Header.Type == wal.RecordTypeAllocation && !db.allocation.isSegmentPage(record.Header.PageID) {
+			pagesPerSegment := db.allocation.pagesPerSegment()
+			if record.Header.PageID <= db.meta.LastPage() || record.Header.PageID%pagesPerSegment != 0 || record.Header.TxID >= latestMetaTxID {
+				return fmt.Errorf("allocation WAL record targets page %d: %w", record.Header.PageID, ErrInvalid)
+			}
+			continue
+		}
+		visible = append(visible, record)
+	}
+	committed = visible
 	if db.options.ReadOnly {
 		return db.loadCommittedIntoOverlay(committed)
 	}
@@ -69,7 +89,11 @@ func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
 	for _, record := range committed {
 		db.wal.LoadCommittedRecord(record)
 	}
-	return db.wal.Checkpoint(db.file)
+	targetSize, err := db.logicalFileSize()
+	if err != nil {
+		return err
+	}
+	return db.wal.Checkpoint(db.file, targetSize)
 }
 
 func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
@@ -145,11 +169,27 @@ func (db *DB) loadCommittedIntoOverlay(committed []wal.WALRecord) error {
 }
 
 // materializeWALPagePatches rebuilds the latest complete image for each data page.
-// Absolute patch ranges can run again after an interrupted checkpoint because later ranges restore the latest committed bytes.
+// A later Delete can free a page that has an older WAL patch.
+// A later full node can replace an older patch for a page that was reused.
+// Neither older patch needs its old main-file page during recovery.
 func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecord, error) {
 	pageImages := make(map[page.ID][]byte)
 	lastRecord := make(map[page.ID]int)
+	lastFullRecord := make(map[page.ID]int)
 	for index, record := range records {
+		if record.Header.Type == wal.RecordTypeNode {
+			lastFullRecord[record.Header.PageID] = index
+		}
+	}
+	for index, record := range records {
+		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch {
+			if db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
+				continue
+			}
+			if fullIndex, ok := lastFullRecord[record.Header.PageID]; ok && index < fullIndex {
+				continue
+			}
+		}
 		var image []byte
 		switch record.Header.Type {
 		case wal.RecordTypeNode:
@@ -182,6 +222,9 @@ func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecor
 	materialized := make([]wal.WALRecord, 0, len(records))
 	for index, record := range records {
 		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch {
+			if db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
+				continue
+			}
 			if lastRecord[record.Header.PageID] != index {
 				continue
 			}

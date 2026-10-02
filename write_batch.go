@@ -6,6 +6,7 @@ import (
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
+	"github.com/Issaminu/kvlite/internal/wal"
 )
 
 const (
@@ -42,10 +43,11 @@ type writeResult struct {
 
 // writeBatchState is the last state produced by successful callbacks in one batch. It stays private until the WAL commit succeeds.
 type writeBatchState struct {
-	meta      *page.Meta
-	rootNode  *btree.Node
-	dirty     map[page.ID]dirtyNode
-	metaDirty bool
+	meta       *page.Meta
+	rootNode   *btree.Node
+	dirty      map[page.ID]dirtyNode
+	allocation *allocationChanges
+	metaDirty  bool
 }
 
 // startWriteBatcher starts the request worker for a writable database in SyncFull mode. Other modes commit without this worker.
@@ -131,14 +133,14 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 
 	for index, request := range requests {
 		// Create the Tx only after earlier requests finish so it starts from their successful state. Keeping it separate also lets a failed callback discard only its own changes.
-		tx := newWriteTx(db, state.meta, state.rootNode, state.dirty)
+		tx := newWriteTx(db, state.meta, state.rootNode, state.dirty, state.allocation)
 		result := executeWriteCallback(request.transaction, tx)
 		if result.err != nil || result.panicked || result.goexited {
 			results[index] = result
 			continue
 		}
 
-		transactionChangedState := len(tx.store.dirty) > 0 || tx.metaDirty
+		transactionChangedState := len(tx.store.dirty) > 0 || tx.metaDirty || (tx.allocationOwned && tx.allocation.changed())
 		result.dependsOnCommit = hasPendingWrites || transactionChangedState
 		results[index] = result
 		if !transactionChangedState {
@@ -147,6 +149,7 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 
 		state.meta = tx.meta
 		state.rootNode = tx.rootNode
+		state.allocation = tx.allocation
 		state.metaDirty = state.metaDirty || tx.metaDirty
 		for pageID, dirty := range tx.store.dirty {
 			state.dirty[pageID] = dirty
@@ -157,13 +160,33 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	var commitErr error
 	needsCheckpoint := false
 	if hasPendingWrites {
+		var retired map[page.ID]struct{}
+		if state.allocation != nil && len(state.allocation.retired) != 0 {
+			// Earlier callbacks can have changed a node that a later callback retired.
+			for pageID := range state.allocation.retired {
+				delete(state.dirty, pageID)
+			}
+			if state.allocation.finalize(state.meta) {
+				state.metaDirty = true
+			}
+		}
+		if state.allocation != nil {
+			retired = state.allocation.walRetiredPages()
+		}
 		// state.dirty contains the original and final image of each changed page. One WAL transaction gives all dependent callbacks the same commit result.
 		nodes, encodedMeta := makeWALCommitData(state.dirty, state.meta, state.metaDirty)
-		needsCheckpoint, commitErr = db.wal.Commit(nodes, encodedMeta)
+		var allocationPages []wal.AllocationRecord
+		if state.allocation != nil {
+			allocationPages = state.allocation.pageRecords()
+		}
+		needsCheckpoint, commitErr = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
 		if commitErr == nil {
 			// Publish the new state only after the WAL append and required synchronization succeed.
 			db.meta = state.meta
 			db.rootNode = state.rootNode
+			if state.allocation != nil {
+				db.allocation = state.allocation.publish()
+			}
 			for _, dirty := range state.dirty {
 				db.cacheWriteNode(dirty.final)
 			}

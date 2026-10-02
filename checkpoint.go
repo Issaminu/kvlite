@@ -1,6 +1,10 @@
 package kvlite
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+	"math"
+)
 
 // checkpointWAL copies committed WAL pages into the main file.
 // SyncFull and SyncNormal make the WAL and main file durable before WAL cleanup.
@@ -15,7 +19,27 @@ func (db *DB) checkpointWAL() error {
 	if db.wal.Stats().CommittedRecordCount == 0 {
 		return nil
 	}
-	checkpointErr := db.wal.Checkpoint(db.file)
+	targetSize, err := db.logicalFileSize()
+	if err != nil {
+		return err
+	}
+	// A mapping past the new end could become invalid after truncate.
+	if int64(len(db.mappedFile)) > targetSize {
+		if err := db.unmapMainFile(); err != nil {
+			return err
+		}
+	}
+	checkpointErr := db.wal.Checkpoint(db.file, targetSize)
 	mapErr := db.refreshMainFileMapping()
 	return errors.Join(checkpointErr, mapErr)
+}
+
+// logicalFileSize is the byte length through the last allocated page.
+func (db *DB) logicalFileSize() (int64, error) {
+	pageSize := db.meta.PageSize()
+	lastPage := uint64(db.meta.LastPage())
+	if pageSize <= 0 || lastPage >= uint64(math.MaxInt64)/uint64(pageSize) {
+		return 0, fmt.Errorf("calculate database file size: %w", ErrInvalid)
+	}
+	return int64(lastPage+1) * pageSize, nil
 }

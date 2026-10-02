@@ -21,7 +21,7 @@ func TestWALCommit_WritesDatabaseFormatHeader(t *testing.T) {
 	defer walFile.Close()
 
 	log := New(Config{File: walFile, PageSize: 64})
-	if _, err := log.Commit(nil, []byte("metadata")); err != nil {
+	if _, err := log.Commit(nil, nil, []byte("metadata"), nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -94,7 +94,7 @@ func TestWALCommit_DoesNotUseCurrentFilePosition(t *testing.T) {
 		CheckpointThresholdBytes: 1 << 20,
 	})
 	first := []byte("first")
-	if _, err := log.Commit(nil, first); err != nil {
+	if _, err := log.Commit(nil, nil, first, nil); err != nil {
 		t.Fatal(err)
 	}
 	firstSize, err := walFile.Seek(0, io.SeekEnd)
@@ -107,7 +107,7 @@ func TestWALCommit_DoesNotUseCurrentFilePosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	second := []byte("second")
-	if _, err := log.Commit(nil, second); err != nil {
+	if _, err := log.Commit(nil, nil, second, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -143,7 +143,7 @@ func TestWALCommit_SyncFailureRestoresAppendOffset(t *testing.T) {
 	syncErr := errors.New("injected sync failure")
 	log.syncFile = func() error { return syncErr }
 	encodedMeta := []byte("value")
-	if _, err := log.Commit(nil, encodedMeta); !errors.Is(err, syncErr) {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); !errors.Is(err, syncErr) {
 		t.Fatalf("first commit error: got %v, want %v", err, syncErr)
 	}
 	if log.appendOffset != 0 {
@@ -154,7 +154,7 @@ func TestWALCommit_SyncFailureRestoresAppendOffset(t *testing.T) {
 	}
 
 	log.syncFile = nil
-	if _, err := log.Commit(nil, encodedMeta); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 	info, err := walFile.Stat()
@@ -189,7 +189,7 @@ func TestWALCommit_SyncFailureDoesNotUseFilePosition(t *testing.T) {
 		t.Fatal(err)
 	}
 	encodedMeta := []byte("value")
-	if _, err := log.Commit(nil, encodedMeta); !errors.Is(err, syncErr) {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); !errors.Is(err, syncErr) {
 		t.Fatalf("commit error: got %v, want %v", err, syncErr)
 	}
 	position, err := walFile.Seek(0, io.SeekCurrent)
@@ -214,7 +214,7 @@ func TestWALTruncate_ResetsAppendOffset(t *testing.T) {
 		CheckpointThresholdBytes: 1 << 20,
 	})
 	encodedMeta := []byte("value")
-	if _, err := log.Commit(nil, encodedMeta); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 	if log.appendOffset == 0 {
@@ -227,7 +227,7 @@ func TestWALTruncate_ResetsAppendOffset(t *testing.T) {
 	if log.appendOffset != 0 {
 		t.Fatalf("append offset after truncate: got %d, want 0", log.appendOffset)
 	}
-	if _, err := log.Commit(nil, encodedMeta); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 	info, err := walFile.Stat()
@@ -272,7 +272,7 @@ func TestWALFailedRollbackBlocksLaterCommits(t *testing.T) {
 		t.Fatal("rollback on closed WAL succeeded")
 	}
 
-	if _, err := log.Commit(nil, []byte("value")); !errors.Is(err, rollbackErr) {
+	if _, err := log.Commit(nil, nil, []byte("value"), nil); !errors.Is(err, rollbackErr) {
 		t.Fatalf("commit after failed rollback: got %v, want rollback error %v", err, rollbackErr)
 	}
 }
@@ -289,7 +289,7 @@ func TestWALReadRecords_InitializesAppendOffsetForRecovery(t *testing.T) {
 		CheckpointThresholdBytes: 1 << 20,
 	})
 	first := []byte("first")
-	if _, err := firstLog.Commit(nil, first); err != nil {
+	if _, err := firstLog.Commit(nil, nil, first, nil); err != nil {
 		t.Fatal(err)
 	}
 	firstInfo, err := walFile.Stat()
@@ -322,7 +322,7 @@ func TestWALReadRecords_InitializesAppendOffsetForRecovery(t *testing.T) {
 	}
 
 	second := []byte("second")
-	if _, err := recoveredLog.Commit(nil, second); err != nil {
+	if _, err := recoveredLog.Commit(nil, nil, second, nil); err != nil {
 		t.Fatal(err)
 	}
 	secondInfo, err := reopenedFile.Stat()
@@ -366,12 +366,12 @@ func TestWALEncodeTransaction_ReusesBuffer(t *testing.T) {
 		nextTxid: 1,
 	}
 	encodedMeta := []byte("value")
-	if _, err := log.encodeTransaction(nil, encodedMeta, log.nextTxid); err != nil {
+	if _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, err := log.encodeTransaction(nil, encodedMeta, log.nextTxid); err != nil {
+		if _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
 			panic(err)
 		}
 	})
@@ -392,12 +392,12 @@ func TestWALEncodeTransaction_ReusesNodePatchBuffers(t *testing.T) {
 
 	log := &WAL{pageSize: 128, nextTxid: 1}
 	nodes := []NodeRecord{{Original: base, Final: target}}
-	if _, err := log.encodeTransaction(nodes, nil, log.nextTxid); err != nil {
+	if _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, err := log.encodeTransaction(nodes, nil, log.nextTxid); err != nil {
+		if _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 			panic(err)
 		}
 	})
@@ -426,7 +426,7 @@ func TestWALCommit_EncodesSmallerPagePatchAndPublishesFinalNode(t *testing.T) {
 		Original: base,
 		Final:    target,
 	}}
-	if _, err := log.Commit(nodes, nil); err != nil {
+	if _, err := log.Commit(nodes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -469,7 +469,7 @@ func TestWALCommit_UsesFullImageWhenEntryCountChanges(t *testing.T) {
 	if _, err := log.Commit([]NodeRecord{{
 		Original: base,
 		Final:    target,
-	}}, nil); err != nil {
+	}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -496,7 +496,7 @@ func TestWALCommit_EncodesPatchForBranchNode(t *testing.T) {
 	target := base.Clone()
 	target.Children[1] = 5
 	log := New(Config{File: walFile, PageSize: 128, CheckpointThresholdBytes: 1 << 20})
-	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil); err != nil {
+	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -530,7 +530,7 @@ func TestWALCommit_DoesNotRetainLargeEncodingBuffer(t *testing.T) {
 		CheckpointThresholdBytes: 4 << 20,
 	})
 	encodedMeta := make([]byte, retentionLimit+1)
-	if _, err := log.Commit(nil, encodedMeta); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 	if capacity := cap(log.encodingBuffer); capacity > retentionLimit {
@@ -553,7 +553,7 @@ func TestWALCommit_RetainsBenchmarkSizedEncodingBuffer(t *testing.T) {
 	})
 	const recordOverhead = HeaderSize + ChecksumSize
 	encodedMeta := make([]byte, (transactionBytes-3*recordOverhead+1)/2)
-	if _, err := log.Commit(nil, encodedMeta); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 	if capacity := cap(log.encodingBuffer); capacity < transactionBytes || capacity > maxRetainedEncodingBufferBytes {
@@ -574,12 +574,12 @@ func TestWALCommit_ReusesAllTransactionStorage(t *testing.T) {
 		CheckpointThresholdBytes: ^uint64(0),
 	})
 	encodedMeta := []byte("value")
-	if _, err := log.Commit(nil, encodedMeta); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, err := log.Commit(nil, encodedMeta); err != nil {
+		if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
 			panic(err)
 		}
 	})
@@ -602,7 +602,7 @@ func TestWALCommit_PublishesBothMetadataPages(t *testing.T) {
 	})
 	encodedMeta := []byte("metadata")
 
-	needsCheckpoint, err := log.Commit(nil, encodedMeta)
+	needsCheckpoint, err := log.Commit(nil, nil, encodedMeta, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -628,6 +628,69 @@ func TestWALCommit_PublishesBothMetadataPages(t *testing.T) {
 	}
 }
 
+func TestWALCommit_WritesTreeAllocationAndMetadataTogether(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+	mainFile, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mainFile.Close()
+
+	log := New(Config{File: walFile, PageSize: 64})
+	image := bytes.Repeat([]byte{0x5a}, 64)
+	node := btree.NewLeafNode(3)
+	if _, err := log.Commit([]NodeRecord{{Final: node}}, []AllocationRecord{{PageID: 2, Payload: image}}, []byte("metadata"), nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 5 || records[0].Header.Type != RecordTypeNode || records[1].Header.Type != RecordTypeAllocation || records[1].Header.PageID != 2 || !bytes.Equal(records[1].Payload, image) || !IsCommitMarker(&records[4]) {
+		t.Fatalf("WAL transaction: got %+v", records)
+	}
+	if committed, ok := log.CommittedRecord(2); !ok || committed.Header.Type != RecordTypeAllocation || !bytes.Equal(committed.Payload, image) {
+		t.Fatalf("committed allocation page: got %+v, found %t", committed, ok)
+	}
+	if err := log.Checkpoint(mainFile, 4*64); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(image))
+	if _, err := mainFile.ReadAt(got, 2*64); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, image) {
+		t.Fatal("checkpoint did not write the allocation page")
+	}
+}
+
+func TestWALCommit_InvalidPageDoesNotPublishOrAppend(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	log := New(Config{File: walFile, PageSize: 64})
+	if _, err := log.Commit(nil, []AllocationRecord{{PageID: 2, Payload: make([]byte, 63)}}, nil, nil); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("invalid allocation page error: got %v", err)
+	}
+	if _, ok := log.CommittedRecord(2); ok {
+		t.Fatal("invalid allocation page was published")
+	}
+	info, err := walFile.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("WAL file after invalid page: got %d bytes, want 0", info.Size())
+	}
+}
+
 func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
@@ -650,12 +713,12 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 		}
 		nodes = append(nodes, NodeRecord{Final: node})
 	}
-	if _, err := log.Commit(nodes, nil); err != nil {
+	if _, err := log.Commit(nodes, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	writtenBytes := log.Stats().TotalBytesWritten
 
-	if err := log.Checkpoint(mainFile); err != nil {
+	if err := log.Checkpoint(mainFile, 34*64); err != nil {
 		t.Fatal(err)
 	}
 	stats := log.Stats()
@@ -665,7 +728,7 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 	if got := stats.CheckpointCount; got != 1 {
 		t.Fatalf("checkpoint count: got %d, want 1", got)
 	}
-	if err := log.Checkpoint(mainFile); err != nil {
+	if err := log.Checkpoint(mainFile, 34*64); err != nil {
 		t.Fatal(err)
 	}
 	if got := log.Stats().CheckpointCount; got != 1 {
@@ -684,6 +747,33 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 		if err != nil || !found || !bytes.Equal(entry.Value(), []byte{byte(pageID)}) {
 			t.Fatalf("checkpoint page %d entry: found=%t value=%v err=%v", pageID, found, entry.Value(), err)
 		}
+	}
+}
+
+func TestWALCheckpoint_MissingLastPageKeepsWAL(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+	mainFile, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mainFile.Close()
+
+	log := New(Config{File: walFile, PageSize: 64})
+	if _, err := log.Commit([]NodeRecord{{Final: btree.NewLeafNode(3)}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Checkpoint(mainFile, 5*64); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("checkpoint with missing last page: got %v, want %v", err, page.ErrInvalid)
+	}
+	if _, ok := log.CommittedRecord(3); !ok {
+		t.Fatal("failed checkpoint removed the committed page")
+	}
+	if err := log.Checkpoint(mainFile, 4*64); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -763,7 +853,7 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 		pageSize: pageSize,
 		nextTxid: transactionID,
 	}
-	transaction, err := log.encodeTransaction(nil, []byte("meta"), transactionID)
+	transaction, err := log.encodeTransaction(nil, nil, []byte("meta"), transactionID)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,14 +1,113 @@
 package kvlite
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
+
+func TestOpenIgnoresDroppedAllocationSegmentInWAL(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		readOnly bool
+		badPage  bool
+	}{
+		{"read-only", true, false},
+		{"writable", false, false},
+		{"invalid allocation page", true, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			initial, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta := *initial.meta
+			if err := initial.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			bitmap := newAllocationBitmap(meta.PageSize())
+			bitmap.addSegment()
+			segmentPageID := bitmap.segmentPageID(1)
+			initialLastPage := meta.LastPage()
+			recordPageID := segmentPageID
+			if test.badPage {
+				recordPageID = firstTreePageID + 1
+			}
+			walFile, err := os.OpenFile(path+"-wal", os.O_RDWR|os.O_CREATE, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log := wal.New(wal.Config{File: walFile, PageSize: meta.PageSize()})
+			meta.SetLastPage(segmentPageID)
+			meta.AdvanceGeneration()
+			meta.RefreshChecksum()
+			if _, err := log.Commit(nil, []wal.AllocationRecord{{PageID: recordPageID, Payload: bitmap.encodeSegment(1)}}, page.EncodeMeta(&meta), nil); err != nil {
+				t.Fatal(err)
+			}
+			meta.SetLastPage(initialLastPage)
+			meta.AdvanceGeneration()
+			meta.RefreshChecksum()
+			if _, err := log.Commit(nil, nil, page.EncodeMeta(&meta), nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := Open(path, 0600, &Options{ReadOnly: test.readOnly, Synchronous: SyncNone})
+			if test.badPage {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("open with invalid allocation page: got %v, want %v", err, ErrInvalid)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if _, found := reopened.wal.CommittedRecord(segmentPageID); found {
+				t.Fatalf("recovery kept dropped allocation page %d", segmentPageID)
+			}
+		})
+	}
+}
+
+func TestRecoverySkipsOldPatchesAfterFreeOrFullNode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	root := btree.NewLeafNode(firstTreePageID)
+	fullRoot := btree.EncodeWALNode(root)
+	records := []wal.WALRecord{
+		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID + 1, TxID: 1}, Payload: btree.EncodeWALNode(btree.NewLeafNode(firstTreePageID + 1))},
+		{Header: wal.RecordHeader{Type: wal.RecordTypePatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypePatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID, TxID: 2}, Payload: fullRoot},
+	}
+	if err := db.loadCommittedIntoOverlay(records); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := db.wal.CommittedRecord(firstTreePageID + 1); ok {
+		t.Fatal("recovery kept a freed page")
+	}
+	got, ok := db.wal.CommittedRecord(firstTreePageID)
+	if !ok || got.Header.Type != wal.RecordTypeNode || !bytes.Equal(got.Payload, fullRoot) {
+		t.Fatalf("recovered root: found=%t type=%d", ok, got.Header.Type)
+	}
+}
 
 func TestMetaFromCommittedRecords_RejectsInvalidPageSize(t *testing.T) {
 	encoded := page.EncodeMeta(page.NewMeta(4096))

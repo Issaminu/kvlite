@@ -8,22 +8,24 @@ import (
 
 // Tx gives a [DB.View] or [DB.Update] callback access to one transaction. Use [Tx.Bucket] to open a top-level bucket. A Tx and every bucket or cursor obtained from it are valid only until the callback returns. Do not save, copy, or share them with another goroutine.
 type Tx struct {
-	db        *DB
-	meta      *page.Meta
-	rootNode  *btree.Node
-	store     txTreeStore
-	tree      *btree.Tree
-	metaDirty bool
-	readOnly  bool
-	closed    bool
-	bucket    *Bucket            // most transactions will only interact with a single bucket, we store it here instead of the [Tx.buckets] map attribute
-	buckets   map[string]*Bucket // created after a second top-level bucket so every caller in this tx observes the same in-memory state
+	db              *DB
+	meta            *page.Meta
+	rootNode        *btree.Node
+	store           txTreeStore
+	tree            *btree.Tree
+	allocation      *allocationChanges
+	allocationOwned bool
+	metaDirty       bool
+	readOnly        bool
+	closed          bool
+	bucket          *Bucket            // most transactions will only interact with a single bucket, we store it here instead of the [Tx.buckets] map attribute
+	buckets         map[string]*Bucket // created after a second top-level bucket so every caller in this tx observes the same in-memory state
 }
 
 // newTx borrows committed state for a read transaction and creates private mutable state for a write transaction.
 func newTx(db *DB, readOnly bool) *Tx {
 	if !readOnly {
-		return newWriteTx(db, db.meta, db.rootNode, nil)
+		return newWriteTx(db, db.meta, db.rootNode, nil, nil)
 	}
 
 	tx := &Tx{db: db, meta: db.meta, rootNode: db.rootNode, readOnly: true}
@@ -34,10 +36,10 @@ func newTx(db *DB, readOnly bool) *Tx {
 	return tx
 }
 
-// newWriteTx starts one private write transaction from baseMeta, baseRoot, and changes prepared by earlier callbacks in the same write batch.
-func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map[page.ID]dirtyNode) *Tx {
+// newWriteTx starts one private write transaction from the committed state or earlier callbacks in the same write batch.
+func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map[page.ID]dirtyNode, baseAllocation *allocationChanges) *Tx {
 	meta := *baseMeta
-	tx := &Tx{db: db, meta: &meta, rootNode: baseRoot}
+	tx := &Tx{db: db, meta: &meta, rootNode: baseRoot, allocation: baseAllocation}
 	tx.store = txTreeStore{
 		tx:        tx,
 		baseDirty: baseDirty,
@@ -83,18 +85,38 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	if err := transaction(tx); err != nil {
 		return err
 	}
+	var retired map[page.ID]struct{}
+	if tx.allocationOwned && len(tx.allocation.retired) != 0 {
+		// A deleted node must not also appear as a changed node in this commit.
+		for pageID := range tx.allocation.retired {
+			delete(tx.store.dirty, pageID)
+		}
+		if tx.allocation.finalize(tx.meta) {
+			tx.metaDirty = true
+		}
+	}
+	if tx.allocationOwned {
+		retired = tx.allocation.walRetiredPages()
+	}
 
-	nodes, encodedMeta := tx.walCommitData()
-	if len(nodes) == 0 && len(encodedMeta) == 0 {
+	nodes, encodedMeta := makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
+	var allocationPages []wal.AllocationRecord
+	if tx.allocationOwned {
+		allocationPages = tx.allocation.pageRecords()
+	}
+	if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
 		return nil
 	}
 
-	needsCheckpoint, err := db.wal.Commit(nodes, encodedMeta)
+	needsCheckpoint, err := db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
 	if err != nil {
 		return err
 	}
 	db.meta = tx.meta
 	db.rootNode = tx.rootNode
+	if tx.allocationOwned {
+		db.allocation = tx.allocation.publish()
+	}
 	for _, dirty := range tx.store.dirty {
 		db.cacheWriteNode(dirty.final)
 	}
@@ -107,10 +129,19 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	return nil
 }
 
-// walCommitData returns the changed data nodes and encoded metadata for this transaction.
-// Update calls it after the transaction callback succeeds, so callback failure does no WAL work.
-func (tx *Tx) walCommitData() ([]wal.NodeRecord, []byte) {
-	return makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
+// writableAllocation gives this callback its own allocation changes.
+// A failed callback cannot change allocation work from an earlier callback in the batch.
+func (tx *Tx) writableAllocation() *allocationChanges {
+	if tx.allocationOwned {
+		return tx.allocation
+	}
+	if tx.allocation != nil {
+		tx.allocation = tx.allocation.clone()
+	} else {
+		tx.allocation = newAllocationChanges(tx.db.allocation)
+	}
+	tx.allocationOwned = true
+	return tx.allocation
 }
 
 // makeWALCommitData returns one original and final node pair for each changed data page.

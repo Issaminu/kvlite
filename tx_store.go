@@ -66,11 +66,28 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 	return node, nil
 }
 
-func (store *txTreeStore) AllocatePage() page.ID {
-	pageID := store.tx.meta.LastPage() + 1
-	store.tx.meta.SetLastPage(pageID)
-	store.tx.metaDirty = true
-	return pageID
+func (store *txTreeStore) AllocatePage() (page.ID, error) {
+	pageID, err := store.tx.writableAllocation().allocate(store.tx.meta.LastPage())
+	if err != nil {
+		return 0, err
+	}
+	if pageID > store.tx.meta.LastPage() {
+		store.tx.meta.SetLastPage(pageID)
+		store.tx.metaDirty = true
+	}
+	return pageID, nil
+}
+
+// FreePage marks a tree page for release at commit.
+// It drops any private node image so the WAL does not write a page that the tree no longer owns.
+// The page stays allocated until commit preparation, so this transaction cannot reuse it early.
+func (store *txTreeStore) FreePage(pageID page.ID) error {
+	if err := store.tx.writableAllocation().retire(pageID); err != nil {
+		return err
+	}
+	delete(store.nodes, pageID)
+	delete(store.dirty, pageID)
+	return nil
 }
 
 // WritableNode returns the transaction-owned version of node. The first write

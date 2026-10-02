@@ -24,10 +24,11 @@ type Config struct {
 	CheckpointThresholdBytes uint64
 }
 
-// CommittedPage is the latest committed state of one page that is not yet checkpointed. A data page can hold Node or Payload. A metadata page holds Payload.
+// CommittedPage is the latest committed state of one page that is not yet checkpointed.
+// A data page can hold Node or Payload. An allocation or metadata page holds Payload.
 type CommittedPage struct {
 	Header RecordHeader
-	// Payload holds a recovered node image or encoded metadata.
+	// Payload holds a recovered node image, a complete allocation page, or encoded metadata.
 	Payload []byte
 	// Node holds a data node from the current process. A page must not hold both Node and Payload.
 	Node *btree.Node
@@ -48,12 +49,17 @@ func New(config Config) *WAL {
 
 // Checkpoint copies the committed overlay into mainFile and then clears the WAL contents.
 // It borrows mainFile and does not close it.
+// targetSize is the byte length through the last allocated database page.
+// Checkpoint removes a free suffix before it syncs mainFile and clears the WAL.
 // When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
-// A main-file write or required sync failure leaves the overlay and WAL available for a later retry.
+// A main-file write, truncate, or required sync failure leaves the overlay and WAL available for a later retry.
 // A WAL truncate failure leaves the overlay in memory for cleanup retry but does not make the committed transaction fail.
-func (wal *WAL) Checkpoint(mainFile *os.File) error {
+func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 	if len(wal.overlay) == 0 {
 		return nil
+	}
+	if wal.pageSize <= 0 || targetSize < 0 || targetSize%wal.pageSize != 0 {
+		return page.ErrInvalid
 	}
 	if wal.syncOnCheckpoint {
 		if err := wal.Sync(); err != nil {
@@ -77,6 +83,18 @@ func (wal *WAL) Checkpoint(mainFile *os.File) error {
 	})
 	if err := writeCheckpointRecordRuns(mainFile, records, wal.pageSize); err != nil {
 		return err
+	}
+	info, err := mainFile.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() < targetSize {
+		return page.ErrInvalid
+	}
+	if info.Size() > targetSize {
+		if err := mainFile.Truncate(targetSize); err != nil {
+			return err
+		}
 	}
 	if wal.syncOnCheckpoint {
 		if err := fileio.SyncData(mainFile); err != nil {

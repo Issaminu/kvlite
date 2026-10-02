@@ -51,23 +51,28 @@ type WAL struct {
 // It returns whether the committed WAL size reached the checkpoint threshold.
 //
 // nodes contains original and final data-page images.
-// encodedMeta contains the encoded metadata when it changed. It can be nil or empty when metadata did not change.
+// allocationPages contains complete allocation segments.
+// encodedMeta contains metadata when it changed. It can be nil or empty when metadata did not change.
 // Commit writes changed metadata to both metadata pages.
-// The caller must not change committed nodes or encodedMeta before the next checkpoint.
+// retired identifies old pages that leave the in-memory WAL view after the append succeeds.
+// The caller must not change committed nodes, allocationPages, or encodedMeta before the next checkpoint.
 //
 // Appends use [WAL.appendOffset], not the WAL file read/write cursor, so unrelated seeks on the file cannot corrupt the log.
 //
 // On failure, Commit truncates the failed append and restores the pre-append byte and synchronization state without updating the overlay.
 // If that rollback truncate fails, Commit stores the truncate error and later Commit calls return it until [WAL.Truncate] succeeds.
-func (wal *WAL) Commit(nodes []NodeRecord, encodedMeta []byte) (bool, error) {
+func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, retired map[page.ID]struct{}) (bool, error) {
 	if wal.appendFailure != nil {
 		return false, fmt.Errorf("WAL append is disabled after failed rollback: %w", wal.appendFailure)
 	}
-	if len(nodes) == 0 && len(encodedMeta) == 0 {
+	if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
+		if len(retired) != 0 {
+			return false, fmt.Errorf("retired WAL pages without a transaction: %w", page.ErrInvalid)
+		}
 		return false, nil
 	}
 
-	transaction, err := wal.encodeTransaction(nodes, encodedMeta, wal.nextTxid)
+	transaction, err := wal.encodeTransaction(nodes, allocationPages, encodedMeta, wal.nextTxid)
 	if err != nil {
 		return false, err
 	}
@@ -83,9 +88,16 @@ func (wal *WAL) Commit(nodes []NodeRecord, encodedMeta []byte) (bool, error) {
 	}
 	wal.totalBytesWritten += uint64(wal.appendOffset - startOffset)
 
+	for pageID := range retired {
+		delete(wal.overlay, pageID)
+	}
 	for _, node := range nodes {
 		header := RecordHeader{Type: RecordTypeNode, PageID: node.Final.PageID(), TxID: wal.nextTxid}
 		wal.overlay[header.PageID] = CommittedPage{Header: header, Node: node.Final}
+	}
+	for _, record := range allocationPages {
+		header := RecordHeader{Type: RecordTypeAllocation, PageID: record.PageID, TxID: wal.nextTxid}
+		wal.overlay[record.PageID] = CommittedPage{Header: header, Payload: record.Payload}
 	}
 	if len(encodedMeta) > 0 {
 		header := RecordHeader{Type: RecordTypeMeta, TxID: wal.nextTxid}
@@ -108,9 +120,8 @@ func (wal *WAL) releaseEncodingBuffer() {
 	}
 }
 
-// encodeTransaction encodes changed nodes, optional metadata, and one commit marker.
-// encodedMeta can be nil or empty when metadata did not change.
-func (wal *WAL) encodeTransaction(nodes []NodeRecord, encodedMeta []byte, txid TxID) ([]byte, error) {
+// encodeTransaction encodes changed nodes, allocation pages, optional metadata, and one commit marker.
+func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, txid TxID) ([]byte, error) {
 	transactionSize := HeaderSize + ChecksumSize
 	for index := range nodes {
 		if nodes[index].Final == nil {
@@ -122,6 +133,12 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, encodedMeta []byte, txid T
 			return nil, fmt.Errorf("record payload exceeds page size (%d > %d)", payloadSize, wal.pageSize)
 		}
 		transactionSize += HeaderSize + payloadSize + ChecksumSize
+	}
+	for _, record := range allocationPages {
+		if int64(len(record.Payload)) != wal.pageSize {
+			return nil, fmt.Errorf("allocation page %d has size %d, want %d: %w", record.PageID, len(record.Payload), wal.pageSize, page.ErrInvalid)
+		}
+		transactionSize += HeaderSize + len(record.Payload) + ChecksumSize
 	}
 	if len(encodedMeta) > 0 {
 		if int64(len(encodedMeta)) > wal.pageSize {
@@ -140,6 +157,10 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, encodedMeta []byte, txid T
 		if err != nil {
 			return nil, err
 		}
+	}
+	for _, record := range allocationPages {
+		header := RecordHeader{Type: RecordTypeAllocation, PageID: record.PageID, TxID: txid}
+		transaction = appendEncodedPayloadRecord(transaction, header, record.Payload)
 	}
 	if len(encodedMeta) > 0 {
 		header := RecordHeader{Type: RecordTypeMeta, TxID: txid}

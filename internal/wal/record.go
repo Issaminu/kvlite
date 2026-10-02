@@ -24,6 +24,8 @@ const (
 	RecordTypeNode RecordType = 2
 	// RecordTypePatch stores replacement ranges for one existing data node.
 	RecordTypePatch RecordType = 3
+	// RecordTypeAllocation stores one complete allocation page.
+	RecordTypeAllocation RecordType = 4
 
 	recordTypeSize          = 1 // A record type uses one byte.
 	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
@@ -52,9 +54,17 @@ type NodeRecord struct {
 	Final *btree.Node
 }
 
+// AllocationRecord carries one complete allocation segment page to [WAL.Commit].
+// It exists only in memory. The WAL file stores its page ID and payload.
+type AllocationRecord struct {
+	PageID  page.ID
+	Payload []byte
+}
+
 // WALRecord represents one record in the WAL file format.
 // [WAL.ReadRecords] returns WALRecord values during recovery.
-// Header.Type defines whether Payload contains a complete node image, page-patch ranges, encoded metadata, or no bytes for a commit marker.
+// Header.Type defines whether Payload contains a complete node or allocation page,
+// page-patch ranges, encoded metadata, or no bytes for a commit marker.
 type WALRecord struct {
 	Header RecordHeader
 	// Payload contains bytes that can be written to the WAL file.
