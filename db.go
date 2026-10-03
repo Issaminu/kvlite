@@ -54,7 +54,6 @@ type DB struct {
 	file              *os.File
 	meta              *page.Meta
 	rootNode          *btree.Node
-	allocation        *allocationBitmap
 	writeNodes        map[page.ID]*writeNodeCacheEntry // Each committed node refers only to stable heap bytes that later write clones can share.
 	writeNodeSlots    []page.ID
 	nextWriteNodeSlot int
@@ -62,7 +61,7 @@ type DB struct {
 	options           *Options
 	wal               *wal.WAL
 	operationMu       sync.RWMutex
-	lifecycleMu       sync.Mutex
+	lifecycleMu       sync.RWMutex
 	activeOperations  sync.WaitGroup
 	writeRequests     chan *writeRequest
 	stopWriteBatcher  chan struct{}
@@ -70,6 +69,7 @@ type DB struct {
 	closing           bool
 	closed            bool
 	stats             Stats
+	allocation        *allocationBitmap
 }
 
 func (db *DB) ensureOpen() error {
@@ -80,8 +80,8 @@ func (db *DB) ensureOpen() error {
 }
 
 func (db *DB) beginOperation() error {
-	db.lifecycleMu.Lock()
-	defer db.lifecycleMu.Unlock()
+	db.lifecycleMu.RLock()
+	defer db.lifecycleMu.RUnlock()
 	if err := db.ensureOpen(); err != nil {
 		return err
 	}

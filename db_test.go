@@ -6188,6 +6188,62 @@ func TestClose_WaitsForActiveUpdate(t *testing.T) {
 	}
 }
 
+func TestClose_WithConcurrentGets(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	const readers = 16
+	ready := make(chan error, readers)
+	done := make(chan error, readers)
+	for range readers {
+		go func() {
+			value, err := db.Get(testBucketName, []byte("key"))
+			if err == nil && !bytes.Equal(value, []byte("value")) {
+				err = fmt.Errorf("Get returned %q", value)
+			}
+			ready <- err
+			if err != nil {
+				done <- err
+				return
+			}
+			for {
+				_, err := db.Get(testBucketName, []byte("key"))
+				if errors.Is(err, ErrDatabaseNotOpen) {
+					done <- nil
+					return
+				}
+				if err != nil {
+					done <- err
+					return
+				}
+			}
+		}()
+	}
+	for range readers {
+		if err := <-ready; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for range readers {
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestView_DoesNotCreatePrivateNodeMaps(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
