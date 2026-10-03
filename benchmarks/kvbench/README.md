@@ -10,6 +10,24 @@ The suite has three result groups:
 
 See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-03 report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
 
+## Run benchmarks on CodSpeed
+
+The [CodSpeed workflow](../../.github/workflows/codspeed.yml) runs on GitHub Actions. It measures the main Go module and KVBench on remote runners. Pull requests run KVLite with the medium profile and all workload groups in durable and no-commit-sync modes. Manual runs can select KVLite, bbolt, Redis, or all three engines. The Redis job starts a Redis service with the same image and persistence settings as the Docker runner below.
+
+To run tests and benchmarks away from your computer, use the workflow. Give each concurrent task its own worktree and branch. Commit and push the branch before you request a remote run. GitHub Actions cannot read changes that stay on your machine. The workflow permits runs from different branches at the same time. A run can wait until a remote runner is free. A pull request runs both the main module and KVBench. Use these commands to select a module for a manual run:
+
+```sh
+gh workflow run codspeed.yml --ref my-benchmark-branch -f suite=main
+gh workflow run codspeed.yml --ref my-benchmark-branch -f suite=kvbench -f engine=kvlite -f profile=light -f workload=focused
+gh workflow run codspeed.yml --ref my-benchmark-branch -f suite=kvbench -f engine=all -f profile=medium -f workload=all
+gh run list --workflow codspeed.yml --branch my-benchmark-branch
+gh run watch 123456789
+```
+
+Replace the example branch and run ID with your values. Omit `suite` to run both modules. Manual runs use KVLite, the medium profile, and all workloads by default. The `engine=all` choice runs each engine in both durability modes. You can select the `light`, `medium`, or `large` profile and the `focused`, `reads`, `writes`, `deletes`, `mixed`, or `all` workload. GitHub needs the workflow on the default branch before it accepts a manual run.
+
+Run the same command on a base branch and a test branch before you compare their results. Change only the `--ref` value. Benchmark names include the profile. Focused cases have separate names because they can do different work. Other workload choices select subsets of the same cases. Use the Docker runner below for a repeated three-engine comparison with changed engine order.
+
 ## Run the suite
 
 Run the light profile during normal development:

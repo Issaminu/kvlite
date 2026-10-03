@@ -5,29 +5,115 @@ on:
     branches:
       - "main"
   pull_request:
-  # `workflow_dispatch` allows CodSpeed to trigger backtest
-  # performance analysis in order to generate initial data.
   workflow_dispatch:
-
+    inputs:
+      suite:
+        description: Go module to benchmark on the selected branch
+        type: choice
+        options:
+          - both
+          - main
+          - kvbench
+        default: both
+      engine:
+        description: KVBench engine for a manual run
+        type: choice
+        options: [kvlite, bbolt, redis, all]
+        default: kvlite
+      profile:
+        description: KVBench profile for a manual run
+        type: choice
+        options: [light, medium, large]
+        default: medium
+      workload:
+        description: KVBench workload for a manual run
+        type: choice
+        options: [focused, reads, writes, deletes, mixed, all]
+        default: all
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  benchmarks:
-    name: Run benchmarks
+  test:
+    name: Test both Go modules
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
-          # CodSpeed's Go integration requires Go 1.24 or later.
-          go-version: stable
+          go-version: '1.26.8'
+
+      - name: Test KVLite
+        run: go test ./...
+
+      - name: Test KVBench
+        working-directory: benchmarks/kvbench
+        run: go test ./...
+
+  benchmarks:
+    name: Run main module benchmarks
+    if: github.event_name != 'workflow_dispatch' || inputs.suite != 'kvbench'
+    needs: test
+    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
         with:
           mode: walltime
-          run: go test -run='^$' -bench=. ./...
+          run: go test -bench=. ./...
+
+  kvbench:
+    name: Run KVBench benchmarks
+    if: github.event_name != 'workflow_dispatch' || inputs.suite != 'main'
+    needs: test
+    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    strategy:
+      fail-fast: false
+      matrix:
+        durability: [durable, no-commit-sync]
+        engine: ${{ fromJSON(inputs.engine == 'all' && '["kvlite","bbolt","redis"]' || format('["{0}"]', inputs.engine || 'kvlite')) }}
+    services:
+      redis:
+        image: ${{ matrix.engine == 'redis' && 'redis@sha256:027002f3d4161eb427643e0cc71023b582fb461c6199e699f46db843f0b39fb1' || '' }}
+        command: >-
+          redis-server --appendonly yes --appendfsync always --save ""
+          --auto-aof-rewrite-percentage 0 --no-appendfsync-on-rewrite no
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      KVBENCH_ENGINE: ${{ matrix.engine }}
+      KVBENCH_DURABILITY: ${{ matrix.durability }}
+      KVBENCH_PROFILE: ${{ inputs.profile || 'medium' }}
+      KVBENCH_WORKLOAD: ${{ inputs.workload || 'all' }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - name: Run KVBench
+        uses: CodSpeedHQ/action@v5
+        env:
+          KVBENCH_REDIS_ADDR: ${{ matrix.engine == 'redis' && format('127.0.0.1:{0}', job.services.redis.ports['6379']) || '' }}
+          KVBENCH_REDIS_FLUSHDB: ${{ matrix.engine == 'redis' && '1' || '' }}
+        with:
+          mode: walltime
+          working-directory: benchmarks/kvbench
+          run: go test -bench=.
