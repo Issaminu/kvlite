@@ -26,12 +26,26 @@ type writeNodeCacheEntry struct {
 	referenced bool
 }
 
-// Stats contains cumulative storage work for one open [DB] handle.
+// Stats contains current page counts and cumulative page work for one open [DB] handle.
 type Stats struct {
 	// WALBytesWritten is the total size of successful WAL transaction appends. A checkpoint does not decrease this value.
 	WALBytesWritten uint64
 	// CheckpointCount is the number of checkpoints that wrote all committed pages and cleared the WAL.
 	CheckpointCount uint64
+	// AllocatedPageCount is the number of pages that contain metadata, allocation data, or live tree data.
+	AllocatedPageCount uint64
+	// ReusablePageCount is the number of free pages at or below LastPageID.
+	ReusablePageCount uint64
+	// AllocationMetadataPageCount is the number of pages that store allocation bitmaps.
+	AllocationMetadataPageCount uint64
+	// LastPageID is the highest page ID in the logical database file.
+	LastPageID uint64
+	// PagesReused counts allocations from free pages since this handle opened.
+	PagesReused uint64
+	// PagesRetired counts tree pages freed by committed writes since this handle opened.
+	PagesRetired uint64
+	// TailPagesReclaimed counts pages removed from the logical file since this handle opened. Checkpoint later shrinks the main file.
+	TailPagesReclaimed uint64
 }
 
 // DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
@@ -55,6 +69,7 @@ type DB struct {
 	writeBatcherDone  chan struct{}
 	closing           bool
 	closed            bool
+	stats             Stats
 }
 
 func (db *DB) ensureOpen() error {
@@ -332,7 +347,7 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// Stats returns cumulative storage work for this database handle. It waits for an active write or checkpoint to finish. It returns [ErrDatabaseNotOpen] after close starts.
+// Stats returns current page counts and cumulative page work for this database handle. It waits for an active write or checkpoint to finish. It returns [ErrDatabaseNotOpen] after close starts. Counting allocated pages scans the allocation bitmap.
 func (db *DB) Stats() (Stats, error) {
 	if err := db.beginOperation(); err != nil {
 		return Stats{}, err
@@ -343,10 +358,14 @@ func (db *DB) Stats() (Stats, error) {
 	defer db.operationMu.RUnlock()
 
 	stats := db.wal.Stats()
-	return Stats{
-		WALBytesWritten: stats.TotalBytesWritten,
-		CheckpointCount: stats.CheckpointCount,
-	}, nil
+	result := db.stats
+	result.WALBytesWritten = stats.TotalBytesWritten
+	result.CheckpointCount = stats.CheckpointCount
+	result.AllocatedPageCount = db.allocation.allocatedPageCount()
+	result.LastPageID = uint64(db.meta.LastPage())
+	result.ReusablePageCount = result.LastPageID + 1 - result.AllocatedPageCount
+	result.AllocationMetadataPageCount = uint64(len(db.allocation.segments))
+	return result, nil
 }
 
 // Put stores value under key in the top-level bucket named bucketName.

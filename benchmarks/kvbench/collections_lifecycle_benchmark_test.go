@@ -246,7 +246,7 @@ func BenchmarkLifecycle(b *testing.B) {
 
 	b.Run("recover-after-process-kill/"+string(environment.kind), func(b *testing.B) {
 		dataDir := b.TempDir()
-		createKilledDatabase(b, environment.kind, dataDir)
+		createKilledDatabase(b, environment.kind, dataDir, false)
 		b.ResetTimer()
 		engine, err := openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: DurabilityDurable, DataDir: dataDir, ClientCount: 1})
 		b.StopTimer()

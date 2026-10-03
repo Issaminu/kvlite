@@ -109,6 +109,72 @@ func TestBatchCasesWriteEachRecordOnce(t *testing.T) {
 	}
 }
 
+func TestDeleteWorkloadSelection(t *testing.T) {
+	for _, workload := range []string{"all", "writes", "deletes"} {
+		t.Run(workload, func(t *testing.T) {
+			t.Setenv("KVBENCH_WORKLOAD", workload)
+			if !workloadEnabled(benchmarkDelete) {
+				t.Fatal("delete workload is disabled")
+			}
+		})
+	}
+	for _, workload := range []string{"reads", "mixed", "focused"} {
+		t.Run(workload, func(t *testing.T) {
+			t.Setenv("KVBENCH_WORKLOAD", workload)
+			if workloadEnabled(benchmarkDelete) {
+				t.Fatal("delete workload is enabled")
+			}
+		})
+	}
+}
+
+func TestDeleteBenchmarkProfiles(t *testing.T) {
+	for _, test := range []struct {
+		profile string
+		want    int
+	}{
+		{profile: "light", want: 4},
+		{profile: "medium", want: 4},
+		{profile: "large", want: 7},
+	} {
+		t.Run(test.profile, func(t *testing.T) {
+			t.Setenv("KVBENCH_PROFILE", test.profile)
+			if got := len(deleteBenchmarkCases()); got != test.want {
+				t.Fatalf("delete cases: got %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestDeleteBenchmarkCasesUseUniqueKeys(t *testing.T) {
+	t.Setenv("KVBENCH_PROFILE", "medium")
+	for _, benchmarkCase := range deleteBenchmarkCases() {
+		keyCount := benchmarkCase.operations * benchmarkCase.batchSize
+		if keyCount > benchmarkCase.records {
+			t.Fatalf("%s deletes %d keys from %d records", benchmarkCase.name, keyCount, benchmarkCase.records)
+		}
+		pairs, err := makePairs(benchmarkCase.records, 128, 1, benchmarkCase.order, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := make(map[string]struct{}, keyCount)
+		for index := 0; index < keyCount; index++ {
+			key := string(pairs[index].Key)
+			if _, exists := seen[key]; exists {
+				t.Fatalf("%s repeats key %x", benchmarkCase.name, pairs[index].Key)
+			}
+			seen[key] = struct{}{}
+		}
+	}
+}
+
+func TestPersistentBytesIncludesPrimaryAndLog(t *testing.T) {
+	stats := storageStats{primaryBytes: 10, logBytes: 7}
+	if got := persistentBytes(stats); got != 17 {
+		t.Fatalf("persistent bytes: got %d, want 17", got)
+	}
+}
+
 func TestProfileValue(t *testing.T) {
 	t.Setenv("KVBENCH_PROFILE", "light")
 	if got := profileValue(10_000, 1_000); got != 1_000 {

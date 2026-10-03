@@ -115,7 +115,7 @@ func testEngineContract(t *testing.T, engine Engine) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.primaryBytes < 0 || stats.logBytes < 0 || stats.memoryBytes < 0 {
+	if stats.primaryBytes < 0 || stats.logBytes < 0 || stats.memoryBytes < 0 || (stats.hasAllocatedBytes && stats.allocatedBytes < 0) {
 		t.Fatalf("storage statistics contain a negative size: %+v", stats)
 	}
 	collections, ok := engine.(collectionEngine)
@@ -223,6 +223,9 @@ func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
 		if err == nil {
 			err = engine.Put(context.Background(), []byte("crash-key"), []byte("crash-value"))
 		}
+		if err == nil && os.Getenv("KVBENCH_CRASH_DELETE") == "1" {
+			err = engine.Delete(context.Background(), []byte("crash-key"))
+		}
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(2)
@@ -238,30 +241,47 @@ func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
 
 	for _, kind := range []EngineKind{EngineKVLite, EngineBBolt} {
 		t.Run(string(kind), func(t *testing.T) {
-			dataDir := t.TempDir()
-			createKilledDatabase(t, kind, dataDir)
-			engine, err := openEngine(context.Background(), engineOpenOptions{
-				Kind:        kind,
-				Mode:        DurabilityDurable,
-				DataDir:     dataDir,
-				ClientCount: 1,
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer engine.Close()
-			got, err := engine.Get(context.Background(), []byte("crash-key"))
-			if err != nil || string(got) != "crash-value" {
-				t.Fatalf("recovered value: got %q, error %v", got, err)
+			for _, deleted := range []bool{false, true} {
+				name := "put"
+				if deleted {
+					name = "delete"
+				}
+				t.Run(name, func(t *testing.T) {
+					dataDir := t.TempDir()
+					createKilledDatabase(t, kind, dataDir, deleted)
+					engine, err := openEngine(context.Background(), engineOpenOptions{
+						Kind:        kind,
+						Mode:        DurabilityDurable,
+						DataDir:     dataDir,
+						ClientCount: 1,
+					})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer engine.Close()
+					got, err := engine.Get(context.Background(), []byte("crash-key"))
+					if deleted {
+						if !errors.Is(err, ErrKeyNotFound) {
+							t.Fatalf("recovered delete: got %q, error %v", got, err)
+						}
+						return
+					}
+					if err != nil || string(got) != "crash-value" {
+						t.Fatalf("recovered value: got %q, error %v", got, err)
+					}
+				})
 			}
 		})
 	}
 }
 
-func createKilledDatabase(tb testing.TB, kind EngineKind, dataDir string) {
+func createKilledDatabase(tb testing.TB, kind EngineKind, dataDir string, deleted bool) {
 	tb.Helper()
 	command := exec.Command(os.Args[0], "-test.run=^TestDurableEmbeddedEngineReopensWithoutCleanClose$")
 	command.Env = append(os.Environ(), "KVBENCH_CRASH_HELPER="+string(kind), "KVBENCH_CRASH_DIR="+dataDir, "KVBENCH_CRASH_WAIT=1")
+	if deleted {
+		command.Env = append(command.Env, "KVBENCH_CRASH_DELETE=1")
+	}
 	stdout, err := command.StdoutPipe()
 	if err != nil {
 		tb.Fatal(err)

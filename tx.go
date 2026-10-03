@@ -116,6 +116,9 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	db.rootNode = tx.rootNode
 	if tx.allocationOwned {
 		db.allocation = tx.allocation.publish()
+		db.stats.PagesReused += tx.allocation.pagesReused
+		db.stats.PagesRetired += tx.allocation.pagesRetired
+		db.stats.TailPagesReclaimed += tx.allocation.tailPagesRemoved
 	}
 	for _, dirty := range tx.store.dirty {
 		db.cacheWriteNode(dirty.final)

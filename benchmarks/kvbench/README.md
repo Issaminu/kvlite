@@ -42,6 +42,7 @@ Select the measured workload when you do not need the complete suite:
 ./run-docker.sh light --workloads=focused
 ./run-docker.sh light --workloads=reads
 ./run-docker.sh medium --workloads=writes
+./run-docker.sh medium --workloads=deletes
 ./run-docker.sh medium --workloads=mixed
 ```
 
@@ -49,7 +50,8 @@ The workload values have these meanings:
 
 - `focused` runs point reads and a combined point-update, point-insert, and 10-key batch-update cycle in both durability modes. It is the light default.
 - `reads` runs pure read workloads.
-- `writes` runs pure update and insert workloads.
+- `writes` runs update, insert, delete, reuse, and space-recovery workloads.
+- `deletes` runs only delete, reuse, and space-recovery workloads.
 - `mixed` runs workloads that combine reads and writes.
 - `all` runs every workload, including life-cycle cases. It is the medium and large default.
 
@@ -174,7 +176,13 @@ Point-read latency uses each engine's single-call caller boundary. KVLite uses `
 
 The last case measures recovery after acknowledged durable writes. It kills the writer process after the write returns. It does not simulate loss of operating-system cache or a power failure. The Docker runner checks Redis restart behavior, but it does not rank that check against embedded open time. KVLite performs its final checkpoint during close, so the close-after-writes case includes that work.
 
-Deletion and delete churn are not in this version.
+### Delete and space recovery
+
+The delete group runs the same fixed key operations through all three engines. It measures existing and missing deletes, random and sequential order, one and eight clients, and single-key and batch calls. It also measures a read after each acknowledged delete.
+
+The group tests one delete-and-insert cycle and ten repeated cycles. It measures file growth before and after close and reopen. A separate case deletes upper keys and measures logical file size and operating-system file blocks. Another case measures reopen after alternating keys are deleted.
+
+KVLite can reuse free pages inside its file. Checkpoint can release a free file suffix to the operating system. The cases do not run bbolt compaction or Redis AOF rewrite. `BenchmarkDeleteVisibility` measures the next read in the same client. It does not measure replication.
 
 ## Metrics
 
@@ -182,11 +190,28 @@ Deletion and delete churn are not in this version.
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
 | `ns/op`                                          | Time for one logical benchmark iteration. Fixed-work subtests also report a named rate.                                     |
 | `ack-keys/s`                                     | Keys acknowledged each second. A write batch counts each key.                                                               |
+| `transactions/s`, `cycle-keys/s`                 | Delete calls or changed keys each second in the named case.                                                                  |
+| `delete-ack-ns`, `post-ack-miss-p50-ns`, `post-ack-miss-p95-ns`, `post-ack-miss-p99-ns` | Delete time and time for the next read to return a miss.                            |
 | `keys/s`, `reads/s`, `entries/s`, `operations/s` | Completed work for the named suite.                                                                                         |
 | `p50-ns`, `p95-ns`, `p99-ns`, `max-ns`           | Caller-visible operation latency in the latency suite.                                                                      |
 | `primary-B`                                      | Main database-file bytes. Redis reports zero because AOF is its tested persistent file.                                     |
 | `log-B`                                          | KVLite WAL bytes or Redis AOF bytes. bbolt reports zero because it has no separate log file.                                |
 | `persistent-B`                                   | `primary-B + log-B`.                                                                                                        |
+| `os-allocated-B`                                 | File-system blocks for embedded database and log files. Redis does not expose its AOF path to this client.                  |
+| `loaded-persistent-B`, `final-persistent-B`      | File bytes before delete and after the selected close or reopen boundary.                                                   |
+| `post-delete-persistent-B`                       | File bytes after delete and before any later close or reopen.                                                                |
+| `active-post-reinsert-persistent-B`, `stable-post-reinsert-persistent-B` | File bytes before and after the embedded close and reopen boundary.                    |
+| `reuse-active-growth-B`, `reuse-stable-growth-B` | File growth from the loaded state before and after that boundary.                                                            |
+| `peak-persistent-B`, `active-final-persistent-B`, `stable-final-persistent-B` | File bytes during and after repeated delete and insert cycles.                 |
+| `loaded-os-allocated-B`, `post-delete-os-allocated-B`, `active-post-reinsert-os-allocated-B`, `stable-post-reinsert-os-allocated-B` | Allocated file blocks at each named point. |
+| `reinsert-pages-reused`                          | KVLite pages reused during the reinsertion part of one cycle.                                                                |
+| `pages-reused`                                   | KVLite pages reused across repeated delete and insert cycles.                                                                |
+| `allocated-pages`, `reusable-pages`              | KVLite pages in use and free pages inside the logical file.                                                                  |
+| `pages-retired`, `tail-pages-reclaimed`          | KVLite pages freed by committed writes and pages removed from the logical file tail.                                        |
+| `persistent-change-B`, `os-change-B`             | Signed change in file bytes or allocated blocks. Positive values mean growth.                                                |
+| `persistent-reclaimed-B`, `os-reclaimed-B`       | Nonnegative number of file bytes or allocated blocks released.                                                              |
+| `persistent-growth-B`, `os-growth-B`             | Nonnegative number of file bytes or allocated blocks added.                                                                 |
+| `close-ns`, `reopen-ns`                          | Time to close and reopen an embedded database in the named case.                                                             |
 | `wal-written-B`                                  | Successful KVLite WAL transaction bytes since the benchmark opened the database. A checkpoint does not decrease this value. |
 | `checkpoints`                                    | Completed KVLite checkpoints since the benchmark opened the database. The value excludes the final close.                   |
 | `dataset-memory-B`                               | Redis `used_memory_dataset`. It is an extra Redis-only value.                                                               |
@@ -205,6 +230,9 @@ The suite does not report cross-engine Go allocation values. Redis server alloca
 | Point write, one client   | `DB.Put`              | `DB.Update`           | `SET`              |
 | Point write, many clients | `DB.Put`              | `DB.Batch`            | `SET`              |
 | Batch write               | One write transaction | One write transaction | `MULTI` and `EXEC` |
+| Point delete, one client   | `DB.Delete`           | `DB.Update`           | `DEL`              |
+| Point delete, many clients | `DB.Delete`           | `DB.Batch`            | `DEL`              |
+| Batch delete              | One write transaction | One write transaction | One variadic `DEL` |
 | Mixed transaction         | One write transaction | One write transaction | `MULTI` and `EXEC` |
 | Prefix enumeration        | Ordered prefix cursor | Ordered prefix cursor | `SCAN` and `MGET`  |
 | Key count                 | Bucket cursor scan    | Bucket cursor scan    | `DBSIZE`           |

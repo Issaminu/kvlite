@@ -186,6 +186,9 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 			db.rootNode = state.rootNode
 			if state.allocation != nil {
 				db.allocation = state.allocation.publish()
+				db.stats.PagesReused += state.allocation.pagesReused
+				db.stats.PagesRetired += state.allocation.pagesRetired
+				db.stats.TailPagesReclaimed += state.allocation.tailPagesRemoved
 			}
 			for _, dirty := range state.dirty {
 				db.cacheWriteNode(dirty.final)

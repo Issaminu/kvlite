@@ -15,7 +15,7 @@ readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 readonly results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|mixed|all] [--storage=tmpfs|volume]"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume]"
 benchmark_profile="light"
 engine_option="--engines=kvlite,bbolt,redis"
 workload_option=""
@@ -113,9 +113,9 @@ tmpfs | volume) ;;
 esac
 readonly benchmark_workload="${workload_option#--workloads=}"
 case "${benchmark_workload}" in
-focused | reads | writes | mixed | all) ;;
+focused | reads | writes | deletes | mixed | all) ;;
 *)
-	echo "workloads must be focused, reads, writes, mixed, or all" >&2
+	echo "workloads must be focused, reads, writes, deletes, mixed, or all" >&2
 	exit 1
 	;;
 esac
@@ -160,13 +160,16 @@ else
 		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections)$'
 		;;
 	writes)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|Latency|Collections)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|Latency|Collections)$'
+		;;
+	deletes)
+		readonly benchmark_filter='^Benchmark(DeleteOperations|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete)$'
 		;;
 	mixed)
 		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
 		;;
 	all)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
 		;;
 	esac
 fi

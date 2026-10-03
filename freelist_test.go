@@ -58,8 +58,14 @@ func TestAllocationChangesReusesFreePageAndRetiresTailPage(t *testing.T) {
 	if got, err := changes.allocate(5); err != nil || got != 4 {
 		t.Fatalf("reused page: got %d, error %v; want page 4", got, err)
 	}
+	if changes.pagesReused != 1 {
+		t.Fatalf("reused pages: got %d, want 1", changes.pagesReused)
+	}
 	if err := changes.retire(5); err != nil {
 		t.Fatal(err)
+	}
+	if changes.pagesRetired != 1 {
+		t.Fatalf("retired pages: got %d, want 1", changes.pagesRetired)
 	}
 	meta := page.NewMeta(4096)
 	meta.SetLastPage(5)
@@ -68,6 +74,9 @@ func TestAllocationChangesReusesFreePageAndRetiresTailPage(t *testing.T) {
 	}
 	if got := meta.LastPage(); got != 4 {
 		t.Fatalf("last page: got %d, want 4", got)
+	}
+	if changes.tailPagesRemoved != 1 {
+		t.Fatalf("removed tail pages: got %d, want 1", changes.tailPagesRemoved)
 	}
 	if changes.allocated(5) {
 		t.Fatal("retired tail page is still allocated")
@@ -528,5 +537,80 @@ func TestDeleteAPIContracts(t *testing.T) {
 	defer readOnly.Close()
 	if err := readOnly.Delete([]byte("parent"), []byte("key")); !errors.Is(err, ErrDatabaseReadOnly) {
 		t.Fatalf("read-only delete: got %v, want ErrDatabaseReadOnly", err)
+	}
+}
+
+func TestAllocationStatsCountCommittedDeleteAndReuse(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "database"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const count = 256
+	for index := range count {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "old-%04d", index), bytes.Repeat([]byte("v"), 512)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("discard delete")
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for index := 0; index < count; index += 2 {
+			if err := bucket.Delete(fmt.Appendf(nil, "old-%04d", index)); err != nil {
+				return err
+			}
+		}
+		return wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("discarded delete: got %v, want %v", err, wantErr)
+	}
+	afterRollback, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRollback.PagesRetired != before.PagesRetired || afterRollback.PagesReused != before.PagesReused || afterRollback.TailPagesReclaimed != before.TailPagesReclaimed {
+		t.Fatalf("rollback changed page work: before %+v, after %+v", before, afterRollback)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for index := 0; index < count; index += 2 {
+			if err := bucket.Delete(fmt.Appendf(nil, "old-%04d", index)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete.PagesRetired <= before.PagesRetired || afterDelete.ReusablePageCount == 0 {
+		t.Fatalf("delete did not free pages: %+v", afterDelete)
+	}
+	for index := range count / 2 {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "new-%04d", index), bytes.Repeat([]byte("n"), 512)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	afterReuse, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterReuse.PagesReused <= afterDelete.PagesReused {
+		t.Fatalf("new keys did not reuse free pages: %+v", afterReuse)
 	}
 }

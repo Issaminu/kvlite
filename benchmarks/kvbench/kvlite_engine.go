@@ -242,16 +242,34 @@ func (engine *kvliteEngine) StorageStats(_ context.Context) (storageStats, error
 	if err != nil {
 		return storageStats{}, err
 	}
+	primaryAllocated, hasPrimaryAllocated, err := fileAllocatedBytes(engine.db.Path())
+	if err != nil {
+		return storageStats{}, err
+	}
+	logAllocated, hasLogAllocated, err := fileAllocatedBytes(engine.db.Path() + "-wal")
+	if err != nil {
+		return storageStats{}, err
+	}
 	runtimeStats, err := engine.db.Stats()
 	if err != nil {
 		return storageStats{}, err
 	}
 	return storageStats{
-		primaryBytes:      primaryBytes,
-		logBytes:          logBytes,
-		walBytesWritten:   runtimeStats.WALBytesWritten,
-		checkpointCount:   runtimeStats.CheckpointCount,
-		hasKVLiteWALStats: true,
+		primaryBytes:       primaryBytes,
+		logBytes:           logBytes,
+		allocatedBytes:     primaryAllocated + logAllocated,
+		walBytesWritten:    runtimeStats.WALBytesWritten,
+		checkpointCount:    runtimeStats.CheckpointCount,
+		hasKVLiteWALStats:  true,
+		allocatedPages:     runtimeStats.AllocatedPageCount,
+		reusablePages:      runtimeStats.ReusablePageCount,
+		allocationPages:    runtimeStats.AllocationMetadataPageCount,
+		lastPageID:         runtimeStats.LastPageID,
+		pagesReused:        runtimeStats.PagesReused,
+		pagesRetired:       runtimeStats.PagesRetired,
+		tailPagesReclaimed: runtimeStats.TailPagesReclaimed,
+		hasAllocationStats: true,
+		hasAllocatedBytes:  hasPrimaryAllocated && hasLogAllocated,
 	}, nil
 }
 

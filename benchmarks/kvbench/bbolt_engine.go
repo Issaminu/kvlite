@@ -233,7 +233,11 @@ func (engine *bboltEngine) StorageStats(_ context.Context) (storageStats, error)
 	if err != nil {
 		return storageStats{}, err
 	}
-	return storageStats{primaryBytes: primaryBytes}, nil
+	allocatedBytes, hasAllocatedBytes, err := fileAllocatedBytes(engine.db.Path())
+	if err != nil {
+		return storageStats{}, err
+	}
+	return storageStats{primaryBytes: primaryBytes, allocatedBytes: allocatedBytes, hasAllocatedBytes: hasAllocatedBytes}, nil
 }
 
 func (engine *bboltEngine) PrepareCollections(_ context.Context, paths [][][]byte) error {

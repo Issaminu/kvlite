@@ -66,6 +66,9 @@ type allocationChanges struct {
 	firstFreeSegment int                        // private search cursor
 	retired          map[page.ID]struct{}       // tree pages that become free during commit preparation
 	obsoleteWALPages map[page.ID]struct{}       // allocation pages removed from the file tail
+	pagesReused      uint64
+	pagesRetired     uint64
+	tailPagesRemoved uint64
 }
 
 // newAllocationChanges starts an empty transaction overlay on bitmap.
@@ -92,6 +95,9 @@ func (changes *allocationChanges) clone() *allocationChanges {
 		firstFreeSegment: changes.firstFreeSegment,
 		retired:          maps.Clone(changes.retired),
 		obsoleteWALPages: maps.Clone(changes.obsoleteWALPages),
+		pagesReused:      changes.pagesReused,
+		pagesRetired:     changes.pagesRetired,
+		tailPagesRemoved: changes.tailPagesRemoved,
 	}
 }
 
@@ -113,6 +119,7 @@ func (changes *allocationChanges) allocate(lastPage page.ID) (page.ID, error) {
 		// Clear bits after lastPage describe pages that are not in the logical file. They are not reusable pages.
 		if candidate >= firstTreePageID && candidate <= lastPage {
 			changes.markAllocated(candidate)
+			changes.pagesReused++
 			return candidate, nil
 		}
 	}
@@ -151,6 +158,7 @@ func (changes *allocationChanges) retire(pageID page.ID) error {
 		return fmt.Errorf("retire page %d twice: %w", pageID, ErrInvalid)
 	}
 	changes.retired[pageID] = struct{}{}
+	changes.pagesRetired++
 	return nil
 }
 
@@ -179,6 +187,7 @@ func (changes *allocationChanges) finalize(meta *page.Meta) bool {
 	if highest >= meta.LastPage() {
 		return false
 	}
+	changes.tailPagesRemoved += uint64(meta.LastPage() - highest)
 	meta.SetLastPage(highest)
 	return true
 }

@@ -17,6 +17,7 @@ const (
 	benchmarkUpdate benchmarkOperation = "update"
 	benchmarkInsert benchmarkOperation = "insert"
 	benchmarkMixed  benchmarkOperation = "mixed"
+	benchmarkDelete benchmarkOperation = "delete"
 )
 
 type benchmarkCase struct {
@@ -175,11 +176,13 @@ func workloadEnabled(operation benchmarkOperation) bool {
 	case "reads":
 		return operation == benchmarkRead
 	case "writes":
-		return operation == benchmarkUpdate || operation == benchmarkInsert
+		return operation == benchmarkUpdate || operation == benchmarkInsert || operation == benchmarkDelete
+	case "deletes":
+		return operation == benchmarkDelete
 	case "mixed":
 		return operation == benchmarkMixed
 	case "focused":
-		return true
+		return operation != benchmarkDelete
 	default:
 		panic("unknown KVBENCH_WORKLOAD")
 	}
