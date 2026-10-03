@@ -325,8 +325,10 @@ for range 2 {
 | `ReadOnly`                 | `false`                            | Opens a writable database and creates it when needed.              |
 | `LockTimeout`              | `0`                                | Waits without a time limit for a conflicting file lock.            |
 | `Synchronous`              | `SyncFull`                         | Synchronizes log data before a non-empty update returns.           |
+| `MaxWriteBatchSize`        | `100`                              | Limits the write callbacks in one `SyncFull` WAL commit.            |
 | `CheckpointThresholdBytes` | About 1,000 operating-system pages | Starts a checkpoint after the committed log reaches the threshold. |
 
+`MaxWriteBatchSize` counts callbacks, not bytes. Set it to `1` to prevent callbacks from sharing a WAL commit.
 
 See the [package documentation](https://pkg.go.dev/github.com/Issaminu/kvlite) for the complete API and error contracts.
 

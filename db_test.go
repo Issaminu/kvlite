@@ -5838,6 +5838,101 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 	}
 }
 
+func TestUpdate_GroupsWriteThatArrivesDuringCallback(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		limit     int
+		wantSyncs int64
+	}{
+		{name: "one", limit: 1, wantSyncs: 2},
+		{name: "two", limit: 2, wantSyncs: 1},
+		{name: "default", wantSyncs: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := tempfile()
+			defer os.RemoveAll(path)
+			defer os.RemoveAll(path + "-wal")
+
+			db, err := Open(path, 0600, &Options{MaxWriteBatchSize: test.limit})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				db.wal.SetSyncFileForTesting(nil)
+				_ = db.Close()
+			}()
+			createBucket(t, db, testBucketName)
+
+			var syncCalls atomic.Int64
+			db.wal.SetSyncFileForTesting(func() error {
+				syncCalls.Add(1)
+				return nil
+			})
+
+			entered := make(chan struct{})
+			release := make(chan struct{})
+			defer func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			}()
+			firstDone := make(chan error, 1)
+			go func() {
+				firstDone <- db.Update(func(tx *Tx) error {
+					bucket, err := tx.Bucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					if err := bucket.Put([]byte("first"), []byte("value")); err != nil {
+						return err
+					}
+					close(entered)
+					<-release
+					return nil
+				})
+			}()
+			<-entered
+
+			secondDone := make(chan error, 1)
+			go func() {
+				secondDone <- db.Update(func(tx *Tx) error {
+					bucket, err := tx.Bucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					if value, err := bucket.Get([]byte("first")); err != nil || !bytes.Equal(value, []byte("value")) {
+						return fmt.Errorf("second callback read first write: value=%q error=%v", value, err)
+					}
+					return bucket.Put([]byte("second"), []byte("value"))
+				})
+			}()
+
+			deadline := time.NewTimer(time.Second)
+			defer deadline.Stop()
+			for len(db.writeRequests) == 0 {
+				select {
+				case <-deadline.C:
+					t.Fatal("second write did not enter the request queue")
+				default:
+					runtime.Gosched()
+				}
+			}
+			close(release)
+			if err := <-firstDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-secondDone; err != nil {
+				t.Fatal(err)
+			}
+			if got := syncCalls.Load(); got != test.wantSyncs {
+				t.Fatalf("WAL sync calls: got %d, want %d", got, test.wantSyncs)
+			}
+		})
+	}
+}
+
 func TestUpdate_DurableGoexitDoesNotStopWriteBatcher(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)

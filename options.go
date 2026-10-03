@@ -39,6 +39,9 @@ type Options struct {
 	// Synchronous controls when KVLite synchronizes committed write-ahead log data. A zero value uses SyncFull.
 	Synchronous Sync
 
+	// MaxWriteBatchSize limits how many SyncFull write callbacks can share one WAL commit. A zero value uses 100. A value of 1 prevents callbacks from sharing a commit.
+	MaxWriteBatchSize int
+
 	// CheckpointThresholdBytes is the number of committed write-ahead log bytes that starts a checkpoint. A zero value uses about 1,000 operating-system pages, while a smaller value keeps the log smaller at the cost of more frequent checkpoints.
 	CheckpointThresholdBytes uint64
 }
@@ -47,6 +50,7 @@ func defaultOptions() Options {
 	return Options{
 		ReadOnly:                 false,
 		Synchronous:              SyncFull,
+		MaxWriteBatchSize:        defaultWriteBatchSize,
 		CheckpointThresholdBytes: defaultCheckpointPageCount * uint64(os.Getpagesize()),
 	}
 }
@@ -59,6 +63,9 @@ func resolveOptions(options *Options) (*Options, error) {
 		if resolved.Synchronous == SyncDefault {
 			resolved.Synchronous = defaults.Synchronous
 		}
+		if resolved.MaxWriteBatchSize == 0 {
+			resolved.MaxWriteBatchSize = defaults.MaxWriteBatchSize
+		}
 		if resolved.CheckpointThresholdBytes == 0 {
 			resolved.CheckpointThresholdBytes = defaults.CheckpointThresholdBytes
 		}
@@ -70,6 +77,9 @@ func resolveOptions(options *Options) (*Options, error) {
 
 	if resolved.Synchronous != SyncFull && resolved.Synchronous != SyncNormal && resolved.Synchronous != SyncNone {
 		return nil, fmt.Errorf("invalid synchronous mode %d: %w", resolved.Synchronous, page.ErrInvalid)
+	}
+	if resolved.MaxWriteBatchSize < 0 {
+		return nil, fmt.Errorf("invalid maximum write batch size %d: %w", resolved.MaxWriteBatchSize, page.ErrInvalid)
 	}
 	return &resolved, nil
 }

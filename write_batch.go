@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	// defaultWriteBatchSize bounds the number of callbacks and private states held by one durable commit.
-	defaultWriteBatchSize = 128
+	// defaultWriteBatchSize is the default callback limit for one durable commit.
+	defaultWriteBatchSize = 100
 )
 
 // writeCallbackResultChannels reuses empty result channels after each callback completes.
@@ -55,7 +55,7 @@ func (db *DB) startWriteBatcher() {
 	if db.options.ReadOnly || db.options.Synchronous != SyncFull {
 		return
 	}
-	db.writeRequests = make(chan *writeRequest, defaultWriteBatchSize)
+	db.writeRequests = make(chan *writeRequest, db.options.MaxWriteBatchSize)
 	db.stopWriteBatcher = make(chan struct{})
 	db.writeBatcherDone = make(chan struct{})
 	go db.runWriteBatcher()
@@ -104,13 +104,24 @@ func (db *DB) runWriteBatcher() {
 	}
 }
 
-// collectWriteBatch returns first and the requests that are ready in the queue. It yields once so concurrent callers can enter the queue without a timer.
+// collectWriteBatch returns first and the requests that are ready in the queue.
+// It yields once when the limit is greater than one. The yield lets concurrent
+// callers enter the queue.
 func (db *DB) collectWriteBatch(first *writeRequest) []*writeRequest {
-	requests := make([]*writeRequest, 1, defaultWriteBatchSize)
+	requests := make([]*writeRequest, 1, db.options.MaxWriteBatchSize)
 	requests[0] = first
+	if db.options.MaxWriteBatchSize == 1 {
+		return requests
+	}
 	runtime.Gosched()
+	return db.drainWriteRequests(requests)
+}
 
-	for len(requests) < defaultWriteBatchSize {
+// drainWriteRequests adds ready requests until the batch is full.
+// The worker calls it at the end of the current request list.
+// New requests can then share one WAL commit with the requests already in the batch.
+func (db *DB) drainWriteRequests(requests []*writeRequest) []*writeRequest {
+	for len(requests) < db.options.MaxWriteBatchSize {
 		select {
 		case request := <-db.writeRequests:
 			requests = append(requests, request)
@@ -128,33 +139,35 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		rootNode: db.rootNode,
 		dirty:    make(map[page.ID]dirtyNode),
 	}
-	results := make([]writeResult, len(requests))
+	results := make([]writeResult, 0, len(requests))
 	hasPendingWrites := false
 
-	for index, request := range requests {
+	for index := 0; index < len(requests); index++ {
+		request := requests[index]
 		// Create the Tx only after earlier requests finish so it starts from their successful state. Keeping it separate also lets a failed callback discard only its own changes.
 		tx := newWriteTx(db, state.meta, state.rootNode, state.dirty, state.allocation)
 		result := executeWriteCallback(request.transaction, tx)
 		if result.err != nil || result.panicked || result.goexited {
-			results[index] = result
-			continue
+			results = append(results, result)
+		} else {
+			transactionChangedState := len(tx.store.dirty) > 0 || tx.metaDirty || (tx.allocationOwned && tx.allocation.changed())
+			result.dependsOnCommit = hasPendingWrites || transactionChangedState
+			results = append(results, result)
+			if transactionChangedState {
+				state.meta = tx.meta
+				state.rootNode = tx.rootNode
+				state.allocation = tx.allocation
+				state.metaDirty = state.metaDirty || tx.metaDirty
+				for pageID, dirty := range tx.store.dirty {
+					state.dirty[pageID] = dirty
+				}
+				hasPendingWrites = true
+			}
 		}
-
-		transactionChangedState := len(tx.store.dirty) > 0 || tx.metaDirty || (tx.allocationOwned && tx.allocation.changed())
-		result.dependsOnCommit = hasPendingWrites || transactionChangedState
-		results[index] = result
-		if !transactionChangedState {
-			continue
+		if index+1 == len(requests) {
+			// Admit queued requests before this batch commits.
+			requests = db.drainWriteRequests(requests)
 		}
-
-		state.meta = tx.meta
-		state.rootNode = tx.rootNode
-		state.allocation = tx.allocation
-		state.metaDirty = state.metaDirty || tx.metaDirty
-		for pageID, dirty := range tx.store.dirty {
-			state.dirty[pageID] = dirty
-		}
-		hasPendingWrites = true
 	}
 
 	var commitErr error
