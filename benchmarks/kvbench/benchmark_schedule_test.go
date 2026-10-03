@@ -110,7 +110,7 @@ func TestBatchCasesWriteEachRecordOnce(t *testing.T) {
 }
 
 func TestDeleteWorkloadSelection(t *testing.T) {
-	for _, workload := range []string{"all", "writes", "deletes", "focused"} {
+	for _, workload := range []string{"all", "writes", "deletes"} {
 		t.Run(workload, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", workload)
 			if !workloadEnabled(benchmarkDelete) {
@@ -118,7 +118,7 @@ func TestDeleteWorkloadSelection(t *testing.T) {
 			}
 		})
 	}
-	for _, workload := range []string{"reads", "mixed"} {
+	for _, workload := range []string{"reads", "mixed", "focused"} {
 		t.Run(workload, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", workload)
 			if workloadEnabled(benchmarkDelete) {
@@ -210,6 +210,27 @@ func TestProfileSizedValue(t *testing.T) {
 			t.Setenv("KVBENCH_PROFILE", test.profile)
 			if got := profileSizedValue(3, 2, 1); got != test.want {
 				t.Fatalf("value is %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
+func TestProfiledBenchmarkName(t *testing.T) {
+	for _, test := range []struct {
+		profile  string
+		workload string
+		want     string
+	}{
+		{profile: "", workload: "", want: "profile=large/durable/read/kvlite"},
+		{profile: "medium", workload: "all", want: "profile=medium/durable/read/kvlite"},
+		{profile: "medium", workload: "reads", want: "profile=medium/durable/read/kvlite"},
+		{profile: "light", workload: "focused", want: "profile=light/focused/durable/read/kvlite"},
+	} {
+		t.Run(test.profile+"/"+test.workload, func(t *testing.T) {
+			t.Setenv("KVBENCH_PROFILE", test.profile)
+			t.Setenv("KVBENCH_WORKLOAD", test.workload)
+			if got := profiledBenchmarkName("durable/read/kvlite"); got != test.want {
+				t.Fatalf("benchmark name is %q, want %q", got, test.want)
 			}
 		})
 	}

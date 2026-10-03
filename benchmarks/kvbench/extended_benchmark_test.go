@@ -64,7 +64,7 @@ func BenchmarkReadTransactions(b *testing.B) {
 		batchSizes = []int{1, 100, 1_000}
 	}
 	for _, batchSize := range batchSizes {
-		b.Run(fmt.Sprintf("keys-per-transaction=%d/%s", batchSize, environment.kind), func(b *testing.B) {
+		runProfiledBenchmark(b, fmt.Sprintf("keys-per-transaction=%d/%s", batchSize, environment.kind), func(b *testing.B) {
 			engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setup)
 			if err != nil {
 				b.Fatal(err)
@@ -127,8 +127,8 @@ func BenchmarkMixedTransactions(b *testing.B) {
 	}
 	for _, readPercent := range readPercents {
 		for _, transactionSize := range transactionSizes {
-			name := fmt.Sprintf("read=%d/operations-per-transaction=%d/%s", readPercent, transactionSize, environment.kind)
-			b.Run(name, func(b *testing.B) {
+			name := fmt.Sprintf("%s/read=%d/operations-per-transaction=%d/%s", environment.mode, readPercent, transactionSize, environment.kind)
+			runProfiledBenchmark(b, name, func(b *testing.B) {
 				engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setup)
 				if err != nil {
 					b.Fatal(err)
@@ -213,7 +213,7 @@ func BenchmarkEnumeration(b *testing.B) {
 		tests[0].want = records
 	}
 	for _, test := range tests {
-		b.Run(test.name+"/"+string(environment.kind), func(b *testing.B) {
+		runProfiledBenchmark(b, test.name+"/"+string(environment.kind), func(b *testing.B) {
 			engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, pairs)
 			if err != nil {
 				b.Fatal(err)
@@ -280,7 +280,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 	for _, limit := range limits {
 		iterations := records / limit * seekMeasurementRepeats
 		name := fmt.Sprintf("seek-and-read=%d/%s", limit, environment.kind)
-		b.Run(name, func(b *testing.B) {
+		runProfiledBenchmark(b, name, func(b *testing.B) {
 			var checksum uint64
 			visited := 0
 			for b.Loop() {
@@ -319,7 +319,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		rangeTests = rangeTests[2:3]
 	}
 	for _, test := range rangeTests {
-		b.Run("range/"+test.name+"/"+string(environment.kind), func(b *testing.B) {
+		runProfiledBenchmark(b, "range/"+test.name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
 			for b.Loop() {
 				checksum = 0
@@ -350,7 +350,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		if reverse {
 			name = "reverse"
 		}
-		b.Run("full-"+name+"/"+string(environment.kind), func(b *testing.B) {
+		runProfiledBenchmark(b, "full-"+name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
 			for b.Loop() {
 				checksum = 0
@@ -393,7 +393,7 @@ func BenchmarkScaleAndAccessDistribution(b *testing.B) {
 			if hot {
 				name = "hot-80-20"
 			}
-			b.Run(fmt.Sprintf("records=%d/%s/%s", records, name, environment.kind), func(b *testing.B) {
+			runProfiledBenchmark(b, fmt.Sprintf("records=%d/%s/%s", records, name, environment.kind), func(b *testing.B) {
 				engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, pairs)
 				if err != nil {
 					b.Fatal(err)
@@ -416,6 +416,9 @@ func BenchmarkScaleAndAccessDistribution(b *testing.B) {
 }
 
 func BenchmarkLatency(b *testing.B) {
+	if !workloadEnabled(benchmarkRead) && !workloadEnabled(benchmarkUpdate) && !workloadEnabled(benchmarkMixed) {
+		b.Skip("latency workloads are not selected")
+	}
 	environment := readBenchmarkEnvironment(b)
 	records := profileSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(records, 128, 1, keyOrderSequential, 1)
@@ -447,8 +450,8 @@ func BenchmarkLatency(b *testing.B) {
 			clientsValues = []int{8}
 		}
 		for _, clients := range clientsValues {
-			name := fmt.Sprintf("%s/clients=%d/%s", operation, clients, environment.kind)
-			b.Run(name, func(b *testing.B) {
+			name := fmt.Sprintf("%s/%s/clients=%d/%s", environment.mode, operation, clients, environment.kind)
+			runProfiledBenchmark(b, name, func(b *testing.B) {
 				engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, clients, setup)
 				if err != nil {
 					b.Fatal(err)
