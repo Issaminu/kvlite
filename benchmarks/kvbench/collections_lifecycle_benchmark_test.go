@@ -29,14 +29,14 @@ func BenchmarkCollections(b *testing.B) {
 			if environment.kind == EngineRedis {
 				model = "logical-prefixes"
 			}
-			name := fmt.Sprintf("collections=%d/depth=%d/model=%s/%s", count, depth, model, environment.kind)
+			name := fmt.Sprintf("%s/collections=%d/depth=%d/model=%s/%s", environment.mode, count, depth, model, environment.kind)
 			if workloadEnabled(benchmarkUpdate) {
-				b.Run(name, func(b *testing.B) {
+				runProfiledBenchmark(b, name, func(b *testing.B) {
 					benchmarkCollectionWrites(b, environment, paths)
 				})
 			}
 			if workloadEnabled(benchmarkRead) && environment.mode == DurabilityDurable {
-				b.Run("read/"+name, func(b *testing.B) {
+				runProfiledBenchmark(b, "read/"+name, func(b *testing.B) {
 					benchmarkCollectionReads(b, environment, paths)
 				})
 			}
@@ -192,7 +192,7 @@ func BenchmarkLifecycle(b *testing.B) {
 	if environment.mode == DurabilityNoCommitSync {
 		b.Skip("recovery requires acknowledged durable writes")
 	}
-	b.Run("create-load-close/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, "create-load-close/"+string(environment.kind), func(b *testing.B) {
 		records := profileSizedValue(10_000, 3_000, 1_000)
 		pairs, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 		if err != nil {
@@ -213,7 +213,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		b.ReportMetric(float64(b.N*records)/b.Elapsed().Seconds(), "loaded-keys/s")
 	})
 
-	b.Run("open-clean/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, "open-clean/"+string(environment.kind), func(b *testing.B) {
 		dataDir := b.TempDir()
 		engine, err := openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: environment.mode, DataDir: dataDir, ClientCount: 1})
 		if err != nil {
@@ -235,7 +235,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		}
 	})
 
-	b.Run("close-after-writes/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, "close-after-writes/"+string(environment.kind), func(b *testing.B) {
 		pairs, err := makePairs(profileSizedValue(10_000, 3_000, 1_000), 128, 1, keyOrderSequential, 1)
 		if err != nil {
 			b.Fatal(err)
@@ -268,7 +268,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		}
 	})
 
-	b.Run("recover-after-process-kill/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, "recover-after-process-kill/"+string(environment.kind), func(b *testing.B) {
 		dataDir := b.TempDir()
 		createKilledDatabase(b, environment.kind, dataDir, false)
 		var engine Engine

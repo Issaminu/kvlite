@@ -35,6 +35,21 @@ type benchmarkCase struct {
 	batchSize       int
 }
 
+func runProfiledBenchmark(b *testing.B, name string, run func(*testing.B)) {
+	b.Run(profiledBenchmarkName(name), run)
+}
+
+func profiledBenchmarkName(name string) string {
+	profile := os.Getenv("KVBENCH_PROFILE")
+	if profile == "" {
+		profile = "large"
+	}
+	if os.Getenv("KVBENCH_WORKLOAD") == "focused" {
+		profile += "/focused"
+	}
+	return "profile=" + profile + "/" + name
+}
+
 func benchmarkCases() []benchmarkCase {
 	focused := os.Getenv("KVBENCH_WORKLOAD") == "focused"
 	records := profileSizedValue(10_000, 3_000, 1_000)
@@ -162,7 +177,7 @@ func benchmarkCases() []benchmarkCase {
 		if focused && benchmarkCase.operation == benchmarkRead {
 			benchmarkCase.operations = max(benchmarkCase.operations, 100_000)
 		}
-		if (selected == nil || selected[benchmarkCase.name]) && workloadEnabled(benchmarkCase.operation) {
+		if (selected == nil || selected[benchmarkCase.name]) && (focused || workloadEnabled(benchmarkCase.operation)) {
 			profileCases = append(profileCases, benchmarkCase)
 		}
 	}
@@ -182,7 +197,7 @@ func workloadEnabled(operation benchmarkOperation) bool {
 	case "mixed":
 		return operation == benchmarkMixed
 	case "focused":
-		return true
+		return false
 	default:
 		panic("unknown KVBENCH_WORKLOAD")
 	}
@@ -204,11 +219,15 @@ func BenchmarkAcknowledgedOperations(b *testing.B) {
 	if engine == EngineRedis && redisAddress == "" {
 		b.Fatal("KVBENCH_REDIS_ADDR is empty")
 	}
-	for _, benchmarkCase := range benchmarkCases() {
+	cases := benchmarkCases()
+	if len(cases) == 0 {
+		b.Skip("core workloads are not selected")
+	}
+	for _, benchmarkCase := range cases {
 		if !benchmarkModeEnabled(os.Getenv("KVBENCH_WORKLOAD"), benchmarkCase.operation, mode) {
 			continue
 		}
-		b.Run(string(mode)+"/"+benchmarkCase.name+"/"+string(engine), func(b *testing.B) {
+		runProfiledBenchmark(b, string(mode)+"/"+benchmarkCase.name+"/"+string(engine), func(b *testing.B) {
 			benchmarkDatabase(b, engine, mode, redisAddress, benchmarkCase)
 		})
 	}
@@ -246,7 +265,7 @@ func BenchmarkFocusedWrites(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run(string(environment.mode)+"/update-insert-batch=10/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, string(environment.mode)+"/update-insert-batch=10/"+string(environment.kind), func(b *testing.B) {
 		engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setupPairs)
 		if err != nil {
 			b.Fatal(err)

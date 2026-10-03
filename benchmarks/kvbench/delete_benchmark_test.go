@@ -43,12 +43,12 @@ func deleteBenchmarkCases() []deleteBenchmarkCase {
 }
 
 func BenchmarkDeleteOperations(b *testing.B) {
-	if !workloadEnabled(benchmarkDelete) {
+	if os.Getenv("KVBENCH_WORKLOAD") != "focused" && !workloadEnabled(benchmarkDelete) {
 		b.Skip("delete workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
 	for _, benchmarkCase := range deleteBenchmarkCases() {
-		b.Run(string(environment.mode)+"/"+benchmarkCase.name+"/"+string(environment.kind), func(b *testing.B) {
+		runProfiledBenchmark(b, string(environment.mode)+"/"+benchmarkCase.name+"/"+string(environment.kind), func(b *testing.B) {
 			setup, err := makePairs(benchmarkCase.records, 128, 1, keyOrderSequential, 1)
 			if err != nil {
 				b.Fatal(err)
@@ -93,7 +93,7 @@ func BenchmarkDeleteOperations(b *testing.B) {
 }
 
 func BenchmarkDeleteBuckets(b *testing.B) {
-	if !workloadEnabled(benchmarkDelete) || os.Getenv("KVBENCH_WORKLOAD") == "focused" {
+	if !workloadEnabled(benchmarkDelete) {
 		b.Skip("bucket delete workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
@@ -106,7 +106,7 @@ func BenchmarkDeleteBuckets(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run(fmt.Sprintf("%s/top-level/buckets=%d/keys-per-bucket=%d/%s", environment.mode, bucketCount, keysPerBucket, environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, fmt.Sprintf("%s/top-level/buckets=%d/keys-per-bucket=%d/%s", environment.mode, bucketCount, keysPerBucket, environment.kind), func(b *testing.B) {
 		options := engineOpenOptions{Kind: environment.kind, Mode: DurabilityDurable, DataDir: b.TempDir(), ClientCount: 1}
 		engine, err := openEngine(b.Context(), options)
 		if err != nil {
@@ -227,7 +227,7 @@ func BenchmarkDeleteVisibility(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run(string(environment.mode)+"/post-ack-miss/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, string(environment.mode)+"/post-ack-miss/"+string(environment.kind), func(b *testing.B) {
 		engine, _ := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 		readDurations := make([]time.Duration, operations)
@@ -283,7 +283,7 @@ func BenchmarkPageReuse(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run(string(environment.mode)+"/random-half/batch=100/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, string(environment.mode)+"/random-half/batch=100/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() {
 			if engine != nil {
@@ -375,7 +375,7 @@ func BenchmarkPageReusePlateau(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	b.Run(string(environment.mode)+"/ten-cycles/batch=100/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, string(environment.mode)+"/ten-cycles/batch=100/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, current)
 		b.Cleanup(func() {
 			if engine != nil {
@@ -465,7 +465,7 @@ func BenchmarkTailReclamation(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run(string(environment.mode)+"/upper-half/batch=100/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, string(environment.mode)+"/upper-half/batch=100/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() {
 			if engine != nil {
@@ -542,7 +542,7 @@ func BenchmarkReopenAfterDelete(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	b.Run(string(environment.mode)+"/alternating-half/"+string(environment.kind), func(b *testing.B) {
+	runProfiledBenchmark(b, string(environment.mode)+"/alternating-half/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() {
 			if engine != nil {
