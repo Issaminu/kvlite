@@ -189,12 +189,6 @@ func workloadEnabled(operation benchmarkOperation) bool {
 }
 
 func BenchmarkAcknowledgedOperations(b *testing.B) {
-	if os.Getenv("KVBENCH_FIXED_WORK") != "1" {
-		b.Skip("use run-docker.sh so every engine receives the same fixed work")
-	}
-	if b.N != 1 {
-		b.Fatalf("benchmark calibration changed b.N to %d; run with -benchtime=1x", b.N)
-	}
 	mode := DurabilityDurable
 	if value := os.Getenv("KVBENCH_DURABILITY"); value != "" {
 		mode = DurabilityMode(value)
@@ -259,23 +253,34 @@ func BenchmarkFocusedWrites(b *testing.B) {
 		}
 		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 		b.SetBytes(int64(cycles * 12 * 128))
-		b.ResetTimer()
-		for cycle := range cycles {
-			update := updates[cycle%len(updates)]
-			if err := engine.Put(b.Context(), update.Key, update.Value); err != nil {
-				b.Fatal(err)
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				closeBenchmarkEngine(b, engine)
+				engine, err = prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setupPairs)
+				if err != nil {
+					b.Fatal(err)
+				}
+				b.StartTimer()
 			}
-			if err := engine.Put(b.Context(), inserts[cycle].Key, inserts[cycle].Value); err != nil {
-				b.Fatal(err)
+			for cycle := range cycles {
+				update := updates[cycle%len(updates)]
+				if err := engine.Put(b.Context(), update.Key, update.Value); err != nil {
+					b.Fatal(err)
+				}
+				if err := engine.Put(b.Context(), inserts[cycle].Key, inserts[cycle].Value); err != nil {
+					b.Fatal(err)
+				}
+				batchStart := cycle * 10 % (len(updates) - 9)
+				if err := engine.PutBatch(b.Context(), updates[batchStart:batchStart+10]); err != nil {
+					b.Fatal(err)
+				}
 			}
-			batchStart := cycle * 10 % (len(updates) - 9)
-			if err := engine.PutBatch(b.Context(), updates[batchStart:batchStart+10]); err != nil {
-				b.Fatal(err)
-			}
+			iteration++
 		}
-		b.StopTimer()
-		b.ReportMetric(float64(cycles*12)/b.Elapsed().Seconds(), "ack-keys/s")
-		b.ReportMetric(float64(cycles*3)/b.Elapsed().Seconds(), "transactions/s")
+		b.ReportMetric(float64(b.N*cycles*12)/b.Elapsed().Seconds(), "ack-keys/s")
+		b.ReportMetric(float64(b.N*cycles*3)/b.Elapsed().Seconds(), "transactions/s")
 		if err := engine.Validate(b.Context()); err != nil {
 			b.Fatal(err)
 		}
@@ -346,9 +351,21 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 		b.Fatalf("initial read returned %d bytes and error %v", len(value), err)
 	}
 	b.SetBytes(int64(benchmarkCase.valueBytes * benchmarkCase.batchSize * benchmarkCase.operations))
-	err = runBenchmarkOperations(b, engine, operationPairs, benchmarkCase, schedule)
-	if err != nil {
-		b.Fatal(err)
+	iteration := 0
+	for b.Loop() {
+		if iteration > 0 {
+			b.StopTimer()
+			closeBenchmarkEngine(b, engine)
+			engine, err = prepareBenchmarkEngine(b, kind, mode, redisAddress, benchmarkCase.clients, setupPairs)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
+		}
+		if err := runBenchmarkOperations(b, engine, operationPairs, benchmarkCase, schedule); err != nil {
+			b.Fatal(err)
+		}
+		iteration++
 	}
 	if err := engine.Validate(b.Context()); err != nil {
 		b.Fatal(err)
@@ -367,8 +384,8 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	if err := validateStoredPairs(b, engine, setupPairs, operationPairs, benchmarkCase, schedule); err != nil {
 		b.Fatal(err)
 	}
-	b.ReportMetric(float64(benchmarkCase.operations*benchmarkCase.batchSize)/b.Elapsed().Seconds(), "ack-keys/s")
-	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(benchmarkCase.operations), "ns/op")
+	b.ReportMetric(float64(b.N*benchmarkCase.operations*benchmarkCase.batchSize)/b.Elapsed().Seconds(), "ack-keys/s")
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*benchmarkCase.operations), "ns/op")
 	stats, err := engine.StorageStats(b.Context())
 	if err != nil {
 		b.Fatal(err)
@@ -536,10 +553,7 @@ func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmark
 		return nil
 	}
 	if benchmarkCase.clients == 1 {
-		b.ResetTimer()
-		err := run(0, len(schedule))
-		b.StopTimer()
-		return err
+		return run(0, len(schedule))
 	}
 
 	start := make(chan struct{})
@@ -556,7 +570,6 @@ func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmark
 		}()
 	}
 	ready.Wait()
-	b.ResetTimer()
 	close(start)
 	var firstError error
 	for range benchmarkCase.clients {
@@ -564,6 +577,5 @@ func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmark
 			firstError = err
 		}
 	}
-	b.StopTimer()
 	return firstError
 }

@@ -14,8 +14,7 @@ func BenchmarkOpenPersistentAllocation(b *testing.B) {
 		b.Run(fmt.Sprintf("segments-%d", segmentCount), func(b *testing.B) {
 			path, logicalBytes := benchmarkAllocationDatabase(b, segmentCount)
 			b.ReportAllocs()
-			b.ResetTimer()
-			for range b.N {
+			for b.Loop() {
 				db, err := Open(path, 0600, &Options{ReadOnly: true})
 				if err != nil {
 					b.Fatal(err)
@@ -39,8 +38,7 @@ func BenchmarkAllocationStateFirstWrite(b *testing.B) {
 				target = firstTreePageID + 1
 			}
 			b.ReportAllocs()
-			b.ResetTimer()
-			for range b.N {
+			for b.Loop() {
 				state := newAllocationChanges(bitmap)
 				state.markAllocated(target)
 			}

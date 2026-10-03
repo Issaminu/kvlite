@@ -67,16 +67,26 @@ func BenchmarkDeleteOperations(b *testing.B) {
 
 			transactions := benchmarkCase.operations
 			keysDeleted := transactions * benchmarkCase.batchSize
-			if err := runDeleteTransactions(b, engine, operations, transactions, benchmarkCase.batchSize, benchmarkCase.clients); err != nil {
-				b.Fatal(err)
+			iteration := 0
+			for b.Loop() {
+				if iteration > 0 {
+					b.StopTimer()
+					closeBenchmarkEngine(b, engine)
+					engine, _ = prepareDeleteBenchmarkEngine(b, environment, benchmarkCase.clients, setup)
+					b.StartTimer()
+				}
+				if err := runDeleteTransactions(b, engine, operations, transactions, benchmarkCase.batchSize, benchmarkCase.clients); err != nil {
+					b.Fatal(err)
+				}
+				iteration++
 			}
 			if !benchmarkCase.missing {
 				removeExpectedPairs(expected, operations[:keysDeleted])
 			}
 			validateExpectedState(b, engine, expected)
-			b.ReportMetric(float64(keysDeleted)/b.Elapsed().Seconds(), "ack-keys/s")
-			b.ReportMetric(float64(transactions)/b.Elapsed().Seconds(), "transactions/s")
-			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(transactions), "ns/op")
+			b.ReportMetric(float64(b.N*keysDeleted)/b.Elapsed().Seconds(), "ack-keys/s")
+			b.ReportMetric(float64(b.N*transactions)/b.Elapsed().Seconds(), "transactions/s")
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*transactions), "ns/op")
 			reportDeleteStorage(b, engine)
 		})
 	}
@@ -120,13 +130,24 @@ func BenchmarkDeleteBuckets(b *testing.B) {
 		}
 		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 		buckets = engine.(bucketDeleteEngine)
-		b.ResetTimer()
-		for _, name := range names {
-			if err := buckets.DeleteBucket(b.Context(), name); err != nil {
-				b.Fatal(err)
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				for _, name := range names {
+					if err := buckets.PrepareBucket(b.Context(), name, pairs); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.StartTimer()
 			}
+			for _, name := range names {
+				if err := buckets.DeleteBucket(b.Context(), name); err != nil {
+					b.Fatal(err)
+				}
+			}
+			iteration++
 		}
-		b.StopTimer()
 		for _, name := range names {
 			exists, err := buckets.BucketExists(b.Context(), name)
 			if err != nil || exists {
@@ -136,9 +157,9 @@ func BenchmarkDeleteBuckets(b *testing.B) {
 		if err := engine.Validate(b.Context()); err != nil {
 			b.Fatal(err)
 		}
-		b.ReportMetric(float64(bucketCount)/b.Elapsed().Seconds(), "buckets/s")
-		b.ReportMetric(float64(bucketCount*keysPerBucket)/b.Elapsed().Seconds(), "keys/s")
-		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/bucketCount, "ns/op")
+		b.ReportMetric(float64(b.N*bucketCount)/b.Elapsed().Seconds(), "buckets/s")
+		b.ReportMetric(float64(b.N*bucketCount*keysPerBucket)/b.Elapsed().Seconds(), "keys/s")
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*bucketCount), "ns/op")
 		reportDeleteStorage(b, engine)
 	})
 }
@@ -169,10 +190,7 @@ func runDeleteTransactions(b *testing.B, engine Engine, pairs []Pair, transactio
 		return nil
 	}
 	if clients == 1 {
-		b.ResetTimer()
-		err := run(0, transactions)
-		b.StopTimer()
-		return err
+		return run(0, transactions)
 	}
 
 	start := make(chan struct{})
@@ -189,7 +207,6 @@ func runDeleteTransactions(b *testing.B, engine Engine, pairs []Pair, transactio
 		}()
 	}
 	ready.Wait()
-	b.ResetTimer()
 	close(start)
 	var firstError error
 	for range clients {
@@ -197,7 +214,6 @@ func runDeleteTransactions(b *testing.B, engine Engine, pairs []Pair, transactio
 			firstError = err
 		}
 	}
-	b.StopTimer()
 	return firstError
 }
 
@@ -216,21 +232,30 @@ func BenchmarkDeleteVisibility(b *testing.B) {
 		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 		readDurations := make([]time.Duration, operations)
 		var deleteDuration time.Duration
-		b.ResetTimer()
-		for index := range operations {
-			start := time.Now()
-			if err := engine.Delete(b.Context(), setup[index].Key); err != nil {
-				b.Fatal(err)
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				closeBenchmarkEngine(b, engine)
+				engine, _ = prepareDeleteBenchmarkEngine(b, environment, 1, setup)
+				b.StartTimer()
+				deleteDuration = 0
 			}
-			deleteDuration += time.Since(start)
-			start = time.Now()
-			_, err := engine.Get(b.Context(), setup[index].Key)
-			readDurations[index] = time.Since(start)
-			if !errors.Is(err, ErrKeyNotFound) {
-				b.Fatalf("post-delete read returned %v, want ErrKeyNotFound", err)
+			for index := range operations {
+				start := time.Now()
+				if err := engine.Delete(b.Context(), setup[index].Key); err != nil {
+					b.Fatal(err)
+				}
+				deleteDuration += time.Since(start)
+				start = time.Now()
+				_, err := engine.Get(b.Context(), setup[index].Key)
+				readDurations[index] = time.Since(start)
+				if !errors.Is(err, ErrKeyNotFound) {
+					b.Fatalf("post-delete read returned %v, want ErrKeyNotFound", err)
+				}
 			}
+			iteration++
 		}
-		b.StopTimer()
 		validateExpectedState(b, engine, nil)
 		sort.Slice(readDurations, func(left, right int) bool { return readDurations[left] < readDurations[right] })
 		b.ReportMetric(float64(deleteDuration.Nanoseconds())/float64(operations), "delete-ack-ns")
@@ -270,17 +295,26 @@ func BenchmarkPageReuse(b *testing.B) {
 		expected := expectedPairs(setup)
 		removeExpectedPairs(expected, deletePairs)
 		addExpectedPairs(expected, inserts)
-		b.ResetTimer()
-		if err := deleteKeysInBatches(b, engine, deletePairs, 100); err != nil {
-			b.Fatal(err)
+		var postDelete storageStats
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				closeBenchmarkEngine(b, engine)
+				engine, options = prepareDeleteBenchmarkEngine(b, environment, 1, setup)
+				b.StartTimer()
+			}
+			if err := deleteKeysInBatches(b, engine, deletePairs, 100); err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			postDelete = mustStorageStats(b, engine)
+			b.StartTimer()
+			if err := loadPairs(b.Context(), engine, inserts, 100); err != nil {
+				b.Fatal(err)
+			}
+			iteration++
 		}
-		b.StopTimer()
-		postDelete := mustStorageStats(b, engine)
-		b.StartTimer()
-		if err := loadPairs(b.Context(), engine, inserts, 100); err != nil {
-			b.Fatal(err)
-		}
-		b.StopTimer()
 		active := mustStorageStats(b, engine)
 		validateExpectedState(b, engine, expected)
 		stable := active
@@ -298,8 +332,8 @@ func BenchmarkPageReuse(b *testing.B) {
 			stable = mustStorageStats(b, engine)
 			validateExpectedState(b, engine, expected)
 		}
-		b.ReportMetric(float64(len(inserts)*2)/b.Elapsed().Seconds(), "cycle-keys/s")
-		b.ReportMetric(float64((len(inserts)/100)*2)/b.Elapsed().Seconds(), "transactions/s")
+		b.ReportMetric(float64(b.N*len(inserts)*2)/b.Elapsed().Seconds(), "cycle-keys/s")
+		b.ReportMetric(float64(b.N*(len(inserts)/100)*2)/b.Elapsed().Seconds(), "transactions/s")
 		b.ReportMetric(float64(persistentBytes(loaded)), "loaded-persistent-B")
 		b.ReportMetric(float64(persistentBytes(postDelete)), "post-delete-persistent-B")
 		b.ReportMetric(float64(persistentBytes(active)), "active-post-reinsert-persistent-B")
@@ -351,27 +385,40 @@ func BenchmarkPageReusePlateau(b *testing.B) {
 		expected := expectedPairs(current)
 		loaded := mustStorageStats(b, engine)
 		peakPersistent := persistentBytes(loaded)
-		b.ResetTimer()
-		for cycle := range cycles {
-			deleteCount := len(current) / 2
-			deleted := current[:deleteCount]
-			inserted := insertsByCycle[cycle]
-			if err := deleteKeysInBatches(b, engine, deleted, 100); err != nil {
-				b.Fatal(err)
+		initialCurrent := append([]Pair(nil), current...)
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				closeBenchmarkEngine(b, engine)
+				current = append(current[:0], initialCurrent...)
+				engine, options = prepareDeleteBenchmarkEngine(b, environment, 1, current)
+				expected = expectedPairs(current)
+				loaded = mustStorageStats(b, engine)
+				peakPersistent = persistentBytes(loaded)
+				b.StartTimer()
 			}
-			if err := loadPairs(b.Context(), engine, inserted, 100); err != nil {
-				b.Fatal(err)
+			for cycle := range cycles {
+				deleteCount := len(current) / 2
+				deleted := current[:deleteCount]
+				inserted := insertsByCycle[cycle]
+				if err := deleteKeysInBatches(b, engine, deleted, 100); err != nil {
+					b.Fatal(err)
+				}
+				if err := loadPairs(b.Context(), engine, inserted, 100); err != nil {
+					b.Fatal(err)
+				}
+				b.StopTimer()
+				removeExpectedPairs(expected, deleted)
+				addExpectedPairs(expected, inserted)
+				current = append(current[:0], current[deleteCount:]...)
+				current = append(current, inserted...)
+				stats := mustStorageStats(b, engine)
+				peakPersistent = max(peakPersistent, persistentBytes(stats))
+				b.StartTimer()
 			}
-			b.StopTimer()
-			removeExpectedPairs(expected, deleted)
-			addExpectedPairs(expected, inserted)
-			current = append(current[:0], current[deleteCount:]...)
-			current = append(current, inserted...)
-			stats := mustStorageStats(b, engine)
-			peakPersistent = max(peakPersistent, persistentBytes(stats))
-			b.StartTimer()
+			iteration++
 		}
-		b.StopTimer()
 		active := mustStorageStats(b, engine)
 		validateExpectedState(b, engine, expected)
 		stable := active
@@ -392,8 +439,8 @@ func BenchmarkPageReusePlateau(b *testing.B) {
 
 		keysChanged := cycles * records
 		transactions := cycles * 2 * ((records / 2) / 100)
-		b.ReportMetric(float64(keysChanged)/b.Elapsed().Seconds(), "cycle-keys/s")
-		b.ReportMetric(float64(transactions)/b.Elapsed().Seconds(), "transactions/s")
+		b.ReportMetric(float64(b.N*keysChanged)/b.Elapsed().Seconds(), "cycle-keys/s")
+		b.ReportMetric(float64(b.N*transactions)/b.Elapsed().Seconds(), "transactions/s")
 		b.ReportMetric(float64(persistentBytes(loaded)), "loaded-persistent-B")
 		b.ReportMetric(float64(peakPersistent), "peak-persistent-B")
 		b.ReportMetric(float64(persistentBytes(active)), "active-final-persistent-B")
@@ -427,12 +474,23 @@ func BenchmarkTailReclamation(b *testing.B) {
 		})
 		loaded := mustStorageStats(b, engine)
 		expected := expectedPairs(setup[:records/2])
-		b.ResetTimer()
-		if err := deleteKeysInBatches(b, engine, setup[records/2:], 100); err != nil {
-			b.Fatal(err)
+		var postDelete storageStats
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				closeBenchmarkEngine(b, engine)
+				engine, options = prepareDeleteBenchmarkEngine(b, environment, 1, setup)
+				b.StartTimer()
+			}
+			if err := deleteKeysInBatches(b, engine, setup[records/2:], 100); err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			postDelete = mustStorageStats(b, engine)
+			b.StartTimer()
+			iteration++
 		}
-		b.StopTimer()
-		postDelete := mustStorageStats(b, engine)
 		var closeDuration time.Duration
 		var reopenDuration time.Duration
 		if environment.kind != EngineRedis {
@@ -453,7 +511,7 @@ func BenchmarkTailReclamation(b *testing.B) {
 		}
 		final := mustStorageStats(b, engine)
 		validateExpectedState(b, engine, expected)
-		b.ReportMetric(float64(records/2)/b.Elapsed().Seconds(), "ack-keys/s")
+		b.ReportMetric(float64(b.N*records/2)/b.Elapsed().Seconds(), "ack-keys/s")
 		b.ReportMetric(float64(persistentBytes(loaded)), "loaded-persistent-B")
 		b.ReportMetric(float64(persistentBytes(postDelete)), "post-delete-persistent-B")
 		b.ReportMetric(float64(persistentBytes(final)), "final-persistent-B")
@@ -504,14 +562,18 @@ func BenchmarkReopenAfterDelete(b *testing.B) {
 			b.Fatal(err)
 		}
 		engine = nil
-		b.ResetTimer()
-		engine, err = openEngine(b.Context(), options)
-		b.StopTimer()
-		if err != nil {
-			b.Fatal(err)
+		for b.Loop() {
+			engine, err = openEngine(b.Context(), options)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			validateExpectedState(b, engine, expected)
+			closeBenchmarkEngine(b, engine)
+			engine = nil
+			b.StartTimer()
 		}
-		validateExpectedState(b, engine, expected)
-		b.ReportMetric(float64(b.Elapsed().Nanoseconds()), "reopen-ns")
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N), "reopen-ns")
 	})
 }
 

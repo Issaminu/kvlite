@@ -46,8 +46,7 @@ func prepareOperationsBenchmark(b *testing.B) (*DB, [][]byte) {
 func BenchmarkCursor_ForwardScan(b *testing.B) {
 	db, _ := prepareOperationsBenchmark(b)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		err := db.View(func(tx *Tx) error {
 			bucket, err := tx.Bucket(operationsBenchmarkBucket)
 			if err != nil {
@@ -80,7 +79,7 @@ func BenchmarkCursor_ForwardScan(b *testing.B) {
 func BenchmarkCursor_Seek(b *testing.B) {
 	db, keys := prepareOperationsBenchmark(b)
 	b.ReportAllocs()
-	b.ResetTimer()
+	index := 0
 	err := db.View(func(tx *Tx) error {
 		bucket, err := tx.Bucket(operationsBenchmarkBucket)
 		if err != nil {
@@ -90,10 +89,11 @@ func BenchmarkCursor_Seek(b *testing.B) {
 		if err != nil {
 			return err
 		}
-		for index := range b.N {
+		for b.Loop() {
 			if _, _, err := cursor.Seek(keys[(index*7919)%len(keys)]); err != nil {
 				return err
 			}
+			index++
 		}
 		return nil
 	})
@@ -107,8 +107,7 @@ func BenchmarkScanPrefix(b *testing.B) {
 	db, _ := prepareOperationsBenchmark(b)
 	prefix := []byte("key-00001")
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		err := db.View(func(tx *Tx) error {
 			bucket, err := tx.Bucket(operationsBenchmarkBucket)
 			if err != nil {
@@ -127,8 +126,7 @@ func BenchmarkScanRange(b *testing.B) {
 	db, keys := prepareOperationsBenchmark(b)
 	start, end := keys[4096], keys[8192]
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		err := db.View(func(tx *Tx) error {
 			bucket, err := tx.Bucket(operationsBenchmarkBucket)
 			if err != nil {
@@ -148,8 +146,8 @@ func BenchmarkUpdate_Batch100(b *testing.B) {
 	db, keys := prepareOperationsBenchmark(b)
 	value := make([]byte, 128)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for iteration := range b.N {
+	iteration := 0
+	for b.Loop() {
 		err := db.Update(func(tx *Tx) error {
 			bucket, err := tx.Bucket(operationsBenchmarkBucket)
 			if err != nil {
@@ -166,6 +164,7 @@ func BenchmarkUpdate_Batch100(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+		iteration++
 	}
 }
 
@@ -174,8 +173,8 @@ func BenchmarkDelete_ThenReinsert(b *testing.B) {
 	db, keys := prepareOperationsBenchmark(b)
 	value := make([]byte, 128)
 	b.ReportAllocs()
-	b.ResetTimer()
-	for iteration := range b.N {
+	iteration := 0
+	for b.Loop() {
 		key := keys[(iteration*7919)%len(keys)]
 		if err := db.Delete(operationsBenchmarkBucket, key); err != nil {
 			b.Fatal(err)
@@ -183,5 +182,6 @@ func BenchmarkDelete_ThenReinsert(b *testing.B) {
 		if err := db.Put(operationsBenchmarkBucket, key, value); err != nil {
 			b.Fatal(err)
 		}
+		iteration++
 	}
 }

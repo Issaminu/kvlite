@@ -138,6 +138,7 @@ func TestDeleteBenchmarkProfiles(t *testing.T) {
 		{profile: "large", want: 7},
 	} {
 		t.Run(test.profile, func(t *testing.T) {
+			t.Setenv("KVBENCH_WORKLOAD", "all")
 			t.Setenv("KVBENCH_PROFILE", test.profile)
 			if got := len(deleteBenchmarkCases()); got != test.want {
 				t.Fatalf("delete cases: got %d, want %d", got, test.want)

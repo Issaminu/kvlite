@@ -19,12 +19,6 @@ type benchmarkEnvironment struct {
 
 func readBenchmarkEnvironment(b *testing.B) benchmarkEnvironment {
 	b.Helper()
-	if os.Getenv("KVBENCH_FIXED_WORK") != "1" {
-		b.Skip("use run-docker.sh so every engine receives the same fixed work")
-	}
-	if b.N != 1 {
-		b.Fatalf("benchmark calibration changed b.N to %d; run with -benchtime=1x", b.N)
-	}
 	environment := benchmarkEnvironment{
 		kind:         EngineKind(os.Getenv("KVBENCH_ENGINE")),
 		mode:         DurabilityMode(os.Getenv("KVBENCH_DURABILITY")),
@@ -80,21 +74,22 @@ func BenchmarkReadTransactions(b *testing.B) {
 			transactions := operations / batchSize
 			var checksum uint64
 			b.SetBytes(int64(transactions * batchSize * 128))
-			b.ResetTimer()
-			for transaction := range transactions {
-				for offset := range batchSize {
-					keys[offset] = pairs[(transaction*batchSize+offset)%len(pairs)].Key
-				}
-				values, err := engine.GetBatch(b.Context(), keys)
-				if err != nil {
-					b.Fatal(err)
-				}
-				for index, value := range values {
-					checksum = consumePair(checksum, keys[index], value)
+			for b.Loop() {
+				checksum = 0
+				for transaction := range transactions {
+					for offset := range batchSize {
+						keys[offset] = pairs[(transaction*batchSize+offset)%len(pairs)].Key
+					}
+					values, err := engine.GetBatch(b.Context(), keys)
+					if err != nil {
+						b.Fatal(err)
+					}
+					for index, value := range values {
+						checksum = consumePair(checksum, keys[index], value)
+					}
 				}
 			}
-			b.StopTimer()
-			b.ReportMetric(float64(transactions*batchSize)/b.Elapsed().Seconds(), "keys/s")
+			b.ReportMetric(float64(b.N*transactions*batchSize)/b.Elapsed().Seconds(), "keys/s")
 			b.ReportMetric(checksumMetric(checksum), "checksum")
 		})
 	}
@@ -145,24 +140,36 @@ func BenchmarkMixedTransactions(b *testing.B) {
 				writes := make([]Pair, writeCount)
 				transactions := max(1, operations/transactionSize)
 				var checksum uint64
-				b.ResetTimer()
-				for transaction := range transactions {
-					base := transaction * transactionSize
-					for index := range keys {
-						keys[index] = reads[(base+index)%len(reads)].Key
+				iteration := 0
+				for b.Loop() {
+					if iteration > 0 {
+						b.StopTimer()
+						closeBenchmarkEngine(b, engine)
+						engine, err = prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setup)
+						if err != nil {
+							b.Fatal(err)
+						}
+						b.StartTimer()
 					}
-					for index := range writes {
-						writes[index] = updates[(base+readCount+index)%len(updates)]
+					checksum = 0
+					for transaction := range transactions {
+						base := transaction * transactionSize
+						for index := range keys {
+							keys[index] = reads[(base+index)%len(reads)].Key
+						}
+						for index := range writes {
+							writes[index] = updates[(base+readCount+index)%len(updates)]
+						}
+						values, err := engine.MixedBatch(b.Context(), keys, writes)
+						if err != nil {
+							b.Fatal(err)
+						}
+						for index, value := range values {
+							checksum = consumePair(checksum, keys[index], value)
+						}
 					}
-					values, err := engine.MixedBatch(b.Context(), keys, writes)
-					if err != nil {
-						b.Fatal(err)
-					}
-					for index, value := range values {
-						checksum = consumePair(checksum, keys[index], value)
-					}
+					iteration++
 				}
-				b.StopTimer()
 				for transaction := range transactions {
 					base := transaction * transactionSize
 					for index := range writeCount {
@@ -173,7 +180,7 @@ func BenchmarkMixedTransactions(b *testing.B) {
 						}
 					}
 				}
-				b.ReportMetric(float64(transactions*transactionSize)/b.Elapsed().Seconds(), "operations/s")
+				b.ReportMetric(float64(b.N*transactions*transactionSize)/b.Elapsed().Seconds(), "operations/s")
 				b.ReportMetric(checksumMetric(checksum), "checksum")
 			})
 		}
@@ -213,23 +220,24 @@ func BenchmarkEnumeration(b *testing.B) {
 			}
 			b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 			var checksum uint64
-			b.ResetTimer()
-			for range test.iterations {
-				count := 0
-				err := engine.ScanPrefix(b.Context(), test.prefix, func(key, value []byte) error {
-					checksum = consumeScannedPair(checksum, key, value)
-					count++
-					return nil
-				})
-				if err != nil {
-					b.Fatal(err)
-				}
-				if count != test.want {
-					b.Fatalf("enumerated %d entries, want %d", count, test.want)
+			for b.Loop() {
+				checksum = 0
+				for range test.iterations {
+					count := 0
+					err := engine.ScanPrefix(b.Context(), test.prefix, func(key, value []byte) error {
+						checksum = consumeScannedPair(checksum, key, value)
+						count++
+						return nil
+					})
+					if err != nil {
+						b.Fatal(err)
+					}
+					if count != test.want {
+						b.Fatalf("enumerated %d entries, want %d", count, test.want)
+					}
 				}
 			}
-			b.StopTimer()
-			b.ReportMetric(float64(test.want*test.iterations)/b.Elapsed().Seconds(), "entries/s")
+			b.ReportMetric(float64(b.N*test.want*test.iterations)/b.Elapsed().Seconds(), "entries/s")
 			b.ReportMetric(checksumMetric(checksum), "checksum")
 		})
 	}
@@ -275,22 +283,23 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		b.Run(name, func(b *testing.B) {
 			var checksum uint64
 			visited := 0
-			b.ResetTimer()
-			for iteration := range iterations {
-				start := pairs[distributedIndex(iteration, len(pairs)-limit+1, false)].Key
-				if err := ordered.VisitOrdered(b.Context(), start, nil, false, limit, func(key, value []byte) error {
-					checksum = consumeScannedPair(checksum, key, value)
-					visited++
-					return nil
-				}); err != nil {
-					b.Fatal(err)
+			for b.Loop() {
+				checksum = 0
+				for iteration := range iterations {
+					start := pairs[distributedIndex(iteration, len(pairs)-limit+1, false)].Key
+					if err := ordered.VisitOrdered(b.Context(), start, nil, false, limit, func(key, value []byte) error {
+						checksum = consumeScannedPair(checksum, key, value)
+						visited++
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
 				}
 			}
-			b.StopTimer()
-			if visited != iterations*limit {
-				b.Fatalf("visited %d entries, want %d", visited, iterations*limit)
+			if visited != b.N*iterations*limit {
+				b.Fatalf("visited %d entries, want %d", visited, b.N*iterations*limit)
 			}
-			b.ReportMetric(float64(iterations*limit)/b.Elapsed().Seconds(), "entries/s")
+			b.ReportMetric(float64(b.N*iterations*limit)/b.Elapsed().Seconds(), "entries/s")
 			b.ReportMetric(checksumMetric(checksum), "checksum")
 		})
 	}
@@ -312,22 +321,23 @@ func BenchmarkOrderedOperations(b *testing.B) {
 	for _, test := range rangeTests {
 		b.Run("range/"+test.name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
-			b.ResetTimer()
-			for range test.iterations {
-				visited := 0
-				if err := ordered.VisitOrdered(b.Context(), test.start, test.end, false, 0, func(key, value []byte) error {
-					checksum = consumeScannedPair(checksum, key, value)
-					visited++
-					return nil
-				}); err != nil {
-					b.Fatal(err)
-				}
-				if visited != test.want {
-					b.Fatalf("visited %d entries, want %d", visited, test.want)
+			for b.Loop() {
+				checksum = 0
+				for range test.iterations {
+					visited := 0
+					if err := ordered.VisitOrdered(b.Context(), test.start, test.end, false, 0, func(key, value []byte) error {
+						checksum = consumeScannedPair(checksum, key, value)
+						visited++
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
+					if visited != test.want {
+						b.Fatalf("visited %d entries, want %d", visited, test.want)
+					}
 				}
 			}
-			b.StopTimer()
-			b.ReportMetric(float64(test.want*test.iterations)/b.Elapsed().Seconds(), "entries/s")
+			b.ReportMetric(float64(b.N*test.want*test.iterations)/b.Elapsed().Seconds(), "entries/s")
 			b.ReportMetric(checksumMetric(checksum), "checksum")
 		})
 	}
@@ -342,17 +352,18 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		}
 		b.Run("full-"+name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
-			b.ResetTimer()
-			for range fullScanMeasurementRepeats {
-				if err := ordered.VisitOrdered(b.Context(), nil, nil, reverse, 0, func(key, value []byte) error {
-					checksum = consumeScannedPair(checksum, key, value)
-					return nil
-				}); err != nil {
-					b.Fatal(err)
+			for b.Loop() {
+				checksum = 0
+				for range fullScanMeasurementRepeats {
+					if err := ordered.VisitOrdered(b.Context(), nil, nil, reverse, 0, func(key, value []byte) error {
+						checksum = consumeScannedPair(checksum, key, value)
+						return nil
+					}); err != nil {
+						b.Fatal(err)
+					}
 				}
 			}
-			b.StopTimer()
-			b.ReportMetric(float64(records*fullScanMeasurementRepeats)/b.Elapsed().Seconds(), "entries/s")
+			b.ReportMetric(float64(b.N*records*fullScanMeasurementRepeats)/b.Elapsed().Seconds(), "entries/s")
 			b.ReportMetric(checksumMetric(checksum), "checksum")
 		})
 	}
@@ -390,15 +401,15 @@ func BenchmarkScaleAndAccessDistribution(b *testing.B) {
 				b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 				operations := profileSizedValue(100_000, 10_000, 1_000)
 				b.SetBytes(int64(operations * 128))
-				b.ResetTimer()
-				for operation := range operations {
-					index := distributedIndex(operation, records, hot)
-					if _, err := engine.Get(b.Context(), pairs[index].Key); err != nil {
-						b.Fatal(err)
+				for b.Loop() {
+					for operation := range operations {
+						index := distributedIndex(operation, records, hot)
+						if _, err := engine.Get(b.Context(), pairs[index].Key); err != nil {
+							b.Fatal(err)
+						}
 					}
 				}
-				b.StopTimer()
-				b.ReportMetric(float64(operations)/b.Elapsed().Seconds(), "reads/s")
+				b.ReportMetric(float64(b.N*operations)/b.Elapsed().Seconds(), "reads/s")
 			})
 		}
 	}
@@ -446,18 +457,28 @@ func BenchmarkLatency(b *testing.B) {
 				operations := latencyOperationCount(operation)
 				durations := make([]time.Duration, operations)
 				if warmupOperations := latencyWarmupOperationCount(operation); warmupOperations > 0 {
-					b.StopTimer()
 					err = runLatencyOperations(b, engine, operation, clients, reads, updates, make([]time.Duration, warmupOperations))
 					if err != nil {
 						b.Fatal(err)
 					}
 				}
-				b.ResetTimer()
-				err = runLatencyOperations(b, engine, operation, clients, reads, updates, durations)
-				if err != nil {
-					b.Fatal(err)
+				iteration := 0
+				for b.Loop() {
+					if iteration > 0 && operation != benchmarkRead {
+						b.StopTimer()
+						closeBenchmarkEngine(b, engine)
+						engine, err = prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, clients, setup)
+						if err != nil {
+							b.Fatal(err)
+						}
+						b.StartTimer()
+					}
+					err = runLatencyOperations(b, engine, operation, clients, reads, updates, durations)
+					if err != nil {
+						b.Fatal(err)
+					}
+					iteration++
 				}
-				b.StopTimer()
 				reportLatency(b, durations)
 			})
 		}

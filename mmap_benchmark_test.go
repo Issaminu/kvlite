@@ -5,7 +5,7 @@ import (
 	"math"
 	"math/rand"
 	"path/filepath"
-	"sync/atomic"
+	"runtime"
 	"testing"
 )
 
@@ -45,18 +45,43 @@ func BenchmarkGet_LargeUniformParallelWarm(b *testing.B) {
 		}
 	}
 
-	var seed atomic.Int64
-	b.ReportAllocs()
-	b.ResetTimer()
-	b.RunParallel(func(pb *testing.PB) {
-		random := rand.New(rand.NewSource(seed.Add(1)))
-		for pb.Next() {
-			if _, err := db.Get([]byte("bench"), keys[random.Intn(len(keys))]); err != nil {
-				b.Error(err)
-				return
+	const readsPerWorker = 100
+	workers := runtime.GOMAXPROCS(0)
+	requests := make([]chan struct{}, workers)
+	results := make(chan error, workers)
+	for worker := range requests {
+		requests[worker] = make(chan struct{})
+		go func(worker int, request <-chan struct{}) {
+			random := rand.New(rand.NewSource(int64(worker + 1)))
+			for range request {
+				var readError error
+				for range readsPerWorker {
+					if _, err := db.Get([]byte("bench"), keys[random.Intn(len(keys))]); err != nil {
+						readError = err
+						break
+					}
+				}
+				results <- readError
+			}
+		}(worker, requests[worker])
+	}
+	defer func() {
+		for _, request := range requests {
+			close(request)
+		}
+	}()
+	b.SetBytes(int64(workers * readsPerWorker * 256))
+	for b.Loop() {
+		for _, request := range requests {
+			request <- struct{}{}
+		}
+		for range requests {
+			if err := <-results; err != nil {
+				b.Fatal(err)
 			}
 		}
-	})
+	}
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*workers*readsPerWorker), "ns/op")
 }
 
 // BenchmarkGet_LargeUniformWAL measures point reads from the WAL overlay.
@@ -106,8 +131,7 @@ func benchmarkLargeUniformGets(b *testing.B, db *DB, keys [][]byte) {
 	b.Helper()
 	random := rand.New(rand.NewSource(1))
 	b.ReportAllocs()
-	b.ResetTimer()
-	for range b.N {
+	for b.Loop() {
 		keyIndex := random.Intn(len(keys))
 		if _, err := db.Get([]byte("bench"), keys[keyIndex]); err != nil {
 			b.Fatal(err)
