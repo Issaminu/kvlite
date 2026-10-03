@@ -6324,11 +6324,14 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("committed overlay value: got %q, err %v", got, err)
 	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	reopened, err := openDB(path)
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNone, LockTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6686,6 +6689,9 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	_ = db.wal.Close()
 	_ = db.file.Close()
 
@@ -6699,7 +6705,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := openDB(path)
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone, LockTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("valid WAL did not recover damaged main metadata: %v", err)
 	}
@@ -6801,6 +6807,9 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	_ = db.wal.Close()
 	_ = db.file.Close()
 
@@ -6818,7 +6827,7 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := openDB(path)
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone, LockTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
