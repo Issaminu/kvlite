@@ -41,7 +41,7 @@ jobs:
 
       - name: Save results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: kvbench-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/kvlite-kvbench-results/
