@@ -5321,10 +5321,13 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatalf("committed Put returned %q, want %q", got, "new")
 	}
 
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, 0644, nil)
+	reopened, err := Open(path, 0644, &Options{LockTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
