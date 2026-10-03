@@ -4,14 +4,78 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"testing"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
+
+// validatePageOwnership walks every tree page to test the bitmap against the tree.
+// Normal Open checks only bitmap pages, so this test helper can find an incorrect bit on a child page.
+func (db *DB) validatePageOwnership() error {
+	if db.allocation == nil || db.meta == nil {
+		return ErrInvalid
+	}
+
+	visited := make(map[page.ID]struct{})
+	pending := []page.ID{db.meta.Root()}
+	for len(pending) > 0 {
+		last := len(pending) - 1
+		pageID := pending[last]
+		pending = pending[:last]
+		if _, exists := visited[pageID]; exists {
+			return fmt.Errorf("tree page %d has more than one owner: %w", pageID, ErrInvalid)
+		}
+		if !db.allocation.allocated(pageID) {
+			return fmt.Errorf("allocation bitmap marks reachable page %d free: %w", pageID, ErrInvalid)
+		}
+		visited[pageID] = struct{}{}
+
+		node, err := db.readNode(pageID)
+		if err != nil {
+			return err
+		}
+		if !node.IsLeaf() {
+			pending = append(pending, node.Children...)
+			continue
+		}
+		for index := 0; index < node.EntryCount(); index++ {
+			entry := node.EntryAt(index)
+			if entry.Flags()&btree.BucketLeafFlag == 0 {
+				continue
+			}
+			rootPageID, err := page.DecodeID(entry.Value())
+			if err != nil {
+				return err
+			}
+			pending = append(pending, rootPageID)
+		}
+	}
+
+	allocatedPages := db.allocation.allocatedPageCount()
+	reservedPages := uint64(2 + len(db.allocation.segments))
+	if allocatedPages < reservedPages {
+		return fmt.Errorf("allocation bitmap marks %d pages used, want at least %d: %w", allocatedPages, reservedPages, ErrInvalid)
+	}
+	if uint64(len(visited)) == allocatedPages-reservedPages {
+		return nil
+	}
+	for pageID := firstTreePageID; pageID <= db.meta.LastPage(); pageID++ {
+		if !db.allocation.allocated(pageID) || db.allocation.isSegmentPage(pageID) {
+			continue
+		}
+		if _, reachable := visited[pageID]; !reachable {
+			return fmt.Errorf("allocated tree page %d has no owner: %w", pageID, ErrInvalid)
+		}
+	}
+	return fmt.Errorf("tree owns %d pages, allocation bitmap marks %d tree pages used: %w", len(visited), allocatedPages-reservedPages, ErrInvalid)
+}
 
 func TestAllocationChangesPageRecordsOnlyIncludeChangedSegments(t *testing.T) {
 	bitmap := newAllocationBitmap(allocationHeaderSize + 1)
@@ -499,6 +563,32 @@ func TestDeleteAPIContracts(t *testing.T) {
 	if err := db.Delete([]byte("parent"), nil); !errors.Is(err, ErrKeyRequired) {
 		t.Fatalf("empty key: got %v, want ErrKeyRequired", err)
 	}
+	if err := db.Delete([]byte("parent"), make([]byte, MaxKeySize+1)); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("large key: got %v, want ErrKeyTooLarge", err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.Delete([]byte("key")); !errors.Is(err, ErrTxNotWritable) {
+			t.Fatalf("read-only transaction delete: got %v, want ErrTxNotWritable", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var closedBucket *Bucket
+	if err := db.Update(func(tx *Tx) error {
+		var err error
+		closedBucket, err = tx.Bucket([]byte("parent"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := closedBucket.Delete([]byte("key")); !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("closed transaction delete: got %v, want ErrTxClosed", err)
+	}
 	if err := db.Update(func(tx *Tx) error {
 		parent, err := tx.Bucket([]byte("parent"))
 		if err != nil {
@@ -612,5 +702,425 @@ func TestAllocationStatsCountCommittedDeleteAndReuse(t *testing.T) {
 	}
 	if afterReuse.PagesReused <= afterDelete.PagesReused {
 		t.Fatalf("new keys did not reuse free pages: %+v", afterReuse)
+	}
+}
+
+func TestDeleteRemovesRetiredTreePagesFromWAL(t *testing.T) {
+	for _, checkpointBeforeDelete := range []bool{true, false} {
+		name := "older WAL pages"
+		if checkpointBeforeDelete {
+			name = "checkpointed pages"
+		}
+		t.Run(name, func(t *testing.T) {
+			db, err := openDB(filepath.Join(t.TempDir(), "database"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					t.Errorf("close database: %v", err)
+				}
+			})
+			db.wal.SetCheckpointThresholdBytes(math.MaxUint64)
+
+			const entryCount = 256
+			value := bytes.Repeat([]byte("v"), 512)
+			for index := range entryCount {
+				if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%04d", index), value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if checkpointBeforeDelete {
+				if err := db.checkpointWAL(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := db.Stats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for index := range entryCount {
+					if err := bucket.Delete(fmt.Appendf(nil, "key-%04d", index)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			after, err := db.Stats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.PagesRetired <= before.PagesRetired {
+				t.Fatal("delete did not retire a tree page")
+			}
+			for pageID, record := range db.wal.CommittedRecords() {
+				if record.Header.Type == wal.RecordTypeNode && !db.allocation.allocated(pageID) {
+					t.Fatalf("WAL kept retired tree page %d", pageID)
+				}
+			}
+		})
+	}
+}
+
+func TestCheckRejectsReachablePageMarkedFree(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := range 256 {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%04d", index), bytes.Repeat([]byte("v"), 256)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var childPageID page.ID
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if bucket.rootNode.IsLeaf() {
+			return errors.New("test bucket did not split")
+		}
+		childPageID = bucket.rootNode.Children[0]
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatalf("check valid database: %v", err)
+	}
+	pageSize := db.meta.PageSize()
+	pagesPerSegment := db.allocation.pagesPerSegment()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	segment := make([]byte, pageSize)
+	if _, err := file.ReadAt(segment, int64(firstAllocationSegmentID)*pageSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	clearAllocationBit(segment[allocationHeaderSize:], childPageID%pagesPerSegment)
+	sealAllocationPage(segment)
+	if _, err := file.WriteAt(segment, int64(firstAllocationSegmentID)*pageSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("open with checksum-valid bitmap: %v", err)
+	}
+	defer readOnly.Close()
+	if err := readOnly.validatePageOwnership(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("check reachable page marked free: got %v, want ErrInvalid", err)
+	}
+}
+
+func TestCheckRejectsAllocatedPageWithoutOwner(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "database"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const entryCount = 512
+	value := bytes.Repeat([]byte("v"), 256)
+	for index := range entryCount {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%04d", index), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for index := 0; index < entryCount; index += 2 {
+			if err := bucket.Delete(fmt.Appendf(nil, "key-%04d", index)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatalf("check valid database: %v", err)
+	}
+
+	for pageID := firstTreePageID; pageID <= db.meta.LastPage(); pageID++ {
+		if db.allocation.allocated(pageID) || db.allocation.isSegmentPage(pageID) {
+			continue
+		}
+		db.allocation.markAllocated(pageID)
+		if err := db.validatePageOwnership(); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("check page %d with no owner: got %v, want ErrInvalid", pageID, err)
+		}
+		return
+	}
+	t.Fatal("delete did not leave an interior free page")
+}
+
+func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
+	const pageSize int64 = 4096
+	path := filepath.Join(t.TempDir(), "database")
+	bitmap := newAllocationBitmap(pageSize)
+	// Fill the first segment in a sparse file. This avoids writing thousands of tree pages.
+	for index := range bitmap.segments[0].bitmapBits() {
+		bitmap.segments[0].bitmapBits()[index] = 0xff
+	}
+	bitmap.segments[0].firstFreeBit = bitmap.pagesPerSegment()
+	bitmap.addSegment()
+	secondPage := bitmap.segmentPageID(1) + 1
+	highPage := secondPage + 1
+	// Keep a used page after secondPage so that secondPage is an interior free page.
+	bitmap.markAllocated(highPage)
+
+	meta := page.NewMeta(pageSize)
+	meta.SetLastPage(highPage)
+	meta.RefreshChecksum()
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int64{0, pageSize} {
+		if _, err := file.WriteAt(page.EncodeMeta(meta), offset); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	for index := range bitmap.segments {
+		pageID := bitmap.segmentPageID(index)
+		if _, err := file.WriteAt(bitmap.encodeSegment(index), int64(pageID)*pageSize); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	root := btree.NewLeafNode(firstTreePageID)
+	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(firstTreePageID)*pageSize), root, pageSize, true); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Truncate(int64(highPage+1) * pageSize); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("second-segment"))
+		if err != nil {
+			return err
+		}
+		if got := bucket.rootNode.PageID(); got != secondPage {
+			return fmt.Errorf("bucket root page: got %d, want %d", got, secondPage)
+		}
+		return bucket.Put([]byte("key"), []byte("value"))
+	}); err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	stats, err := db.Stats()
+	if err != nil {
+		_ = db.Close()
+		t.Fatal(err)
+	}
+	if stats.PagesReused != 1 {
+		_ = db.Close()
+		t.Fatalf("reused pages: got %d, want 1", stats.PagesReused)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	readOnly, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	value, err := readOnly.Get([]byte("second-segment"), []byte("key"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(value, []byte("value")) {
+		t.Fatalf("reopened value: got %q, want value", value)
+	}
+}
+
+func TestDeleteWALFailureKeepsTreeAndAllocationState(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		db.wal.SetSyncFileForTesting(nil)
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	createBucket(t, db, testBucketName)
+	const entryCount = 128
+	value := bytes.Repeat([]byte("v"), 256)
+	for index := range entryCount {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%04d", index), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	allocationBefore := slices.Clone(db.allocation.encodeSegment(0))
+	lastPageBefore := db.meta.LastPage()
+	wantErr := errors.New("WAL sync failed")
+	db.wal.SetSyncFileForTesting(func() error { return wantErr })
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for index := range entryCount {
+			if err := bucket.Delete(fmt.Appendf(nil, "key-%04d", index)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("delete commit: got %v, want %v", err, wantErr)
+	}
+	db.wal.SetSyncFileForTesting(nil)
+	if !bytes.Equal(db.allocation.encodeSegment(0), allocationBefore) {
+		t.Fatal("failed delete commit changed allocation state")
+	}
+	if db.meta.LastPage() != lastPageBefore {
+		t.Fatalf("last page after failed delete: got %d, want %d", db.meta.LastPage(), lastPageBefore)
+	}
+	for index := range entryCount {
+		if _, err := db.Get(testBucketName, fmt.Appendf(nil, "key-%04d", index)); err != nil {
+			t.Fatalf("read key %d after failed delete: %v", index, err)
+		}
+	}
+}
+
+func TestOpenRejectsCorruptAllocationSegment(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	offset := int64(firstAllocationSegmentID)*pageSize + pageSize - 1
+	if _, err := file.WriteAt([]byte{0xff}, offset); err != nil {
+		_ = file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	opened, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted a damaged allocation page")
+	}
+	if !errors.Is(err, ErrChecksum) {
+		t.Fatalf("Open error: got %v, want ErrChecksum", err)
+	}
+}
+
+func TestOpenRejectsLastPageBeyondFileAndWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageSize := db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	meta := page.NewMeta(pageSize)
+	meta.SetLastPage(^page.ID(0))
+	meta.RefreshChecksum()
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, offset := range []int64{0, pageSize} {
+		if _, err := file.WriteAt(page.EncodeMeta(meta), offset); err != nil {
+			_ = file.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	opened, err := Open(path, 0600, &Options{ReadOnly: true})
+	if opened != nil {
+		_ = opened.Close()
+		t.Fatal("Open accepted an unavailable last page")
+	}
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Open error: got %v, want ErrInvalid", err)
+	}
+}
+
+func TestBucketDeleteIsVisibleInsideTransactionAndAfterCommit(t *testing.T) {
+	db, err := openDB(filepath.Join(t.TempDir(), "database"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("key"), []byte("value")); err != nil {
+			return err
+		}
+		if err := bucket.Delete([]byte("key")); err != nil {
+			return err
+		}
+		if _, err := bucket.Get([]byte("key")); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("read after delete in transaction: got %v, want ErrKeyNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("read after commit: got %v, want ErrKeyNotFound", err)
 	}
 }

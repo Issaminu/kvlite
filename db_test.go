@@ -2433,10 +2433,30 @@ func TestOpen_Size(t *testing.T) {
 	t.Skip("deferred: needs page size + initial layout")
 }
 
-// TestOpen_Check: fresh and reopened DBs pass an integrity check.
-// TODO(hardening): needs tx.Check().
-func TestOpen_Check(t *testing.T) {
-	t.Skip("deferred: needs tx.Check() integrity checker")
+func TestPageOwnershipValidOnNewAndReopenedDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatalf("check new database: %v", err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	reopened, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.validatePageOwnership(); err != nil {
+		t.Fatalf("check reopened database: %v", err)
+	}
 }
 
 // TestDB_Open_ReadOnly: a read-only open allows reads, rejects writes, and does not
