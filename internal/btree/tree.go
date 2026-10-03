@@ -31,7 +31,7 @@ type Store interface {
 	StageNode(*Node)
 }
 
-// Tree performs B+tree lookup, insertion, and splitting through a [Store].
+// Tree performs B+tree lookup, insertion, deletion, and repair through a [Store].
 // It keeps no page state outside that store.
 type Tree struct {
 	store Store
@@ -279,6 +279,17 @@ func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool,
 // [Store.FreePage]. If a store operation fails after mutation starts, the
 // caller must discard the private store changes.
 func (tree *Tree) DeleteEntry(root *Node, key []byte) (*Node, bool, error) {
+	return tree.deleteEntry(root, key, false)
+}
+
+// DeleteBucketEntry removes one bucket entry and repairs its parent tree.
+// The caller must release the pages owned by that bucket.
+// If a store operation fails after mutation starts, the caller must discard its private store changes.
+func (tree *Tree) DeleteBucketEntry(root *Node, key []byte) (*Node, bool, error) {
+	return tree.deleteEntry(root, key, true)
+}
+
+func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool, error) {
 	if len(key) == 0 {
 		return nil, false, ErrKeyRequired
 	}
@@ -303,7 +314,7 @@ func (tree *Tree) DeleteEntry(root *Node, key []byte) (*Node, bool, error) {
 		}
 	}
 
-	deleteIndex, found, err := node.prepareDelete(key)
+	deleteIndex, found, err := node.prepareDelete(key, bucket)
 	if err != nil || !found {
 		return root, found, err
 	}

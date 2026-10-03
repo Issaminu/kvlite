@@ -6,7 +6,7 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-// Tx gives a [DB.View] or [DB.Update] callback access to one transaction. Use [Tx.Bucket] to open a top-level bucket. A Tx and every bucket or cursor obtained from it are valid only until the callback returns. Do not save, copy, or share them with another goroutine.
+// Tx gives a [DB.View] or [DB.Update] callback access to one transaction. Use [Tx.Bucket] to open a top-level bucket and [Tx.DeleteBucket] to remove one. A Tx and every bucket or cursor obtained from it are valid only until the callback returns. Do not save, copy, or share them with another goroutine.
 type Tx struct {
 	db              *DB
 	meta            *page.Meta

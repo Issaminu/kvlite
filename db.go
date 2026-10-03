@@ -48,7 +48,7 @@ type Stats struct {
 	TailPagesReclaimed uint64
 }
 
-// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put] and [DB.Get] convenience methods.
+// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
 type DB struct {
 	path              string
 	file              *os.File
@@ -389,11 +389,9 @@ func (db *DB) Put(bucketName, key, value []byte) error {
 	})
 }
 
-// Delete removes one plain key from a top-level bucket in one write transaction.
-// A missing key returns nil. A missing bucket returns [ErrBucketNotFound].
-// Delete returns [ErrIncompatibleValue] when key names a nested bucket.
-// An empty bucket name returns [ErrBucketNameRequired]. See [Bucket.Delete] for key errors.
-// A read-only database returns [ErrDatabaseReadOnly].
+// Delete removes one plain key from an existing top-level bucket in one write transaction. Other database operations see the change after this method returns successfully.
+//
+// A missing key returns nil. A missing bucket returns [ErrBucketNotFound]. A key that names a nested bucket returns [ErrIncompatibleValue]. An empty bucket name returns [ErrBucketNameRequired]. See [Bucket.Delete] for key errors. A read-only database returns [ErrDatabaseReadOnly].
 func (db *DB) Delete(bucketName, key []byte) error {
 	return db.Update(func(tx *Tx) error {
 		bucket, err := tx.Bucket(bucketName)
@@ -401,6 +399,15 @@ func (db *DB) Delete(bucketName, key []byte) error {
 			return err
 		}
 		return bucket.Delete(key)
+	})
+}
+
+// DeleteBucket removes an existing top-level bucket and all of its contents in one write transaction.
+// It removes nested buckets and releases their pages after the transaction commits.
+// A missing bucket returns [ErrBucketNotFound]. An empty name returns [ErrBucketNameRequired]. A read-only database returns [ErrDatabaseReadOnly].
+func (db *DB) DeleteBucket(bucketName []byte) error {
+	return db.Update(func(tx *Tx) error {
+		return tx.DeleteBucket(bucketName)
 	})
 }
 

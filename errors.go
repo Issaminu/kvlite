@@ -17,7 +17,7 @@ var (
 	ErrTxNotWritable        = errors.New("tx not writable")
 	ErrTxClosed             = errors.New("tx closed")
 	ErrDatabaseReadOnly     = errors.New("database is in read-only mode")
-	ErrBucketNotFound       = errors.New("bucket not found")
+	ErrBucketNotFound       = errors.New("bucket not found") // ErrBucketNotFound means a bucket is absent or its handle was removed in the current transaction.
 	ErrBucketExists         = errors.New("bucket already exists")
 	ErrBucketNameRequired   = errors.New("bucket name required")
 	ErrKeyNotFound          = btree.ErrKeyNotFound

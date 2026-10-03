@@ -8,7 +8,7 @@ A blazingly-fast embedded key/value database for Go.
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/Issaminu/kvlite.svg)](https://pkg.go.dev/github.com/Issaminu/kvlite) [![Go 1.23.4](https://img.shields.io/badge/Go-1.23.4-00ADD8?logo=go)](go.mod) [![Benchmark results](https://img.shields.io/badge/benchmarks-results-2563EB)](BENCHMARKS.md) [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-KVLite uses a paged B+ tree. It supports transactions, nested buckets, ordered cursors, prefix scans, range scans, and read-only database handles.
+KVLite uses a paged B+ tree. It supports transactions, nested buckets, key and bucket deletion, page reuse, ordered cursors, prefix scans, range scans, and read-only database handles.
 
 > [!WARNING]
 > KVLite does not have a stable release yet. Its API and file format can change between pre-release versions. For production usage, wait for the 1.0 release.
@@ -89,6 +89,7 @@ Always check the error from `DB.Close`. A writable close moves committed data in
 ## Features
 
 - Named and nested buckets store byte keys and values.
+- Delete plain keys or whole buckets. Later writes can reuse freed pages.
 - Read-only and read-write transactions provide a consistent view and atomic changes.
 - Cursors move forward or backward in byte-key order.
 - Prefix and half-open range scans visit entries in byte-key order.
@@ -99,7 +100,7 @@ Always check the error from `DB.Close`. A writable close moves committed data in
 - Durable concurrent updates can share one log write and storage sync.
 - Read-only handles use shared file locks. Writable handles use an exclusive file lock.
 
-After a bucket exists, use `DB.Put` and `DB.Get` for one-key operations:
+After a bucket exists, use `DB.Put`, `DB.Get`, and `DB.Delete` for one-key operations:
 
 ```go
 if err := db.Put([]byte("users"), []byte("42"), []byte("Ada")); err != nil {
@@ -119,7 +120,17 @@ fmt.Println(string(value))
 
 A database contains named top-level buckets. A bucket can contain key/value pairs and nested buckets. A user value always belongs to a bucket.
 
-`DB.Get` and `DB.Put` provide short operations for an existing top-level bucket. Use `DB.View` or `DB.Update` when several operations must use one database state.
+`DB.Get`, `DB.Put`, and `DB.Delete` provide short operations for an existing top-level bucket. `DB.DeleteBucket` removes a top-level bucket and its contents. Use `DB.View` or `DB.Update` when several operations must use one database state.
+
+`DB.Delete` removes one plain key. A missing key causes no change. Use `Bucket.Delete` in `DB.Update` when the delete must be in the same transaction as other writes.
+
+```go
+if err := db.Delete([]byte("users"), []byte("42")); err != nil {
+	return err
+}
+```
+
+Use `Tx.DeleteBucket` to remove a top-level bucket within a write transaction. Use `Bucket.DeleteBucket` to remove a nested bucket. Both methods also remove child buckets. A missing bucket returns `ErrBucketNotFound`.
 
 Keys use byte order. A shorter key sorts before a longer key when the shorter key is its prefix. For example, `user/1` sorts before `user/10`.
 
@@ -242,15 +253,17 @@ fmt.Println(string(saved))
 For a database at `app.db`, KVLite can use two files:
 
 
-| File         | Purpose                                                                        |
-| ------------ | ------------------------------------------------------------------------------ |
-| `app.db`     | Stores metadata and fixed-size B+ tree pages.                                  |
-| `app.db-wal` | Stores committed page images until a checkpoint moves them into the main file. |
+| File         | Purpose                                                                      |
+| ------------ | ---------------------------------------------------------------------------- |
+| `app.db`     | Stores metadata, page allocation data, and fixed-size B+ tree pages.         |
+| `app.db-wal` | Stores committed tree, allocation, and metadata changes until a checkpoint. |
 
 
 A writable open creates the log. A clean writable close removes it. An application or system failure can leave the log beside the main file.
 
 `Open` validates metadata and checksums. It replays complete committed log transactions. It ignores an incomplete final transaction. A checksum error in committed data stops recovery and returns an error.
+
+KVLite records which database pages are in use. A later transaction can reuse a tree page that an earlier transaction freed. When free pages reach the end of the file, a checkpoint can shorten the main file. `DB.Stats` reports allocated pages, reusable pages, retired pages, and reused pages.
 
 
 | Mode         | Behavior                                                                                                                                                  |
@@ -354,8 +367,6 @@ cd benchmarks/kvbench
 
 ## Current limits
 
-- KVLite does not provide a delete or bucket-removal API.
-- KVLite does not reuse free pages.
 - Each key/value entry must fit in one database page. KVLite does not use overflow pages for large values.
 - One database file can have one writable handle or several read-only handles. It cannot have both at the same time.
 - A write transaction waits for active read transactions on the same `DB`.

@@ -4,13 +4,13 @@
 //
 // A [DB] stores data in a file. Each key and value belongs to a named [Bucket]. A bucket can also contain other buckets.
 //
-// Use [Open] to open a database. [DB.Get] and [DB.Put] are the simplest way to read or write one value in a top-level bucket.
+// Use [Open] to open a database. [DB.Get], [DB.Put], and [DB.Delete] read, write, and remove one value in an existing top-level bucket. [DB.DeleteBucket] removes a top-level bucket.
 //
 // # Transactions
 //
 // A transaction groups related database operations into one unit. [DB.View] starts a read-only transaction. [DB.Update] starts a transaction that can read and write.
 //
-// View gives its callback one unchanged view of the database. Update lets its callback read its own writes. If an Update callback returns nil, KVLite commits all of its changes together. If it returns an error, KVLite discards all of its changes.
+// View gives its callback one unchanged view of the database. Update lets its callback read its own writes, including deletes. If an Update callback returns nil, KVLite commits all of its changes together. If it returns an error or panics, KVLite discards all of its changes.
 //
 // The callback receives a [Tx]. Buckets, cursors, keys, and values obtained from that Tx belong to the transaction. Use them only before the callback returns.
 //
@@ -25,6 +25,16 @@
 // Use [Bucket.ScanPrefix] or [Bucket.ScanRange] inside [DB.View] to scan one unchanged database state. Use them inside [DB.Update] when the scan belongs to a transaction that also writes. A scan does not change its bucket. Do not change that bucket until the scan returns.
 //
 // KVLite copies keys and values when it stores them. The caller can reuse or change its input slices after a write returns. [DB.Get] also returns a copy. [Bucket.Get] and [Cursor] return read-only data owned by their transaction. Use [bytes.Clone] to keep that data after the transaction ends.
+//
+// # Delete and page reuse
+//
+// [Bucket.Delete] removes a plain key from a bucket in a write transaction. [DB.Delete] does the same in an existing top-level bucket. A missing key causes no change. Delete does not remove a nested bucket.
+//
+// [Tx.DeleteBucket] removes a top-level bucket in a write transaction. [Bucket.DeleteBucket] removes a nested bucket. Both operations remove all child buckets and values. A handle to a removed bucket cannot be used again in that transaction.
+//
+// A delete can make tree pages free. KVLite records free pages in the database file and can use them for later writes. A write cannot reuse a page retired by the same transaction. If the free pages are at the end of the file, a checkpoint can shorten the file. [DB.Stats] reports page counts and page reuse.
+//
+// Each key and value entry must fit in one database page. KVLite does not store large entries across pages.
 //
 // # Errors
 //

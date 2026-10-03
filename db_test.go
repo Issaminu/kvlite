@@ -3,8 +3,7 @@ package kvlite
 // Some tests here are adapted from etcd-io/bbolt
 // (https://github.com/etcd-io/bbolt), MIT License, Copyright (c) 2013 Ben Johnson.
 //
-// The suite started from a small Put/Get path and now covers the database file,
-// metadata, WAL, transactions, buckets, locking, and recovery behavior.
+// This suite covers the database file, metadata, WAL, transactions, buckets, locks, and recovery.
 
 import (
 	"bytes"
@@ -16,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -635,13 +635,7 @@ func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// RUNG 2 — Efficient lookup + no forever-growth: a single sorted node.  <-- NEXT
-//
-// Same Put/Get contract, smarter guts. These two are hook-free and run now. (The
-// "is it ACTUALLY binary search?" test needs a probe counter in your Get — see chat.)
-// -----------------------------------------------------------------------------
-
+// TestPut_Overwrite_BoundedGrowth checks that repeated writes to one key do not grow the main file without a bound.
 func TestPut_Overwrite_BoundedGrowth(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -665,15 +659,12 @@ func TestPut_Overwrite_BoundedGrowth(t *testing.T) {
 	big := fileSize(t, path)
 
 	if big > small*4 {
-		t.Fatalf("file grew unboundedly overwriting one key 1000x: %d -> %d bytes "+
-			"(append-log symptom — Rung 2 wants in-place update)", small, big)
+		t.Fatalf("file grew unboundedly overwriting one key 1000 times: %d -> %d bytes", small, big)
 	}
 }
 
-// TestPutGet_Stress: many keys inserted in a non-sorted order, half overwritten, all
-// must read back correctly after a reopen. Algorithm-blind (passes for linear OR binary
-// search) — the correctness backstop that catches off-by-ones, bad inserts, and wrong
-// overwrite handling.
+// TestPutGet_Stress checks reads after keys arrive in reverse order and some values change.
+// It checks all values again after reopen.
 func TestPutGet_Stress(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -725,15 +716,7 @@ func TestPutGet_Stress(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// RUNG 3a — Real fixed-size pages: correct padding + offsets.  <-- NEXT
-//
-// No behavior change; the LAYOUT becomes page-based. Every node is padded to a whole
-// NODE_SIZE page and written at a page offset. (Splitting big nodes into one-page nodes
-// so they stay <= a page is Rung 3b.)
-// -----------------------------------------------------------------------------
-
-// TestFile_SinglePage: a small bucket uses one allocation page, one catalog leaf, and one data leaf.
+// TestFile_SinglePage checks the fixed page layout for a small bucket.
 func TestFile_SinglePage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -759,16 +742,7 @@ func TestFile_SinglePage(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// RUNG 3b — The split: a full node splits, and the tree grows up.  <-- NEXT
-//
-// When a node's serialized size exceeds one page, it splits in two and a separator
-// is pushed to its parent; splitting the root mints a new branch root (tree grows up).
-// -----------------------------------------------------------------------------
-
-// TestSplit_TreeGrows: insert enough to overflow a single leaf, forcing a split. The
-// root must stop being a leaf — a new branch root is born (the tree grows up). RED
-// while everything still lives in one oversized node.
+// TestSplit_TreeGrows checks that a full root leaf becomes a branch with readable children.
 func TestSplit_TreeGrows(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -788,8 +762,7 @@ func TestSplit_TreeGrows(t *testing.T) {
 	}
 
 	if mustBucketRoot(t, db, testBucketName).IsLeaf() {
-		t.Fatal("root is still a single leaf after ~38 KB of entries — a full node must " +
-			"split and grow a branch root (Rung 3b)")
+		t.Fatal("root is still a single leaf after about 38 KB of entries")
 	}
 	if got, err := db.Get(testBucketName, []byte("key-00042")); err != nil || !bytes.Equal(got, val) {
 		t.Fatalf("key-00042 unreadable after split: err=%v", err)
@@ -835,21 +808,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// RUNG 3b — split staircase.  Build in THIS order; each test lights up the next
-// capability. They all fail today with "not implemented" (the overflow insert
-// bails), which IS your to-do list.
-//
-//   1. TestSplit_RootBecomesBranch   — the first split: root leaf -> branch root.
-//   2. TestSplit_EveryNodeFitsInOnePage — the invariant the split exists to keep.
-//   3. TestSplit_PropagatesToParent  — a child leaf splits and pushes a separator
-//                                       up into the already-existing branch root.
-//   4. TestSplit_TreeGrows / _SurvivesReopen (above) then carry you home.
-// -----------------------------------------------------------------------------
-
-// walkNodes visits every node of the on-disk tree rooted at root, reading
-// each child by its pgid. It doubles as a reachability check: a bad child pgid
-// (mis-wired separator/split) makes readNode fail and the walk t.Fatal.
+// walkNodes visits each node in a tree and checks that each child page can be read.
 func walkNodes(t *testing.T, db *DB, root *btree.Node, visit func(n *btree.Node)) {
 	t.Helper()
 	var rec func(n *btree.Node)
@@ -869,10 +828,7 @@ func walkNodes(t *testing.T, db *DB, root *btree.Node, visit func(n *btree.Node)
 	rec(root)
 }
 
-// TestSplit_RootBecomesBranch: the first milestone. Insert ~1.5 pages of data so a
-// single leaf overflows once. The root must stop being a leaf, the new branch root
-// must point at both halves, and BOTH the smallest and largest keys must survive
-// (a split that drops a half fails here).
+// TestSplit_RootBecomesBranch checks both sides of a root leaf split.
 func TestSplit_RootBecomesBranch(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -910,9 +866,7 @@ func TestSplit_RootBecomesBranch(t *testing.T) {
 	}
 }
 
-// TestSplit_EveryNodeFitsInOnePage: the invariant the whole rung exists to keep.
-// After many inserts, walk the on-disk tree and assert no node serializes past one
-// page. A "split" that doesn't actually drop each piece below a page fails here.
+// TestSplit_EveryNodeFitsInOnePage checks that each reachable node fits in one page.
 func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1441,11 +1395,9 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	}
 }
 
-// TestMode2_CommitDefersMainWrite_CheckpointDrains: the defining property of Mode 2
-// (SQLite WAL mode). A commit writes only the WAL; the main file is untouched until a
-// checkpoint. Reads still see committed data, served from the in-memory overlay, not
-// the main file. A checkpoint (here, Close) drains the overlay into the main file.
-func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
+// TestCommitDefersMainWriteUntilCheckpoint checks that a commit below the checkpoint threshold leaves the main file unchanged.
+// Reads use the committed WAL data. Close moves that data to the main file.
+func TestCommitDefersMainWriteUntilCheckpoint(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -1470,7 +1422,7 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(mainAfterOpen, mainAfterPut) {
-		t.Fatal("main file changed on a plain commit: Mode 2 must defer main writes to a checkpoint")
+		t.Fatal("main file changed before checkpoint")
 	}
 
 	// Yet the value is readable, served from the overlay, not from main.
@@ -1501,23 +1453,9 @@ func TestMode2_CommitDefersMainWrite_CheckpointDrains(t *testing.T) {
 	}
 }
 
-// TestMode2_RecoversAfterCheckpointThenCrash: the Mode 2 recovery seam that every
-// other crash test skips. All of TestWAL_Recovers* replay a WAL onto a *pristine*
-// (pre-write) main file. Real Mode 2 crashes onto a main file that a PRIOR checkpoint
-// already filled: main holds the checkpointed base, the WAL holds only the delta
-// committed since. Recovery must replay that delta ON TOP OF the non-empty base.
-//
-// It also pins last-write-wins across the checkpoint boundary: a key checkpointed
-// into main with an OLD value, then re-Put with a NEW value that lives only in the
-// WAL, must recover to the NEW value — the replayed WAL page must win over the page
-// already sitting in main. Get it wrong and recovery serves the stale checkpointed
-// value (or silently keeps both).
-//
-// The three post-recovery buckets prove the union is correct:
-//   - keys 0..9    : checkpointed as valBase, then overwritten to valUpd (WAL only)  -> valUpd
-//   - keys 10..99  : checkpointed as valBase, never touched again (main base only)   -> valBase
-//   - keys 100..149: committed only after the checkpoint (WAL only)                  -> valBase
-func TestMode2_RecoversAfterCheckpointThenCrash(t *testing.T) {
+// TestRecoveryAppliesWALOverCheckpointedMainFile checks recovery when the main file has older committed data.
+// Keys 0 to 9 have newer values in the WAL. Keys 10 to 99 exist only in the main file. Keys 100 to 149 exist only in the WAL.
+func TestRecoveryAppliesWALOverCheckpointedMainFile(t *testing.T) {
 	path := tempfile()
 	wal := path + "-wal"
 	defer os.RemoveAll(path)
@@ -1643,7 +1581,7 @@ func TestPutGet(t *testing.T) {
 	}
 }
 
-// TestPutGet_Persists is the rung-1 goal: a value survives Close + reopen.
+// TestPutGet_Persists checks that a value survives Close and reopen.
 func TestPutGet_Persists(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -1784,7 +1722,7 @@ func TestPutGet_MultipleKeys(t *testing.T) {
 }
 
 // -----------------------------------------------------------------------------
-// Open: creation & basic lifecycle  (already GREEN)
+// Open: creation and basic file lifecycle.
 // -----------------------------------------------------------------------------
 
 // TestOpen ensures that a database can be created and opened without error.
@@ -2427,12 +2365,6 @@ func TestOpen_ReadPageSize_FromMeta1(t *testing.T) {
 	}
 }
 
-// TestOpen_Size: a fresh DB lays out a fixed initial set of pages; reopen + a small
-// write must not balloon the file. TODO(Rung 3-4): needs page size + layout + writes.
-func TestOpen_Size(t *testing.T) {
-	t.Skip("deferred: needs page size + initial layout")
-}
-
 func TestPageOwnershipValidOnNewAndReopenedDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := openDB(path)
@@ -2686,20 +2618,7 @@ func TestOpen_MetaInitWriteError(t *testing.T) {
 	t.Skip("deferred (fault injection)")
 }
 
-// -----------------------------------------------------------------------------
-// FSYNC DECISION BENCHMARK
-//
-// Decide whether re-enabling fsync (the commented-out db.file.Sync() calls in
-// persistNode/persistMeta/applyRecordToDatabase, and any Sync() added to
-// wal.persistRecord) is acceptable: run this now (fsync off) to get a baseline,
-// enable fsync, run again, and compare ns/op. Every Put currently does 2 WAL
-// record writes (node + meta) and 2 main-file writes even on the non-split path,
-// so each Sync() call you add multiplies the number of syncs per Put — the
-// benchmark should make that cost visible up front, before deciding where to sync.
-// -----------------------------------------------------------------------------
-
-// BenchmarkPut_Sequential: repeated Put with ascending keys — the common case,
-// triggers node splits as the tree grows.
+// BenchmarkPut_Sequential measures writes with ascending keys and tree splits.
 func BenchmarkPut_Sequential(b *testing.B) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3289,10 +3208,8 @@ func TestBucketReadsAfterViewStopAtClosedTransaction(t *testing.T) {
 	}
 }
 
-// TestTx_ViewCannotCreateBucket: CreateBucket is a write. A View transaction must
-// reject it with ErrTxNotWritable, exactly like Bucket.Put does. Before the fix,
-// CreateBucket changed shared metadata and pending WAL state. The next write could
-// then commit a bucket that came from a read-only transaction.
+// TestTx_ViewCannotCreateBucket checks that a read-only transaction cannot add a bucket.
+// It also checks that a later write cannot commit a bucket from the rejected call.
 func TestTx_ViewCannotCreateBucket(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3613,28 +3530,463 @@ func TestBucketGetReturnsLookupErrors(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// RUNG 5b — Buckets: many named keyspaces in one file.  <-- BUILD THIS
-//
-// A bucket is your SAME tree, started at a different root pgid. The root bucket's
-// root is meta.root; a named bucket's root is a (BucketLeafFlag-flagged) value that
-// lives as an entry in a parent bucket's tree. So CreateBucket("users") = insert
-// name->newRootPgid into the root tree (flagged) AND materialize an empty leaf at
-// newRootPgid; bucket.Put/Get then descend FROM that pgid, not db.rootNode.
-//
-// The bucket surface these tests use:
-//   - (*Tx).CreateBucket(name []byte) (*Bucket, error)   // ErrBucketExists if present
-//   - (*Tx).Bucket(name []byte) (*Bucket, error)
-//   - (*Bucket).Put(key, value []byte) error
-//   - (*Bucket).Get(key []byte) ([]byte, error)
-//
-// The load-bearing gap these drive out: descend must take the bucket's root as a
-// parameter. Until then every bucket shares one tree and TestBucket_IsolatesSameKey
-// fails.
-// -----------------------------------------------------------------------------
+func TestDeleteBucketTopLevelInvalidatesOldHandles(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
 
-// TestBucket_PutGetRoundTrip: create a bucket, write into it, read it back — both
-// read-your-writes inside the txn and from a separate read txn after commit.
+	err = db.Update(func(tx *Tx) error {
+		old, err := tx.CreateBucket([]byte("users"))
+		if err != nil {
+			return err
+		}
+		if err := old.Put([]byte("old"), []byte("value")); err != nil {
+			return err
+		}
+		cursor, err := old.Cursor()
+		if err != nil {
+			return err
+		}
+		if err := tx.DeleteBucket([]byte("users")); err != nil {
+			return err
+		}
+		if _, err := tx.Bucket([]byte("users")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted bucket lookup: got %v, want ErrBucketNotFound", err)
+		}
+		if _, err := old.Get([]byte("old")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("old handle read: got %v, want ErrBucketNotFound", err)
+		}
+		if err := old.Put([]byte("key"), []byte("value")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("old handle write: got %v, want ErrBucketNotFound", err)
+		}
+		if _, err := old.Cursor(); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("old handle cursor: got %v, want ErrBucketNotFound", err)
+		}
+		if _, _, err := cursor.First(); !errors.Is(err, ErrCursorInvalidated) {
+			t.Fatalf("old cursor: got %v, want ErrCursorInvalidated", err)
+		}
+		replacement, err := tx.CreateBucket([]byte("users"))
+		if err != nil {
+			return err
+		}
+		return replacement.Put([]byte("new"), []byte("value"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := db.Get([]byte("users"), []byte("new")); err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("replacement value: got %q, error %v", got, err)
+	}
+	if _, err := db.Get([]byte("users"), []byte("old")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("old value: got %v, want ErrKeyNotFound", err)
+	}
+	if err := db.DeleteBucket([]byte("users")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get([]byte("users"), []byte("new")); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("removed bucket: got %v, want ErrBucketNotFound", err)
+	}
+}
+
+func TestDeleteBucketNestedReclaimsPagesAndRollsBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	value := bytes.Repeat([]byte("v"), 400)
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if err := parent.Put([]byte("keep"), []byte("value")); err != nil {
+			return err
+		}
+		child, err := parent.CreateBucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		grandchild, err := child.CreateBucket([]byte("grandchild"))
+		if err != nil {
+			return err
+		}
+		for index := range 100 {
+			key := fmt.Appendf(nil, "key-%03d", index)
+			if err := child.Put(key, value); err != nil {
+				return err
+			}
+			if err := grandchild.Put(key, value); err != nil {
+				return err
+			}
+		}
+		_, err = tx.CreateBucket([]byte("anchor"))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rollback := errors.New("roll back bucket deletion")
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if err := parent.DeleteBucket([]byte("child")); err != nil {
+			return err
+		}
+		return rollback
+	})
+	if !errors.Is(err, rollback) {
+		t.Fatalf("rollback: got %v, want callback error", err)
+	}
+	afterRollback, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterRollback.AllocatedPageCount != before.AllocatedPageCount || afterRollback.PagesRetired != before.PagesRetired {
+		t.Fatalf("rollback changed allocation: before %+v, after %+v", before, afterRollback)
+	}
+	if err := db.View(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.Bucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		grandchild, err := child.Bucket([]byte("grandchild"))
+		if err != nil {
+			return err
+		}
+		_, err = grandchild.Get([]byte("key-099"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.Bucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		grandchild, err := child.Bucket([]byte("grandchild"))
+		if err != nil {
+			return err
+		}
+		cursor, err := parent.Cursor()
+		if err != nil {
+			return err
+		}
+		if err := parent.DeleteBucket([]byte("child")); err != nil {
+			return err
+		}
+		if _, err := grandchild.Get([]byte("key-099")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("old descendant handle: got %v, want ErrBucketNotFound", err)
+		}
+		if err := grandchild.ScanRange(nil, nil, func([]byte, []byte) error { return nil }); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("old descendant scan: got %v, want ErrBucketNotFound", err)
+		}
+		if _, err := grandchild.CreateBucket([]byte("new")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("old descendant create: got %v, want ErrBucketNotFound", err)
+		}
+		if _, _, err := cursor.First(); !errors.Is(err, ErrCursorInvalidated) {
+			t.Fatalf("parent cursor: got %v, want ErrCursorInvalidated", err)
+		}
+		if _, err := parent.Bucket([]byte("child")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted child lookup: got %v, want ErrBucketNotFound", err)
+		}
+		got, err := parent.Get([]byte("keep"))
+		if err != nil || !bytes.Equal(got, []byte("value")) {
+			t.Fatalf("parent value: got %q, error %v", got, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterDelete, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterDelete.PagesRetired <= before.PagesRetired || afterDelete.ReusablePageCount == 0 {
+		t.Fatalf("bucket pages were not retired: before %+v, after %+v", before, afterDelete)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatalf("page ownership after delete: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket([]byte("replacement"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	afterReuse, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if afterReuse.PagesReused <= afterDelete.PagesReused {
+		t.Fatalf("replacement did not reuse a page: before %+v, after %+v", afterDelete, afterReuse)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.validatePageOwnership(); err != nil {
+		t.Fatalf("page ownership after reopen: %v", err)
+	}
+	if err := reopened.View(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		_, err = parent.Bucket([]byte("child"))
+		if !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted child after reopen: got %v, want ErrBucketNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteBucketErrors(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteBucket(nil); !errors.Is(err, ErrBucketNameRequired) {
+		t.Fatalf("empty name: got %v, want ErrBucketNameRequired", err)
+	}
+	if err := db.DeleteBucket([]byte("missing")); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("missing bucket: got %v, want ErrBucketNotFound", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if err := parent.Put([]byte("plain"), []byte("value")); err != nil {
+			return err
+		}
+		if err := parent.DeleteBucket([]byte("plain")); !errors.Is(err, ErrIncompatibleValue) {
+			t.Fatalf("plain value: got %v, want ErrIncompatibleValue", err)
+		}
+		if err := parent.DeleteBucket([]byte("missing")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("missing child: got %v, want ErrBucketNotFound", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		if err := tx.DeleteBucket([]byte("parent")); !errors.Is(err, ErrTxNotWritable) {
+			t.Fatalf("read-only transaction: got %v, want ErrTxNotWritable", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnly, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer readOnly.Close()
+	if err := readOnly.DeleteBucket([]byte("parent")); !errors.Is(err, ErrDatabaseReadOnly) {
+		t.Fatalf("read-only database: got %v, want ErrDatabaseReadOnly", err)
+	}
+}
+
+func TestDeleteBucketRepairsNestedParentRoot(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	const count = 200
+	name := func(index int) []byte {
+		return []byte(fmt.Sprintf("child-%03d-%s", index, strings.Repeat("x", 100)))
+	}
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		for index := range count {
+			if _, err := parent.CreateBucket(name(index)); err != nil {
+				return err
+			}
+		}
+		if parent.rootNode.IsLeaf() {
+			t.Fatal("parent tree did not split")
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		for index := range count - 1 {
+			if err := parent.DeleteBucket(name(index)); err != nil {
+				return err
+			}
+		}
+		if !parent.rootNode.IsLeaf() {
+			t.Fatal("parent root did not collapse")
+		}
+		_, err = parent.Bucket(name(count - 1))
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		_, err = parent.Bucket(name(count - 1))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteBucketRepairsCatalogRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := func(index int) []byte {
+		return []byte(fmt.Sprintf("bucket-%03d-%s", index, strings.Repeat("x", 100)))
+	}
+	const count = 200
+	if err := db.Update(func(tx *Tx) error {
+		for index := range count {
+			if _, err := tx.CreateBucket(name(index)); err != nil {
+				return err
+			}
+		}
+		if tx.rootNode.IsLeaf() {
+			t.Fatal("catalog tree did not split")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		for index := range count - 1 {
+			if err := tx.DeleteBucket(name(index)); err != nil {
+				return err
+			}
+		}
+		if !tx.rootNode.IsLeaf() || tx.rootNode.PageID() != tx.meta.Root() {
+			t.Fatal("catalog root did not collapse into metadata")
+		}
+		_, err := tx.Bucket(name(count - 1))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if err := reopened.View(func(tx *Tx) error {
+		_, err := tx.Bucket(name(count - 1))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteBucketWALFailureKeepsTreeAndAllocation(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		db.wal.SetSyncFileForTesting(nil)
+		if err := db.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		for index := range 100 {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%03d", index), bytes.Repeat([]byte("v"), 300)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("WAL sync failed")
+	db.wal.SetSyncFileForTesting(func() error { return wantErr })
+	if err := db.DeleteBucket([]byte("data")); !errors.Is(err, wantErr) {
+		t.Fatalf("failed delete: got %v, want %v", err, wantErr)
+	}
+	db.wal.SetSyncFileForTesting(nil)
+	after, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.AllocatedPageCount != before.AllocatedPageCount || after.PagesRetired != before.PagesRetired {
+		t.Fatalf("failed commit changed allocation: before %+v, after %+v", before, after)
+	}
+	if value, err := db.Get([]byte("data"), []byte("key-099")); err != nil || len(value) != 300 {
+		t.Fatalf("value after failed delete: length %d, error %v", len(value), err)
+	}
+}
+
+// TestBucket_PutGetRoundTrip checks reads in the write transaction and after commit.
 func TestBucket_PutGetRoundTrip(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3673,10 +4025,7 @@ func TestBucket_PutGetRoundTrip(t *testing.T) {
 	}
 }
 
-// TestBucket_IsolatesSameKey: THE bucket test. The SAME key in two different buckets
-// holds two different values — they must not collide. This is impossible unless
-// Put/Get descend from each bucket's own root pgid. RED while everything still lives
-// in the one db.rootNode tree.
+// TestBucket_IsolatesSameKey checks that two buckets can store different values under the same key.
 func TestBucket_IsolatesSameKey(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -3951,14 +4300,8 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 	verify(t, db, "after reopen")
 }
 
-// TestBucket_NestedInSplitParent: a nested bucket must resolve even when the PARENT
-// bucket's OWN tree has split (its root became a branch). Bucket.Bucket() and the
-// duplicate check in Bucket.CreateBucket look the child up with bucket.rootNode.get(name)
-// — a single-node lookup that ERRORS on a branch root (ErrNotLeafNode) instead of
-// descending — while Tx.Bucket() correctly uses the descending _get. So a child bucket
-// in a large parent is wrongly reported missing (and CreateBucket's guard then silently
-// overwrites). Here the parent is filled past one page BEFORE the child is created, then
-// the child is read back both in-session and after a reopen.
+// TestBucket_NestedInSplitParent checks child lookup after the parent tree splits.
+// It checks the child before and after reopen.
 func TestBucket_NestedInSplitParent(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -4031,12 +4374,8 @@ func TestBucket_NestedInSplitParent(t *testing.T) {
 	}
 }
 
-// TestBucket_Nested: a bucket inside a bucket — the recursion the whole flag design
-// exists for. A sub-bucket is a BucketLeafFlag entry in its parent's tree, so the same
-// machinery nests with no new tree type. Drives (*Bucket).CreateBucket, which doesn't
-// exist yet. Checks: the child round-trips through parent.Bucket(...).Get; a plain key
-// and a sub-bucket key coexist in the same parent without colliding; Get on a sub-bucket
-// key returns nil (it's not a value); and all of it survives a reopen.
+// TestBucket_Nested checks that values and nested buckets can share one parent.
+// A nested bucket name does not act as a plain value. The child survives reopen.
 func TestBucket_Nested(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -4114,18 +4453,8 @@ func TestBucket_Nested(t *testing.T) {
 	verify(t, db, "after reopen")
 }
 
-// -----------------------------------------------------------------------------
-// Spring-cleaning Phase 1 — bug fixes (TDD: these are RED before the fix).
-// -----------------------------------------------------------------------------
-
-// TestSplit_LargeValuesGetOwnNode: a value whose encoded size reaches half a page
-// must still split cleanly. Node.split cuts at the first entry that reaches
-// pageSize/2, so if the FIRST entry already exceeds that limit the separator index
-// is 0 — the left node becomes EMPTY and the right node keeps the whole (over-page)
-// content. The split loop in _put then advances to the parent and never re-checks
-// that oversized right node. Result: two ~0.6-page values (which fit fine at one
-// entry per node) are rejected with "record payload exceeds page size", or a
-// corrupt empty leaf is wired under a branch separator.
+// TestSplit_LargeValuesGetOwnNode checks that a split keeps one large value in each leaf.
+// Each value fits in one page, but two values do not fit together.
 func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -4334,10 +4663,6 @@ func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 	verify(t, db, "after reopen")
 }
 
-// -----------------------------------------------------------------------------
-// PHASE 1 — spring-cleaning regression tests.
-// -----------------------------------------------------------------------------
-
 // TestCreateBucket_ParentRootSplitUpdatesCatalog catches nested bucket creation
 // that does not write the parent bucket's replacement root into the catalog.
 func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
@@ -4430,13 +4755,10 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 	}
 }
 
-// TestWAL_BytesSinceCheckpointTracksWALSize arms Phase-1 bug #3.
+// TestWAL_BytesSinceCheckpointTracksWALSize checks the count after repeated writes to one page.
 //
-// bytesSinceCheckpoint gates the checkpoint. The old code added a record's size
-// every time it staged a page. Rewriting one page many times inflated the counter
-// and started checkpoints too early. The counter must equal the bytes actually
-// appended to the WAL since the last checkpoint. A fresh DB starts with an empty
-// WAL, so after one commit the counter must equal the WAL file size on disk.
+// BytesSinceCheckpoint starts a checkpoint at the set limit. Only the final page image enters the WAL.
+// After this commit, the count must equal the WAL file size.
 func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -4448,8 +4770,7 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	}
 	defer db.Close()
 
-	// Overwrite one key 100 times in a single transaction. Only the final leaf page
-	// enters the WAL. The old per-call counter would report about 100 times that.
+	// Overwrite one key 100 times in one transaction. Only the final leaf page enters the WAL.
 	err = db.Update(func(tx *Tx) error {
 		for i := 0; i < 100; i++ {
 			if err := mustBucket(t, tx, testBucketName).Put([]byte("k"), []byte("v")); err != nil {
@@ -4469,13 +4790,9 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 	}
 }
 
-// TestBucket_SharedHandleSeesWrites fixes Phase-1 bug #1.
+// TestBucket_SharedHandleSeesWrites checks that two lookups use the same bucket handle.
 //
-// tx.Bucket(name) used to build a fresh handle on every call, each caching its own
-// root snapshot, so a write through one handle that split the bucket was invisible
-// to a second handle for the same bucket. Tx and Bucket now cache one handle per
-// name (per transaction, and per parent bucket for nested names), so every call
-// with the same name returns the same *Bucket object.
+// The first handle sees a root split. The second lookup must return that same handle.
 func TestBucket_SharedHandleSeesWrites(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -4512,11 +4829,7 @@ func TestBucket_SharedHandleSeesWrites(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Bug 1 — an empty or nil value must round-trip, and must not read back as a
-// missing key. "Missing" is signalled by ErrKeyNotFound, not by a nil value.
-// -----------------------------------------------------------------------------
-
+// TestGet_NilValueIsFoundNotMissing checks that a stored empty value differs from a missing key.
 func TestGet_NilValueIsFoundNotMissing(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
@@ -4750,15 +5063,7 @@ func TestBucketCreateBucket_RefusesOverwritingNestedValue(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Bug 4 — a committed-but-not-yet-checkpointed WAL record must carry the txid it
-// was actually committed under. persistCollectedRecords stamped the txid onto a
-// range-loop copy of each record before encoding it, but copied the ORIGINAL
-// (pre-stamp) record into wal.overlay, so every overlay record carried a stale
-// txid. Nothing reads that field today, but it exists for future crash-recovery
-// ordering, so it must be correct now rather than silently wrong.
-// -----------------------------------------------------------------------------
-
+// TestWAL_OverlayRecordsCarryCommittedTxid checks the transaction ID on each committed WAL record.
 func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
@@ -4787,14 +5092,7 @@ func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Bug 5 — a single key/value pair that alone overflows a page cannot be split
-// (both halves of a split must be non-empty), so it used to fail with the
-// internal ErrNodeNotSaturated leaking straight out of Put. That error describes
-// a split precondition, not something a caller can act on. It must now surface as
-// a clear, documented error instead.
-// -----------------------------------------------------------------------------
-
+// TestPut_EntryTooLargeForPageReturnsClearError checks the error for an entry that cannot fit in one page.
 func TestPut_EntryTooLargeForPageReturnsClearError(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
@@ -4830,12 +5128,7 @@ func TestPut_EntryTooLargeForPageDoesNotChangeDatabase(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Bug 6 — a *Bucket must own a private copy of its name. CreateBucket and Bucket
-// must not retain the caller's mutable buffer for the stored catalog entry or the
-// transaction bucket cache.
-// -----------------------------------------------------------------------------
-
+// TestCreateBucket_OwnsNameAfterCallerMutatesBuffer checks that the bucket does not keep the caller's mutable name slice.
 func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 	path := tempfile()
 	db, err := openDB(path)
@@ -4948,11 +5241,7 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 	}
 }
 
-// -----------------------------------------------------------------------------
-// Bug 7 — a required WAL sync is the commit point. A checkpoint failure after
-// that sync must keep the committed WAL and overlay state and return success.
-// -----------------------------------------------------------------------------
-
+// TestUpdate_FailedCheckpointDoesNotLeakOverlayData checks that a checkpoint failure does not undo a committed WAL write.
 func TestUpdate_FailedCheckpointDoesNotLeakOverlayData(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)

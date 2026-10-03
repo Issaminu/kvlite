@@ -16,7 +16,7 @@ import (
 //
 // A nested bucket is returned with a nil value. A stored empty value has a non-nil value with length zero.
 //
-// Do not change the bucket while a cursor is in use. A change makes the saved cursor position out of date. Later movement returns [ErrCursorInvalidated]. Create a new cursor after the change.
+// Do not change the bucket while a cursor is in use. A change makes the saved cursor position out of date. Removing the bucket or one of its parents also invalidates the cursor. Later movement returns [ErrCursorInvalidated]. Create a new cursor after the change if the bucket still exists.
 type Cursor struct {
 	bucket        *Bucket
 	treeCursor    btree.Cursor
@@ -25,8 +25,8 @@ type Cursor struct {
 
 // Cursor creates a cursor for bucket. A new cursor has no current entry. Call [Cursor.First], [Cursor.Last], or [Cursor.Seek] before [Cursor.Next] or [Cursor.Prev].
 func (bucket *Bucket) Cursor() (*Cursor, error) {
-	if bucket.tx.closed {
-		return nil, ErrTxClosed
+	if err := bucket.liveError(); err != nil {
+		return nil, err
 	}
 	if err := bucket.loadRootNode(); err != nil {
 		return nil, err
@@ -81,6 +81,9 @@ func (cursor *Cursor) Prev() ([]byte, []byte, error) {
 func (cursor *Cursor) checkValid() error {
 	if cursor.bucket.tx.closed {
 		return ErrTxClosed
+	}
+	if err := cursor.bucket.liveError(); err != nil {
+		return ErrCursorInvalidated
 	}
 	if cursor.bucketVersion != cursor.bucket.treeVersion {
 		return ErrCursorInvalidated
@@ -183,8 +186,8 @@ func prefixRangeEnd(prefix []byte) []byte {
 //
 // If fn returns an error, ScanRange stops and returns that error. A nil fn returns [ErrScanCallbackRequired].
 func (bucket *Bucket) ScanRange(start, end []byte, fn func(key, value []byte) error) error {
-	if bucket.tx.closed {
-		return ErrTxClosed
+	if err := bucket.liveError(); err != nil {
+		return err
 	}
 	if fn == nil {
 		return ErrScanCallbackRequired

@@ -72,6 +72,29 @@ func TestTreeDeleteEntryValidatesKeyAndRejectsBucket(t *testing.T) {
 	}
 }
 
+func TestTreeDeleteBucketEntryRejectsPlainValue(t *testing.T) {
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	root := NewLeafNode(2)
+	store.StageNode(root)
+	if err := root.InsertEntry(NewEntry(0, []byte("plain"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := root.InsertEntry(NewEntry(BucketLeafFlag, []byte("nested"), page.EncodeID(9))); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := tree.DeleteBucketEntry(root, []byte("plain")); !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("plain value: got %v, want ErrIncompatibleValue", err)
+	}
+	root, found, err := tree.DeleteBucketEntry(root, []byte("nested"))
+	if err != nil || !found {
+		t.Fatalf("bucket delete: found %t, error %v", found, err)
+	}
+	if _, found, err := tree.FindEntryRef(root, []byte("nested")); err != nil || found {
+		t.Fatalf("deleted bucket entry: found %t, error %v", found, err)
+	}
+}
+
 func TestTreeDeleteEntryDoesNotDirtyUnchangedParent(t *testing.T) {
 	store := &memoryTreeStore{pageSize: 256, nextID: 5, nodes: make(map[page.ID]*Node)}
 	tree := NewTree(store)

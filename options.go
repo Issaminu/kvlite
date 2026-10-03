@@ -30,7 +30,7 @@ const (
 
 // Options configures [Open]. Open resolves the zero values described below and then copies the result, so callers can reuse or change their Options after Open returns.
 type Options struct {
-	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. Because this mode cannot write, [DB.Update] and [DB.Put] return [ErrDatabaseReadOnly].
+	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. Because this mode cannot write, [DB.Update], [DB.Put], [DB.Delete], and [DB.DeleteBucket] return [ErrDatabaseReadOnly].
 	ReadOnly bool
 
 	// LockTimeout limits how long [Open] waits for a conflicting database-file lock. A zero value waits until the other handle closes, a positive value returns an error that matches [ErrDatabaseLocked] after that duration, and a negative value is invalid. KVLite holds the lock for the full [DB] lifetime, not for one transaction.

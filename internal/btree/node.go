@@ -257,12 +257,12 @@ func (n *Node) InsertEntry(entry Entry) error {
 	return nil
 }
 
-func (n *Node) prepareDelete(key []byte) (int, bool, error) {
+func (n *Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
 	index, found, err := n.findKeyIndex(key)
 	if err != nil || !found {
 		return 0, found, err
 	}
-	if n.entries[index].flags&BucketLeafFlag != 0 {
+	if (n.entries[index].flags&BucketLeafFlag != 0) != bucket {
 		return 0, false, ErrIncompatibleValue
 	}
 	return index, true, nil
