@@ -48,10 +48,10 @@ Select the measured workload when you do not need the complete suite:
 
 The workload values have these meanings:
 
-- `focused` runs point reads and a combined point-update, point-insert, and 10-key batch-update cycle in both durability modes. It is the light default.
+- `focused` runs one random point read, one combined point-update, point-insert, and 10-key batch-update cycle, and one random point delete in both durability modes. It is the light default.
 - `reads` runs pure read workloads.
 - `writes` runs update, insert, delete, reuse, and space-recovery workloads.
-- `deletes` runs only delete, reuse, and space-recovery workloads.
+- `deletes` runs key delete, bucket delete, reuse, and space-recovery workloads.
 - `mixed` runs workloads that combine reads and writes.
 - `all` runs every workload, including life-cycle cases. It is the medium and large default.
 
@@ -75,7 +75,7 @@ The `storage` modifier is independent of the profile and workload. `tmpfs` uses 
 
 The light profile compares the selected engines in Docker. It skips pre-run test passes. Its wider workloads use 1,000 records, 1,000 point reads, 100 point writes, 1,000 mixed operations, and 320 concurrent point writes. It runs one warm-up and records six samples for each selected engine and durability mode.
 
-The focused workload selects the four critical data paths: random point read, random point update, random point insert, and random 10-key batch update. Each sample uses at least 100,000 reads and 1,000 fixed write cycles. The three write paths run in one cycle. This cycle gives each write sample enough work and reports one combined signal. The cases run in durable and no-sync modes. KVLite, bbolt, and Redis run the same operations. Focused uses one CPU by default. `KVBENCH_CPUSET` can select a different CPU set. Mixed, scan, lifecycle, and collection work remain in the wider workloads. Use `light --workloads=focused` for quick repeated code-regression comparisons.
+The focused workload selects five data paths: random point read, random point update, random point insert, random 10-key batch update, and random point delete of an existing key with one client. Each sample uses at least 100,000 reads, 1,000 fixed write cycles, and 1,000 point deletes in the light profile. The three write paths run in one cycle and report one combined signal. Point deletes report a separate result. The cases run in durable and no-sync modes. KVLite, bbolt, and Redis run the same operations. Focused uses one CPU by default. `KVBENCH_CPUSET` can select a different CPU set. Mixed, scan, lifecycle, and collection work remain in the wider workloads. Use `light --workloads=focused` for quick repeated code-regression comparisons.
 
 The medium profile uses 3,000 records for its main cases. It uses 10,000 point reads, 200 single-client point writes, 640 concurrent point writes, and 2,000 mixed operations. It keeps 15 core cases. These cases cover misses, sequential and random reads, large values, value growth, inserts, updates, concurrency, mixed work, and batches.
 
@@ -182,6 +182,8 @@ The delete group runs the same fixed key operations through all three engines. I
 
 The group tests one delete-and-insert cycle and ten repeated cycles. It measures file growth before and after close and reopen. A separate case deletes upper keys and measures logical file size and operating-system file blocks. Another case measures reopen after alternating keys are deleted.
 
+`BenchmarkDeleteBuckets` removes 100 populated top-level buckets. Each bucket has 10, 30, or 100 keys in the light, medium, or large profile. It times one committed delete call per bucket. Setup and checks run outside the timer. This case compares KVLite and bbolt. Redis has no native buckets, so it does not run this case. The focused workload runs only the random one-client key-delete case.
+
 KVLite can reuse free pages inside its file. Checkpoint can release a free file suffix to the operating system. The cases do not run bbolt compaction or Redis AOF rewrite. `BenchmarkDeleteVisibility` measures the next read in the same client. It does not measure replication.
 
 ## Metrics
@@ -233,6 +235,7 @@ The suite does not report cross-engine Go allocation values. Redis server alloca
 | Point delete, one client   | `DB.Delete`           | `DB.Update`           | `DEL`              |
 | Point delete, many clients | `DB.Delete`           | `DB.Batch`            | `DEL`              |
 | Batch delete              | One write transaction | One write transaction | One variadic `DEL` |
+| Whole top-level bucket delete | `DB.DeleteBucket` | `DB.Update` with `Tx.DeleteBucket` | No native bucket |
 | Mixed transaction         | One write transaction | One write transaction | `MULTI` and `EXEC` |
 | Prefix enumeration        | Ordered prefix cursor | Ordered prefix cursor | `SCAN` and `MGET`  |
 | Key count                 | Bucket cursor scan    | Bucket cursor scan    | `DBSIZE`           |

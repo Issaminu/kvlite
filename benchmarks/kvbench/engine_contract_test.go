@@ -45,6 +45,46 @@ func TestRedisEngineContract(t *testing.T) {
 	testEngineContract(t, engine)
 }
 
+func TestBucketDeleteEngineContract(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		open func(*testing.T, DurabilityMode) Engine
+	}{
+		{name: "kvlite", open: openTestKVLiteEngine},
+		{name: "bbolt", open: openTestBBoltEngine},
+	} {
+		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
+			t.Run(test.name+"/"+string(mode), func(t *testing.T) {
+				engine := test.open(t, mode)
+				t.Cleanup(func() {
+					if err := engine.Close(); err != nil {
+						t.Errorf("close engine: %v", err)
+					}
+				})
+				buckets, ok := engine.(bucketDeleteEngine)
+				if !ok {
+					t.Fatal("engine does not support bucket deletion")
+				}
+				ctx := context.Background()
+				name := []byte("delete-me")
+				pairs := []Pair{{Key: []byte("key"), Value: []byte("value")}}
+				if err := buckets.PrepareBucket(ctx, name, pairs); err != nil {
+					t.Fatal(err)
+				}
+				if exists, err := buckets.BucketExists(ctx, name); err != nil || !exists {
+					t.Fatalf("prepared bucket: exists=%t, error=%v", exists, err)
+				}
+				if err := buckets.DeleteBucket(ctx, name); err != nil {
+					t.Fatal(err)
+				}
+				if exists, err := buckets.BucketExists(ctx, name); err != nil || exists {
+					t.Fatalf("deleted bucket: exists=%t, error=%v", exists, err)
+				}
+			})
+		}
+	}
+}
+
 func testEngineContract(t *testing.T, engine Engine) {
 	t.Helper()
 	t.Cleanup(func() {

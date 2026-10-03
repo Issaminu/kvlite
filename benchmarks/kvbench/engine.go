@@ -77,6 +77,12 @@ type collectionEngine interface {
 	GetCollection(context.Context, [][]byte, []byte) ([]byte, error)
 }
 
+type bucketDeleteEngine interface {
+	PrepareBucket(context.Context, []byte, []Pair) error
+	DeleteBucket(context.Context, []byte) error
+	BucketExists(context.Context, []byte) (bool, error)
+}
+
 type engineOpenOptions struct {
 	Kind         EngineKind
 	Mode         DurabilityMode

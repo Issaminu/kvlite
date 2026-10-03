@@ -110,7 +110,7 @@ func TestBatchCasesWriteEachRecordOnce(t *testing.T) {
 }
 
 func TestDeleteWorkloadSelection(t *testing.T) {
-	for _, workload := range []string{"all", "writes", "deletes"} {
+	for _, workload := range []string{"all", "writes", "deletes", "focused"} {
 		t.Run(workload, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", workload)
 			if !workloadEnabled(benchmarkDelete) {
@@ -118,7 +118,7 @@ func TestDeleteWorkloadSelection(t *testing.T) {
 			}
 		})
 	}
-	for _, workload := range []string{"reads", "mixed", "focused"} {
+	for _, workload := range []string{"reads", "mixed"} {
 		t.Run(workload, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", workload)
 			if workloadEnabled(benchmarkDelete) {
@@ -143,6 +143,15 @@ func TestDeleteBenchmarkProfiles(t *testing.T) {
 				t.Fatalf("delete cases: got %d, want %d", got, test.want)
 			}
 		})
+	}
+}
+
+func TestFocusedDeleteBenchmarkCase(t *testing.T) {
+	t.Setenv("KVBENCH_WORKLOAD", "focused")
+	t.Setenv("KVBENCH_PROFILE", "light")
+	cases := deleteBenchmarkCases()
+	if len(cases) != 1 || cases[0].name != "existing/random/clients=1" {
+		t.Fatalf("focused delete cases: %+v", cases)
 	}
 }
 

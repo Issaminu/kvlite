@@ -29,6 +29,9 @@ func deleteBenchmarkCases() []deleteBenchmarkCase {
 		{name: "missing/random/clients=1", records: records, operations: records, order: keyOrderRandom, clients: 1, batchSize: 1, missing: true},
 		{name: "existing/sequential/clients=1/batch=100", records: records, operations: records / 100, order: keyOrderSequential, clients: 1, batchSize: 100},
 	}
+	if os.Getenv("KVBENCH_WORKLOAD") == "focused" {
+		return cases[:1]
+	}
 	if !lightProfile() && !mediumProfile() {
 		cases = append(cases,
 			deleteBenchmarkCase{name: "existing/sequential/clients=1", records: records, operations: records, order: keyOrderSequential, clients: 1, batchSize: 1},
@@ -77,6 +80,67 @@ func BenchmarkDeleteOperations(b *testing.B) {
 			reportDeleteStorage(b, engine)
 		})
 	}
+}
+
+func BenchmarkDeleteBuckets(b *testing.B) {
+	if !workloadEnabled(benchmarkDelete) || os.Getenv("KVBENCH_WORKLOAD") == "focused" {
+		b.Skip("bucket delete workloads are not selected")
+	}
+	environment := readBenchmarkEnvironment(b)
+	if environment.kind == EngineRedis {
+		b.Skip("Redis does not have native buckets")
+	}
+	const bucketCount = 100
+	keysPerBucket := profileSizedValue(100, 30, 10)
+	pairs, err := makePairs(keysPerBucket, 128, 1, keyOrderSequential, 1)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Run(fmt.Sprintf("%s/top-level/buckets=%d/keys-per-bucket=%d/%s", environment.mode, bucketCount, keysPerBucket, environment.kind), func(b *testing.B) {
+		options := engineOpenOptions{Kind: environment.kind, Mode: DurabilityDurable, DataDir: b.TempDir(), ClientCount: 1}
+		engine, err := openEngine(b.Context(), options)
+		if err != nil {
+			b.Fatal(err)
+		}
+		buckets := engine.(bucketDeleteEngine)
+		names := make([][]byte, bucketCount)
+		for index := range names {
+			names[index] = fmt.Appendf(nil, "delete-bucket-%03d", index)
+			if err := buckets.PrepareBucket(b.Context(), names[index], pairs); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if err := engine.Close(); err != nil {
+			b.Fatal(err)
+		}
+		options.Mode = environment.mode
+		engine, err = openEngine(b.Context(), options)
+		if err != nil {
+			b.Fatal(err)
+		}
+		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
+		buckets = engine.(bucketDeleteEngine)
+		b.ResetTimer()
+		for _, name := range names {
+			if err := buckets.DeleteBucket(b.Context(), name); err != nil {
+				b.Fatal(err)
+			}
+		}
+		b.StopTimer()
+		for _, name := range names {
+			exists, err := buckets.BucketExists(b.Context(), name)
+			if err != nil || exists {
+				b.Fatalf("bucket %q remains after delete: exists=%t, error=%v", name, exists, err)
+			}
+		}
+		if err := engine.Validate(b.Context()); err != nil {
+			b.Fatal(err)
+		}
+		b.ReportMetric(float64(bucketCount)/b.Elapsed().Seconds(), "buckets/s")
+		b.ReportMetric(float64(bucketCount*keysPerBucket)/b.Elapsed().Seconds(), "keys/s")
+		b.ReportMetric(float64(b.Elapsed().Nanoseconds())/bucketCount, "ns/op")
+		reportDeleteStorage(b, engine)
+	})
 }
 
 func runDeleteTransactions(b *testing.B, engine Engine, pairs []Pair, transactions, batchSize, clients int) error {

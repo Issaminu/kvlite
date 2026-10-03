@@ -182,7 +182,7 @@ func workloadEnabled(operation benchmarkOperation) bool {
 	case "mixed":
 		return operation == benchmarkMixed
 	case "focused":
-		return operation != benchmarkDelete
+		return true
 	default:
 		panic("unknown KVBENCH_WORKLOAD")
 	}

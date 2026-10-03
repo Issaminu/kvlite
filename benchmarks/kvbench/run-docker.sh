@@ -153,23 +153,23 @@ readonly selected_engines
 readonly uses_redis
 
 if [[ "${benchmark_workload}" == "focused" ]]; then
-	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|FocusedWrites)$'
+	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|FocusedWrites|DeleteOperations)$'
 else
 	case "${benchmark_workload}" in
 	reads)
 		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections)$'
 		;;
 	writes)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|Latency|Collections)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|Latency|Collections)$'
 		;;
 	deletes)
-		readonly benchmark_filter='^Benchmark(DeleteOperations|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete)$'
+		readonly benchmark_filter='^Benchmark(DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete)$'
 		;;
 	mixed)
 		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
 		;;
 	all)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
 		;;
 	esac
 fi
