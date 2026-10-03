@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/Issaminu/kvlite"
+	"github.com/Issaminu/kvlite/internal/btree"
 )
 
 type kvliteEngine struct {
@@ -58,7 +59,7 @@ func (engine *kvliteEngine) ensureBucket() error {
 
 func (engine *kvliteEngine) Get(_ context.Context, key []byte) ([]byte, error) {
 	value, err := engine.db.Get(benchmarkBucketName, key)
-	if errors.Is(err, kvlite.ErrKeyNotFound) {
+	if errors.Is(err, btree.ErrKeyNotFound) {
 		return nil, ErrKeyNotFound
 	}
 	return value, err
@@ -73,7 +74,7 @@ func (engine *kvliteEngine) GetBatch(_ context.Context, keys [][]byte) ([][]byte
 		}
 		for index, key := range keys {
 			value, err := bucket.Get(key)
-			if errors.Is(err, kvlite.ErrKeyNotFound) {
+			if errors.Is(err, btree.ErrKeyNotFound) {
 				return ErrKeyNotFound
 			}
 			if err != nil {
@@ -318,7 +319,7 @@ func (engine *kvliteEngine) GetCollection(_ context.Context, path [][]byte, key 
 			return err
 		}
 		found, err := bucket.Get(key)
-		if errors.Is(err, kvlite.ErrKeyNotFound) {
+		if errors.Is(err, btree.ErrKeyNotFound) {
 			return ErrKeyNotFound
 		}
 		value = bytes.Clone(found)

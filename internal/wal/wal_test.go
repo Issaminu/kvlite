@@ -13,6 +13,23 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+func TestWALValidationErrors(t *testing.T) {
+	if _, err := EncodedWALRecordSize(&WALRecord{Payload: make([]byte, 65)}, 64); !errors.Is(err, ErrRecordPayloadTooLarge) {
+		t.Fatalf("oversized record: got %v, want ErrRecordPayloadTooLarge", err)
+	}
+
+	log := New(Config{PageSize: 64})
+	if _, err := log.encodeTransaction([]NodeRecord{{}}, nil, nil, 1); !errors.Is(err, ErrNodeRecordMissingFinal) {
+		t.Fatalf("node without final state: got %v, want ErrNodeRecordMissingFinal", err)
+	}
+	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1); !errors.Is(err, ErrNodePageMismatch) {
+		t.Fatalf("changed node page ID: got %v, want ErrNodePageMismatch", err)
+	}
+	if _, err := CommittedPageToNode(&CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
+		t.Fatalf("page without payload: got %v, want ErrRecordPayloadRequired", err)
+	}
+}
+
 func TestWALCommit_WritesDatabaseFormatHeader(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {

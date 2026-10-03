@@ -87,7 +87,7 @@ func EncodeWALRecord(record *WALRecord, pageSize int64) ([]byte, error) {
 func EncodedWALRecordSize(record *WALRecord, pageSize int64) (int, error) {
 	payloadSize := len(record.Payload)
 	if int64(payloadSize) > pageSize {
-		return 0, fmt.Errorf("record payload exceeds page size (%d > %d)", payloadSize, pageSize)
+		return 0, fmt.Errorf("record payload %d bytes, page size %d bytes: %w", payloadSize, pageSize, ErrRecordPayloadTooLarge)
 	}
 	return HeaderSize + payloadSize + ChecksumSize, nil
 }

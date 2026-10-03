@@ -8,6 +8,7 @@ import (
 )
 
 var (
+	ErrPathRequired         = errors.New("path required") // ErrPathRequired means Open received an empty path.
 	ErrDatabaseNotOpen      = errors.New("database not open")
 	ErrDatabaseLocked       = errors.New("database is locked") // ErrDatabaseLocked means Open did not acquire a conflicting database-file lock before the configured positive timeout expired.
 	ErrInvalid              = page.ErrInvalid

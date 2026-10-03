@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 // checkpointWAL copies committed WAL pages into the main file.
@@ -39,7 +41,7 @@ func (db *DB) logicalFileSize() (int64, error) {
 	pageSize := db.meta.PageSize()
 	lastPage := uint64(db.meta.LastPage())
 	if pageSize <= 0 || lastPage >= uint64(math.MaxInt64)/uint64(pageSize) {
-		return 0, fmt.Errorf("calculate database file size: %w", ErrInvalid)
+		return 0, fmt.Errorf("calculate database file size: %w", page.ErrInvalid)
 	}
 	return int64(lastPage+1) * pageSize, nil
 }

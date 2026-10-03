@@ -26,6 +26,10 @@
 //
 // KVLite copies keys and values when it stores them. The caller can reuse or change its input slices after a write returns. [DB.Get] also returns a copy. [Bucket.Get] and [Cursor] return read-only data owned by their transaction. Use [bytes.Clone] to keep that data after the transaction ends.
 //
+// # Errors
+//
+// KVLite defines named errors for its own failure conditions. Use [errors.Is] to check a named error, including one that has more detail. File operations can return operating-system errors. A transaction can return an error from its callback.
+//
 // # Files and closing
 //
 // KVLite locks the database file while a [DB] is open. A writable DB prevents another KVLite DB from opening the same file. Read-only DBs can open the same file together.

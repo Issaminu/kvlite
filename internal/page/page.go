@@ -2,14 +2,7 @@ package page
 
 import (
 	"encoding/binary"
-	"errors"
 	"fmt"
-)
-
-var (
-	ErrInvalid         = errors.New("invalid database")
-	ErrVersionMismatch = errors.New("version mismatch")
-	ErrChecksum        = errors.New("checksum error")
 )
 
 // Identifier for the page number (Pgid)

@@ -1,7 +1,6 @@
 package btree
 
 import (
-	"errors"
 	"fmt"
 	"slices"
 
@@ -459,7 +458,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				if !redistributeChildren(parent, step.childIndex, node, right, pageSize, minimumSize) {
 					// The trial used the same rule on copies. It must also
 					// work on the pages we now change.
-					return nil, errors.New("selected right redistribution is not valid")
+					return nil, fmt.Errorf("selected right redistribution: %w", ErrRedistributionInvalid)
 				}
 				// The right page now starts at a different key. Put that key
 				// in the parent so future searches reach the right page.
@@ -486,7 +485,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			if !redistributeChildren(parent, step.childIndex-1, left, node, pageSize, minimumSize) {
 				// The trial used the same rule on copies. It must also
 				// work on the pages we now change.
-				return nil, errors.New("selected left redistribution is not valid")
+				return nil, fmt.Errorf("selected left redistribution: %w", ErrRedistributionInvalid)
 			}
 			// The changed page got entries from the left page. Use its new
 			// first key in the parent.

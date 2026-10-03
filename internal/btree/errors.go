@@ -20,4 +20,7 @@ var (
 	ErrEntryTooLarge     = errors.New("entry cannot fit the fixed-page tree representation")
 )
 
+// ErrRedistributionInvalid means a planned page redistribution could not run.
+var ErrRedistributionInvalid = errors.New("selected redistribution is not valid")
+
 const BucketLeafFlag uint32 = 0x01

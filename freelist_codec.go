@@ -111,7 +111,7 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 		}
 	}
 	if meta.LastPage() > availableLastPage {
-		return nil, fmt.Errorf("metadata last page %d exceeds main-file and WAL page IDs: %w", meta.LastPage(), ErrInvalid)
+		return nil, fmt.Errorf("metadata last page %d exceeds main-file and WAL page IDs: %w", meta.LastPage(), page.ErrInvalid)
 	}
 
 	bitmap := &allocationBitmap{pageSize: meta.PageSize()}
@@ -148,19 +148,19 @@ func sealAllocationPage(data []byte) {
 // verifyAllocationPage checks the exact page size, checksum, magic value, and expected physical page ID.
 func verifyAllocationPage(data []byte, pageSize int64, pageID page.ID) error {
 	if int64(len(data)) != pageSize || len(data) < allocationHeaderSize {
-		return fmt.Errorf("decode allocation page size: %w", ErrInvalid)
+		return fmt.Errorf("decode allocation page size: %w", page.ErrInvalid)
 	}
 	storedChecksum := binary.LittleEndian.Uint32(data[allocationChecksumOffset : allocationChecksumOffset+allocationChecksumSize])
 	if storedChecksum != checksum.Sum32(data[:allocationChecksumOffset], data[allocationPageIDOffset:]) {
-		return fmt.Errorf("verify allocation page: %w", ErrChecksum)
+		return fmt.Errorf("verify allocation page: %w", page.ErrChecksum)
 	}
 	magic := binary.LittleEndian.Uint32(data[allocationMagicOffset : allocationMagicOffset+allocationMagicSize])
 	if magic != allocationSegmentMagic {
-		return fmt.Errorf("decode allocation page magic: %w", ErrInvalid)
+		return fmt.Errorf("decode allocation page magic: %w", page.ErrInvalid)
 	}
 	storedPageID := page.ID(binary.LittleEndian.Uint64(data[allocationPageIDOffset : allocationPageIDOffset+allocationPageIDSize]))
 	if storedPageID != pageID {
-		return fmt.Errorf("allocation page stores page %d, want %d: %w", storedPageID, pageID, ErrInvalid)
+		return fmt.Errorf("allocation page stores page %d, want %d: %w", storedPageID, pageID, page.ErrInvalid)
 	}
 	return nil
 }

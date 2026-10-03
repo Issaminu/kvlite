@@ -28,7 +28,7 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 		if record.Header.Type == wal.RecordTypeAllocation && !db.allocation.isSegmentPage(record.Header.PageID) {
 			pagesPerSegment := db.allocation.pagesPerSegment()
 			if record.Header.PageID <= db.meta.LastPage() || record.Header.PageID%pagesPerSegment != 0 || record.Header.TxID >= latestMetaTxID {
-				return fmt.Errorf("allocation WAL record targets page %d: %w", record.Header.PageID, ErrInvalid)
+				return fmt.Errorf("allocation WAL record targets page %d: %w", record.Header.PageID, page.ErrInvalid)
 			}
 			continue
 		}
@@ -117,7 +117,7 @@ func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
 			if index == len(records)-1 {
 				return committed, nil
 			}
-			return nil, ErrInvalid
+			return nil, page.ErrInvalid
 		}
 
 		committed = append(committed, pending...)

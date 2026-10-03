@@ -4,11 +4,12 @@ package kvlite
 
 import (
 	"errors"
+	"fmt"
 	"os"
 )
 
 func systemMapMainFile(*os.File, int) ([]byte, error) {
-	return nil, errors.New("main-file mapping is not supported")
+	return nil, fmt.Errorf("main-file mapping: %w", errors.ErrUnsupported)
 }
 
 func systemUnmapMainFile([]byte) error {

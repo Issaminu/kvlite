@@ -93,7 +93,7 @@ func (db *DB) endOperation() {
 	db.activeOperations.Done()
 }
 
-// Open opens the database at path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
+// Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
 //
@@ -104,7 +104,7 @@ func (db *DB) endOperation() {
 // The caller must call [DB.Close] when the database is no longer needed and must check its error.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if path == "" {
-		return nil, errors.New("path required")
+		return nil, ErrPathRequired
 	}
 
 	resolvedOptions, err := resolveOptions(options)
@@ -146,7 +146,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 			mainMetaErr = fmt.Errorf("read db meta: %w", mainMetaErr)
 		}
 		// An unsupported main-file format can use another WAL layout. Current-format WAL data must not replace it.
-		if errors.Is(mainMetaErr, ErrVersionMismatch) {
+		if errors.Is(mainMetaErr, page.ErrVersionMismatch) {
 			return db.failOpen(mainMetaErr)
 		}
 		if walPageSize == 0 {
@@ -245,7 +245,7 @@ func (db *DB) loadRootNode() error {
 		return err
 	}
 	if rootNode == nil {
-		return fmt.Errorf("read root node: got nil")
+		return fmt.Errorf("read root node: got nil: %w", page.ErrInvalid)
 	}
 	db.rootNode = rootNode
 	return nil
@@ -571,7 +571,7 @@ func (db *DB) readMetaAt(offset int64) (*page.Meta, error) {
 	data := make([]byte, page.MetaSize)
 	reader := io.NewSectionReader(db.file, offset, page.MetaSize)
 	if err := fileio.ReadFull(reader, data); err != nil {
-		return nil, errors.Join(ErrInvalid, err)
+		return nil, errors.Join(page.ErrInvalid, err)
 	}
 	return page.DecodeMeta(data)
 }
@@ -583,13 +583,13 @@ func validMetaPageSize(pageSize int64) bool {
 // validateMeta checks the file marker, format version, checksum, and supported page size.
 func validateMeta(meta *page.Meta) error {
 	if meta == nil {
-		return ErrInvalid
+		return page.ErrInvalid
 	}
 	if err := meta.Validate(); err != nil {
 		return err
 	}
 	if !validMetaPageSize(meta.PageSize()) {
-		return fmt.Errorf("invalid database page size %d: %w", meta.PageSize(), ErrInvalid)
+		return fmt.Errorf("invalid database page size %d: %w", meta.PageSize(), page.ErrInvalid)
 	}
 	return nil
 }
@@ -613,7 +613,7 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 	}
 
 	var meta1 *page.Meta
-	meta1Err := error(ErrInvalid)
+	meta1Err := error(page.ErrInvalid)
 	for _, pageSize := range pageSizes {
 		candidate, readErr := db.readMetaAt(pageSize)
 		if readErr != nil {
@@ -623,7 +623,7 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 
 		candidateErr := validateMeta(candidate)
 		if candidateErr == nil && candidate.PageSize() != pageSize {
-			candidateErr = fmt.Errorf("metadata page size %d does not match page offset %d: %w", candidate.PageSize(), pageSize, ErrInvalid)
+			candidateErr = fmt.Errorf("metadata page size %d does not match page offset %d: %w", candidate.PageSize(), pageSize, page.ErrInvalid)
 		}
 		if candidateErr == nil {
 			meta1 = candidate
@@ -640,7 +640,7 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 	switch {
 	case meta0Err == nil && meta1Err == nil:
 		if meta1.Generation() == meta0.Generation() && !bytes.Equal(page.EncodeMeta(meta0), page.EncodeMeta(meta1)) {
-			return nil, meta0.PageSize(), fmt.Errorf("metadata pages have different contents at generation %d: %w", meta0.Generation(), ErrInvalid)
+			return nil, meta0.PageSize(), fmt.Errorf("metadata pages have different contents at generation %d: %w", meta0.Generation(), page.ErrInvalid)
 		}
 		if meta1.Generation() > meta0.Generation() {
 			return meta1, meta1.PageSize(), nil

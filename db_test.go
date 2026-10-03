@@ -1808,11 +1808,11 @@ func TestOpen(t *testing.T) {
 	}
 }
 
-// TestOpen_ErrPathRequired ensures that opening with a blank path returns an error.
+// TestOpen_ErrPathRequired checks the error from an empty path.
 func TestOpen_ErrPathRequired(t *testing.T) {
 	_, err := Open("", 0600, nil)
-	if err == nil {
-		t.Fatalf("expected error")
+	if !errors.Is(err, ErrPathRequired) {
+		t.Fatalf("Open with an empty path: got %v, want ErrPathRequired", err)
 	}
 }
 

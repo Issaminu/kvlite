@@ -61,7 +61,7 @@ func (db *DB) refreshMainFileMapping() error {
 func (db *DB) readMainPage(pageID page.ID) ([]byte, error) {
 	pageSize := db.meta.PageSize()
 	if pageSize <= 0 || uint64(pageID) > uint64(math.MaxInt64)/uint64(pageSize) {
-		return nil, fmt.Errorf("read page %d offset: %w", pageID, ErrInvalid)
+		return nil, fmt.Errorf("read page %d offset: %w", pageID, page.ErrInvalid)
 	}
 	offset := int64(pageID) * pageSize
 	mappedSize := int64(len(db.mappedFile))

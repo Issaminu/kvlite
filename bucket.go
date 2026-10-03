@@ -189,17 +189,17 @@ func (tx *Tx) openBucket(entry btree.Entry, parent *Bucket) (*Bucket, error) {
 
 func decodeBucketRootPageID(entry btree.Entry) (page.ID, error) {
 	if entry.Flags()&btree.BucketLeafFlag == 0 {
-		return 0, ErrIncompatibleValue
+		return 0, btree.ErrIncompatibleValue
 	}
 	return page.DecodeID(entry.Value())
 }
 
 func valueFromEntry(entry btree.Entry, found bool) ([]byte, error) {
 	if !found {
-		return nil, ErrKeyNotFound
+		return nil, btree.ErrKeyNotFound
 	}
 	if entry.Flags()&btree.BucketLeafFlag != 0 {
-		return nil, ErrIncompatibleValue
+		return nil, btree.ErrIncompatibleValue
 	}
 	return entry.Value(), nil
 }

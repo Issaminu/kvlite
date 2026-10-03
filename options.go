@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"time"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 // Sync controls when committed write-ahead log data is synchronized to storage.
@@ -63,11 +65,11 @@ func resolveOptions(options *Options) (*Options, error) {
 	}
 
 	if resolved.LockTimeout < 0 {
-		return nil, fmt.Errorf("invalid database lock timeout %s: %w", resolved.LockTimeout, ErrInvalid)
+		return nil, fmt.Errorf("invalid database lock timeout %s: %w", resolved.LockTimeout, page.ErrInvalid)
 	}
 
 	if resolved.Synchronous != SyncFull && resolved.Synchronous != SyncNormal && resolved.Synchronous != SyncNone {
-		return nil, fmt.Errorf("invalid synchronous mode %d: %w", resolved.Synchronous, ErrInvalid)
+		return nil, fmt.Errorf("invalid synchronous mode %d: %w", resolved.Synchronous, page.ErrInvalid)
 	}
 	return &resolved, nil
 }

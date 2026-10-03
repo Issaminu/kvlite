@@ -125,12 +125,12 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	transactionSize := HeaderSize + ChecksumSize
 	for index := range nodes {
 		if nodes[index].Final == nil {
-			return nil, fmt.Errorf("WAL node record has no final node")
+			return nil, ErrNodeRecordMissingFinal
 		}
 		// Size for the complete final image: patches are only written when smaller, so this is a safe upper bound for the encoding buffer capacity.
 		payloadSize := btree.WALNodeEncodedSize(nodes[index].Final)
 		if int64(payloadSize) > wal.pageSize {
-			return nil, fmt.Errorf("record payload exceeds page size (%d > %d)", payloadSize, wal.pageSize)
+			return nil, fmt.Errorf("record payload %d bytes, page size %d bytes: %w", payloadSize, wal.pageSize, ErrRecordPayloadTooLarge)
 		}
 		transactionSize += HeaderSize + payloadSize + ChecksumSize
 	}
@@ -142,7 +142,7 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	}
 	if len(encodedMeta) > 0 {
 		if int64(len(encodedMeta)) > wal.pageSize {
-			return nil, fmt.Errorf("metadata payload exceeds page size (%d > %d)", len(encodedMeta), wal.pageSize)
+			return nil, fmt.Errorf("metadata payload %d bytes, page size %d bytes: %w", len(encodedMeta), wal.pageSize, ErrRecordPayloadTooLarge)
 		}
 		transactionSize += 2 * (HeaderSize + len(encodedMeta) + ChecksumSize)
 	}
@@ -182,7 +182,7 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 		return appendEncodedNodeRecord(transaction, header, record.Final), nil
 	}
 	if record.Original.PageID() != header.PageID {
-		return nil, fmt.Errorf("WAL node record changes page %d from page %d", header.PageID, record.Original.PageID())
+		return nil, fmt.Errorf("WAL node page %d, original page %d: %w", header.PageID, record.Original.PageID(), ErrNodePageMismatch)
 	}
 
 	wal.pagePatch.reset()
@@ -428,7 +428,7 @@ func CommittedPageToNode(record *CommittedPage) (*btree.Node, error) {
 		return record.Node, nil
 	}
 	if record.Payload == nil {
-		return nil, fmt.Errorf("record has no payload")
+		return nil, ErrRecordPayloadRequired
 	}
 
 	node, err := btree.DecodeWALNode(record.Payload, record.Header.PageID)

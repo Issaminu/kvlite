@@ -125,7 +125,7 @@ func (changes *allocationChanges) allocate(lastPage page.ID) (page.ID, error) {
 	}
 
 	if lastPage == ^page.ID(0) {
-		return 0, fmt.Errorf("allocate after page %d: %w", lastPage, ErrInvalid)
+		return 0, fmt.Errorf("allocate after page %d: %w", lastPage, page.ErrInvalid)
 	}
 	nextPage := lastPage + 1
 	segmentIndex := changes.base.segmentIndex(nextPage)
@@ -136,7 +136,7 @@ func (changes *allocationChanges) allocate(lastPage page.ID) (page.ID, error) {
 		segmentIndex = changes.base.segmentIndex(nextPage)
 	}
 	if segmentIndex >= changes.segmentCount {
-		return 0, fmt.Errorf("allocation segment %d is not present: %w", segmentIndex, ErrInvalid)
+		return 0, fmt.Errorf("allocation segment %d is not present: %w", segmentIndex, page.ErrInvalid)
 	}
 	changes.markAllocated(nextPage)
 	return nextPage, nil
@@ -146,16 +146,16 @@ func (changes *allocationChanges) allocate(lastPage page.ID) (page.ID, error) {
 // It rejects reserved pages, free pages, allocation pages, and repeated retirement.
 func (changes *allocationChanges) retire(pageID page.ID) error {
 	if pageID < firstTreePageID || changes.isSegmentPage(pageID) {
-		return fmt.Errorf("retire reserved page %d: %w", pageID, ErrInvalid)
+		return fmt.Errorf("retire reserved page %d: %w", pageID, page.ErrInvalid)
 	}
 	if !changes.allocated(pageID) {
-		return fmt.Errorf("retire free page %d: %w", pageID, ErrInvalid)
+		return fmt.Errorf("retire free page %d: %w", pageID, page.ErrInvalid)
 	}
 	if changes.retired == nil {
 		changes.retired = make(map[page.ID]struct{})
 	}
 	if _, exists := changes.retired[pageID]; exists {
-		return fmt.Errorf("retire page %d twice: %w", pageID, ErrInvalid)
+		return fmt.Errorf("retire page %d twice: %w", pageID, page.ErrInvalid)
 	}
 	changes.retired[pageID] = struct{}{}
 	changes.pagesRetired++
@@ -558,26 +558,26 @@ func (bitmap *allocationBitmap) allocatedPageCount() uint64 {
 // It checks segment ownership, reserved pages, the root page, and the highest allocated page. It does not walk the tree.
 func (bitmap *allocationBitmap) validate(meta *page.Meta) error {
 	if len(bitmap.segments) == 0 || bitmap.pagesPerSegment() == 0 {
-		return fmt.Errorf("allocation bitmap has no segments: %w", ErrInvalid)
+		return fmt.Errorf("allocation bitmap has no segments: %w", page.ErrInvalid)
 	}
 	wantSegments := bitmap.segmentIndex(meta.LastPage()) + 1
 	if len(bitmap.segments) != wantSegments {
-		return fmt.Errorf("allocation bitmap has %d segments, want %d: %w", len(bitmap.segments), wantSegments, ErrInvalid)
+		return fmt.Errorf("allocation bitmap has %d segments, want %d: %w", len(bitmap.segments), wantSegments, page.ErrInvalid)
 	}
 	for index := range bitmap.segments {
 		segmentPageID := bitmap.segmentPageID(index)
 		if !bitmap.allocated(segmentPageID) {
-			return fmt.Errorf("allocation segment page %d is free: %w", segmentPageID, ErrInvalid)
+			return fmt.Errorf("allocation segment page %d is free: %w", segmentPageID, page.ErrInvalid)
 		}
 		bitmap.segments[index].firstFreeBit = bitmap.findFirstFreeBit(index, 0)
 	}
 	for _, pageID := range []page.ID{page.Meta0ID, page.Meta1ID, meta.Root()} {
 		if !bitmap.allocated(pageID) {
-			return fmt.Errorf("allocation bitmap marks live page %d free: %w", pageID, ErrInvalid)
+			return fmt.Errorf("allocation bitmap marks live page %d free: %w", pageID, page.ErrInvalid)
 		}
 	}
 	if highest := bitmap.highestAllocated(); highest != meta.LastPage() {
-		return fmt.Errorf("allocation high page %d does not match metadata page %d: %w", highest, meta.LastPage(), ErrInvalid)
+		return fmt.Errorf("allocation high page %d does not match metadata page %d: %w", highest, meta.LastPage(), page.ErrInvalid)
 	}
 	bitmap.firstFreeSegment = 0
 	bitmap.advanceFirstFree()
