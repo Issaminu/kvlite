@@ -344,19 +344,19 @@ db, err := kvlite.Open("app.db", 0o600, options)
 
 ## Benchmarks
 
-The current [KVBench](benchmarks/kvbench) report contains the median of 15 measured `large --workloads=all --storage=volume` runs at commit `4848f2d`. At eight clients, KVLite delivered **4.14x the point-read throughput of bbolt** and **19.50x the throughput of Redis**. Its 1.75 µs p99 latency gave it a **4.29x advantage over bbolt** and a **103.48x advantage over Redis**. KVLite also led the highlighted durable point-update, durable point-insert, mixed-work, and clean-open cases.
+The current [KVBench report](BENCHMARKS.md) contains the median of 15 measured `large --workloads=all --storage=volume` runs at commit `c0fff00`. At eight clients, KVLite delivered **3.70x the point-read throughput of bbolt** and **18.25x the throughput of Redis**. Its 2.04 µs p99 latency gave it a **3.70x advantage over bbolt** and an **83.03x advantage over Redis**. KVLite also led the highlighted durable point-update, mixed-work, no-commit-sync key-delete, and clean-open cases.
 
 #### Highlights
 
 | Workload | KVLite | bbolt | Redis | Highlight |
 | --- | ---: | ---: | ---: | --- |
-| Random point reads, eight clients | 3,473,763 keys/s | 839,698 keys/s | 178,184 keys/s | **KVLite: 4.14x bbolt; 19.50x Redis** |
-| Point-read p99, eight clients | 1.75 µs | 7.50 µs | 181.09 µs | **KVLite: 4.29x advantage over bbolt; 103.48x over Redis** |
-| Durable random point updates, batch of 100 | 83,640 keys/s | 17,253 keys/s | 56,312 keys/s | **KVLite: 4.85x bbolt; 1.49x Redis** |
-| Durable random point inserts, eight clients | 7,365 keys/s | 512 keys/s | 5,273 keys/s | **KVLite: 14.40x bbolt; 1.40x Redis** |
-| Durable mixed work, 95% reads | 109,519 operations/s | 10,505 operations/s | 16,825 operations/s | **KVLite: 10.43x bbolt; 6.51x Redis** |
-| No-commit-sync mixed work, 95% reads | 825,681 operations/s | 329,072 operations/s | 154,136 operations/s | **KVLite: 2.51x bbolt; 5.36x Redis** |
-| Open an existing clean database | 69.79 µs | 2.86 ms | Not comparable | **KVLite: 41.04x advantage** |
+| Random point reads, eight clients | 3,306,425 keys/s | 893,510 keys/s | 181,213 keys/s | **KVLite: 3.70x bbolt; 18.25x Redis** |
+| Point-read p99, eight clients | 2.04 µs | 7.54 µs | 169.46 µs | **KVLite: 3.70x advantage over bbolt; 83.03x over Redis** |
+| Durable random point updates, batch of 100 | 87,213 keys/s | 20,401 keys/s | 45,206 keys/s | **KVLite: 4.27x bbolt; 1.93x Redis** |
+| Durable mixed work, 95% reads | 122,394 operations/s | 8,625 operations/s | 14,323 operations/s | **KVLite: 14.19x bbolt; 8.55x Redis** |
+| No-commit-sync mixed work, 95% reads | 1,021,348 operations/s | 332,597 operations/s | 163,943 operations/s | **KVLite: 3.07x bbolt; 6.23x Redis** |
+| No-commit-sync random key deletes, one client | 201,255 keys/s | 64,736 keys/s | 101,353 keys/s | **KVLite: 3.11x bbolt; 1.99x Redis** |
+| Open an existing clean database | 48.04 µs | 2.91 ms | Not comparable | **KVLite: 60.55x advantage** |
 
 The results apply only to the tested machine and workloads. The Docker volume path includes the OrbStack virtual machine and host storage path. It does not prove bare-metal device performance. Durable and no-commit-sync results have different guarantees. See the [complete benchmark report](BENCHMARKS.md) and the [benchmark suite guide](benchmarks/kvbench/README.md).
 

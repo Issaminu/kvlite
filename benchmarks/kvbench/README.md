@@ -4,11 +4,11 @@ This suite compares KVLite, bbolt, and Redis at the caller API boundary. It uses
 
 The suite has three result groups:
 
-- Matched three-engine tests cover point operations, transactions, enumeration, access distribution, latency, and storage size.
-- Ordered tests compare KVLite and bbolt. Redis does not provide the required ordered cursor API.
+- Matched three-engine tests cover point operations, key deletion, transactions, enumeration, access distribution, latency, and storage size.
+- Ordered and native-bucket tests compare KVLite and bbolt. Redis does not provide the required ordered cursor or bucket API.
 - Life-cycle tests compare the two embedded engines. The Redis server life cycle does not fit inside the Go client benchmark.
 
-See the repository [benchmark report](../../BENCHMARKS.md) for the latest published run. The current report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
+See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-03 report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
 
 ## Run the suite
 
@@ -284,4 +284,4 @@ The contract tests check grouped reads, mixed transactions, enumeration, stored-
 
 Core timers include only selected API operations and required acknowledgements. They exclude open, fixture load, final stored-data checks, and close. The life-cycle group measures excluded work separately.
 
-Use raw files with `benchstat`. Keep hardware, CPU set, Docker system, source hashes, versions, suite, and benchmark filter unchanged.
+Keep hardware, CPU set, Docker system, source hashes, versions, suite, and benchmark filter unchanged when you compare runs.
