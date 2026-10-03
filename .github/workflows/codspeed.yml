@@ -57,7 +57,7 @@ jobs:
     name: Run main module benchmarks
     if: github.event_name != 'workflow_dispatch' || inputs.suite != 'kvbench'
     needs: test
-    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    runs-on: codspeed-macro
     steps:
       - uses: actions/checkout@v5
 
@@ -76,7 +76,7 @@ jobs:
     name: Run KVBench benchmarks
     if: github.event_name != 'workflow_dispatch' || inputs.suite != 'main'
     needs: test
-    runs-on: codspeed-macro-arm64-graviton-ubuntu-22-04
+    runs-on: codspeed-macro
     strategy:
       fail-fast: false
       matrix:
