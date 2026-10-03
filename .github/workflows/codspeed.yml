@@ -23,7 +23,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
+          # CodSpeed's Go integration requires Go 1.24 or later.
+          go-version: stable
 
       - name: Run the benchmarks
         uses: CodSpeedHQ/action@v5
