@@ -10,25 +10,23 @@ The suite has three result groups:
 
 See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-03 report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
 
-## Run benchmarks on CodSpeed
+## Run benchmarks on GitHub Actions
 
-The [CodSpeed workflow](../../.github/workflows/codspeed.yml) runs on GitHub Actions. It measures the main Go module and KVBench on remote runners. Pull requests run KVLite with the medium profile and all workload groups in durable and no-commit-sync modes. Manual runs can select KVLite, bbolt, Redis, or all three engines. The Redis job starts a Redis service with the same image and persistence settings as the Docker runner below.
+The [test workflow](../../.github/workflows/ci.yml) tests both Go modules on each pull request and push to main. The [KVBench workflow](../../.github/workflows/kvbench.yml) runs the Docker runner below on a remote machine. Pull requests use `light`, `focused`, and all three engines. Pushes to main use `medium`, `all`, and all three engines. Each run measures both durability modes and saves the raw results and environment record as a workflow artifact.
 
-[CodSpeed macro runners](https://codspeed.io/docs/integrations/ci/github-actions/macro-runners) require a GitHub organization. They cannot run for a repository owned by a personal account. For a public repository, the organization must also allow public repositories in its default runner group.
-
-To run tests and benchmarks away from your computer, use the workflow. Give each concurrent task its own worktree and branch. Commit and push the branch before you request a remote run. GitHub Actions cannot read changes that stay on your machine. The workflow permits runs from different branches at the same time. A run can wait until a remote runner is free. A pull request runs both the main module and KVBench. Use these commands to select a module for a manual run:
+To run a selected branch away from your computer, commit and push its changes. GitHub Actions cannot read changes that stay on your computer. After the workflow is on the default branch, start a manual run with the profile, workload, and engines you need:
 
 ```sh
-gh workflow run codspeed.yml --ref my-benchmark-branch -f suite=main
-gh workflow run codspeed.yml --ref my-benchmark-branch -f suite=kvbench -f engine=kvlite -f profile=light -f workload=focused
-gh workflow run codspeed.yml --ref my-benchmark-branch -f suite=kvbench -f engine=all -f profile=medium -f workload=all
-gh run list --workflow codspeed.yml --branch my-benchmark-branch
+gh workflow run kvbench.yml --ref my-benchmark-branch -f profile=light -f workload=focused -f engines=kvlite
+gh workflow run kvbench.yml --ref my-benchmark-branch -f profile=medium -f workload=all -f engines=kvlite,bbolt,redis
+gh run list --workflow kvbench.yml --branch my-benchmark-branch
 gh run watch 123456789
+gh run download 123456789
 ```
 
-Replace the example branch and run ID with your values. Omit `suite` to run both modules. Manual runs use KVLite, the medium profile, and all workloads by default. The `engine=all` choice runs each engine in both durability modes. You can select the `light`, `medium`, or `large` profile and the `focused`, `reads`, `writes`, `deletes`, `mixed`, or `all` workload. GitHub needs the workflow on the default branch before it accepts a manual run.
+Replace the branch and run ID with your values. A manual run uses `medium`, `all`, and all three engines by default. The workflow accepts the `light`, `medium`, or `large` profile and the `focused`, `reads`, `writes`, `deletes`, `mixed`, or `all` workload. Select one or more engines with a comma-separated list. Each workflow run gets its own GitHub-hosted machine. Runs from different branches can start at the same time, subject to GitHub runner capacity.
 
-Run the same command on a base branch and a test branch before you compare their results. Change only the `--ref` value. Benchmark names include the profile. Focused cases have separate names because they can do different work. Other workload choices select subsets of the same cases. Use the Docker runner below for a repeated three-engine comparison with changed engine order.
+Use the saved environment record and raw samples when you compare results. Shared runners can change timing between runs. Treat small differences between separate workflow runs as uncertain. The Docker runner changes engine and durability order within each run.
 
 ## Run the suite
 
