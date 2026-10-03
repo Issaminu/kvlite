@@ -14,6 +14,8 @@ See the repository [benchmark report](../../BENCHMARKS.md) for the latest full r
 
 The [CodSpeed workflow](../../.github/workflows/codspeed.yml) runs on GitHub Actions. It measures the main Go module and KVBench on remote runners. Pull requests run KVLite with the medium profile and all workload groups in durable and no-commit-sync modes. Manual runs can select KVLite, bbolt, Redis, or all three engines. The Redis job starts a Redis service with the same image and persistence settings as the Docker runner below.
 
+[CodSpeed macro runners](https://codspeed.io/docs/integrations/ci/github-actions/macro-runners) require a GitHub organization. They cannot run for a repository owned by a personal account. For a public repository, the organization must also allow public repositories in its default runner group.
+
 To run tests and benchmarks away from your computer, use the workflow. Give each concurrent task its own worktree and branch. Commit and push the branch before you request a remote run. GitHub Actions cannot read changes that stay on your machine. The workflow permits runs from different branches at the same time. A run can wait until a remote runner is free. A pull request runs both the main module and KVBench. Use these commands to select a module for a manual run:
 
 ```sh
