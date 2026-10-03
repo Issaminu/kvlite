@@ -70,15 +70,27 @@ func benchmarkCollectionWrites(b *testing.B, environment benchmarkEnvironment, p
 		transactions[transaction] = pairs
 	}
 	b.SetBytes(int64(totalKeys * 128))
-	b.ResetTimer()
-	for transaction, pairs := range transactions {
-		pathIndex := transaction % len(paths)
-		if err := collections.PutCollectionBatch(b.Context(), paths[pathIndex], pairs); err != nil {
-			b.Fatal(err)
+	iteration := 0
+	for b.Loop() {
+		if iteration > 0 {
+			b.StopTimer()
+			closeBenchmarkEngine(b, engine)
+			engine, err = prepareCollectionEngine(b, environment, paths)
+			if err != nil {
+				b.Fatal(err)
+			}
+			collections = engine.(collectionEngine)
+			b.StartTimer()
 		}
+		for transaction, pairs := range transactions {
+			pathIndex := transaction % len(paths)
+			if err := collections.PutCollectionBatch(b.Context(), paths[pathIndex], pairs); err != nil {
+				b.Fatal(err)
+			}
+		}
+		iteration++
 	}
-	b.StopTimer()
-	b.ReportMetric(float64(totalKeys)/b.Elapsed().Seconds(), "keys/s")
+	b.ReportMetric(float64(b.N*totalKeys)/b.Elapsed().Seconds(), "keys/s")
 }
 
 func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, paths [][][]byte) {
@@ -107,18 +119,19 @@ func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, pa
 	operations := profileSizedValue(100_000, 10_000, 1_000)
 	var checksum uint64
 	b.SetBytes(int64(operations * 128))
-	b.ResetTimer()
-	for operation := range operations {
-		pathIndex := operation % len(paths)
-		key := pairsByCollection[pathIndex][operation%keysPerCollection].Key
-		value, err := collections.GetCollection(b.Context(), paths[pathIndex], key)
-		if err != nil {
-			b.Fatal(err)
+	for b.Loop() {
+		checksum = 0
+		for operation := range operations {
+			pathIndex := operation % len(paths)
+			key := pairsByCollection[pathIndex][operation%keysPerCollection].Key
+			value, err := collections.GetCollection(b.Context(), paths[pathIndex], key)
+			if err != nil {
+				b.Fatal(err)
+			}
+			checksum = consumePair(checksum, key, value)
 		}
-		checksum = consumePair(checksum, key, value)
 	}
-	b.StopTimer()
-	b.ReportMetric(float64(operations)/b.Elapsed().Seconds(), "reads/s")
+	b.ReportMetric(float64(b.N*operations)/b.Elapsed().Seconds(), "reads/s")
 	b.ReportMetric(checksumMetric(checksum), "checksum")
 }
 
@@ -185,22 +198,19 @@ func BenchmarkLifecycle(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.ResetTimer()
-		engine, err := openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: environment.mode, DataDir: b.TempDir(), ClientCount: 1})
-		if err != nil {
-			b.StopTimer()
-			b.Fatal(err)
+		for b.Loop() {
+			engine, err := openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: environment.mode, DataDir: b.TempDir(), ClientCount: 1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			if err := loadPairs(b.Context(), engine, pairs, 1_000); err != nil {
+				b.Fatal(errors.Join(err, engine.Close()))
+			}
+			if err := engine.Close(); err != nil {
+				b.Fatal(err)
+			}
 		}
-		if err := loadPairs(b.Context(), engine, pairs, 1_000); err != nil {
-			b.StopTimer()
-			b.Fatal(errors.Join(err, engine.Close()))
-		}
-		err = engine.Close()
-		b.StopTimer()
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.ReportMetric(float64(records)/b.Elapsed().Seconds(), "loaded-keys/s")
+		b.ReportMetric(float64(b.N*records)/b.Elapsed().Seconds(), "loaded-keys/s")
 	})
 
 	b.Run("open-clean/"+string(environment.kind), func(b *testing.B) {
@@ -212,14 +222,16 @@ func BenchmarkLifecycle(b *testing.B) {
 		if err := engine.Close(); err != nil {
 			b.Fatal(err)
 		}
-		b.ResetTimer()
-		engine, err = openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: environment.mode, DataDir: dataDir, ClientCount: 1})
-		b.StopTimer()
-		if err != nil {
-			b.Fatal(err)
-		}
-		if err := engine.Close(); err != nil {
-			b.Fatal(err)
+		for b.Loop() {
+			engine, err = openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: environment.mode, DataDir: dataDir, ClientCount: 1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			if err := engine.Close(); err != nil {
+				b.Fatal(err)
+			}
+			b.StartTimer()
 		}
 	})
 
@@ -236,27 +248,51 @@ func BenchmarkLifecycle(b *testing.B) {
 		if err := loadPairs(b.Context(), engine, updates, 100); err != nil {
 			b.Fatal(errors.Join(err, engine.Close()))
 		}
-		b.ResetTimer()
-		err = engine.Close()
-		b.StopTimer()
-		if err != nil {
-			b.Fatal(err)
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				engine, err = prepareBenchmarkEngine(b, environment.kind, environment.mode, "", 1, pairs)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := loadPairs(b.Context(), engine, updates, 100); err != nil {
+					b.Fatal(errors.Join(err, engine.Close()))
+				}
+				b.StartTimer()
+			}
+			if err := engine.Close(); err != nil {
+				b.Fatal(err)
+			}
+			iteration++
 		}
 	})
 
 	b.Run("recover-after-process-kill/"+string(environment.kind), func(b *testing.B) {
 		dataDir := b.TempDir()
 		createKilledDatabase(b, environment.kind, dataDir, false)
-		b.ResetTimer()
-		engine, err := openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: DurabilityDurable, DataDir: dataDir, ClientCount: 1})
-		b.StopTimer()
-		if err != nil {
-			b.Fatal(err)
-		}
-		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
-		value, err := engine.Get(b.Context(), []byte("crash-key"))
-		if err != nil || !bytes.Equal(value, []byte("crash-value")) {
-			b.Fatalf("recovered value is %q with error %v", value, err)
+		var engine Engine
+		var err error
+		iteration := 0
+		for b.Loop() {
+			if iteration > 0 {
+				b.StopTimer()
+				dataDir = b.TempDir()
+				createKilledDatabase(b, environment.kind, dataDir, false)
+				b.StartTimer()
+			}
+			engine, err = openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: DurabilityDurable, DataDir: dataDir, ClientCount: 1})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.StopTimer()
+			value, err := engine.Get(b.Context(), []byte("crash-key"))
+			if err != nil || !bytes.Equal(value, []byte("crash-value")) {
+				b.Fatalf("recovered value is %q with error %v", value, err)
+			}
+			closeBenchmarkEngine(b, engine)
+			b.StartTimer()
+			iteration++
 		}
 	})
 }

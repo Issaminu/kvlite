@@ -2632,12 +2632,13 @@ func BenchmarkPut_Sequential(b *testing.B) {
 
 	value := []byte("some-benchmark-value-thats-a-realistic-size")
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	i := 0
+	for b.Loop() {
 		key := fmt.Appendf(nil, "key-%08d", i)
 		if err := db.Put(testBucketName, key, value); err != nil {
 			b.Fatal(err)
 		}
+		i++
 	}
 }
 
@@ -2657,8 +2658,7 @@ func BenchmarkPut_OneOperationBucket(b *testing.B) {
 	key := []byte("the-one-key")
 	value := []byte("some-benchmark-value-thats-a-realistic-size")
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if err := db.Put(testBucketName, key, value); err != nil {
 			b.Fatal(err)
 		}
@@ -2681,13 +2681,12 @@ func BenchmarkPut_ReusedBucket(b *testing.B) {
 	key := []byte("the-one-key")
 	value := []byte("some-benchmark-value-thats-a-realistic-size")
 
-	b.ResetTimer()
 	err = db.Update(func(tx *Tx) error {
 		bucket, err := tx.Bucket(testBucketName)
 		if err != nil {
 			return err
 		}
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			if err := bucket.Put(key, value); err != nil {
 				return err
 			}
@@ -2717,8 +2716,7 @@ func BenchmarkGet_OneOperationBucket(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := db.Get(testBucketName, key); err != nil {
 			b.Fatal(err)
 		}
@@ -2744,13 +2742,12 @@ func BenchmarkGet_ReusedBucket(b *testing.B) {
 		b.Fatal(err)
 	}
 
-	b.ResetTimer()
 	err = db.View(func(tx *Tx) error {
 		bucket, err := tx.Bucket(testBucketName)
 		if err != nil {
 			return err
 		}
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			if _, err := bucket.Get(key); err != nil {
 				return err
 			}

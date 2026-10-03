@@ -272,7 +272,6 @@ run_go() {
 		--env TMPDIR=/benchmark-data/tmp \
 		--env KVBENCH_DURABILITY="${mode}" \
 		--env KVBENCH_ENGINE="${engine}" \
-		--env KVBENCH_FIXED_WORK=1 \
 		--env KVBENCH_PROFILE="${benchmark_profile}" \
 		--env KVBENCH_WORKLOAD="${benchmark_workload}" \
 		--env KVBENCH_REDIS_ADDR="${redis_address}" \

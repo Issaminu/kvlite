@@ -486,8 +486,7 @@ func BenchmarkWriteNode(b *testing.B) {
 
 			b.ReportAllocs()
 			b.SetBytes(pageSize)
-			b.ResetTimer()
-			for index := 0; index < b.N; index++ {
+			for b.Loop() {
 				if err := WriteNode(io.Discard, node, pageSize, true); err != nil {
 					b.Fatal(err)
 				}
@@ -520,13 +519,13 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 		t.Fatalf("separator: got %q, want %q", separator, "b")
 	}
 	if len(node.entries) != 1 || !bytes.Equal(node.entries[0].key, []byte("a")) {
-		t.Fatalf("left entries: got %q, want [a]", node.entries)
+		t.Fatalf("left entries: got %v, want [a]", node.entries)
 	}
 	if rightNode.PageID() != rightPgid {
 		t.Fatalf("right page ID: got %d, want %d", rightNode.PageID(), rightPgid)
 	}
 	if !rightNode.IsLeaf() || len(rightNode.entries) != 1 || !bytes.Equal(rightNode.entries[0].key, []byte("b")) {
-		t.Fatalf("right entries: got %q, want [b]", rightNode.entries)
+		t.Fatalf("right entries: got %v, want [b]", rightNode.entries)
 	}
 }
 
