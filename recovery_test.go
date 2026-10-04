@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -94,7 +95,9 @@ func TestRecoverySkipsOldPatchesAfterFreeOrFullNode(t *testing.T) {
 	records := []wal.WALRecord{
 		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID + 1, TxID: 1}, Payload: btree.EncodeWALNode(btree.NewLeafNode(firstTreePageID + 1))},
 		{Header: wal.RecordHeader{Type: wal.RecordTypePatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeLeafDelete, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
 		{Header: wal.RecordHeader{Type: wal.RecordTypePatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeLeafDelete, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
 		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID, TxID: 2}, Payload: fullRoot},
 	}
 	if err := db.loadCommittedIntoOverlay(records); err != nil {
@@ -106,6 +109,276 @@ func TestRecoverySkipsOldPatchesAfterFreeOrFullNode(t *testing.T) {
 	got, ok := db.wal.CommittedRecord(firstTreePageID)
 	if !ok || got.Header.Type != wal.RecordTypeNode || !bytes.Equal(got.Payload, fullRoot) {
 		t.Fatalf("recovered root: found=%t type=%d", ok, got.Header.Type)
+	}
+}
+
+func TestLeafDeleteWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	name := []byte("bucket")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		for index := range 50 {
+			if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), []byte("value")); err != nil {
+				return err
+			}
+		}
+		child, err := bucket.CreateBucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		return child.Put([]byte("inside"), []byte("value"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(name)
+		if err != nil {
+			return err
+		}
+		return bucket.DeleteBatch([][]byte{[]byte("key-010"), []byte("key-020")})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(name)
+		if err != nil {
+			return err
+		}
+		return bucket.DeleteBucket([]byte("child"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	records, err := db.wal.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundDelete := false
+	for _, record := range records {
+		foundDelete = foundDelete || record.Header.Type == wal.RecordTypeLeafDelete
+	}
+	if !foundDelete {
+		t.Fatal("WAL did not use a leaf-delete record")
+	}
+	// Close the file handles without a checkpoint to test both recovery modes.
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	check := func(db *DB) {
+		t.Helper()
+		for _, test := range []struct {
+			key     string
+			missing bool
+		}{
+			{"key-010", true},
+			{"key-020", true},
+			{"key-030", false},
+		} {
+			value, err := db.Get(name, []byte(test.key))
+			if test.missing {
+				if !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("deleted key %s: got %q, error %v", test.key, value, err)
+				}
+			} else if err != nil || string(value) != "value" {
+				t.Fatalf("retained key %s: got %q, error %v", test.key, value, err)
+			}
+		}
+		if err := db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket(name)
+			if err != nil {
+				return err
+			}
+			_, err = bucket.Bucket([]byte("child"))
+			return err
+		}); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted child bucket: got %v, want ErrBucketNotFound", err)
+		}
+	}
+	readOnly, err := Open(path, 0600, &Options{ReadOnly: true, Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(readOnly)
+	if err := readOnly.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writable, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(writable)
+	if err := writable.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLeafDeleteWALReplayAfterCheckpointWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	name := []byte("bucket")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		for index := range 50 {
+			if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), []byte("value")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(name, []byte("key-011"), []byte("VALUE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(name, []byte("key-010")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyLog, err := os.Open(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.wal.ReplaceFileForTesting(readOnlyLog)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	if err := readOnlyLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	if _, err := recovered.Get(name, []byte("key-010")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("deleted key after repeated replay: got %v, want ErrKeyNotFound", err)
+	}
+	if value, err := recovered.Get(name, []byte("key-011")); err != nil || string(value) != "VALUE" {
+		t.Fatalf("next key after repeated replay: got %q, error %v", value, err)
+	}
+}
+
+func TestLeafDeleteWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	name := []byte("bucket")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		for index := range 50 {
+			if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), []byte("value")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(name, []byte("key-010")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyLog, err := os.Open(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.wal.ReplaceFileForTesting(readOnlyLog)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	if err := readOnlyLog.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writableLog, err := os.OpenFile(path+"-wal", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.wal.ReplaceFileForTesting(writableLog)
+	if err := db.Put(name, []byte("key-011"), []byte("VALUE")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Delete(name, []byte("key-012")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	for _, key := range []string{"key-010", "key-012"} {
+		if _, err := recovered.Get(name, []byte(key)); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("deleted key %s: got %v, want ErrKeyNotFound", key, err)
+		}
+	}
+	if value, err := recovered.Get(name, []byte("key-011")); err != nil || string(value) != "VALUE" {
+		t.Fatalf("updated key: got %q, error %v", value, err)
+	}
+	if value, err := recovered.Get(name, []byte("key-013")); err != nil || string(value) != "value" {
+		t.Fatalf("retained key: got %q, error %v", value, err)
 	}
 }
 

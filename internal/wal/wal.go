@@ -174,7 +174,7 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	return transaction, nil
 }
 
-// appendNodeRecord appends one complete node image or a smaller page patch to transaction.
+// appendNodeRecord appends a complete node image or a smaller patch or leaf-delete record.
 func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid TxID) ([]byte, error) {
 	targetSize := btree.WALNodeEncodedSize(record.Final)
 	header := RecordHeader{Type: RecordTypeNode, PageID: record.Final.PageID(), TxID: txid}
@@ -183,6 +183,14 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	}
 	if record.Original.PageID() != header.PageID {
 		return nil, fmt.Errorf("WAL node page %d, original page %d: %w", header.PageID, record.Original.PageID(), ErrNodePageMismatch)
+	}
+	if record.Final.IsLeaf() && record.Final.EntryCount() < record.Original.EntryCount() {
+		keys, ok := appendLeafDeleteKeys(wal.pagePatch.ranges[:0], record.Original, record.Final, targetSize)
+		if ok && len(keys) < targetSize {
+			wal.pagePatch.ranges = keys
+			header.Type = RecordTypeLeafDelete
+			return appendEncodedPayloadRecord(transaction, header, keys), nil
+		}
 	}
 
 	wal.pagePatch.reset()
@@ -229,6 +237,42 @@ func appendLeafNodePatch(patch *PagePatch, base, target *btree.Node) (encodedSiz
 		offset = valueOffset + len(targetValue)
 	}
 	return offset, true
+}
+
+// appendLeafDeleteKeys reports a target made only by removing base entries.
+// Keys make replay safe if checkpoint already wrote the final leaf to the main file.
+func appendLeafDeleteKeys(keys []byte, base, target *btree.Node, imageSize int) ([]byte, bool) {
+	if !base.IsLeaf() || !target.IsLeaf() || target.EntryCount() >= base.EntryCount() {
+		return keys, false
+	}
+	// Dense deletion leaves a small final image and rarely makes a key list smaller.
+	if target.EntryCount()*2 <= base.EntryCount() {
+		return keys, false
+	}
+	if imageSize <= 8 {
+		return keys, false
+	}
+	keys = binary.LittleEndian.AppendUint32(keys, uint32(base.EntryCount()))
+	keys = binary.LittleEndian.AppendUint32(keys, uint32(target.EntryCount()))
+	baseIndex, targetIndex := 0, 0
+	for baseIndex < base.EntryCount() {
+		if targetIndex < target.EntryCount() {
+			before, after := base.EntryAt(baseIndex), target.EntryAt(targetIndex)
+			if before.Flags() == after.Flags() && bytes.Equal(before.Key(), after.Key()) && bytes.Equal(before.Value(), after.Value()) {
+				baseIndex++
+				targetIndex++
+				continue
+			}
+		}
+		key := base.EntryAt(baseIndex).Key()
+		if len(keys)+2+len(key) >= imageSize {
+			return keys, false
+		}
+		keys = binary.LittleEndian.AppendUint16(keys, uint16(len(key)))
+		keys = append(keys, key...)
+		baseIndex++
+	}
+	return keys, targetIndex == target.EntryCount()
 }
 
 // appendBranchNodePatch scans one branch once and appends changed child IDs and separator keys.
@@ -318,6 +362,9 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 			return nil, err
 		}
 		records = append(records, *record)
+		if record.Header.Type > RecordTypeLeafDelete {
+			return nil, fmt.Errorf("WAL record type %d: %w", record.Header.Type, page.ErrInvalid)
+		}
 		if record.Header.TxID >= wal.nextTxid {
 			wal.nextTxid = record.Header.TxID + 1
 		}

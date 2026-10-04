@@ -1,9 +1,11 @@
 package wal
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -133,6 +135,74 @@ func ApplyPagePatch(base, patch []byte, pageSize int64) ([]byte, error) {
 	}
 	decoded := PagePatch{ranges: patch}
 	return decoded.apply(base)
+}
+
+// LeafDeleteEntryCounts reads the entry counts from one leaf-delete payload.
+func LeafDeleteEntryCounts(keys []byte) (uint32, uint32, error) {
+	if len(keys) < 11 {
+		return 0, 0, page.ErrInvalid
+	}
+	baseCount := binary.LittleEndian.Uint32(keys[:4])
+	targetCount := binary.LittleEndian.Uint32(keys[4:8])
+	if targetCount >= baseCount {
+		return 0, 0, page.ErrInvalid
+	}
+	var previous []byte
+	var removed uint32
+	for offset := 8; offset < len(keys); {
+		if len(keys)-offset < 2 {
+			return 0, 0, page.ErrInvalid
+		}
+		keySize := int(binary.LittleEndian.Uint16(keys[offset : offset+2]))
+		offset += 2
+		if keySize == 0 || keySize > btree.MaxKeySize || len(keys)-offset < keySize {
+			return 0, 0, page.ErrInvalid
+		}
+		key := keys[offset : offset+keySize]
+		if previous != nil && bytes.Compare(previous, key) >= 0 {
+			return 0, 0, page.ErrInvalid
+		}
+		previous = key
+		offset += keySize
+		removed++
+	}
+	if removed != baseCount-targetCount {
+		return 0, 0, page.ErrInvalid
+	}
+	return baseCount, targetCount, nil
+}
+
+// ApplyLeafDeletes removes named entries from a verified compact leaf image.
+// The payload holds base and final entry counts followed by byte-ordered keys.
+// It also accepts a main-file leaf that already has the final entry count.
+func ApplyLeafDeletes(base, keys []byte, pageID page.ID) ([]byte, error) {
+	baseCount, targetCount, err := LeafDeleteEntryCounts(keys)
+	if err != nil {
+		return nil, err
+	}
+	node, err := btree.DecodeWALNode(base, pageID)
+	if err != nil {
+		return nil, err
+	}
+	if !node.IsLeaf() {
+		return nil, page.ErrInvalid
+	}
+	if count := uint32(node.EntryCount()); count != baseCount && count != targetCount {
+		return nil, page.ErrInvalid
+	}
+	for offset := 8; offset < len(keys); {
+		keySize := int(binary.LittleEndian.Uint16(keys[offset : offset+2]))
+		offset += 2
+		key := keys[offset : offset+keySize]
+		if err := node.DeleteKeyIfPresent(key); err != nil {
+			return nil, err
+		}
+		offset += keySize
+	}
+	if uint32(node.EntryCount()) != targetCount {
+		return nil, page.ErrInvalid
+	}
+	return btree.EncodeWALNode(node), nil
 }
 
 // apply parses the encoded ranges and writes them into a new copy of base.

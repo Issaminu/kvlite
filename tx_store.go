@@ -66,6 +66,17 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 	return node, nil
 }
 
+// VisitNodeReferences visits one node without decoding a committed main page.
+func (store *txTreeStore) VisitNodeReferences(pageID page.ID, visit func(page.ID) error) error {
+	if node, ok := store.nodes[pageID]; ok {
+		return btree.VisitNodeReferences(node, visit)
+	}
+	if dirty, ok := store.baseDirty[pageID]; ok {
+		return btree.VisitNodeReferences(dirty.final, visit)
+	}
+	return store.tx.db.visitCommittedNodeReferences(pageID, visit)
+}
+
 func (store *txTreeStore) AllocatePage() (page.ID, error) {
 	pageID, err := store.tx.writableAllocation().allocate(store.tx.meta.LastPage())
 	if err != nil {

@@ -1,6 +1,7 @@
 package btree
 
 import (
+	"bytes"
 	"fmt"
 	"slices"
 
@@ -280,6 +281,82 @@ func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool,
 // caller must discard the private store changes.
 func (tree *Tree) DeleteEntry(root *Node, key []byte) (*Node, bool, error) {
 	return tree.deleteEntry(root, key, false)
+}
+
+// DeleteEntries removes plain keys from one tree. It changes each leaf once
+// for keys in that leaf and repairs the leaf before it moves to the next one.
+// A missing key has no effect. Duplicate keys have the same effect as one key.
+// If a key names a bucket, earlier leaves can already have changed.
+// The caller must discard the transaction when it returns an error.
+func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) {
+	for _, key := range keys {
+		if err := validateLookupKey(key); err != nil {
+			return root, false, err
+		}
+	}
+	ordered := keys
+	if !slices.IsSortedFunc(keys, bytes.Compare) {
+		ordered = slices.Clone(keys)
+		slices.SortFunc(ordered, bytes.Compare)
+	}
+	changed := false
+	for first := 0; first < len(ordered); {
+		node := root
+		var path []treePathStep
+		for !node.IsLeaf() {
+			index, err := node.FindChildIndex(ordered[first])
+			if err != nil {
+				return nil, changed, err
+			}
+			path = append(path, treePathStep{parent: node, childIndex: index})
+			node, err = tree.store.ReadNode(node.Children[index])
+			if err != nil {
+				return nil, changed, err
+			}
+			if node == nil {
+				return nil, changed, ErrKeyNotFound
+			}
+		}
+		var upper []byte
+		for index := len(path) - 1; index >= 0; index-- {
+			step := path[index]
+			if step.childIndex < step.parent.EntryCount() {
+				upper = step.parent.EntryAt(step.childIndex).Key()
+				break
+			}
+		}
+		last := first
+		for last < len(ordered) && (upper == nil || bytes.Compare(ordered[last], upper) < 0) {
+			last++
+		}
+		indexes := make([]int, 0, last-first)
+		for _, key := range ordered[first:last] {
+			index, found, err := node.prepareDelete(key, false)
+			if err != nil {
+				return root, changed, err
+			}
+			if found && (len(indexes) == 0 || indexes[len(indexes)-1] != index) {
+				indexes = append(indexes, index)
+			}
+		}
+		if len(indexes) > 0 {
+			leaf := tree.store.WritableNode(node)
+			for index := len(indexes) - 1; index >= 0; index-- {
+				leaf.applyDelete(indexes[index])
+			}
+			if leaf.PageID() == root.PageID() {
+				root = leaf
+			}
+			var err error
+			root, err = tree.repairAfterDelete(root, leaf, path, indexes[0] == 0)
+			if err != nil {
+				return nil, changed, err
+			}
+			changed = true
+		}
+		first = last
+	}
+	return root, changed, nil
 }
 
 // DeleteBucketEntry removes one bucket entry and repairs its parent tree.

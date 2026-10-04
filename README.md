@@ -124,6 +124,8 @@ A database contains named top-level buckets. A bucket can contain key/value pair
 
 `DB.Delete` removes one plain key. A missing key causes no change. Use `Bucket.Delete` in `DB.Update` when the delete must be in the same transaction as other writes.
 
+Use `Bucket.DeleteBatch` in `DB.Update` to remove several keys at once. KVLite groups the keys by tree leaf before it removes them.
+
 ```go
 if err := db.Delete([]byte("users"), []byte("42")); err != nil {
 	return err

@@ -225,3 +225,56 @@ func TestLookupEncodedWALNode_UsesBranchDirectoryBinarySearch(t *testing.T) {
 		t.Fatalf("full branch decode error: got %v, want ErrInvalid", err)
 	}
 }
+
+func TestVisitNodeReferencesChecksMappedAndWALPages(t *testing.T) {
+	leaf := NewLeafNode(7)
+	if err := leaf.InsertEntry(NewEntry(0, []byte("plain"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := leaf.InsertEntry(NewEntry(BucketLeafFlag, []byte("nested"), page.EncodeID(9))); err != nil {
+		t.Fatal(err)
+	}
+	visit := func(data []byte, mapped bool) ([]page.ID, error) {
+		var refs []page.ID
+		add := func(id page.ID) error { refs = append(refs, id); return nil }
+		var err error
+		if mapped {
+			err = VisitMappedNodeReferences(data, 7, 4096, add)
+		} else {
+			err = VisitWALNodeReferences(data, 7, add)
+		}
+		return refs, err
+	}
+	for _, mapped := range []bool{true, false} {
+		var data []byte
+		if mapped {
+			data = EncodeNode(leaf, 4096)
+		} else {
+			data = EncodeWALNode(leaf)
+		}
+		refs, err := visit(data, mapped)
+		if err != nil || !slices.Equal(refs, []page.ID{9}) {
+			t.Fatalf("mapped=%t: refs=%v, err=%v", mapped, refs, err)
+		}
+	}
+	data := EncodeNode(leaf, 4096)
+	data[len(data)-1] ^= 1
+	if err := VisitMappedNodeReferences(data, 7, 4096, func(page.ID) error { return nil }); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("damaged page: %v", err)
+	}
+}
+
+func TestVisitNodeReferencesReadsBranchChildren(t *testing.T) {
+	left := NewLeafNode(3)
+	right := NewLeafNode(4)
+	branch := NewRootNode(2, left, right, []byte("middle"))
+	data := EncodeNode(branch, 4096)
+	var refs []page.ID
+	err := VisitMappedNodeReferences(data, 2, 4096, func(id page.ID) error {
+		refs = append(refs, id)
+		return nil
+	})
+	if err != nil || !slices.Equal(refs, []page.ID{3, 4}) {
+		t.Fatalf("branch refs=%v, err=%v", refs, err)
+	}
+}

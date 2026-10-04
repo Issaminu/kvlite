@@ -125,6 +125,32 @@ func (n *Node) EntryCount() int {
 	return len(n.entries)
 }
 
+// VisitNodeReferences visits each child page in a decoded node.
+// A leaf contributes only roots of nested buckets.
+func VisitNodeReferences(node *Node, visit func(page.ID) error) error {
+	if !node.IsLeaf() {
+		for _, child := range node.Children {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, entry := range node.entries {
+		if entry.flags&BucketLeafFlag == 0 {
+			continue
+		}
+		child, err := page.DecodeID(entry.value)
+		if err != nil {
+			return err
+		}
+		if err := visit(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // EntryAt returns the entry at index without copying it.
 // The returned entry refers to storage owned by the node.
 // It remains valid until the node changes its entry list.
@@ -271,6 +297,19 @@ func (n *Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
 func (n *Node) applyDelete(index int) {
 	n.entries = slices.Delete(n.entries, index, index+1)
 	n.header.Checksum = 0
+}
+
+// DeleteKeyIfPresent removes a leaf entry. A missing key makes no change.
+// WAL recovery can call it when a checkpoint already wrote the final leaf.
+func (n *Node) DeleteKeyIfPresent(key []byte) error {
+	index, found, err := n.findKeyIndex(key)
+	if err != nil {
+		return err
+	}
+	if found {
+		n.applyDelete(index)
+	}
+	return nil
 }
 
 func (n *Node) setSeparator(index int, key []byte) {

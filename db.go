@@ -502,6 +502,28 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	return node, nil
 }
 
+// visitCommittedNodeReferences checks one committed node and visits its children.
+// It reads mapped pages without making a private node copy.
+func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit func(page.ID) error) error {
+	if record, ok := db.wal.Lookup(pageID); ok {
+		if record.Node != nil {
+			return btree.VisitNodeReferences(record.Node, visit)
+		}
+		if record.Payload == nil {
+			return wal.ErrRecordPayloadRequired
+		}
+		return btree.VisitWALNodeReferences(record.Payload, pageID, visit)
+	}
+	if node, ok := db.cachedWriteNode(pageID); ok {
+		return btree.VisitNodeReferences(node, visit)
+	}
+	data, err := db.readMainPage(pageID)
+	if err != nil {
+		return err
+	}
+	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), visit)
+}
+
 // cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
 // The caller must have exclusive access to database state. Open has this access before it returns. Writes use the database operation lock.
 func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {

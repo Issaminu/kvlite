@@ -29,6 +29,7 @@
 // # Delete and page reuse
 //
 // [Bucket.Delete] removes a plain key from a bucket in a write transaction. [DB.Delete] does the same in an existing top-level bucket. A missing key causes no change. Delete does not remove a nested bucket.
+// [Bucket.DeleteBatch] removes several plain keys in one write transaction. It groups the keys by tree leaf.
 //
 // [Tx.DeleteBucket] removes a top-level bucket in a write transaction. [Bucket.DeleteBucket] removes a nested bucket. Both operations remove all child buckets and values. A handle to a removed bucket cannot be used again in that transaction.
 //

@@ -26,6 +26,8 @@ const (
 	RecordTypePatch RecordType = 3
 	// RecordTypeAllocation stores one complete allocation page.
 	RecordTypeAllocation RecordType = 4
+	// RecordTypeLeafDelete stores removed leaf keys in byte order.
+	RecordTypeLeafDelete RecordType = 5
 
 	recordTypeSize          = 1 // A record type uses one byte.
 	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
@@ -44,7 +46,7 @@ type RecordHeader struct {
 }
 
 // NodeRecord carries one changed data node from a write transaction to [WAL.Commit].
-// WAL.Commit compares Original and Final and writes a page patch when it is smaller than the complete final image.
+// WAL.Commit compares Original and Final and writes a page patch or leaf-delete record when it is smaller than the complete final image.
 // NodeRecord exists only in memory. The WAL file does not store this structure.
 type NodeRecord struct {
 	// Original is the committed node before the transaction.
@@ -64,7 +66,7 @@ type AllocationRecord struct {
 // WALRecord represents one record in the WAL file format.
 // [WAL.ReadRecords] returns WALRecord values during recovery.
 // Header.Type defines whether Payload contains a complete node or allocation page,
-// page-patch ranges, encoded metadata, or no bytes for a commit marker.
+// page-patch ranges, leaf-delete keys, encoded metadata, or no bytes for a commit marker.
 type WALRecord struct {
 	Header RecordHeader
 	// Payload contains bytes that can be written to the WAL file.

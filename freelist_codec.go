@@ -100,7 +100,7 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 	var latest map[page.ID][]byte
 	for _, record := range records {
 		switch record.Header.Type {
-		case wal.RecordTypeNode, wal.RecordTypeAllocation:
+		case wal.RecordTypeNode, wal.RecordTypePatch, wal.RecordTypeLeafDelete, wal.RecordTypeAllocation:
 			availableLastPage = max(availableLastPage, record.Header.PageID)
 		}
 		if record.Header.Type == wal.RecordTypeAllocation {

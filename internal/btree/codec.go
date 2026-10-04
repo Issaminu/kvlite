@@ -57,7 +57,7 @@ func DecodeNode(data []byte, expectedPageID page.ID, pageSize int64) (*Node, err
 	if storedChecksum != nodePageChecksum(data, pageSize) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
-	node, _, _, _, err := readEncodedNode(data, expectedPageID, storedChecksum, nil, true, true)
+	node, _, _, _, err := readEncodedNode(data, expectedPageID, storedChecksum, nil, true, true, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -83,11 +83,41 @@ func DecodeWALNode(data []byte, expectedPageID page.ID) (*Node, error) {
 	if checksum := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]); checksum != 0 {
 		return nil, fmt.Errorf("read WAL node checksum %x: %w", checksum, ErrInvalid)
 	}
-	node, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, true, false)
+	node, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, true, false, nil)
 	if err != nil {
 		return nil, err
 	}
 	return node, nil
+}
+
+// VisitMappedNodeReferences checks one main-file node and visits its child pages.
+// It checks the page checksum first. It checks node fields as it visits each page.
+func VisitMappedNodeReferences(data []byte, expectedPageID page.ID, pageSize int64, visit func(page.ID) error) error {
+	if len(data) < NodeHeaderSize || pageSize < NodeHeaderSize || int64(len(data)) > pageSize {
+		return ErrInvalid
+	}
+	stored := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize])
+	if stored != nodePageChecksum(data, pageSize) {
+		return page.ErrChecksum
+	}
+	return visitEncodedNodeReferences(data, expectedPageID, stored, true, visit)
+}
+
+// VisitWALNodeReferences checks one verified WAL node and visits its child pages.
+// The WAL record checksum protects the node bytes.
+func VisitWALNodeReferences(data []byte, expectedPageID page.ID, visit func(page.ID) error) error {
+	if len(data) < NodeHeaderSize {
+		return ErrInvalid
+	}
+	if binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]) != 0 {
+		return ErrInvalid
+	}
+	return visitEncodedNodeReferences(data, expectedPageID, 0, false, visit)
+}
+
+func visitEncodedNodeReferences(data []byte, expectedPageID page.ID, checksum uint32, allowPadding bool, visit func(page.ID) error) error {
+	_, _, _, _, err := readEncodedNode(data, expectedPageID, checksum, nil, false, allowPadding, visit)
+	return err
 }
 
 // ValidateWALNode checks every field in one compact node from a verified WAL record.
@@ -99,7 +129,7 @@ func ValidateWALNode(data []byte, expectedPageID page.ID) error {
 	if checksum := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]); checksum != 0 {
 		return fmt.Errorf("read WAL node checksum %x: %w", checksum, ErrInvalid)
 	}
-	_, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, false, false)
+	_, _, _, _, err := readEncodedNode(data, expectedPageID, 0, nil, false, false, nil)
 	return err
 }
 
@@ -126,7 +156,7 @@ func LookupMappedNode(data []byte, expectedPageID page.ID, key []byte) (Entry, b
 	if len(data) < NodeHeaderSize {
 		return Entry{}, false, 0, fmt.Errorf("read node header: %w", ErrInvalid)
 	}
-	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false, true)
+	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false, true, nil)
 	return entry, found, child, err
 }
 
@@ -194,7 +224,7 @@ func LookupEncodedWALNode(data []byte, expectedPageID page.ID, key []byte) (Entr
 	if checksum := binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]); checksum != 0 {
 		return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", checksum, ErrInvalid)
 	}
-	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false, false)
+	_, entry, found, child, err := readEncodedNode(data, expectedPageID, 0, key, false, false, nil)
 	return entry, found, child, err
 }
 
@@ -203,13 +233,14 @@ func LookupEncodedWALNode(data []byte, expectedPageID page.ID, key []byte) (Entr
 // If createNode is true, readEncodedNode ignores key. It validates the complete body and returns a [Node].
 //
 // If createNode is false and key is nil, readEncodedNode validates the complete body without creating a [Node].
+// In that mode, visit can receive each child page during validation.
 //
 // If createNode is false and key is not nil, readEncodedNode performs a point lookup. A leaf match returns an [Entry] and true. A branch returns its child page ID. A missing leaf key returns zero results. Point lookup validates only the fields that it reads.
 //
 // Node entries and returned entry bytes refer to data. The caller must keep data unchanged while it uses these results.
 //
 // The caller must check the header length and the source checksum before this call. allowPadding applies only to complete-body validation.
-func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool) (*Node, Entry, bool, page.ID, error) {
+func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool, visit func(page.ID) error) (*Node, Entry, bool, page.ID, error) {
 	nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset]))
 	if nodeType != NodeTypeLeaf && nodeType != NodeTypeBranch {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node type %d: %w", nodeType, ErrInvalid)
@@ -322,6 +353,11 @@ func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32,
 				if err != nil {
 					return nil, Entry{}, false, 0, err
 				}
+				if visit != nil {
+					if err := visit(child); err != nil {
+						return nil, Entry{}, false, 0, err
+					}
+				}
 				if createNode {
 					node.Children = append(node.Children, child)
 				}
@@ -341,6 +377,15 @@ func readEncodedNode(data []byte, expectedPageID page.ID, storedChecksum uint32,
 			}
 			previousKey = entry.key
 			nextOffset = end
+			if visit != nil && nodeType == NodeTypeLeaf && entry.flags&BucketLeafFlag != 0 {
+				child, err := page.DecodeID(entry.value)
+				if err != nil {
+					return nil, Entry{}, false, 0, err
+				}
+				if err := visit(child); err != nil {
+					return nil, Entry{}, false, 0, err
+				}
+			}
 			if createNode {
 				node.entries = append(node.entries, entry)
 			}

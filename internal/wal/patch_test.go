@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"os"
 	"testing"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -79,5 +81,78 @@ func TestApplyPagePatch_RejectsBaseLargerThanPage(t *testing.T) {
 
 	if _, err := ApplyPagePatch([]byte("base"), patch, 3); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("large base error: got %v, want ErrInvalid", err)
+	}
+}
+
+func TestWALCommit_EncodesLeafDeletes(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	base := btree.NewLeafNode(2)
+	for _, key := range []string{"a", "b", "c", "d", "e"} {
+		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), bytes.Repeat([]byte(key), 16))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := base.Clone()
+	for _, key := range []string{"b", "d"} {
+		if err := target.DeleteKeyIfPresent([]byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	log := New(Config{File: file, PageSize: 256, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Header.Type != RecordTypeLeafDelete {
+		t.Fatalf("WAL records: got %+v, want leaf delete and commit", records)
+	}
+	if got := records[0].Payload; !bytes.Equal(got, []byte{5, 0, 0, 0, 3, 0, 0, 0, 1, 0, 'b', 1, 0, 'd'}) {
+		t.Fatalf("deleted keys: got %v, want b and d", got)
+	}
+	image, err := ApplyLeafDeletes(btree.EncodeWALNode(base), records[0].Payload, base.PageID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(image, btree.EncodeWALNode(target)) {
+		t.Fatal("leaf delete did not rebuild the final node")
+	}
+	image, err = ApplyLeafDeletes(btree.EncodeWALNode(target), records[0].Payload, base.PageID())
+	if err != nil || !bytes.Equal(image, btree.EncodeWALNode(target)) {
+		t.Fatalf("repeated leaf delete changed final node: error %v", err)
+	}
+}
+
+func TestApplyLeafDeletes_RejectsInvalidKeys(t *testing.T) {
+	base := btree.NewLeafNode(2)
+	for _, key := range []string{"a", "b", "c"} {
+		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), []byte("value"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	image := btree.EncodeWALNode(base)
+	for name, keys := range map[string][]byte{
+		"empty":     nil,
+		"short":     {1},
+		"duplicate": {3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 'a', 1, 0, 'a'},
+		"reverse":   {3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 'b', 1, 0, 'a'},
+		"short-key": {3, 0, 0, 0, 2, 0, 0, 0, 4, 0, 'a'},
+		"empty-key": {3, 0, 0, 0, 2, 0, 0, 0, 0, 0},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ApplyLeafDeletes(image, keys, base.PageID()); !errors.Is(err, page.ErrInvalid) {
+				t.Fatalf("invalid keys: got %v, want invalid page", err)
+			}
+		})
+	}
+	branch := btree.NewRootNode(2, btree.NewLeafNode(3), btree.NewLeafNode(4), []byte("b"))
+	if _, err := ApplyLeafDeletes(btree.EncodeWALNode(branch), []byte{1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 'a'}, branch.PageID()); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("branch delete: got %v, want invalid page", err)
 	}
 }

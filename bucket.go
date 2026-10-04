@@ -59,7 +59,7 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 	bucket.children[string(b.name)] = b
 }
 
-// writeBackRoot updates the existing fixed-size root pointer after a root split.
+// writeBackRoot updates the existing fixed-size root pointer after the root page changes.
 // The transaction already loaded this entry before it changed the bucket tree.
 func (bucket *Bucket) writeBackRoot() {
 	entry := btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(bucket.rootNode.PageID()))
@@ -72,6 +72,16 @@ func (bucket *Bucket) writeBackRoot() {
 	if err != nil {
 		panic("kvlite: failed to update an existing bucket root pointer: " + err.Error())
 	}
+}
+
+// setRoot records a tree change and updates the bucket entry if the root page changed.
+func (bucket *Bucket) setRoot(newRoot *btree.Node) {
+	oldRootPageID := bucket.rootNode.PageID()
+	bucket.rootNode = newRoot
+	if newRoot.PageID() != oldRootPageID {
+		bucket.writeBackRoot()
+	}
+	bucket.treeVersion++
 }
 
 // CreateBucket creates a top-level bucket named bucketName in a writable transaction. The new bucket is part of the transaction, so [DB.Update] commits or rolls it back with the other changes in that transaction.
@@ -286,16 +296,11 @@ func (bucket *Bucket) Put(key, value []byte) error {
 }
 
 func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
-	oldRootPageID := bucket.rootNode.PageID()
 	newRoot, err := bucket.tx.tree.PutEntry(bucket.rootNode, entry)
 	if err != nil {
 		return err
 	}
-	bucket.rootNode = newRoot
-	if newRoot.PageID() != oldRootPageID {
-		bucket.writeBackRoot()
-	}
-	bucket.treeVersion++
+	bucket.setRoot(newRoot)
 	return nil
 }
 
@@ -309,17 +314,31 @@ func (bucket *Bucket) Delete(key []byte) error {
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
-	oldRootPageID := bucket.rootNode.PageID()
 	newRoot, deleted, err := bucket.tx.tree.DeleteEntry(bucket.rootNode, key)
 	if err != nil || !deleted {
 		return err
 	}
-	bucket.rootNode = newRoot
-	if newRoot.PageID() != oldRootPageID {
-		bucket.writeBackRoot()
-	}
-	bucket.treeVersion++
+	bucket.setRoot(newRoot)
 	return nil
+}
+
+// DeleteBatch removes plain keys from this bucket in the current write transaction.
+// A missing key has no effect. A repeated key has the same effect as one key.
+// It returns the same key and bucket errors as [Bucket.Delete].
+// If it returns an error, the caller must return that error from [DB.Update].
+func (bucket *Bucket) DeleteBatch(keys [][]byte) error {
+	if err := bucket.tx.writableError(); err != nil {
+		return err
+	}
+	if err := bucket.liveError(); err != nil {
+		return err
+	}
+	newRoot, changed, err := bucket.tx.tree.DeleteEntries(bucket.rootNode, keys)
+	if !changed || newRoot == nil {
+		return err
+	}
+	bucket.setRoot(newRoot)
+	return err
 }
 
 // DeleteBucket removes a top-level bucket and all of its contents in this write transaction.
@@ -387,7 +406,6 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 			tx.metaDirty = true
 		}
 	} else {
-		oldRootPageID := parent.rootNode.PageID()
 		newRoot, found, err := tx.tree.DeleteBucketEntry(parent.rootNode, bucketName)
 		if err != nil {
 			return err
@@ -395,11 +413,7 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 		if !found {
 			return ErrBucketNotFound
 		}
-		parent.rootNode = newRoot
-		if newRoot.PageID() != oldRootPageID {
-			parent.writeBackRoot()
-		}
-		parent.treeVersion++
+		parent.setRoot(newRoot)
 	}
 
 	for _, pageID := range pages {
@@ -440,29 +454,13 @@ func (tx *Tx) collectBucketPages(root page.ID) ([]page.ID, error) {
 			return nil, fmt.Errorf("bucket page %d is already retired: %w", pageID, ErrInvalid)
 		}
 		seen[pageID] = struct{}{}
-		node, err := tx.store.ReadNode(pageID)
-		if err != nil {
+		if err := tx.store.VisitNodeReferences(pageID, func(child page.ID) error {
+			stack = append(stack, child)
+			return nil
+		}); err != nil {
 			return nil, err
 		}
-		if node == nil {
-			return nil, fmt.Errorf("bucket page %d is missing: %w", pageID, ErrInvalid)
-		}
 		pages = append(pages, pageID)
-		if !node.IsLeaf() {
-			stack = append(stack, node.Children...)
-			continue
-		}
-		for index := 0; index < node.EntryCount(); index++ {
-			entry := node.EntryAt(index)
-			if entry.Flags()&btree.BucketLeafFlag == 0 {
-				continue
-			}
-			childRoot, err := page.DecodeID(entry.Value())
-			if err != nil {
-				return nil, err
-			}
-			stack = append(stack, childRoot)
-		}
 	}
 	return pages, nil
 }

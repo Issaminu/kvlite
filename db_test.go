@@ -12,9 +12,11 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -3527,6 +3529,53 @@ func TestBucketGetReturnsLookupErrors(t *testing.T) {
 	}
 }
 
+func TestDeleteBucketVisitsMappedDescendants(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.CreateBucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		for index := range 200 {
+			if err := child.Put([]byte(fmt.Sprintf("key-%03d", index)), make([]byte, 200)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.DeleteBucket([]byte("parent")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		_, err := tx.Bucket([]byte("parent"))
+		return err
+	}); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("deleted bucket: got %v, want ErrBucketNotFound", err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestDeleteBucketTopLevelInvalidatesOldHandles(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
@@ -6864,5 +6913,143 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 
 	if _, err := os.Stat(path + "-wal"); err != nil {
 		t.Fatalf("failed recovery removed the committed WAL: %v", err)
+	}
+}
+
+func TestDeleteBatchAcrossLeaves(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "batch.db")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := []byte("batch")
+	keys := make([][]byte, 600)
+	value := bytes.Repeat([]byte("v"), 80)
+	for index := range keys {
+		keys[index] = []byte(fmt.Sprintf("key-%04d", index))
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			if err := bucket.Put(key, value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	order := rand.New(rand.NewSource(42)).Perm(len(keys))
+	for first := 0; first < len(order); first += 75 {
+		batch := make([][]byte, 0, 78)
+		for _, index := range order[first : first+75] {
+			batch = append(batch, keys[index])
+		}
+		batch = append(batch, batch[0], []byte("missing"), batch[0])
+		if first/75%2 == 0 {
+			slices.SortFunc(batch, bytes.Compare)
+		}
+		if err := db.Update(func(tx *Tx) error {
+			bucket, err := tx.Bucket(name)
+			if err != nil {
+				return err
+			}
+			return bucket.DeleteBatch(batch)
+		}); err != nil {
+			t.Fatalf("batch %d: %v", first/75, err)
+		}
+		if err := db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket(name)
+			if err != nil {
+				return err
+			}
+			for _, index := range order[:first+75] {
+				if _, err := bucket.Get(keys[index]); !errors.Is(err, ErrKeyNotFound) {
+					return fmt.Errorf("deleted key %q: %w", keys[index], err)
+				}
+			}
+			for _, index := range order[first+75:] {
+				if got, err := bucket.Get(keys[index]); err != nil || !bytes.Equal(got, value) {
+					return fmt.Errorf("remaining key %q: value %q, error %v", keys[index], got, err)
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(name)
+		if err != nil {
+			return err
+		}
+		for _, key := range keys {
+			if _, err := bucket.Get(key); !errors.Is(err, ErrKeyNotFound) {
+				return fmt.Errorf("reopened deleted key %q: %v", key, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDeleteBatchRejectsBucketAndRollsBack(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "batch.db"), 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("a-plain"), []byte("value")); err != nil {
+			return err
+		}
+		for index := range 200 {
+			if err := bucket.Put([]byte(fmt.Sprintf("middle-%03d", index)), []byte("value")); err != nil {
+				return err
+			}
+		}
+		_, err = bucket.CreateBucket([]byte("z-child"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		return bucket.DeleteBatch([][]byte{[]byte("a-plain"), []byte("z-child")})
+	})
+	if !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("delete nested bucket: %v", err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		if value, err := bucket.Get([]byte("a-plain")); err != nil || string(value) != "value" {
+			return fmt.Errorf("rollback plain key: %q, %v", value, err)
+		}
+		_, err = bucket.Bucket([]byte("z-child"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
 	}
 }

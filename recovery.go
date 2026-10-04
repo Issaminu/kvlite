@@ -82,7 +82,7 @@ func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.WALRecord, error)
 }
 
 func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
-	committed, err := db.materializeWALPagePatches(committed)
+	committed, err := db.materializeWALNodeChanges(committed)
 	if err != nil {
 		return err
 	}
@@ -149,7 +149,7 @@ func metaFromCommittedRecords(committed []wal.WALRecord) (*page.Meta, error) {
 
 // loadCommittedIntoOverlay makes committed WAL pages visible to a read-only database. It does not change the main file.
 func (db *DB) loadCommittedIntoOverlay(committed []wal.WALRecord) error {
-	committed, err := db.materializeWALPagePatches(committed)
+	committed, err := db.materializeWALNodeChanges(committed)
 	if err != nil {
 		return err
 	}
@@ -168,25 +168,75 @@ func (db *DB) loadCommittedIntoOverlay(committed []wal.WALRecord) error {
 	return nil
 }
 
-// materializeWALPagePatches rebuilds the latest complete image for each data page.
+// materializeWALNodeChanges rebuilds the latest complete image for each data page.
 // A later Delete can free a page that has an older WAL patch.
 // A later full node can replace an older patch for a page that was reused.
 // Neither older patch needs its old main-file page during recovery.
-func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecord, error) {
+func (db *DB) materializeWALNodeChanges(records []wal.WALRecord) ([]wal.WALRecord, error) {
 	pageImages := make(map[page.ID][]byte)
 	lastRecord := make(map[page.ID]int)
 	lastFullRecord := make(map[page.ID]int)
+	loadMain := func(pageID page.ID) ([]byte, uint32, error) {
+		mainPage, err := db.readMainPage(pageID)
+		if err != nil {
+			return nil, 0, fmt.Errorf("read page %d for WAL change: %w", pageID, err)
+		}
+		node, err := btree.DecodeNode(slices.Clone(mainPage), pageID, db.meta.PageSize())
+		if err != nil {
+			return nil, 0, fmt.Errorf("decode page %d for WAL change: %w", pageID, err)
+		}
+		return btree.EncodeWALNode(node), uint32(node.EntryCount()), nil
+	}
 	for index, record := range records {
 		if record.Header.Type == wal.RecordTypeNode {
 			lastFullRecord[record.Header.PageID] = index
 		}
 	}
+	// A checkpoint can write the final main page and fail before it clears the WAL.
+	// If the main leaf already has a delete record's final entry count, it has
+	// also received every earlier change to that page. Skip that prefix so an
+	// older same-size patch cannot run against the smaller leaf image.
+	skipThrough := make(map[page.ID]int)
+	mainCounts := make(map[page.ID]uint32)
 	for index, record := range records {
-		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch {
+		if record.Header.Type != wal.RecordTypeLeafDelete {
+			continue
+		}
+		pageID := record.Header.PageID
+		if db.allocation != nil && !db.allocation.allocated(pageID) {
+			continue
+		}
+		if _, hasFull := lastFullRecord[pageID]; hasFull {
+			continue
+		}
+		_, targetCount, err := wal.LeafDeleteEntryCounts(record.Payload)
+		if err != nil {
+			return nil, fmt.Errorf("read leaf delete for page %d: %w", pageID, err)
+		}
+		count, loaded := mainCounts[pageID]
+		if !loaded {
+			image, mainCount, err := loadMain(pageID)
+			if err != nil {
+				return nil, err
+			}
+			pageImages[pageID] = image
+			mainCounts[pageID] = mainCount
+			count = mainCount
+		}
+		if count == targetCount {
+			skipThrough[pageID] = index
+		}
+	}
+	for index, record := range records {
+		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch || record.Header.Type == wal.RecordTypeLeafDelete {
 			if db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
 				continue
 			}
 			if fullIndex, ok := lastFullRecord[record.Header.PageID]; ok && index < fullIndex {
+				continue
+			}
+			if through, ok := skipThrough[record.Header.PageID]; ok && index <= through {
+				lastRecord[record.Header.PageID] = through
 				continue
 			}
 		}
@@ -194,23 +244,23 @@ func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecor
 		switch record.Header.Type {
 		case wal.RecordTypeNode:
 			image = record.Payload
-		case wal.RecordTypePatch:
+		case wal.RecordTypePatch, wal.RecordTypeLeafDelete:
 			base, ok := pageImages[record.Header.PageID]
 			if !ok {
-				mainPage, err := db.readMainPage(record.Header.PageID)
+				var err error
+				base, _, err = loadMain(record.Header.PageID)
 				if err != nil {
-					return nil, fmt.Errorf("read page %d for WAL patch: %w", record.Header.PageID, err)
+					return nil, err
 				}
-				node, err := btree.DecodeNode(slices.Clone(mainPage), record.Header.PageID, db.meta.PageSize())
-				if err != nil {
-					return nil, fmt.Errorf("decode page %d for WAL patch: %w", record.Header.PageID, err)
-				}
-				base = btree.EncodeWALNode(node)
 			}
 			var err error
-			image, err = wal.ApplyPagePatch(base, record.Payload, db.meta.PageSize())
+			if record.Header.Type == wal.RecordTypePatch {
+				image, err = wal.ApplyPagePatch(base, record.Payload, db.meta.PageSize())
+			} else {
+				image, err = wal.ApplyLeafDeletes(base, record.Payload, record.Header.PageID)
+			}
 			if err != nil {
-				return nil, fmt.Errorf("apply WAL patch for page %d: %w", record.Header.PageID, err)
+				return nil, fmt.Errorf("apply WAL node change for page %d: %w", record.Header.PageID, err)
 			}
 		default:
 			continue
@@ -221,7 +271,7 @@ func (db *DB) materializeWALPagePatches(records []wal.WALRecord) ([]wal.WALRecor
 
 	materialized := make([]wal.WALRecord, 0, len(records))
 	for index, record := range records {
-		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch {
+		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch || record.Header.Type == wal.RecordTypeLeafDelete {
 			if db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
 				continue
 			}

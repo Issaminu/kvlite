@@ -116,12 +116,7 @@ func (engine *kvliteEngine) DeleteBatch(_ context.Context, keys [][]byte) error 
 		if err != nil {
 			return err
 		}
-		for _, key := range keys {
-			if err := bucket.Delete(key); err != nil {
-				return err
-			}
-		}
-		return nil
+		return bucket.DeleteBatch(keys)
 	})
 }
 
