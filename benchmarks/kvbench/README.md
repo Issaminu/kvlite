@@ -28,6 +28,23 @@ Replace the branch and run ID with your values. A manual run uses `medium`, `all
 
 Use the saved environment record and raw samples when you compare results. Shared runners can change timing between runs. Treat small differences between separate workflow runs as uncertain. The Docker runner changes engine and durability order within each run.
 
+## Run benchmarks on CodSpeed
+
+Maintainers with access to the private [dispatcher](https://github.com/ci-thing/dispatcher) can run a selected KVBench benchmark on a dedicated CodSpeed macro runner. Push the KVLite commit first. Give each task its own commit SHA so that a moving branch cannot change the tested code.
+
+```sh
+gh workflow run kvlite-benchmarks.yml --repo ci-thing/dispatcher --ref main \
+  -f kvlite_ref="$(git rev-parse HEAD)" -f engine=kvlite \
+  -f durability=durable -f profile=light -f workload=focused \
+  -f benchmark=BenchmarkAcknowledgedOperations
+```
+
+The workflow accepts `engine=kvlite`, `bbolt`, `redis`, or `all`. It accepts `durability=durable`, `no-commit-sync`, or `both`. It accepts the same profile and workload choices as the GitHub Actions KVBench workflow above. Set `benchmark=all` to run every top-level Go benchmark. Otherwise, give one top-level `Benchmark...` function name from the `*_test.go` files. An `all` engine or `both` durability choice creates a separate macro runner job for each combination.
+
+The command returns a GitHub Actions run URL. Use `gh run watch <run-id> --repo ci-thing/dispatcher --exit-status` to wait. Use `gh run view <run-id> --repo ci-thing/dispatcher --log` to read the measured cases. Each job summary links to the exact KVLite commit. The CodSpeed MCP tools can list runs, read their metrics, and compare two run IDs.
+
+To check a pull request, run the same selection once for its base commit and once for its head commit. Get those commits with `gh pr view <number> --repo Issaminu/kvlite --json baseRefOid,headRefOid`. Compare the two CodSpeed runs only after both complete. Match their profile, workload, engine, durability, and benchmark name. CodSpeed stores these reports under `ci-thing/dispatcher`, so it does not add a native CodSpeed check to the KVLite pull request. When runs overlap, use each GitHub Actions run and its log to identify its tested commit. The CodSpeed report alone does not show that KVLite commit.
+
 ## Run the suite
 
 Run the light profile during normal development:
