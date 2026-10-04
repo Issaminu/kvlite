@@ -217,6 +217,7 @@ start_go() {
 	docker rm --force "${go_name}" >/dev/null 2>&1 || true
 	docker run --detach --name "${go_name}" \
 		--cpuset-cpus "${cpu_set}" \
+		--env GOFLAGS=-buildvcs=false \
 		--network "${network_name}" \
 		"${benchmark_data_mount[@]}" \
 		--volume "${cache_volume_name}:/go-cache" \
