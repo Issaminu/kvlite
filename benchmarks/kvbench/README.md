@@ -30,7 +30,14 @@ Use the saved environment record and raw samples when you compare results. Share
 
 ## Run benchmarks on CodSpeed
 
-Maintainers with access to the private [dispatcher](https://github.com/ci-thing/dispatcher) can run a selected KVBench benchmark on a dedicated CodSpeed macro runner. Push the KVLite commit first. Give each task its own commit SHA so that a moving branch cannot change the tested code.
+Maintainers with access to the private [dispatcher](https://github.com/ci-thing/dispatcher) can run KVBench Go benchmarks on CodSpeed macro runners. Push the KVLite commit first. Give each task its own commit SHA so that a moving branch cannot change the tested code. The default runs the medium profile, all workloads, all three engines, both durability modes, and all top-level benchmark functions. It splits the functions into four groups per engine and mode. This creates 24 jobs that can run at the same time when runner capacity is available:
+
+```sh
+gh workflow run kvlite-benchmarks.yml --repo ci-thing/dispatcher --ref main \
+  -f kvlite_ref="$(git rev-parse HEAD)"
+```
+
+Select one quick case when you need a shorter run:
 
 ```sh
 gh workflow run kvlite-benchmarks.yml --repo ci-thing/dispatcher --ref main \
@@ -39,7 +46,9 @@ gh workflow run kvlite-benchmarks.yml --repo ci-thing/dispatcher --ref main \
   -f benchmark=BenchmarkAcknowledgedOperations
 ```
 
-The workflow accepts `engine=kvlite`, `bbolt`, `redis`, or `all`. It accepts `durability=durable`, `no-commit-sync`, or `both`. It accepts the same profile and workload choices as the GitHub Actions KVBench workflow above. Set `benchmark=all` to run every top-level Go benchmark. Otherwise, give one top-level `Benchmark...` function name from the `*_test.go` files. An `all` engine or `both` durability choice creates a separate macro runner job for each combination.
+The workflow accepts `engine=kvlite`, `bbolt`, `redis`, or `all`. It accepts `durability=durable`, `no-commit-sync`, or `both`. It accepts the same profile and workload choices as the GitHub Actions KVBench workflow above. Set `benchmark=all` to run every top-level Go benchmark allowed by the workload. Otherwise, give one top-level `Benchmark...` function name from the `*_test.go` files. An `all` engine or `both` durability choice creates a separate macro runner job for each combination.
+
+Each job starts one Go benchmark command. The Go benchmark engine sets the iteration count for each case. CodSpeed combines different cases from parallel jobs into one report. It does not combine repeated copies of one case in the same run. The groups apply only when `workload=all`; a smaller workload uses one job per engine and mode. More jobs use more CodSpeed runner minutes even when they finish sooner. The `large` profile selects the complete case matrix, but this CodSpeed workflow does not run the Docker runner's warm-up, repeated-round schedule, storage setup, or Redis restart check. Use the KVBench GitHub Actions workflow above when you need that full runner.
 
 The command returns a GitHub Actions run URL. Use `gh run watch <run-id> --repo ci-thing/dispatcher --exit-status` to wait. Use `gh run view <run-id> --repo ci-thing/dispatcher --log` to read the measured cases. Each job summary links to the exact KVLite commit. The CodSpeed MCP tools can list runs, read their metrics, and compare two run IDs.
 
