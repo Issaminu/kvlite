@@ -14,25 +14,26 @@ suite_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
-readonly results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume]"
-benchmark_profile="light"
+results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--profile]"
+benchmark_scale="light"
 engine_option="--engines=kvlite,bbolt,redis"
 workload_option=""
 storage_option=""
-profile_set=0
+profile_enabled=0
+scale_set=0
 engine_set=0
 workload_set=0
 storage_set=0
 for argument in "$@"; do
 	case "${argument}" in
 	light | medium | large)
-		if ((profile_set)); then
-			echo "select one profile" >&2
+		if ((scale_set)); then
+			echo "select one scale" >&2
 			exit 1
 		fi
-		benchmark_profile="${argument}"
-		profile_set=1
+		benchmark_scale="${argument}"
+		scale_set=1
 		;;
 	--engines=*)
 		if ((engine_set)); then
@@ -58,37 +59,45 @@ for argument in "$@"; do
 		storage_option="${argument}"
 		storage_set=1
 		;;
+	--profile)
+		if ((profile_enabled)); then
+			echo "select profiling once" >&2
+			exit 1
+		fi
+		profile_enabled=1
+		;;
 	*)
 		echo "${usage}" >&2
 		exit 1
 		;;
 	esac
 done
-readonly benchmark_profile
+readonly benchmark_scale
 readonly engine_option
-case "${benchmark_profile}" in
+case "${benchmark_scale}" in
 light)
-	readonly measured_count=3
+	measured_count=3
 	readonly samples_per_round=2
 	readonly warmup_count=1
 	;;
 medium)
-	readonly measured_count=10
+	measured_count=10
 	readonly samples_per_round=1
 	readonly warmup_count=1
 	;;
 large)
-	readonly measured_count=15
+	measured_count=15
 	readonly samples_per_round=1
 	readonly warmup_count=1
 	;;
 *)
-	echo "profile must be light, medium, or large" >&2
+	echo "scale must be light, medium, or large" >&2
 	exit 1
 	;;
 esac
+readonly measured_count
 if [[ -z "${workload_option}" ]]; then
-	if [[ "${benchmark_profile}" == "light" ]]; then
+	if [[ "${benchmark_scale}" == "light" ]]; then
 		workload_option="--workloads=focused"
 	else
 		workload_option="--workloads=all"
@@ -96,7 +105,7 @@ if [[ -z "${workload_option}" ]]; then
 fi
 readonly workload_option
 if [[ -z "${storage_option}" ]]; then
-	if [[ "${benchmark_profile}" == "light" ]]; then
+	if [[ "${benchmark_scale}" == "light" ]]; then
 		storage_option="--storage=tmpfs"
 	else
 		storage_option="--storage=volume"
@@ -169,7 +178,7 @@ else
 		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
 		;;
 	all)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
+		readonly benchmark_filter='^Benchmark'
 		;;
 	esac
 fi
@@ -211,6 +220,7 @@ start_go() {
 		--network "${network_name}" \
 		"${benchmark_data_mount[@]}" \
 		--volume "${cache_volume_name}:/go-cache" \
+		--mount "type=bind,source=${results_dir},target=/benchmark-results" \
 		--mount "type=bind,source=${repository_dir},target=/workspace,readonly" \
 		--workdir /workspace/benchmarks/kvbench \
 		"${go_image}" \
@@ -247,6 +257,9 @@ start_redis() {
 }
 
 mkdir -p "${results_dir}"
+results_dir="$(cd "${results_dir}" && pwd -P)"
+readonly results_dir
+rm -f "${results_dir}/profiles/index.tsv"
 docker network create "${network_name}" >/dev/null
 if [[ "${benchmark_storage}" == "volume" ]]; then
 	docker volume create "${volume_name}" >/dev/null
@@ -254,6 +267,12 @@ fi
 docker volume create "${cache_volume_name}" >/dev/null
 start_go
 docker exec "${go_name}" chmod 0777 /benchmark-data
+docker exec \
+	--env GOCACHE=/go-cache/build \
+	--env GOMODCACHE=/go-cache/mod \
+	--env TMPDIR=/benchmark-data/tmp \
+	"${go_name}" \
+	sh -c 'mkdir -p "$GOCACHE" "$GOMODCACHE" "$TMPDIR" && go build -o /benchmark-data/kvbench-report ./cmd/report'
 redis_address=""
 if ((uses_redis)); then
 	start_redis
@@ -272,7 +291,7 @@ run_go() {
 		--env TMPDIR=/benchmark-data/tmp \
 		--env KVBENCH_DURABILITY="${mode}" \
 		--env KVBENCH_ENGINE="${engine}" \
-		--env KVBENCH_PROFILE="${benchmark_profile}" \
+		--env KVBENCH_SCALE="${benchmark_scale}" \
 		--env KVBENCH_WORKLOAD="${benchmark_workload}" \
 		--env KVBENCH_REDIS_ADDR="${redis_address}" \
 		--env KVBENCH_REDIS_FLUSHDB=1 \
@@ -319,6 +338,7 @@ run_warmup_round() {
 			echo "${output}" >&2
 			return 1
 		fi
+		printf '%s\n' "${output}" >> "${results_dir}/warmup-${mode}.txt"
 	done
 }
 
@@ -359,13 +379,14 @@ verify_redis_reopen_after_kill() {
 {
 	echo "Run date: $(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 	echo "KVLite commit: $(git -C "${repository_dir}" rev-parse HEAD)"
-	echo "Benchmark profile: ${benchmark_profile}"
+	echo "Benchmark scale: ${benchmark_scale}"
 	echo "Engines: ${selected_engines}"
 	echo "Workloads: ${benchmark_workload}"
 	echo "Warm-up count: ${warmup_count}"
 	echo "Measured rounds: ${measured_count}"
 	echo "Samples per round: ${samples_per_round}"
 	echo "Measured samples: $((measured_count * samples_per_round))"
+	echo "Profile every selected case: ${profile_enabled}"
 	echo "Benchmark filter: ${benchmark_filter}"
 	echo "CPU set: ${cpu_set}"
 	echo "Benchmark data storage: ${benchmark_storage}"
@@ -396,7 +417,7 @@ fi
 	} | sort -z | xargs -0 shasum -a 256
 ) >"${results_dir}/source-sha256.txt"
 
-if [[ "${benchmark_profile}" != "light" ]]; then
+if [[ "${benchmark_scale}" != "light" ]]; then
 	run_root_tests
 	run_go durable "" -count=1 ./...
 	if ((uses_redis)) && [[ "${benchmark_workload}" != "reads" ]]; then
@@ -410,6 +431,8 @@ fi
 
 : >"${results_dir}/durable.txt"
 : >"${results_dir}/no-commit-sync.txt"
+: >"${results_dir}/warmup-durable.txt"
+: >"${results_dir}/warmup-no-commit-sync.txt"
 
 for ((round = 0; round < warmup_count; round++)); do
 	echo "Warm-up round $((round + 1)) of ${warmup_count}"
@@ -422,3 +445,48 @@ for ((round = 0; round < measured_count; round++)); do
 done
 
 echo "Raw results: ${results_dir}"
+if ((profile_enabled)); then
+	profile_dir="${results_dir}/profiles"
+	mkdir -p "${profile_dir}"
+	docker exec "${go_name}" /benchmark-data/kvbench-report cases /benchmark-results >"${profile_dir}/index.tsv"
+	while IFS=$'\t' read -r case_id case_mode case_name case_engine case_filter case_rounds; do
+		case_dir="${profile_dir}/${case_id}"
+		container_case_dir="/benchmark-results/profiles/${case_id}"
+		mkdir -p "${case_dir}"
+		rm -f "${case_dir}"/{cpu.pprof,memory.pprof,trace.out,run.txt,cpu-top.txt,cpu-cum.txt,alloc-top.txt,net.pprof,net-top.txt,sync.pprof,sync-top.txt,syscall.pprof,syscall-top.txt,sched.pprof,sched-top.txt}
+		echo "Profile ${case_id}: ${case_mode} ${case_name} (${case_rounds} repeats)"
+		run_go "${case_mode}" "${case_engine}" \
+			-run '^$' -bench "${case_filter}" -benchtime=1x -count="${case_rounds}" -timeout=0 \
+			-o /benchmark-data/kvbench.test \
+			-cpuprofile="${container_case_dir}/cpu.pprof" \
+			-memprofile="${container_case_dir}/memory.pprof" \
+			-trace="${container_case_dir}/trace.out" | tee "${case_dir}/run.txt"
+		docker exec "${go_name}" /benchmark-data/kvbench-report check-profile \
+			"${container_case_dir}/run.txt" "${case_name}" "${case_rounds}"
+		for view in cpu alloc; do
+			if [[ "${view}" == cpu ]]; then
+				profile_file="${container_case_dir}/cpu.pprof"
+				view_option=()
+			else
+				profile_file="${container_case_dir}/memory.pprof"
+				view_option=(-alloc_space)
+			fi
+			docker exec "${go_name}" go tool pprof -top -nodecount=15 -divide_by="${case_rounds}" \
+				"${view_option[@]}" /benchmark-data/kvbench.test "${profile_file}" >"${case_dir}/${view}-top.txt"
+		done
+		docker exec "${go_name}" go tool pprof -top -cum -nodecount=15 -divide_by="${case_rounds}" \
+			/benchmark-data/kvbench.test "${container_case_dir}/cpu.pprof" >"${case_dir}/cpu-cum.txt"
+		for wait_kind in net sync syscall sched; do
+			if docker exec "${go_name}" sh -c 'go tool trace -pprof="$1" "$2" > "$3"' sh \
+				"${wait_kind}" "${container_case_dir}/trace.out" "${container_case_dir}/${wait_kind}.pprof"; then
+				if ! docker exec "${go_name}" go tool pprof -top -nodecount=15 -divide_by="${case_rounds}" \
+					/benchmark-data/kvbench.test "${container_case_dir}/${wait_kind}.pprof" >"${case_dir}/${wait_kind}-top.txt"; then
+					rm -f "${case_dir}/${wait_kind}-top.txt"
+				fi
+			fi
+		done
+	done <"${profile_dir}/index.tsv"
+	docker cp "${go_name}:/benchmark-data/kvbench.test" "${profile_dir}/kvbench.test"
+fi
+docker exec "${go_name}" /benchmark-data/kvbench-report report /benchmark-results
+echo "Report: ${results_dir}/report.md"

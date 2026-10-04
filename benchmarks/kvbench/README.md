@@ -10,23 +10,44 @@ The suite has three result groups:
 
 See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-03 report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
 
+## Run benchmarks on GitHub Actions
+
+The [test workflow](../../.github/workflows/ci.yml) tests both Go modules on each pull request and push to main. The [KVBench workflow](../../.github/workflows/kvbench.yml) runs the Docker runner below on a remote machine. Pull requests use `light`, `focused`, and all three engines. Pushes to main use `medium`, `all`, and all three engines. Each run measures both durability modes and saves the raw results and environment record as a workflow artifact.
+
+To run a selected branch away from your computer, commit and push its changes. GitHub Actions cannot read changes that stay on your computer. After the workflow is on the default branch, start a manual run with the scale, workload, and engines you need:
+
+```sh
+gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=light -f workload=focused -f engines=kvlite
+gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=medium -f workload=all -f engines=kvlite,bbolt,redis
+gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=light -f workload=focused -f engines=kvlite -f profiling=true
+gh run list --workflow kvbench.yml --branch my-benchmark-branch
+gh run watch 123456789
+gh run download 123456789
+```
+
+Replace the branch and run ID with your values. A manual run uses `medium`, `all`, and all three engines by default. The workflow accepts the `light`, `medium`, or `large` scale and the `focused`, `reads`, `writes`, `deletes`, `mixed`, or `all` workload. Select one or more engines with a comma-separated list. Each workflow run gets its own GitHub-hosted machine. Runs from different branches can start at the same time, subject to GitHub runner capacity.
+
+Set `profiling=true` to profile every selected case after the normal timing run. Leave it false for an ordinary timing run. The workflow saves the report and profiles in the same result artifact. Profiling a large, all-workload run can take much longer and produce large artifacts.
+
+Use the saved environment record and raw samples when you compare results. Shared runners can change timing between runs. Treat small differences between separate workflow runs as uncertain. The Docker runner changes engine and durability order within each run.
+
 ## Run the suite
 
-Run the light profile during normal development:
+Run the light scale during normal development:
 
 ```sh
 cd benchmarks/kvbench
 ./run-docker.sh
 ```
 
-Select another profile when you need repeated results or complete case coverage:
+Select another scale when you need repeated results or complete case coverage:
 
 ```sh
 ./run-docker.sh medium
 ./run-docker.sh large
 ```
 
-All profiles run all three engines by default. Select a smaller engine set when needed:
+All scales run all three engines by default. Select a smaller engine set when needed:
 
 ```sh
 ./run-docker.sh light --engines=kvlite,bbolt
@@ -34,7 +55,7 @@ All profiles run all three engines by default. Select a smaller engine set when 
 ./run-docker.sh --engines=kvlite
 ```
 
-When you omit the profile, the runner uses light. Light uses the focused workload and tmpfs by default.
+When you omit the scale, the runner uses light. Light uses the focused workload and tmpfs by default.
 
 Select the measured workload when you do not need the complete suite:
 
@@ -65,31 +86,47 @@ Select where the runner stores benchmark data:
 ./run-docker.sh medium --workloads=all --storage=tmpfs
 ```
 
-The `storage` modifier is independent of the profile and workload. `tmpfs` uses container memory. It reduces host storage variation, but it does not measure physical-device sync latency or survive a container restart. The runner therefore skips the Redis restart durability probe when it uses tmpfs. `volume` uses a temporary Docker volume. It includes the Docker host or virtual-machine storage path. It is still specific to that environment.
+The `storage` modifier is independent of the scale and workload. `tmpfs` uses container memory. It reduces host storage variation, but it does not measure physical-device sync latency or survive a container restart. The runner therefore skips the Redis restart durability probe when it uses tmpfs. `volume` uses a temporary Docker volume. It includes the Docker host or virtual-machine storage path. It is still specific to that environment.
 
-| Profile | Scope | Warm-up | Measurement | Default workload | Default storage | Use |
+| Scale | Scope | Warm-up | Measurement | Default workload | Default storage | Use |
 | --- | --- | ---: | --- | --- | --- | --- |
 | `light` | One representative case from every comparison group | 1 | 3 rounds with 2 samples each | `focused` | `tmpfs` | Quick repeated comparison |
 | `medium` | A selected decision set from every comparison group | 1 | 10 fixed-work runs | `all` | `volume` | Repeated engineering comparisons |
 | `large` | Every case variant at the standard work size | 1 | 15 fixed-work runs | `all` | `volume` | Release and publication results |
 
-The light profile compares the selected engines in Docker. It skips pre-run test passes. Its wider workloads use 1,000 records, 1,000 point reads, 100 point writes, 1,000 mixed operations, and 320 concurrent point writes. It runs one warm-up and records six samples for each selected engine and durability mode.
+The light scale compares the selected engines in Docker. It skips pre-run test passes. Its wider workloads use 1,000 records, 1,000 point reads, 100 point writes, 1,000 mixed operations, and 320 concurrent point writes. It runs one warm-up and records six samples for each selected engine and durability mode.
 
-The focused workload selects five data paths: random point read, random point update, random point insert, random 10-key batch update, and random point delete of an existing key with one client. Each sample uses at least 100,000 reads, 1,000 fixed write cycles, and 1,000 point deletes in the light profile. The three write paths run in one cycle and report one combined signal. Point deletes report a separate result. The cases run in durable and no-sync modes. KVLite, bbolt, and Redis run the same operations. Focused uses one CPU by default. `KVBENCH_CPUSET` can select a different CPU set. Mixed, scan, lifecycle, and collection work remain in the wider workloads. Use `light --workloads=focused` for quick repeated code-regression comparisons.
+The focused workload selects five data paths: random point read, random point update, random point insert, random 10-key batch update, and random point delete of an existing key with one client. Each sample uses at least 100,000 reads, 1,000 fixed write cycles, and 1,000 point deletes at the light scale. The three write paths run in one cycle and report one combined signal. Point deletes report a separate result. The cases run in durable and no-sync modes. KVLite, bbolt, and Redis run the same operations. Focused uses one CPU by default. `KVBENCH_CPUSET` can select a different CPU set. Mixed, scan, lifecycle, and collection work remain in the wider workloads. Use `light --workloads=focused` for quick repeated code-regression comparisons.
 
-The medium profile uses 3,000 records for its main cases. It uses 10,000 point reads, 200 single-client point writes, 640 concurrent point writes, and 2,000 mixed operations. It keeps 15 core cases. These cases cover misses, sequential and random reads, large values, value growth, inserts, updates, concurrency, mixed work, and batches.
+The medium scale uses 3,000 records for its main cases. It uses 10,000 point reads, 200 single-client point writes, 640 concurrent point writes, and 2,000 mixed operations. It keeps 15 core cases. These cases cover misses, sequential and random reads, large values, value growth, inserts, updates, concurrency, mixed work, and batches.
 
-The large profile uses the full case matrix. It uses 10,000 records, 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations.
+The large scale uses the full case matrix. It uses 10,000 records, 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations.
 
-All profiles run one unrecorded pass before measurement. Light records two samples in each of three rounds. Medium records ten runs. Large records fifteen runs. The runner changes engine order and durability-mode order across the measured rounds. The focused workload runs reads in both modes. Other read workloads do not repeat the no-sync mode because commit sync does not affect reads.
+All scales run one unrecorded pass before measurement. Light records two samples in each of three rounds. Medium records ten runs. Large records fifteen runs. The runner changes engine order and durability-mode order across the measured rounds. The focused workload runs reads in both modes. Other read workloads do not repeat the no-sync mode because commit sync does not affect reads.
 
 A large run is suitable for environment-specific publication. Keep the raw values and environment record with every published report.
 
-All profiles use pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout and runs the selected engines on Linux. Light uses `tmpfs` by default for quick development feedback. Medium and large use a Docker volume by default for storage-sensitive results. An explicit `--storage` value overrides these defaults. The runner keeps the Go module and build caches in the `kvlite-kvbench-go-cache` Docker volume. The cache reduces repeat-run setup time. It does not contain benchmark data.
+All scales use pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout and runs the selected engines on Linux. Light uses `tmpfs` by default for quick development feedback. Medium and large use a Docker volume by default for storage-sensitive results. An explicit `--storage` value overrides these defaults. The runner keeps the Go module and build caches in the `kvlite-kvbench-go-cache` Docker volume. The cache reduces repeat-run setup time. It does not contain benchmark data.
 
 The full warm-up pass prepares the executable, container, and shared operating-system state. It does not reuse a measured database fixture. Read-latency cases also perform unrecorded operations against their own loaded fixture before they start the timer. Medium and large run the correctness tests before warm-up and measurement. Light skips these tests.
 
-The Docker profiles use up to four CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. All profiles can set `KVBENCH_RESULTS_DIR` to select the output directory.
+The Docker scales use up to four CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. All scales can set `KVBENCH_RESULTS_DIR` to select the output directory.
+
+## Read results and profile cases
+
+The Docker runner builds the Go report tool in its pinned Go container. After the measured rounds, it writes `report.md`, `report.json`, `summary.csv`, `metrics.csv`, and `comparisons.csv` beside the raw result files. The short report lists the largest KVLite gains and losses against each matched engine. The JSON file keeps every sample. The CSV files show the mean, median, minimum, and maximum for each case and metric.
+
+The gain and loss percentages compare medians. They do not prove that a difference is stable. Check the sample range and environment record before you make a performance claim. Cases without a matching peer have no comparison row.
+
+To profile every case selected by the scale, workload, durability modes, and engines, add `--profile`. For example:
+
+```sh
+./run-docker.sh light --workloads=focused --engines=kvlite --profile
+```
+
+The runner finishes its normal unprofiled rounds first. It then runs each selected case again with CPU profiling, allocation profiling, and an execution trace. It repeats each profiled case once per measured round. The profiles cover the repeats together. The report divides sampled CPU time, allocated bytes, and traced wait time by the number of repeats. Its table shows top functions for each case; `report.json` lists the top three functions in each group. Raw profiles, traces, and full function lists are under `profiles/`. The report also includes the normal timing averages and matched-engine comparisons.
+
+Profiles include fixture setup, final checks, and profiling overhead. CPU samples estimate time spent on the CPU; trace wait profiles estimate blocked time. Neither gives exact time for each function call. Use the unprofiled rounds to measure speed changes. A Redis profile covers its Go client process, not the Redis server process.
 
 ## Fairness contract
 
@@ -126,7 +163,7 @@ The core group covers:
 - Concurrent 100-key update and insert batches at 8 and 32 clients.
 - Mixed work with 95% or 50% reads.
 
-The medium profile uses the selected cases and work sizes listed above. Large uses every case and the standard work sizes. Light uses the smallest fixed workloads.
+The medium scale uses the selected cases and work sizes listed above. Large uses every case and the standard work sizes. Light uses the smallest fixed workloads.
 
 ### Read and mixed transactions
 
@@ -147,7 +184,7 @@ The medium profile uses the selected cases and work sizes listed above. Large us
 
 ### Access distribution
 
-`BenchmarkScaleAndAccessDistribution` tests 1,000 keys in light, 10,000 keys in medium, and 10,000 and 100,000 keys in large. Each profile tests uniform reads and an 80/20 hot set. Each distribution uses a separate fixture.
+`BenchmarkScaleAndAccessDistribution` tests 1,000 keys in light, 10,000 keys in medium, and 10,000 and 100,000 keys in large. Each scale tests uniform reads and an 80/20 hot set. Each distribution uses a separate fixture.
 
 These are warm operating-system-cache tests. A reopen does not make a reliable cold-cache test. Redis also keeps its data in memory. The suite does not label any case as cold unless the runner can enforce the same memory pressure for the complete Redis server and each embedded process.
 
@@ -182,7 +219,7 @@ The delete group runs the same fixed key operations through all three engines. I
 
 The group tests one delete-and-insert cycle and ten repeated cycles. It measures file growth before and after close and reopen. A separate case deletes upper keys and measures logical file size and operating-system file blocks. Another case measures reopen after alternating keys are deleted.
 
-`BenchmarkDeleteBuckets` removes 100 populated top-level buckets. Each bucket has 10, 30, or 100 keys in the light, medium, or large profile. It times one committed delete call per bucket. Setup and checks run outside the timer. This case compares KVLite and bbolt. Redis has no native buckets, so it does not run this case. The focused workload runs only the random one-client key-delete case.
+`BenchmarkDeleteBuckets` removes 100 populated top-level buckets. Each bucket has 10, 30, or 100 keys at the light, medium, or large scale. It times one committed delete call per bucket. Setup and checks run outside the timer. This case compares KVLite and bbolt. Redis has no native buckets, so it does not run this case. The focused workload runs only the random one-client key-delete case.
 
 KVLite can reuse free pages inside its file. Checkpoint can release a free file suffix to the operating system. The cases do not run bbolt compaction or Redis AOF rewrite. `BenchmarkDeleteVisibility` measures the next read in the same client. It does not measure replication.
 

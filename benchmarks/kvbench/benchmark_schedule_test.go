@@ -93,9 +93,9 @@ func TestHotDistributionPlacesEightyPercentInHotSet(t *testing.T) {
 }
 
 func TestBatchCasesWriteEachRecordOnce(t *testing.T) {
-	for _, profile := range []string{"large", "medium", "light"} {
-		t.Run(profile, func(t *testing.T) {
-			t.Setenv("KVBENCH_PROFILE", profile)
+	for _, scale := range []string{"large", "medium", "light"} {
+		t.Run(scale, func(t *testing.T) {
+			t.Setenv("KVBENCH_SCALE", scale)
 			t.Setenv("KVBENCH_WORKLOAD", "all")
 			for _, benchmarkCase := range benchmarkCases() {
 				if benchmarkCase.batchSize == 1 {
@@ -128,18 +128,18 @@ func TestDeleteWorkloadSelection(t *testing.T) {
 	}
 }
 
-func TestDeleteBenchmarkProfiles(t *testing.T) {
+func TestDeleteBenchmarkScales(t *testing.T) {
 	for _, test := range []struct {
-		profile string
-		want    int
+		scale string
+		want  int
 	}{
-		{profile: "light", want: 4},
-		{profile: "medium", want: 4},
-		{profile: "large", want: 7},
+		{scale: "light", want: 4},
+		{scale: "medium", want: 4},
+		{scale: "large", want: 7},
 	} {
-		t.Run(test.profile, func(t *testing.T) {
+		t.Run(test.scale, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", "all")
-			t.Setenv("KVBENCH_PROFILE", test.profile)
+			t.Setenv("KVBENCH_SCALE", test.scale)
 			if got := len(deleteBenchmarkCases()); got != test.want {
 				t.Fatalf("delete cases: got %d, want %d", got, test.want)
 			}
@@ -149,7 +149,7 @@ func TestDeleteBenchmarkProfiles(t *testing.T) {
 
 func TestFocusedDeleteBenchmarkCase(t *testing.T) {
 	t.Setenv("KVBENCH_WORKLOAD", "focused")
-	t.Setenv("KVBENCH_PROFILE", "light")
+	t.Setenv("KVBENCH_SCALE", "light")
 	cases := deleteBenchmarkCases()
 	if len(cases) != 1 || cases[0].name != "existing/random/clients=1" {
 		t.Fatalf("focused delete cases: %+v", cases)
@@ -157,7 +157,7 @@ func TestFocusedDeleteBenchmarkCase(t *testing.T) {
 }
 
 func TestDeleteBenchmarkCasesUseUniqueKeys(t *testing.T) {
-	t.Setenv("KVBENCH_PROFILE", "medium")
+	t.Setenv("KVBENCH_SCALE", "medium")
 	for _, benchmarkCase := range deleteBenchmarkCases() {
 		keyCount := benchmarkCase.operations * benchmarkCase.batchSize
 		if keyCount > benchmarkCase.records {
@@ -185,51 +185,51 @@ func TestPersistentBytesIncludesPrimaryAndLog(t *testing.T) {
 	}
 }
 
-func TestProfileValue(t *testing.T) {
-	t.Setenv("KVBENCH_PROFILE", "light")
-	if got := profileValue(10_000, 1_000); got != 1_000 {
+func TestScaleValue(t *testing.T) {
+	t.Setenv("KVBENCH_SCALE", "light")
+	if got := scaleValue(10_000, 1_000); got != 1_000 {
 		t.Fatalf("light value is %d, want 1000", got)
 	}
-	t.Setenv("KVBENCH_PROFILE", "large")
-	if got := profileValue(10_000, 1_000); got != 10_000 {
+	t.Setenv("KVBENCH_SCALE", "large")
+	if got := scaleValue(10_000, 1_000); got != 10_000 {
 		t.Fatalf("large value is %d, want 10000", got)
 	}
 }
 
-func TestProfileSizedValue(t *testing.T) {
+func TestScaleSizedValue(t *testing.T) {
 	tests := []struct {
-		profile string
-		want    int
+		scale string
+		want  int
 	}{
-		{profile: "light", want: 1},
-		{profile: "medium", want: 2},
-		{profile: "large", want: 3},
+		{scale: "light", want: 1},
+		{scale: "medium", want: 2},
+		{scale: "large", want: 3},
 	}
 	for _, test := range tests {
-		t.Run(test.profile, func(t *testing.T) {
-			t.Setenv("KVBENCH_PROFILE", test.profile)
-			if got := profileSizedValue(3, 2, 1); got != test.want {
+		t.Run(test.scale, func(t *testing.T) {
+			t.Setenv("KVBENCH_SCALE", test.scale)
+			if got := scaleSizedValue(3, 2, 1); got != test.want {
 				t.Fatalf("value is %d, want %d", got, test.want)
 			}
 		})
 	}
 }
 
-func TestProfiledBenchmarkName(t *testing.T) {
+func TestScaledBenchmarkName(t *testing.T) {
 	for _, test := range []struct {
-		profile  string
+		scale    string
 		workload string
 		want     string
 	}{
-		{profile: "", workload: "", want: "profile=large/durable/read/kvlite"},
-		{profile: "medium", workload: "all", want: "profile=medium/durable/read/kvlite"},
-		{profile: "medium", workload: "reads", want: "profile=medium/durable/read/kvlite"},
-		{profile: "light", workload: "focused", want: "profile=light/focused/durable/read/kvlite"},
+		{scale: "", workload: "", want: "scale=large/durable/read/kvlite"},
+		{scale: "medium", workload: "all", want: "scale=medium/durable/read/kvlite"},
+		{scale: "medium", workload: "reads", want: "scale=medium/durable/read/kvlite"},
+		{scale: "light", workload: "focused", want: "scale=light/focused/durable/read/kvlite"},
 	} {
-		t.Run(test.profile+"/"+test.workload, func(t *testing.T) {
-			t.Setenv("KVBENCH_PROFILE", test.profile)
+		t.Run(test.scale+"/"+test.workload, func(t *testing.T) {
+			t.Setenv("KVBENCH_SCALE", test.scale)
 			t.Setenv("KVBENCH_WORKLOAD", test.workload)
-			if got := profiledBenchmarkName("durable/read/kvlite"); got != test.want {
+			if got := scaledBenchmarkName("durable/read/kvlite"); got != test.want {
 				t.Fatalf("benchmark name is %q, want %q", got, test.want)
 			}
 		})
@@ -238,19 +238,19 @@ func TestProfiledBenchmarkName(t *testing.T) {
 
 func TestLatencyOperationCounts(t *testing.T) {
 	tests := []struct {
-		profile string
-		read    int
-		update  int
-		mixed   int
-		warmup  int
+		scale  string
+		read   int
+		update int
+		mixed  int
+		warmup int
 	}{
-		{profile: "light", read: 10_000, update: 1_000, mixed: 1_000, warmup: 100},
-		{profile: "medium", read: 100_000, update: 1_000, mixed: 10_000, warmup: 1_000},
-		{profile: "large", read: 1_000_000, update: 10_000, mixed: 100_000, warmup: 10_000},
+		{scale: "light", read: 10_000, update: 1_000, mixed: 1_000, warmup: 100},
+		{scale: "medium", read: 100_000, update: 1_000, mixed: 10_000, warmup: 1_000},
+		{scale: "large", read: 1_000_000, update: 10_000, mixed: 100_000, warmup: 10_000},
 	}
 	for _, test := range tests {
-		t.Run(test.profile, func(t *testing.T) {
-			t.Setenv("KVBENCH_PROFILE", test.profile)
+		t.Run(test.scale, func(t *testing.T) {
+			t.Setenv("KVBENCH_SCALE", test.scale)
 			if got := latencyOperationCount(benchmarkRead); got != test.read {
 				t.Errorf("read operations are %d, want %d", got, test.read)
 			}
@@ -271,7 +271,7 @@ func TestLatencyOperationCounts(t *testing.T) {
 }
 
 func TestWorkloadSelectsMatchingCases(t *testing.T) {
-	t.Setenv("KVBENCH_PROFILE", "medium")
+	t.Setenv("KVBENCH_SCALE", "medium")
 	tests := []struct {
 		workload string
 		want     int
@@ -292,8 +292,8 @@ func TestWorkloadSelectsMatchingCases(t *testing.T) {
 	}
 }
 
-func TestLightProfileSelectsRepresentativeCoreCases(t *testing.T) {
-	t.Setenv("KVBENCH_PROFILE", "light")
+func TestLightScaleSelectsRepresentativeCoreCases(t *testing.T) {
+	t.Setenv("KVBENCH_SCALE", "light")
 	t.Setenv("KVBENCH_WORKLOAD", "all")
 	want := map[string]bool{
 		"read/random/value=128/clients=1":             true,
@@ -314,7 +314,7 @@ func TestLightProfileSelectsRepresentativeCoreCases(t *testing.T) {
 }
 
 func TestFocusedWorkloadSelectsCriticalCases(t *testing.T) {
-	t.Setenv("KVBENCH_PROFILE", "light")
+	t.Setenv("KVBENCH_SCALE", "light")
 	t.Setenv("KVBENCH_WORKLOAD", "focused")
 	want := map[string]bool{
 		"read/random/value=128/clients=1": true,
@@ -351,8 +351,8 @@ func TestFocusedWorkloadUsesStableDurabilityModes(t *testing.T) {
 	}
 }
 
-func TestMediumProfileSelectsDecisionCoreCases(t *testing.T) {
-	t.Setenv("KVBENCH_PROFILE", "medium")
+func TestMediumScaleSelectsDecisionCoreCases(t *testing.T) {
+	t.Setenv("KVBENCH_SCALE", "medium")
 	t.Setenv("KVBENCH_WORKLOAD", "all")
 	want := map[string]bool{
 		"read/random/value=128/clients=1":                       true,

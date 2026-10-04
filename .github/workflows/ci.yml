@@ -1,0 +1,26 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test both Go modules
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - name: Test KVLite
+        run: go test -timeout=2m ./...
+
+      - name: Test KVBench
+        working-directory: benchmarks/kvbench
+        run: go test ./...

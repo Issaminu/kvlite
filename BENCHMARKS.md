@@ -1,6 +1,6 @@
 # KVLite benchmarks
 
-This report compares KVLite with bbolt and Redis at the public call boundary. It contains the median of 15 measured runs from the complete `large --workloads=all --storage=volume` profile.
+This report compares KVLite with bbolt and Redis at the public call boundary. It contains the median of 15 measured runs at the complete `large --workloads=all --storage=volume` scale.
 
 | Item | Value |
 | --- | --- |
@@ -10,7 +10,7 @@ This report compares KVLite with bbolt and Redis at the public call boundary. It
 | bbolt | `v1.4.3` |
 | Redis | `8.8.0` |
 | Platform | Linux `arm64`, four CPUs in containers |
-| Profile | `large --workloads=all --storage=volume` |
+| Scale | `large --workloads=all --storage=volume` |
 | Warm-up | One complete unrecorded round |
 | Measurement | 15 measured rounds |
 
@@ -32,7 +32,7 @@ These ratios apply only to the named workloads and public call boundaries.
 
 ## Scope
 
-This run measured every workload group and every case variant in the large profile. It covers point operations, deletion, transactions, enumeration, ordered operations, access distributions, latency, collections, storage size, and embedded life-cycle operations.
+This run measured every workload group and every case variant at the large scale. It covers point operations, deletion, transactions, enumeration, ordered operations, access distributions, latency, collections, storage size, and embedded life-cycle operations.
 
 ## Fairness and API boundaries
 
@@ -82,7 +82,7 @@ The runner first completed its correctness tests. It then completed one unrecord
 
 The runner recorded 15 fixed-work rounds. It changed the engine order and durability-mode order between rounds. Pure reads ran once per round because commit-sync settings do not affect them.
 
-The large profile uses 10,000 records for its main cases. It also tests key and bucket deletion, delete visibility, page reuse, tail reclamation, and reopen after deletion. It uses 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations. Read-latency cases use 1,000,000 recorded operations and 10,000 unrecorded fixture warm-up reads. Update-latency cases use 10,000 operations. Mixed-latency cases use 100,000 operations.
+The large scale uses 10,000 records for its main cases. It also tests key and bucket deletion, delete visibility, page reuse, tail reclamation, and reopen after deletion. It uses 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations. Read-latency cases use 1,000,000 recorded operations and 10,000 unrecorded fixture warm-up reads. Update-latency cases use 10,000 operations. Mixed-latency cases use 100,000 operations.
 
 Setup, fixture loading, final stored-data checks, and close operations were outside the core timers. The named life-cycle cases measure open, close, and recovery work separately.
 
@@ -471,7 +471,7 @@ KVLite and bbolt use native buckets. Redis uses logical key prefixes.
 
 ### Latency
 
-The large profile reports one, eight, and 32 clients.
+The large scale reports one, eight, and 32 clients.
 
 #### Durable
 

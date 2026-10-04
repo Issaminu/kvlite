@@ -47,8 +47,8 @@ func BenchmarkReadTransactions(b *testing.B) {
 	if environment.mode == DurabilityNoCommitSync {
 		b.Skip("read results do not depend on commit sync mode")
 	}
-	records := profileSizedValue(10_000, 3_000, 1_000)
-	operations := profileSizedValue(100_000, 10_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
+	operations := scaleSizedValue(100_000, 10_000, 1_000)
 	setup, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
@@ -58,13 +58,13 @@ func BenchmarkReadTransactions(b *testing.B) {
 		b.Fatal(err)
 	}
 	batchSizes := []int{1, 10, 100, 1_000}
-	if lightProfile() {
+	if lightScale() {
 		batchSizes = []int{100}
-	} else if mediumProfile() {
+	} else if mediumScale() {
 		batchSizes = []int{1, 100, 1_000}
 	}
 	for _, batchSize := range batchSizes {
-		runProfiledBenchmark(b, fmt.Sprintf("keys-per-transaction=%d/%s", batchSize, environment.kind), func(b *testing.B) {
+		runScaledBenchmark(b, fmt.Sprintf("keys-per-transaction=%d/%s", batchSize, environment.kind), func(b *testing.B) {
 			engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setup)
 			if err != nil {
 				b.Fatal(err)
@@ -100,8 +100,8 @@ func BenchmarkMixedTransactions(b *testing.B) {
 		b.Skip("mixed workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
-	records := profileSizedValue(10_000, 3_000, 1_000)
-	operations := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
+	operations := scaleSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
@@ -119,16 +119,16 @@ func BenchmarkMixedTransactions(b *testing.B) {
 	}
 	readPercents := []int{95, 50}
 	transactionSizes := []int{10, 100, 1_000}
-	if lightProfile() {
+	if lightScale() {
 		readPercents = []int{95}
 		transactionSizes = []int{100}
-	} else if mediumProfile() {
+	} else if mediumScale() {
 		transactionSizes = []int{10, 100}
 	}
 	for _, readPercent := range readPercents {
 		for _, transactionSize := range transactionSizes {
 			name := fmt.Sprintf("%s/read=%d/operations-per-transaction=%d/%s", environment.mode, readPercent, transactionSize, environment.kind)
-			runProfiledBenchmark(b, name, func(b *testing.B) {
+			runScaledBenchmark(b, name, func(b *testing.B) {
 				engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setup)
 				if err != nil {
 					b.Fatal(err)
@@ -195,7 +195,7 @@ func BenchmarkEnumeration(b *testing.B) {
 	if environment.mode == DurabilityNoCommitSync {
 		b.Skip("enumeration results do not depend on commit sync mode")
 	}
-	records := profileValue(10_000, 1_000)
+	records := scaleValue(10_000, 1_000)
 	pairs := makeTextPairs(records, 128)
 	tests := []struct {
 		name       string
@@ -208,12 +208,12 @@ func BenchmarkEnumeration(b *testing.B) {
 		{name: "selectivity=10", prefix: []byte("item/00000"), want: 1_000, iterations: 1_000},
 		{name: "selectivity=100", want: 10_000, iterations: 1_000},
 	}
-	if lightProfile() {
+	if lightScale() {
 		tests = tests[3:]
 		tests[0].want = records
 	}
 	for _, test := range tests {
-		runProfiledBenchmark(b, test.name+"/"+string(environment.kind), func(b *testing.B) {
+		runScaledBenchmark(b, test.name+"/"+string(environment.kind), func(b *testing.B) {
 			engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, pairs)
 			if err != nil {
 				b.Fatal(err)
@@ -260,7 +260,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 	if environment.kind == EngineRedis {
 		b.Skip("Redis does not provide the ordered cursor contract used by this suite")
 	}
-	records := profileValue(10_000, 1_000)
+	records := scaleValue(10_000, 1_000)
 	pairs := makeTextPairs(records, 128)
 	engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, pairs)
 	if err != nil {
@@ -272,15 +272,15 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		b.Fatalf("%s does not implement ordered visits", environment.kind)
 	}
 	limits := []int{1, 10, 100, 1_000}
-	if lightProfile() {
+	if lightScale() {
 		limits = []int{10}
-	} else if mediumProfile() {
+	} else if mediumScale() {
 		limits = []int{1, 100, 1_000}
 	}
 	for _, limit := range limits {
 		iterations := records / limit * seekMeasurementRepeats
 		name := fmt.Sprintf("seek-and-read=%d/%s", limit, environment.kind)
-		runProfiledBenchmark(b, name, func(b *testing.B) {
+		runScaledBenchmark(b, name, func(b *testing.B) {
 			var checksum uint64
 			visited := 0
 			for b.Loop() {
@@ -310,16 +310,16 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		want       int
 		iterations int
 	}{
-		{name: "selectivity=0", start: []byte("item/99999999"), end: []byte("item/99999999"), want: 0, iterations: profileValue(1_000, 10) * scanMeasurementRepeats},
-		{name: "selectivity=1", start: pairs[0].Key, end: pairs[records/100].Key, want: records / 100, iterations: profileValue(100, 10) * scanMeasurementRepeats},
-		{name: "selectivity=10", start: pairs[0].Key, end: pairs[records/10].Key, want: records / 10, iterations: profileValue(10, 2) * scanMeasurementRepeats},
+		{name: "selectivity=0", start: []byte("item/99999999"), end: []byte("item/99999999"), want: 0, iterations: scaleValue(1_000, 10) * scanMeasurementRepeats},
+		{name: "selectivity=1", start: pairs[0].Key, end: pairs[records/100].Key, want: records / 100, iterations: scaleValue(100, 10) * scanMeasurementRepeats},
+		{name: "selectivity=10", start: pairs[0].Key, end: pairs[records/10].Key, want: records / 10, iterations: scaleValue(10, 2) * scanMeasurementRepeats},
 		{name: "selectivity=100", want: records, iterations: scanMeasurementRepeats},
 	}
-	if lightProfile() {
+	if lightScale() {
 		rangeTests = rangeTests[2:3]
 	}
 	for _, test := range rangeTests {
-		runProfiledBenchmark(b, "range/"+test.name+"/"+string(environment.kind), func(b *testing.B) {
+		runScaledBenchmark(b, "range/"+test.name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
 			for b.Loop() {
 				checksum = 0
@@ -342,7 +342,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		})
 	}
 	directions := []bool{false, true}
-	if lightProfile() {
+	if lightScale() {
 		directions = []bool{false}
 	}
 	for _, reverse := range directions {
@@ -350,7 +350,7 @@ func BenchmarkOrderedOperations(b *testing.B) {
 		if reverse {
 			name = "reverse"
 		}
-		runProfiledBenchmark(b, "full-"+name+"/"+string(environment.kind), func(b *testing.B) {
+		runScaledBenchmark(b, "full-"+name+"/"+string(environment.kind), func(b *testing.B) {
 			var checksum uint64
 			for b.Loop() {
 				checksum = 0
@@ -378,9 +378,9 @@ func BenchmarkScaleAndAccessDistribution(b *testing.B) {
 		b.Skip("read results do not depend on commit sync mode")
 	}
 	sizes := []int{10_000, 100_000}
-	if lightProfile() {
+	if lightScale() {
 		sizes = []int{1_000}
-	} else if mediumProfile() {
+	} else if mediumScale() {
 		sizes = []int{10_000}
 	}
 	for _, records := range sizes {
@@ -393,13 +393,13 @@ func BenchmarkScaleAndAccessDistribution(b *testing.B) {
 			if hot {
 				name = "hot-80-20"
 			}
-			runProfiledBenchmark(b, fmt.Sprintf("records=%d/%s/%s", records, name, environment.kind), func(b *testing.B) {
+			runScaledBenchmark(b, fmt.Sprintf("records=%d/%s/%s", records, name, environment.kind), func(b *testing.B) {
 				engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, pairs)
 				if err != nil {
 					b.Fatal(err)
 				}
 				b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
-				operations := profileSizedValue(100_000, 10_000, 1_000)
+				operations := scaleSizedValue(100_000, 10_000, 1_000)
 				b.SetBytes(int64(operations * 128))
 				for b.Loop() {
 					for operation := range operations {
@@ -420,7 +420,7 @@ func BenchmarkLatency(b *testing.B) {
 		b.Skip("latency workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
-	records := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
@@ -444,14 +444,14 @@ func BenchmarkLatency(b *testing.B) {
 			continue
 		}
 		clientsValues := []int{1, 8, 32}
-		if lightProfile() {
+		if lightScale() {
 			clientsValues = []int{8}
-		} else if mediumProfile() {
+		} else if mediumScale() {
 			clientsValues = []int{8}
 		}
 		for _, clients := range clientsValues {
 			name := fmt.Sprintf("%s/%s/clients=%d/%s", environment.mode, operation, clients, environment.kind)
-			runProfiledBenchmark(b, name, func(b *testing.B) {
+			runScaledBenchmark(b, name, func(b *testing.B) {
 				engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, clients, setup)
 				if err != nil {
 					b.Fatal(err)
@@ -491,11 +491,11 @@ func BenchmarkLatency(b *testing.B) {
 func latencyOperationCount(operation benchmarkOperation) int {
 	switch operation {
 	case benchmarkRead:
-		return profileSizedValue(1_000_000, 100_000, 10_000)
+		return scaleSizedValue(1_000_000, 100_000, 10_000)
 	case benchmarkMixed:
-		return profileSizedValue(100_000, 10_000, 1_000)
+		return scaleSizedValue(100_000, 10_000, 1_000)
 	case benchmarkUpdate:
-		return profileSizedValue(10_000, 1_000, 1_000)
+		return scaleSizedValue(10_000, 1_000, 1_000)
 	default:
 		panic("unknown latency operation")
 	}
@@ -505,7 +505,7 @@ func latencyWarmupOperationCount(operation benchmarkOperation) int {
 	if operation != benchmarkRead {
 		return 0
 	}
-	return profileSizedValue(10_000, 1_000, 100)
+	return scaleSizedValue(10_000, 1_000, 100)
 }
 
 func makeTextPairs(count, valueBytes int) []Pair {

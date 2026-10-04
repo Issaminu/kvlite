@@ -15,13 +15,13 @@ func BenchmarkCollections(b *testing.B) {
 	environment := readBenchmarkEnvironment(b)
 	counts := []int{1, 100}
 	depths := []int{1, 3}
-	if lightProfile() {
+	if lightScale() {
 		counts = []int{100}
 		depths = []int{3}
 	}
 	for _, count := range counts {
 		for _, depth := range depths {
-			if mediumProfile() && !((count == 1 && depth == 1) || (count == 100 && depth == 3)) {
+			if mediumScale() && !((count == 1 && depth == 1) || (count == 100 && depth == 3)) {
 				continue
 			}
 			paths := makeCollectionPaths(count, depth)
@@ -31,12 +31,12 @@ func BenchmarkCollections(b *testing.B) {
 			}
 			name := fmt.Sprintf("%s/collections=%d/depth=%d/model=%s/%s", environment.mode, count, depth, model, environment.kind)
 			if workloadEnabled(benchmarkUpdate) {
-				runProfiledBenchmark(b, name, func(b *testing.B) {
+				runScaledBenchmark(b, name, func(b *testing.B) {
 					benchmarkCollectionWrites(b, environment, paths)
 				})
 			}
 			if workloadEnabled(benchmarkRead) && environment.mode == DurabilityDurable {
-				runProfiledBenchmark(b, "read/"+name, func(b *testing.B) {
+				runScaledBenchmark(b, "read/"+name, func(b *testing.B) {
 					benchmarkCollectionReads(b, environment, paths)
 				})
 			}
@@ -54,7 +54,7 @@ func benchmarkCollectionWrites(b *testing.B, environment benchmarkEnvironment, p
 	if !ok {
 		b.Fatalf("%s does not implement collections", environment.kind)
 	}
-	totalKeys := profileSizedValue(10_000, 3_000, 1_000)
+	totalKeys := scaleSizedValue(10_000, 3_000, 1_000)
 	const batchSize = 100
 	transactions := make([][]Pair, totalKeys/batchSize)
 	for transaction := range transactions {
@@ -103,7 +103,7 @@ func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, pa
 	if !ok {
 		b.Fatalf("%s does not implement collections", environment.kind)
 	}
-	totalKeys := profileSizedValue(10_000, 3_000, 1_000)
+	totalKeys := scaleSizedValue(10_000, 3_000, 1_000)
 	keysPerCollection := totalKeys / len(paths)
 	pairsByCollection := make([][]Pair, len(paths))
 	for pathIndex, path := range paths {
@@ -116,7 +116,7 @@ func benchmarkCollectionReads(b *testing.B, environment benchmarkEnvironment, pa
 		}
 		pairsByCollection[pathIndex] = pairs
 	}
-	operations := profileSizedValue(100_000, 10_000, 1_000)
+	operations := scaleSizedValue(100_000, 10_000, 1_000)
 	var checksum uint64
 	b.SetBytes(int64(operations * 128))
 	for b.Loop() {
@@ -192,8 +192,8 @@ func BenchmarkLifecycle(b *testing.B) {
 	if environment.mode == DurabilityNoCommitSync {
 		b.Skip("recovery requires acknowledged durable writes")
 	}
-	runProfiledBenchmark(b, "create-load-close/"+string(environment.kind), func(b *testing.B) {
-		records := profileSizedValue(10_000, 3_000, 1_000)
+	runScaledBenchmark(b, "create-load-close/"+string(environment.kind), func(b *testing.B) {
+		records := scaleSizedValue(10_000, 3_000, 1_000)
 		pairs, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 		if err != nil {
 			b.Fatal(err)
@@ -213,7 +213,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		b.ReportMetric(float64(b.N*records)/b.Elapsed().Seconds(), "loaded-keys/s")
 	})
 
-	runProfiledBenchmark(b, "open-clean/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, "open-clean/"+string(environment.kind), func(b *testing.B) {
 		dataDir := b.TempDir()
 		engine, err := openEngine(b.Context(), engineOpenOptions{Kind: environment.kind, Mode: environment.mode, DataDir: dataDir, ClientCount: 1})
 		if err != nil {
@@ -235,8 +235,8 @@ func BenchmarkLifecycle(b *testing.B) {
 		}
 	})
 
-	runProfiledBenchmark(b, "close-after-writes/"+string(environment.kind), func(b *testing.B) {
-		pairs, err := makePairs(profileSizedValue(10_000, 3_000, 1_000), 128, 1, keyOrderSequential, 1)
+	runScaledBenchmark(b, "close-after-writes/"+string(environment.kind), func(b *testing.B) {
+		pairs, err := makePairs(scaleSizedValue(10_000, 3_000, 1_000), 128, 1, keyOrderSequential, 1)
 		if err != nil {
 			b.Fatal(err)
 		}
@@ -244,7 +244,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
-		updates := makeTextPairs(profileSizedValue(1_000, 300, 100), 128)
+		updates := makeTextPairs(scaleSizedValue(1_000, 300, 100), 128)
 		if err := loadPairs(b.Context(), engine, updates, 100); err != nil {
 			b.Fatal(errors.Join(err, engine.Close()))
 		}
@@ -268,7 +268,7 @@ func BenchmarkLifecycle(b *testing.B) {
 		}
 	})
 
-	runProfiledBenchmark(b, "recover-after-process-kill/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, "recover-after-process-kill/"+string(environment.kind), func(b *testing.B) {
 		dataDir := b.TempDir()
 		createKilledDatabase(b, environment.kind, dataDir, false)
 		var engine Engine

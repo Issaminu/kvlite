@@ -1,0 +1,59 @@
+name: KVBench
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: Benchmark scale
+        type: choice
+        options: [light, medium, large]
+        default: medium
+      workload:
+        description: Measured workload
+        type: choice
+        options: [focused, reads, writes, deletes, mixed, all]
+        default: all
+      engines:
+        description: Comma-separated engines (kvlite,bbolt,redis)
+        type: string
+        default: kvlite,bbolt,redis
+      profiling:
+        description: Profile every selected benchmark case
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    name: Run KVBench
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    env:
+      SCALE: ${{ github.event_name == 'pull_request' && 'light' || inputs.scale || 'medium' }}
+      WORKLOAD: ${{ github.event_name == 'pull_request' && 'focused' || inputs.workload || 'all' }}
+      ENGINES: ${{ inputs.engines || 'kvlite,bbolt,redis' }}
+      PROFILING: ${{ inputs.profiling || false }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Run KVBench
+        run: |
+          args=("$SCALE" "--engines=$ENGINES" "--workloads=$WORKLOAD")
+          if [[ "$PROFILING" == true ]]; then
+            args+=("--profile")
+          fi
+          ./benchmarks/kvbench/run-docker.sh "${args[@]}"
+
+      - name: Save results
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: kvbench-${{ github.run_id }}-${{ github.run_attempt }}
+          path: /tmp/kvlite-kvbench-results/
+          if-no-files-found: warn
+          retention-days: 14

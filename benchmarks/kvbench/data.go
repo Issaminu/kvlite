@@ -8,26 +8,26 @@ import (
 	"os"
 )
 
-func profileValue(standard, light int) int {
-	if lightProfile() {
+func scaleValue(standard, light int) int {
+	if lightScale() {
 		return light
 	}
 	return standard
 }
 
-func lightProfile() bool {
-	return os.Getenv("KVBENCH_PROFILE") == "light"
+func lightScale() bool {
+	return os.Getenv("KVBENCH_SCALE") == "light"
 }
 
-func mediumProfile() bool {
-	return os.Getenv("KVBENCH_PROFILE") == "medium"
+func mediumScale() bool {
+	return os.Getenv("KVBENCH_SCALE") == "medium"
 }
 
-func profileSizedValue(full, medium, light int) int {
-	if lightProfile() {
+func scaleSizedValue(full, medium, light int) int {
+	if lightScale() {
 		return light
 	}
-	if mediumProfile() {
+	if mediumScale() {
 		return medium
 	}
 	return full

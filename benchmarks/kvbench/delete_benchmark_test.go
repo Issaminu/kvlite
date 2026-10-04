@@ -22,7 +22,7 @@ type deleteBenchmarkCase struct {
 }
 
 func deleteBenchmarkCases() []deleteBenchmarkCase {
-	records := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
 	cases := []deleteBenchmarkCase{
 		{name: "existing/random/clients=1", records: records, operations: records, order: keyOrderRandom, clients: 1, batchSize: 1},
 		{name: "existing/random/clients=8", records: records, operations: records, order: keyOrderRandom, clients: 8, batchSize: 1},
@@ -32,7 +32,7 @@ func deleteBenchmarkCases() []deleteBenchmarkCase {
 	if os.Getenv("KVBENCH_WORKLOAD") == "focused" {
 		return cases[:1]
 	}
-	if !lightProfile() && !mediumProfile() {
+	if !lightScale() && !mediumScale() {
 		cases = append(cases,
 			deleteBenchmarkCase{name: "existing/sequential/clients=1", records: records, operations: records, order: keyOrderSequential, clients: 1, batchSize: 1},
 			deleteBenchmarkCase{name: "existing/random/clients=1/batch=100", records: records, operations: records / 100, order: keyOrderRandom, clients: 1, batchSize: 100},
@@ -48,7 +48,7 @@ func BenchmarkDeleteOperations(b *testing.B) {
 	}
 	environment := readBenchmarkEnvironment(b)
 	for _, benchmarkCase := range deleteBenchmarkCases() {
-		runProfiledBenchmark(b, string(environment.mode)+"/"+benchmarkCase.name+"/"+string(environment.kind), func(b *testing.B) {
+		runScaledBenchmark(b, string(environment.mode)+"/"+benchmarkCase.name+"/"+string(environment.kind), func(b *testing.B) {
 			setup, err := makePairs(benchmarkCase.records, 128, 1, keyOrderSequential, 1)
 			if err != nil {
 				b.Fatal(err)
@@ -101,12 +101,12 @@ func BenchmarkDeleteBuckets(b *testing.B) {
 		b.Skip("Redis does not have native buckets")
 	}
 	const bucketCount = 100
-	keysPerBucket := profileSizedValue(100, 30, 10)
+	keysPerBucket := scaleSizedValue(100, 30, 10)
 	pairs, err := makePairs(keysPerBucket, 128, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
-	runProfiledBenchmark(b, fmt.Sprintf("%s/top-level/buckets=%d/keys-per-bucket=%d/%s", environment.mode, bucketCount, keysPerBucket, environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, fmt.Sprintf("%s/top-level/buckets=%d/keys-per-bucket=%d/%s", environment.mode, bucketCount, keysPerBucket, environment.kind), func(b *testing.B) {
 		options := engineOpenOptions{Kind: environment.kind, Mode: DurabilityDurable, DataDir: b.TempDir(), ClientCount: 1}
 		engine, err := openEngine(b.Context(), options)
 		if err != nil {
@@ -222,12 +222,12 @@ func BenchmarkDeleteVisibility(b *testing.B) {
 		b.Skip("delete workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
-	operations := profileSizedValue(10_000, 3_000, 1_000)
+	operations := scaleSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(operations, 128, 1, keyOrderRandom, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
-	runProfiledBenchmark(b, string(environment.mode)+"/post-ack-miss/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, string(environment.mode)+"/post-ack-miss/"+string(environment.kind), func(b *testing.B) {
 		engine, _ := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
 		readDurations := make([]time.Duration, operations)
@@ -270,7 +270,7 @@ func BenchmarkPageReuse(b *testing.B) {
 		b.Skip("delete workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
-	records := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(records, 512, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
@@ -283,7 +283,7 @@ func BenchmarkPageReuse(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	runProfiledBenchmark(b, string(environment.mode)+"/random-half/batch=100/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, string(environment.mode)+"/random-half/batch=100/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() {
 			if engine != nil {
@@ -363,7 +363,7 @@ func BenchmarkPageReusePlateau(b *testing.B) {
 	}
 	const cycles = 10
 	environment := readBenchmarkEnvironment(b)
-	records := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
 	current, err := makePairs(records, 512, 1, keyOrderRandom, 1)
 	if err != nil {
 		b.Fatal(err)
@@ -375,7 +375,7 @@ func BenchmarkPageReusePlateau(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	runProfiledBenchmark(b, string(environment.mode)+"/ten-cycles/batch=100/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, string(environment.mode)+"/ten-cycles/batch=100/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, current)
 		b.Cleanup(func() {
 			if engine != nil {
@@ -460,12 +460,12 @@ func BenchmarkTailReclamation(b *testing.B) {
 		b.Skip("delete workloads are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
-	records := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(records, 512, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
-	runProfiledBenchmark(b, string(environment.mode)+"/upper-half/batch=100/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, string(environment.mode)+"/upper-half/batch=100/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() {
 			if engine != nil {
@@ -537,12 +537,12 @@ func BenchmarkReopenAfterDelete(b *testing.B) {
 	if environment.kind == EngineRedis {
 		b.Skip("a Redis server restart is not comparable to an embedded database reopen")
 	}
-	records := profileSizedValue(10_000, 3_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
 	setup, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
 	}
-	runProfiledBenchmark(b, string(environment.mode)+"/alternating-half/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, string(environment.mode)+"/alternating-half/"+string(environment.kind), func(b *testing.B) {
 		engine, options := prepareDeleteBenchmarkEngine(b, environment, 1, setup)
 		b.Cleanup(func() {
 			if engine != nil {

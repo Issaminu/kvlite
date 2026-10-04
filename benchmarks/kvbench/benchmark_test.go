@@ -35,28 +35,28 @@ type benchmarkCase struct {
 	batchSize       int
 }
 
-func runProfiledBenchmark(b *testing.B, name string, run func(*testing.B)) {
-	b.Run(profiledBenchmarkName(name), run)
+func runScaledBenchmark(b *testing.B, name string, run func(*testing.B)) {
+	b.Run(scaledBenchmarkName(name), run)
 }
 
-func profiledBenchmarkName(name string) string {
-	profile := os.Getenv("KVBENCH_PROFILE")
-	if profile == "" {
-		profile = "large"
+func scaledBenchmarkName(name string) string {
+	scale := os.Getenv("KVBENCH_SCALE")
+	if scale == "" {
+		scale = "large"
 	}
 	if os.Getenv("KVBENCH_WORKLOAD") == "focused" {
-		profile += "/focused"
+		scale += "/focused"
 	}
-	return "profile=" + profile + "/" + name
+	return "scale=" + scale + "/" + name
 }
 
 func benchmarkCases() []benchmarkCase {
 	focused := os.Getenv("KVBENCH_WORKLOAD") == "focused"
-	records := profileSizedValue(10_000, 3_000, 1_000)
-	pointReadOperations := profileSizedValue(100_000, 10_000, 1_000)
-	pointWriteOperations := profileSizedValue(1_000, 200, 100)
-	concurrentOperations := profileSizedValue(3_200, 640, 320)
-	mixedOperations := profileSizedValue(10_000, 2_000, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
+	pointReadOperations := scaleSizedValue(100_000, 10_000, 1_000)
+	pointWriteOperations := scaleSizedValue(1_000, 200, 100)
+	concurrentOperations := scaleSizedValue(3_200, 640, 320)
+	mixedOperations := scaleSizedValue(10_000, 2_000, 1_000)
 	var cases []benchmarkCase
 	for _, valueBytes := range []int{32, 128, 1024, 3072} {
 		cases = append(cases,
@@ -145,7 +145,7 @@ func benchmarkCases() []benchmarkCase {
 		selected = map[string]bool{
 			"read/random/value=128/clients=1": true,
 		}
-	} else if lightProfile() {
+	} else if lightScale() {
 		selected = map[string]bool{
 			"read/random/value=128/clients=1":             true,
 			"update/random/value=128/clients=1":           true,
@@ -153,7 +153,7 @@ func benchmarkCases() []benchmarkCase {
 			"mixed/read=95/value=128/clients=8":           true,
 			"update/random/value=128/clients=1/batch=100": true,
 		}
-	} else if mediumProfile() {
+	} else if mediumScale() {
 		selected = map[string]bool{
 			"read/random/value=128/clients=1":                       true,
 			"read/random/value=3072/clients=1":                      true,
@@ -172,16 +172,16 @@ func benchmarkCases() []benchmarkCase {
 			"update/random/value=128/clients=8/batch=100":           true,
 		}
 	}
-	profileCases := cases[:0]
+	scaleCases := cases[:0]
 	for _, benchmarkCase := range cases {
 		if focused && benchmarkCase.operation == benchmarkRead {
 			benchmarkCase.operations = max(benchmarkCase.operations, 100_000)
 		}
 		if (selected == nil || selected[benchmarkCase.name]) && (focused || workloadEnabled(benchmarkCase.operation)) {
-			profileCases = append(profileCases, benchmarkCase)
+			scaleCases = append(scaleCases, benchmarkCase)
 		}
 	}
-	return profileCases
+	return scaleCases
 }
 
 func workloadEnabled(operation benchmarkOperation) bool {
@@ -227,7 +227,7 @@ func BenchmarkAcknowledgedOperations(b *testing.B) {
 		if !benchmarkModeEnabled(os.Getenv("KVBENCH_WORKLOAD"), benchmarkCase.operation, mode) {
 			continue
 		}
-		runProfiledBenchmark(b, string(mode)+"/"+benchmarkCase.name+"/"+string(engine), func(b *testing.B) {
+		runScaledBenchmark(b, string(mode)+"/"+benchmarkCase.name+"/"+string(engine), func(b *testing.B) {
 			benchmarkDatabase(b, engine, mode, redisAddress, benchmarkCase)
 		})
 	}
@@ -248,8 +248,8 @@ func BenchmarkFocusedWrites(b *testing.B) {
 		b.Skip("focused writes are not selected")
 	}
 	environment := readBenchmarkEnvironment(b)
-	records := profileSizedValue(10_000, 3_000, 1_000)
-	cycles := profileSizedValue(1_000, 200, 1_000)
+	records := scaleSizedValue(10_000, 3_000, 1_000)
+	cycles := scaleSizedValue(1_000, 200, 1_000)
 	setupPairs, err := makePairs(records, 128, 1, keyOrderSequential, 1)
 	if err != nil {
 		b.Fatal(err)
@@ -265,7 +265,7 @@ func BenchmarkFocusedWrites(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	runProfiledBenchmark(b, string(environment.mode)+"/update-insert-batch=10/"+string(environment.kind), func(b *testing.B) {
+	runScaledBenchmark(b, string(environment.mode)+"/update-insert-batch=10/"+string(environment.kind), func(b *testing.B) {
 		engine, err := prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setupPairs)
 		if err != nil {
 			b.Fatal(err)

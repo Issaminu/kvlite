@@ -3545,7 +3545,7 @@ func TestDeleteBucketVisitsMappedDescendants(t *testing.T) {
 			return err
 		}
 		for index := range 200 {
-			if err := child.Put([]byte(fmt.Sprintf("key-%03d", index)), make([]byte, 200)); err != nil {
+			if err := child.Put(fmt.Appendf(nil, "key-%03d", index), make([]byte, 200)); err != nil {
 				return err
 			}
 		}
@@ -3875,7 +3875,7 @@ func TestDeleteBucketRepairsNestedParentRoot(t *testing.T) {
 
 	const count = 200
 	name := func(index int) []byte {
-		return []byte(fmt.Sprintf("child-%03d-%s", index, strings.Repeat("x", 100)))
+		return fmt.Appendf(nil, "child-%03d-%s", index, strings.Repeat("x", 100))
 	}
 	err = db.Update(func(tx *Tx) error {
 		parent, err := tx.CreateBucket([]byte("parent"))
@@ -3936,7 +3936,7 @@ func TestDeleteBucketRepairsCatalogRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	name := func(index int) []byte {
-		return []byte(fmt.Sprintf("bucket-%03d-%s", index, strings.Repeat("x", 100)))
+		return fmt.Appendf(nil, "bucket-%03d-%s", index, strings.Repeat("x", 100))
 	}
 	const count = 200
 	if err := db.Update(func(tx *Tx) error {
@@ -5370,10 +5370,13 @@ func TestPut_FailedCheckpointDoesNotChangeReadableValue(t *testing.T) {
 		t.Fatalf("committed Put returned %q, want %q", got, "new")
 	}
 
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reopened, err := Open(path, 0644, nil)
+	reopened, err := Open(path, 0644, &Options{LockTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -5839,7 +5842,7 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 			defer done.Done()
 			ready.Done()
 			<-start
-			key := []byte(fmt.Sprintf("key-%02d", index))
+			key := fmt.Appendf(nil, "key-%02d", index)
 			errorsByWrite <- db.Put(testBucketName, key, []byte("value"))
 		}()
 	}
@@ -5877,7 +5880,7 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 		t.Fatalf("WAL commit markers: got %d, want %d", commitMarkers, len(transactionIDs))
 	}
 	for index := range writeCount {
-		key := []byte(fmt.Sprintf("key-%02d", index))
+		key := fmt.Appendf(nil, "key-%02d", index)
 		if value, err := db.Get(testBucketName, key); err != nil || !bytes.Equal(value, []byte("value")) {
 			t.Fatalf("read %q after grouped commit: value=%q error=%v", key, value, err)
 		}
@@ -6370,11 +6373,14 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("committed overlay value: got %q, err %v", got, err)
 	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	reopened, err := openDB(path)
+	reopened, err := Open(path, 0600, &Options{Synchronous: SyncNone, LockTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6732,6 +6738,9 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	_ = db.wal.Close()
 	_ = db.file.Close()
 
@@ -6745,7 +6754,7 @@ func TestAudit_ValidWALRecoversDamagedMainMeta(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := openDB(path)
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone, LockTimeout: time.Second})
 	if err != nil {
 		t.Fatalf("valid WAL did not recover damaged main metadata: %v", err)
 	}
@@ -6847,6 +6856,9 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
 	_ = db.wal.Close()
 	_ = db.file.Close()
 
@@ -6864,7 +6876,7 @@ func TestAudit_CommitMarkerMustMatchRecordTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	recovered, err := openDB(path)
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone, LockTimeout: time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -6926,7 +6938,7 @@ func TestDeleteBatchAcrossLeaves(t *testing.T) {
 	keys := make([][]byte, 600)
 	value := bytes.Repeat([]byte("v"), 80)
 	for index := range keys {
-		keys[index] = []byte(fmt.Sprintf("key-%04d", index))
+		keys[index] = fmt.Appendf(nil, "key-%04d", index)
 	}
 	if err := db.Update(func(tx *Tx) error {
 		bucket, err := tx.CreateBucket(name)
@@ -7020,7 +7032,7 @@ func TestDeleteBatchRejectsBucketAndRollsBack(t *testing.T) {
 			return err
 		}
 		for index := range 200 {
-			if err := bucket.Put([]byte(fmt.Sprintf("middle-%03d", index)), []byte("value")); err != nil {
+			if err := bucket.Put(fmt.Appendf(nil, "middle-%03d", index), []byte("value")); err != nil {
 				return err
 			}
 		}
