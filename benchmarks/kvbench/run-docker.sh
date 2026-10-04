@@ -183,7 +183,7 @@ else
 		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
 		;;
 	all)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|ReadTransactions|MixedTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections|Lifecycle)$'
+		readonly benchmark_filter='^Benchmark'
 		;;
 	esac
 fi
@@ -333,6 +333,7 @@ run_warmup_round() {
 			echo "${output}" >&2
 			return 1
 		fi
+		printf '%s\n' "${output}" >> "${results_dir}/warmup-${mode}.txt"
 	done
 }
 
@@ -425,6 +426,8 @@ fi
 
 : >"${results_dir}/durable.txt"
 : >"${results_dir}/no-commit-sync.txt"
+: >"${results_dir}/warmup-durable.txt"
+: >"${results_dir}/warmup-no-commit-sync.txt"
 
 for ((round = 0; round < warmup_count; round++)); do
 	echo "Warm-up round $((round + 1)) of ${warmup_count}"
