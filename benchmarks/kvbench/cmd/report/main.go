@@ -68,6 +68,7 @@ type caseProfile struct {
 	PeerGaps      []peerGap `json:"peer_gaps,omitempty"`
 	SampledCPUMs  float64   `json:"sampled_cpu_ms"`
 	SparseCPU     bool      `json:"sparse_cpu"`
+	LimitedCPU    bool      `json:"limited_cpu"`
 	CPUSelf       []hotspot `json:"cpu_self"`
 	CPUStack      []hotspot `json:"cpu_stack"`
 	AllocSpace    []hotspot `json:"alloc_space"`
@@ -296,6 +297,12 @@ func writeReport(dir string) error {
 	if err != nil {
 		return err
 	}
+	if r.Comparisons == nil {
+		r.Comparisons = []comparison{}
+	}
+	if r.Profiles == nil {
+		r.Profiles = []caseProfile{}
+	}
 	data, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
 		return err
@@ -388,7 +395,11 @@ func markdown(r report) string {
 		if len(timings) == 0 {
 			continue
 		}
-		fmt.Fprintf(&b, "## %s\n\n%d timed cases.\n\n", mode, len(timings))
+		caseWord := "cases"
+		if len(timings) == 1 {
+			caseWord = "case"
+		}
+		fmt.Fprintf(&b, "## %s\n\n%d timed %s.\n\n", mode, len(timings), caseWord)
 		if len(timings) <= 10 {
 			b.WriteString("| Case | Median (range) |\n| --- | ---: |\n")
 			for _, row := range timings {
@@ -421,7 +432,7 @@ func markdown(r report) string {
 		}
 	}
 	if len(r.Profiles) > 0 {
-		b.WriteString("## Profiles\n\nProfiles are separate from the timing samples. CPU and allocation values are sampled estimates per repeat. Inclusive values contain called functions and can overlap. The table selects functions in the measured engine. It hides CPU rankings when the profile has less than 200ms of sampled CPU time across all repeats. Traces and wait files remain in the artifact; the short report omits their Go test and profiler wait activity. Redis profiles cover the Go client, not the Redis server.\n\n")
+		b.WriteString("## Profiles\n\nProfiles are separate from the timing samples. CPU and allocation values are sampled estimates per repeat. Inclusive values contain called functions and can overlap. The table selects functions in the measured engine. It hides CPU rankings below 200ms of sampled CPU time and marks rankings below 1s as limited. Traces and wait files remain in the artifact; the short report omits their Go test and profiler wait activity. Redis profiles cover the Go client, not the Redis server.\n\n")
 		b.WriteString("| Mode and case | Timed median | Peer gap | Sampled CPU | CPU self | CPU inclusive | Allocation inclusive | Files |\n| --- | ---: | --- | ---: | --- | --- | --- | --- |\n")
 		for _, p := range r.Profiles {
 			var gaps []string
@@ -437,8 +448,14 @@ func markdown(r report) string {
 			if p.SparseCPU {
 				cpuTime += " (sparse)"
 				cpuSelf, cpuStack = "—", "—"
+			} else if p.LimitedCPU {
+				cpuTime += " (limited)"
 			}
-			fmt.Fprintf(&b, "| %s: %s | %s | %s | %s | %s | %s | %s | [CPU](profiles/%s/cpu-top.txt), [allocation](profiles/%s/alloc-cum.txt), [trace](profiles/%s/trace.out) |\n", p.Mode, p.Benchmark, formatNS(p.MedianNSPerOp), strings.Join(gaps, "<br>"), cpuTime, cpuSelf, cpuStack, firstHotspot(p.AllocStack), p.ID, p.ID, p.ID)
+			gapText := strings.Join(gaps, "<br>")
+			if gapText == "" {
+				gapText = "—"
+			}
+			fmt.Fprintf(&b, "| %s: %s | %s | %s | %s | %s | %s | %s | [CPU](profiles/%s/cpu-top.txt), [allocation](profiles/%s/alloc-cum.txt), [trace](profiles/%s/trace.out) |\n", p.Mode, p.Benchmark, formatNS(p.MedianNSPerOp), gapText, cpuTime, cpuSelf, cpuStack, firstHotspot(p.AllocStack), p.ID, p.ID, p.ID)
 		}
 		b.WriteString("\nThe [profile index](profiles/index.tsv) maps each case to its raw profiles. The [test binary](profiles/kvbench.test) supports `go tool pprof`. `report.json` has up to three functions per profile metric.\n\n")
 	}
@@ -605,6 +622,7 @@ func readProfiles(dir string, r report) ([]caseProfile, error) {
 			return nil, err
 		}
 		p.SparseCPU = p.SampledCPUMs < 200
+		p.LimitedCPU = !p.SparseCPU && p.SampledCPUMs < 1000
 		for _, view := range []struct {
 			file       string
 			cumulative bool

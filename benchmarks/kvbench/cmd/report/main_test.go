@@ -88,11 +88,11 @@ func TestProfileReport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(profiles) != 1 || profiles[0].CPUSelf[0].Mean != "2ms" || profiles[0].CPUStack[0].Mean != "3ms" || profiles[0].AllocSpace[0].Function != "testing.(*B).runN" || profiles[0].AllocStack[0].Function != "github.com/Issaminu/kvlite.Get" || profiles[0].SampledCPUMs != 300 || profiles[0].SparseCPU || profiles[0].Repeats != 3 || profiles[0].MedianNSPerOp != 42 || len(profiles[0].PeerGaps) != 1 {
+	if len(profiles) != 1 || profiles[0].CPUSelf[0].Mean != "2ms" || profiles[0].CPUStack[0].Mean != "3ms" || profiles[0].AllocSpace[0].Function != "testing.(*B).runN" || profiles[0].AllocStack[0].Function != "github.com/Issaminu/kvlite.Get" || profiles[0].SampledCPUMs != 300 || profiles[0].SparseCPU || !profiles[0].LimitedCPU || profiles[0].Repeats != 3 || profiles[0].MedianNSPerOp != 42 || len(profiles[0].PeerGaps) != 1 {
 		t.Fatalf("profiles = %+v", profiles)
 	}
 	r.Profiles = profiles
-	if text := markdown(r); !strings.Contains(text, "kvlite.Get (2ms, 50.00%)") || !strings.Contains(text, "+30.0% vs bbolt") || strings.Contains(text, "testing.(*B).runN") {
+	if text := markdown(r); !strings.Contains(text, "kvlite.Get (2ms, 50.00%)") || !strings.Contains(text, "+30.0% vs bbolt") || !strings.Contains(text, "300ms (limited)") || strings.Contains(text, "testing.(*B).runN") {
 		t.Fatalf("profile summary = %q", text)
 	}
 	top = strings.Replace(top, "100ms", "10ms", 1)
