@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/csv"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type result struct {
@@ -29,16 +31,17 @@ type result struct {
 }
 
 type comparison struct {
-	Mode         string  `json:"mode"`
-	Case         string  `json:"case"`
-	Peer         string  `json:"peer"`
-	KVLiteMedian float64 `json:"kvlite_median_ns_per_op"`
-	PeerMedian   float64 `json:"peer_median_ns_per_op"`
-	KVLiteMin    float64 `json:"kvlite_min_ns_per_op"`
-	KVLiteMax    float64 `json:"kvlite_max_ns_per_op"`
-	PeerMin      float64 `json:"peer_min_ns_per_op"`
-	PeerMax      float64 `json:"peer_max_ns_per_op"`
-	SlowerByPct  float64 `json:"kvlite_slower_by_percent"`
+	Mode          string  `json:"mode"`
+	Case          string  `json:"case"`
+	Peer          string  `json:"peer"`
+	KVLiteMedian  float64 `json:"kvlite_median_ns_per_op"`
+	PeerMedian    float64 `json:"peer_median_ns_per_op"`
+	KVLiteMin     float64 `json:"kvlite_min_ns_per_op"`
+	KVLiteMax     float64 `json:"kvlite_max_ns_per_op"`
+	PeerMin       float64 `json:"peer_min_ns_per_op"`
+	PeerMax       float64 `json:"peer_max_ns_per_op"`
+	SlowerByPct   float64 `json:"kvlite_slower_by_percent"`
+	RangesOverlap bool    `json:"ranges_overlap"`
 }
 
 type report struct {
@@ -63,18 +66,18 @@ type caseProfile struct {
 	Repeats       int       `json:"repeats"`
 	MedianNSPerOp float64   `json:"median_ns_per_op"`
 	PeerGaps      []peerGap `json:"peer_gaps,omitempty"`
+	SampledCPUMs  float64   `json:"sampled_cpu_ms"`
+	SparseCPU     bool      `json:"sparse_cpu"`
 	CPUSelf       []hotspot `json:"cpu_self"`
 	CPUStack      []hotspot `json:"cpu_stack"`
 	AllocSpace    []hotspot `json:"alloc_space"`
-	NetworkWait   []hotspot `json:"network_wait,omitempty"`
-	SyncWait      []hotspot `json:"sync_wait,omitempty"`
-	SyscallWait   []hotspot `json:"syscall_wait,omitempty"`
-	SchedulerWait []hotspot `json:"scheduler_wait,omitempty"`
+	AllocStack    []hotspot `json:"alloc_stack"`
 }
 
 type peerGap struct {
-	Peer        string  `json:"peer"`
-	SlowerByPct float64 `json:"kvlite_slower_by_percent"`
+	Peer          string  `json:"peer"`
+	SlowerByPct   float64 `json:"kvlite_slower_by_percent"`
+	RangesOverlap bool    `json:"ranges_overlap"`
 }
 
 var cpuSuffix = regexp.MustCompile(`-[0-9]+$`)
@@ -254,7 +257,13 @@ func collect(dir string) (report, error) {
 			if !ok || other.Median == 0 {
 				continue
 			}
-			r.Comparisons = append(r.Comparisons, comparison{mode, caseName, peer, kv.Median, other.Median, kv.Min, kv.Max, other.Min, other.Max, (kv.Median/other.Median - 1) * 100})
+			r.Comparisons = append(r.Comparisons, comparison{
+				Mode: mode, Case: caseName, Peer: peer,
+				KVLiteMedian: kv.Median, PeerMedian: other.Median,
+				KVLiteMin: kv.Min, KVLiteMax: kv.Max, PeerMin: other.Min, PeerMax: other.Max,
+				SlowerByPct:   (kv.Median/other.Median - 1) * 100,
+				RangesOverlap: kv.Min <= other.Max && other.Min <= kv.Max,
+			})
 		}
 	}
 	slices.SortFunc(r.Comparisons, func(a, b comparison) int {
@@ -302,7 +311,7 @@ func writeReport(dir string) error {
 		}
 	}
 	for _, row := range r.Comparisons {
-		comparisons = append(comparisons, []string{row.Mode, row.Case, row.Peer, number(row.KVLiteMedian), number(row.PeerMedian), number(row.KVLiteMin), number(row.KVLiteMax), number(row.PeerMin), number(row.PeerMax), number(row.SlowerByPct)})
+		comparisons = append(comparisons, []string{row.Mode, row.Case, row.Peer, number(row.KVLiteMedian), number(row.PeerMedian), number(row.KVLiteMin), number(row.KVLiteMax), number(row.PeerMin), number(row.PeerMax), number(row.SlowerByPct), strconv.FormatBool(row.RangesOverlap)})
 	}
 	if err := writeCSV(filepath.Join(dir, "summary.csv"), []string{"mode", "benchmark", "engine", "samples", "mean_ns_per_op", "median_ns_per_op", "min_ns_per_op", "max_ns_per_op"}, summary); err != nil {
 		return err
@@ -310,7 +319,7 @@ func writeReport(dir string) error {
 	if err := writeCSV(filepath.Join(dir, "metrics.csv"), []string{"mode", "benchmark", "metric", "samples", "mean", "median", "min", "max"}, metrics); err != nil {
 		return err
 	}
-	if err := writeCSV(filepath.Join(dir, "comparisons.csv"), []string{"mode", "case", "peer", "kvlite_median_ns_per_op", "peer_median_ns_per_op", "kvlite_min_ns_per_op", "kvlite_max_ns_per_op", "peer_min_ns_per_op", "peer_max_ns_per_op", "kvlite_slower_by_percent"}, comparisons); err != nil {
+	if err := writeCSV(filepath.Join(dir, "comparisons.csv"), []string{"mode", "case", "peer", "kvlite_median_ns_per_op", "peer_median_ns_per_op", "kvlite_min_ns_per_op", "kvlite_max_ns_per_op", "peer_min_ns_per_op", "peer_max_ns_per_op", "kvlite_slower_by_percent", "ranges_overlap"}, comparisons); err != nil {
 		return err
 	}
 	text := markdown(r)
@@ -321,10 +330,54 @@ func writeReport(dir string) error {
 	return nil
 }
 
+func formatNS(ns float64) string {
+	switch {
+	case ns >= 1e9:
+		return fmt.Sprintf("%.2fs", ns/1e9)
+	case ns >= 1e6:
+		return fmt.Sprintf("%.2fms", ns/1e6)
+	case ns >= 1e3:
+		return fmt.Sprintf("%.2fµs", ns/1e3)
+	default:
+		return fmt.Sprintf("%.1fns", ns)
+	}
+}
+
+func formatRange(median, minValue, maxValue float64) string {
+	return fmt.Sprintf("%s (%s–%s)", formatNS(median), formatNS(minValue), formatNS(maxValue))
+}
+
+func writeGaps(b *strings.Builder, peer, label string, rows []comparison) {
+	if len(rows) == 0 {
+		return
+	}
+	slices.SortFunc(rows, func(a, c comparison) int {
+		if label == "Slower" {
+			return cmp.Compare(c.SlowerByPct, a.SlowerByPct)
+		}
+		return cmp.Compare(a.SlowerByPct, c.SlowerByPct)
+	})
+	fmt.Fprintf(b, "**Largest clear gaps: KVLite %s**\n\n| Case | Median gap | KVLite median (range) | %s median (range) |\n| --- | ---: | ---: | ---: |\n", strings.ToLower(label), peer)
+	for _, row := range rows[:min(5, len(rows))] {
+		gap := row.SlowerByPct
+		if label == "Faster" {
+			gap = -gap
+		}
+		gapText := fmt.Sprintf("%.1f%% %s", gap, strings.ToLower(label))
+		if gap >= 90 && label == "Faster" && row.KVLiteMedian > 0 {
+			gapText = fmt.Sprintf("%.1f× faster", row.PeerMedian/row.KVLiteMedian)
+		} else if gap >= 100 && label == "Slower" {
+			gapText = fmt.Sprintf("%.1f× slower", row.KVLiteMedian/row.PeerMedian)
+		}
+		fmt.Fprintf(b, "| %s | %s | %s | %s |\n", row.Case, gapText, formatRange(row.KVLiteMedian, row.KVLiteMin, row.KVLiteMax), formatRange(row.PeerMedian, row.PeerMin, row.PeerMax))
+	}
+	b.WriteByte('\n')
+}
+
 func markdown(r report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# KVBench report\n\n%d measured samples per case.\n\n", r.ExpectedSamples)
-	b.WriteString("This report compares matched cases. A median difference does not prove a stable speed change. Check the sample ranges and raw data.\n\n")
+	b.WriteString("Matched engine gaps use median time. Clear gaps have nonoverlapping observed ranges. This is a useful lead, not proof of a stable speed difference. Full values are in [summary.csv](summary.csv), [comparisons.csv](comparisons.csv), and `report.json`.\n\n")
 	for _, mode := range []string{"durable", "no-commit-sync"} {
 		var timings []result
 		for _, row := range r.Results {
@@ -335,79 +388,59 @@ func markdown(r report) string {
 		if len(timings) == 0 {
 			continue
 		}
-		fmt.Fprintf(&b, "## %s\n\n%d timed cases. The table lists up to 15 cases with the highest median time. Cases can do different work.\n\n", mode, len(timings))
-		slices.SortFunc(timings, func(a, c result) int {
-			if a.Median > c.Median {
-				return -1
+		fmt.Fprintf(&b, "## %s\n\n%d timed cases.\n\n", mode, len(timings))
+		if len(timings) <= 10 {
+			b.WriteString("| Case | Median (range) |\n| --- | ---: |\n")
+			for _, row := range timings {
+				fmt.Fprintf(&b, "| %s | %s |\n", row.Benchmark, formatRange(row.Median, row.Min, row.Max))
 			}
-			if a.Median < c.Median {
-				return 1
-			}
-			return strings.Compare(a.Benchmark, c.Benchmark)
-		})
-		b.WriteString("| Case | Engine | Median ns/op | Range ns/op |\n| --- | --- | ---: | ---: |\n")
-		for _, row := range timings[:min(15, len(timings))] {
-			fmt.Fprintf(&b, "| %s | %s | %.1f | %.1f–%.1f |\n", row.Benchmark, row.Engine, row.Median, row.Min, row.Max)
+			b.WriteByte('\n')
 		}
-		b.WriteByte('\n')
 		for _, peer := range []string{"bbolt", "redis"} {
-			var matched []comparison
+			var faster, slower []comparison
+			matched, overlapping := 0, 0
 			for _, row := range r.Comparisons {
-				if row.Mode == mode && row.Peer == peer {
-					matched = append(matched, row)
-				}
-			}
-			if len(matched) == 0 {
-				continue
-			}
-			slower, faster := 0, 0
-			for _, row := range matched {
-				if row.SlowerByPct > 0 {
-					slower++
-				} else if row.SlowerByPct < 0 {
-					faster++
-				}
-			}
-			fmt.Fprintf(&b, "### KVLite against %s\n\nKVLite has a lower median in %d cases, a higher median in %d cases, and an equal median in %d cases.\n\n", peer, faster, slower, len(matched)-faster-slower)
-			slices.SortFunc(matched, func(a, c comparison) int {
-				if a.SlowerByPct > c.SlowerByPct {
-					return -1
-				}
-				if a.SlowerByPct < c.SlowerByPct {
-					return 1
-				}
-				return strings.Compare(a.Case, c.Case)
-			})
-			for _, group := range []struct {
-				name string
-				rows []comparison
-			}{
-				{"Largest losses", matched[:min(10, slower)]},
-				{"Largest wins", matched[max(0, len(matched)-min(10, faster)):]},
-			} {
-				if len(group.rows) == 0 {
+				if row.Mode != mode || row.Peer != peer {
 					continue
 				}
-				fmt.Fprintf(&b, "**%s**\n\n", group.name)
-				b.WriteString("| Case | KVLite slower by | KVLite range ns/op | Peer range ns/op |\n| --- | ---: | ---: | ---: |\n")
-				for _, row := range group.rows {
-					fmt.Fprintf(&b, "| %s | %+.1f%% | %.1f–%.1f | %.1f–%.1f |\n", row.Case, row.SlowerByPct, row.KVLiteMin, row.KVLiteMax, row.PeerMin, row.PeerMax)
+				matched++
+				if row.RangesOverlap || row.SlowerByPct == 0 {
+					overlapping++
+				} else if row.SlowerByPct > 0 {
+					slower = append(slower, row)
+				} else {
+					faster = append(faster, row)
 				}
-				b.WriteByte('\n')
 			}
+			if matched == 0 {
+				continue
+			}
+			fmt.Fprintf(&b, "### KVLite against %s\n\n%d matched cases: %d clear faster, %d clear slower, %d with overlapping ranges or equal medians.\n\n", peer, matched, len(faster), len(slower), overlapping)
+			writeGaps(&b, peer, "Slower", slower)
+			writeGaps(&b, peer, "Faster", faster)
 		}
 	}
 	if len(r.Profiles) > 0 {
-		b.WriteString("## Profiles\n\nEach profile covers one case across all profiled repeats. CPU and allocation values are sampled estimates per repeat. Stack values include called functions and can overlap. Wait values come from the execution trace. These runs are separate from the unprofiled timing results above. Redis profiles cover the Go client only.\n\n")
-		b.WriteString("| Mode and case | Engine | Median ns/op | KVLite against peers | CPU self | CPU stack | Allocated | Wait | Files |\n| --- | --- | ---: | --- | --- | --- | --- | --- | --- |\n")
+		b.WriteString("## Profiles\n\nProfiles are separate from the timing samples. CPU and allocation values are sampled estimates per repeat. Inclusive values contain called functions and can overlap. The table selects functions in the measured engine. It hides CPU rankings when the profile has less than 200ms of sampled CPU time across all repeats. Traces and wait files remain in the artifact; the short report omits their Go test and profiler wait activity. Redis profiles cover the Go client, not the Redis server.\n\n")
+		b.WriteString("| Mode and case | Timed median | Peer gap | Sampled CPU | CPU self | CPU inclusive | Allocation inclusive | Files |\n| --- | ---: | --- | ---: | --- | --- | --- | --- |\n")
 		for _, p := range r.Profiles {
 			var gaps []string
 			for _, gap := range p.PeerGaps {
-				gaps = append(gaps, fmt.Sprintf("%+.1f%% vs %s", gap.SlowerByPct, gap.Peer))
+				value := fmt.Sprintf("%+.1f%% vs %s", gap.SlowerByPct, gap.Peer)
+				if gap.RangesOverlap {
+					value += " (ranges overlap)"
+				}
+				gaps = append(gaps, value)
 			}
-			fmt.Fprintf(&b, "| %s: %s | %s | %.1f | %s | %s | %s | %s | %s | [CPU](profiles/%s/cpu-top.txt), [allocation](profiles/%s/alloc-top.txt), [trace](profiles/%s/trace.out) |\n", p.Mode, p.Benchmark, p.Engine, p.MedianNSPerOp, strings.Join(gaps, "<br>"), firstHotspot(p.CPUSelf), firstHotspot(p.CPUStack), firstHotspot(p.AllocSpace), waitHotspots(p), p.ID, p.ID, p.ID)
+			cpuTime := fmt.Sprintf("%.0fms", p.SampledCPUMs)
+			cpuSelf, cpuStack := firstHotspot(p.CPUSelf), firstHotspot(p.CPUStack)
+			if p.SparseCPU {
+				cpuTime += " (sparse)"
+				cpuSelf, cpuStack = "—", "—"
+			}
+			fmt.Fprintf(&b, "| %s: %s | %s | %s | %s | %s | %s | %s | [CPU](profiles/%s/cpu-top.txt), [allocation](profiles/%s/alloc-cum.txt), [trace](profiles/%s/trace.out) |\n", p.Mode, p.Benchmark, formatNS(p.MedianNSPerOp), strings.Join(gaps, "<br>"), cpuTime, cpuSelf, cpuStack, firstHotspot(p.AllocStack), p.ID, p.ID, p.ID)
 		}
-		b.WriteString("\nThe [profile index](profiles/index.tsv) maps each row to its raw profiles and full function lists. The [test binary](profiles/kvbench.test) lets `go tool pprof` read the raw profiles. `report.json` contains the top three functions for each metric.\n\n")
+		b.WriteString("\nThe [profile index](profiles/index.tsv) maps each case to its raw profiles. The [test binary](profiles/kvbench.test) supports `go tool pprof`. `report.json` has up to three functions per profile metric.\n\n")
 	}
 	return b.String()
 }
@@ -455,31 +488,56 @@ func firstHotspot(h []hotspot) string {
 	if len(h) == 0 {
 		return "—"
 	}
-	return h[0].Function + " (" + h[0].Mean + ", " + h[0].Percent + ")"
-}
-
-func waitHotspots(p caseProfile) string {
-	var waits []string
-	for _, item := range []struct {
-		name string
-		top  []hotspot
-	}{
-		{"network", p.NetworkWait},
-		{"sync", p.SyncWait},
-		{"syscall", p.SyscallWait},
-		{"scheduler", p.SchedulerWait},
+	name := h[0].Function
+	for _, item := range []struct{ prefix, label string }{
+		{"github.com/Issaminu/kvlite", "kvlite"},
+		{"go.etcd.io/bbolt", "bbolt"},
+		{"github.com/redis/go-redis/v9", "redis"},
 	} {
-		if len(item.top) > 0 {
-			waits = append(waits, item.name+": "+firstHotspot(item.top))
+		if strings.HasPrefix(name, item.prefix) {
+			name = item.label + strings.TrimPrefix(name, item.prefix)
+			break
 		}
 	}
-	if len(waits) == 0 {
-		return "—"
-	}
-	return strings.Join(waits, "<br>")
+	return name + " (" + h[0].Mean + ", " + h[0].Percent + ")"
 }
 
-func readTop(path string, cumulative bool) ([]hotspot, error) {
+func engineFunction(name, engine string) bool {
+	switch engine {
+	case "kvlite":
+		return (strings.HasPrefix(name, "github.com/Issaminu/kvlite.") || strings.HasPrefix(name, "github.com/Issaminu/kvlite/")) && !strings.Contains(name, "/benchmarks/kvbench.")
+	case "bbolt":
+		return strings.HasPrefix(name, "go.etcd.io/bbolt.") || strings.HasPrefix(name, "go.etcd.io/bbolt/")
+	case "redis":
+		return strings.HasPrefix(name, "github.com/redis/go-redis/v9.") || strings.HasPrefix(name, "github.com/redis/go-redis/v9/")
+	}
+	return false
+}
+
+func sampledCPU(path string, repeats int) (float64, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		_, value, ok := strings.Cut(line, "Total samples = ")
+		if !ok {
+			continue
+		}
+		fields := strings.Fields(value)
+		if len(fields) == 0 {
+			break
+		}
+		duration, err := time.ParseDuration(fields[0])
+		if err == nil {
+			return float64(duration) * float64(repeats) / float64(time.Millisecond), nil
+		}
+		break
+	}
+	return 0, fmt.Errorf("%s: no sampled CPU duration", path)
+}
+
+func readTop(path string, cumulative bool, engine string) ([]hotspot, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -487,7 +545,7 @@ func readTop(path string, cumulative bool) ([]hotspot, error) {
 	var top []hotspot
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 6 || fields[0] == "flat" || !strings.HasSuffix(fields[1], "%") || !strings.HasSuffix(fields[4], "%") {
+		if len(fields) < 6 || fields[0] == "flat" || !strings.HasSuffix(fields[1], "%") || !strings.HasSuffix(fields[4], "%") || (engine != "" && !engineFunction(fields[5], engine)) {
 			continue
 		}
 		value, percent := fields[0], fields[1]
@@ -538,10 +596,15 @@ func readProfiles(dir string, r report) ([]caseProfile, error) {
 			caseName, _ := strings.CutSuffix(p.Benchmark, "/kvlite")
 			for _, comparison := range r.Comparisons {
 				if comparison.Mode == p.Mode && comparison.Case == caseName {
-					p.PeerGaps = append(p.PeerGaps, peerGap{Peer: comparison.Peer, SlowerByPct: comparison.SlowerByPct})
+					p.PeerGaps = append(p.PeerGaps, peerGap{Peer: comparison.Peer, SlowerByPct: comparison.SlowerByPct, RangesOverlap: comparison.RangesOverlap})
 				}
 			}
 		}
+		p.SampledCPUMs, err = sampledCPU(filepath.Join(dir, "profiles", p.ID, "cpu-top.txt"), repeats)
+		if err != nil {
+			return nil, err
+		}
+		p.SparseCPU = p.SampledCPUMs < 200
 		for _, view := range []struct {
 			file       string
 			cumulative bool
@@ -550,23 +613,14 @@ func readProfiles(dir string, r report) ([]caseProfile, error) {
 			{"cpu-top.txt", false, &p.CPUSelf},
 			{"cpu-cum.txt", true, &p.CPUStack},
 			{"alloc-top.txt", false, &p.AllocSpace},
+			{"alloc-cum.txt", true, &p.AllocStack},
 		} {
-			*view.target, err = readTop(filepath.Join(dir, "profiles", p.ID, view.file), view.cumulative)
-			if err != nil {
-				return nil, err
+			engine := p.Engine
+			if view.file == "alloc-top.txt" {
+				engine = ""
 			}
-		}
-		for _, view := range []struct {
-			file   string
-			target *[]hotspot
-		}{
-			{"net-top.txt", &p.NetworkWait},
-			{"sync-top.txt", &p.SyncWait},
-			{"syscall-top.txt", &p.SyscallWait},
-			{"sched-top.txt", &p.SchedulerWait},
-		} {
-			*view.target, err = readTop(filepath.Join(dir, "profiles", p.ID, view.file), false)
-			if err != nil && !errors.Is(err, os.ErrNotExist) {
+			*view.target, err = readTop(filepath.Join(dir, "profiles", p.ID, view.file), view.cumulative, engine)
+			if err != nil {
 				return nil, err
 			}
 		}

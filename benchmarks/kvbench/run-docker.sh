@@ -15,16 +15,18 @@ readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--profile]"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile]"
 benchmark_scale="light"
 engine_option="--engines=kvlite,bbolt,redis"
 workload_option=""
 storage_option=""
+case_option=""
 profile_enabled=0
 scale_set=0
 engine_set=0
 workload_set=0
 storage_set=0
+case_set=0
 for argument in "$@"; do
 	case "${argument}" in
 	light | medium | large)
@@ -58,6 +60,14 @@ for argument in "$@"; do
 		fi
 		storage_option="${argument}"
 		storage_set=1
+		;;
+	--case=*)
+		if ((case_set)); then
+			echo "select the case once" >&2
+			exit 1
+		fi
+		case_option="${argument#--case=}"
+		case_set=1
 		;;
 	--profile)
 		if ((profile_enabled)); then
@@ -97,7 +107,9 @@ large)
 esac
 readonly measured_count
 if [[ -z "${workload_option}" ]]; then
-	if [[ "${benchmark_scale}" == "light" ]]; then
+	if ((case_set)); then
+		workload_option="--workloads=all"
+	elif [[ "${benchmark_scale}" == "light" ]]; then
 		workload_option="--workloads=focused"
 	else
 		workload_option="--workloads=all"
@@ -161,7 +173,26 @@ fi
 readonly selected_engines
 readonly uses_redis
 
-if [[ "${benchmark_workload}" == "focused" ]]; then
+selected_case_mode=""
+selected_case_name=""
+if ((case_set)); then
+	selected_case_mode="${case_option%%:*}"
+	selected_case_name="${case_option#*:}"
+	if [[ "${selected_case_mode}" != "durable" && "${selected_case_mode}" != "no-commit-sync" ]] ||
+		[[ ! "${selected_case_name}" =~ ^Benchmark[A-Za-z0-9_=/\-]+$ ]] ||
+		[[ "${selected_case_name}" != *"/scale=${benchmark_scale}/"* ]]; then
+		echo "case must be MODE:BenchmarkName/scale=${benchmark_scale}/... with mode durable or no-commit-sync" >&2
+		exit 1
+	fi
+	case "${selected_case_name}" in
+	*/kvlite | */bbolt | */redis) selected_case_name="${selected_case_name%/*}" ;;
+	esac
+	IFS='/' read -r -a case_parts <<<"${selected_case_name}"
+	benchmark_filter=""
+	for part in "${case_parts[@]}"; do
+		benchmark_filter+="${benchmark_filter:+/}^${part}$"
+	done
+elif [[ "${benchmark_workload}" == "focused" ]]; then
 	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|FocusedWrites|DeleteOperations)$'
 else
 	case "${benchmark_workload}" in
@@ -182,6 +213,9 @@ else
 		;;
 	esac
 fi
+readonly selected_case_mode
+readonly selected_case_name
+readonly benchmark_filter
 docker_cpu_count="$(docker info --format '{{.NCPU}}')"
 if [[ ! "${docker_cpu_count}" =~ ^[1-9][0-9]*$ ]]; then
 	echo "Docker reported an invalid CPU count: ${docker_cpu_count}" >&2
@@ -339,6 +373,10 @@ run_warmup_round() {
 			echo "${output}" >&2
 			return 1
 		fi
+		if [[ -n "${selected_case_name}" && "${output}" != *"${selected_case_name}/${engine}"* ]]; then
+			echo "${selected_case_mode}:${selected_case_name} produced no result for ${engine}; check the workload and engine" >&2
+			return 1
+		fi
 		printf '%s\n' "${output}" >> "${results_dir}/warmup-${mode}.txt"
 	done
 }
@@ -346,6 +384,10 @@ run_warmup_round() {
 run_profile_round() {
 	local round="$1"
 	local command="$2"
+	if [[ -n "${selected_case_mode}" ]]; then
+		"${command}" "${selected_case_mode}" "${round}"
+		return
+	fi
 	if [[ "${benchmark_workload}" == "reads" ]]; then
 		"${command}" durable "${round}"
 		return
@@ -383,6 +425,7 @@ verify_redis_reopen_after_kill() {
 	echo "Benchmark scale: ${benchmark_scale}"
 	echo "Engines: ${selected_engines}"
 	echo "Workloads: ${benchmark_workload}"
+	echo "Selected case: ${case_option:-all}"
 	echo "Warm-up count: ${warmup_count}"
 	echo "Measured rounds: ${measured_count}"
 	echo "Samples per round: ${samples_per_round}"
@@ -454,7 +497,7 @@ if ((profile_enabled)); then
 		case_dir="${profile_dir}/${case_id}"
 		container_case_dir="/benchmark-results/profiles/${case_id}"
 		mkdir -p "${case_dir}"
-		rm -f "${case_dir}"/{cpu.pprof,memory.pprof,trace.out,run.txt,cpu-top.txt,cpu-cum.txt,alloc-top.txt,net.pprof,net-top.txt,sync.pprof,sync-top.txt,syscall.pprof,syscall-top.txt,sched.pprof,sched-top.txt}
+		rm -f "${case_dir}"/{cpu.pprof,memory.pprof,trace.out,run.txt,cpu-top.txt,cpu-cum.txt,alloc-top.txt,alloc-cum.txt,net.pprof,net-top.txt,sync.pprof,sync-top.txt,syscall.pprof,syscall-top.txt,sched.pprof,sched-top.txt}
 		echo "Profile ${case_id}: ${case_mode} ${case_name} (${case_rounds} repeats)"
 		run_go "${case_mode}" "${case_engine}" \
 			-run '^$' -bench "${case_filter}" -benchtime=1x -count="${case_rounds}" -timeout=0 \
@@ -472,11 +515,13 @@ if ((profile_enabled)); then
 				profile_file="${container_case_dir}/memory.pprof"
 				view_option=(-alloc_space)
 			fi
-			docker exec "${go_name}" go tool pprof -top -nodecount=15 -divide_by="${case_rounds}" \
+			docker exec "${go_name}" go tool pprof -top -nodecount=0 -divide_by="${case_rounds}" \
 				"${view_option[@]}" /benchmark-data/kvbench.test "${profile_file}" >"${case_dir}/${view}-top.txt"
 		done
-		docker exec "${go_name}" go tool pprof -top -cum -nodecount=15 -divide_by="${case_rounds}" \
+		docker exec "${go_name}" go tool pprof -top -cum -nodecount=0 -divide_by="${case_rounds}" \
 			/benchmark-data/kvbench.test "${container_case_dir}/cpu.pprof" >"${case_dir}/cpu-cum.txt"
+		docker exec "${go_name}" go tool pprof -top -cum -alloc_space -nodecount=0 -divide_by="${case_rounds}" \
+			/benchmark-data/kvbench.test "${container_case_dir}/memory.pprof" >"${case_dir}/alloc-cum.txt"
 		for wait_kind in net sync syscall sched; do
 			if docker exec "${go_name}" sh -c 'go tool trace -pprof="$1" "$2" > "$3"' sh \
 				"${wait_kind}" "${container_case_dir}/trace.out" "${container_case_dir}/${wait_kind}.pprof"; then
