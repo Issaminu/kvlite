@@ -32,7 +32,7 @@ Use the saved environment record and raw samples when you compare results. Share
 
 Maintainers with access to the private [dispatcher](https://github.com/ci-thing/dispatcher) can run KVBench on CodSpeed macro runners. Push the KVLite commit first. Use its commit SHA so that a moving branch cannot change the tested code.
 
-The parallel-round workflow runs the Docker suite. Its default is `medium`, `all`, all three engines, both durability modes, and 10 measured rounds. Each worker runs one warm-up and one measured round. Up to 10 workers can run at the same time:
+The parallel-round workflow runs the Docker suite. Its default is `medium`, `all`, all three engines, both durability modes, and 10 measured rounds. Each worker runs one warm-up and one measured round. The workflow can start up to 15 workers at the same time. Runner capacity can delay some starts:
 
 ```sh
 gh workflow run kvlite-parallel-rounds.yml --repo ci-thing/dispatcher --ref main \
