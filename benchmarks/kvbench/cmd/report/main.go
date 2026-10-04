@@ -400,7 +400,7 @@ func markdown(r report) string {
 			caseWord = "case"
 		}
 		fmt.Fprintf(&b, "## %s\n\n%d timed %s.\n\n", mode, len(timings), caseWord)
-		if len(timings) <= 10 {
+		if len(timings) <= 10 && len(r.Comparisons) == 0 {
 			b.WriteString("| Case | Median (range) |\n| --- | ---: |\n")
 			for _, row := range timings {
 				fmt.Fprintf(&b, "| %s | %s |\n", row.Benchmark, formatRange(row.Median, row.Min, row.Max))

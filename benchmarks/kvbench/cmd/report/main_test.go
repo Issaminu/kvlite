@@ -41,7 +41,7 @@ func TestCollect(t *testing.T) {
 		t.Fatal(err)
 	}
 	report, err := os.ReadFile(filepath.Join(dir, "report.md"))
-	if err != nil || !strings.Contains(string(report), "Largest clear gaps: KVLite slower") {
+	if err != nil || !strings.Contains(string(report), "Largest clear gaps: KVLite slower") || strings.Contains(string(report), "| Case | Median (range) |") {
 		t.Fatalf("report = %q, error = %v", report, err)
 	}
 	files["durable.txt"] = strings.Replace(files["durable.txt"], "BenchmarkRead/scale=light/bbolt 1 50 ns/op", "BenchmarkRead/scale=light/bbolt 1 105 ns/op", 1)
