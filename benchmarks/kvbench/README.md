@@ -32,14 +32,14 @@ Use the saved environment record and raw samples when you compare results. Share
 
 Maintainers with access to the private [dispatcher](https://github.com/ci-thing/dispatcher) can run KVBench on CodSpeed macro runners. Push the KVLite commit first. Use its commit SHA so that a moving branch cannot change the tested code.
 
-The parallel-round workflow runs the Docker suite. Its default is `medium`, `all`, all three engines, both durability modes, and 10 measured rounds. Each worker runs one warm-up and one measured round. The workflow can start up to 15 workers at the same time. Runner capacity can delay some starts:
+The parallel-round workflow runs the Docker suite. Its default is `medium`, `all`, all three engines, both durability modes, and 10 measured rounds. Each worker runs one engine through one warm-up and one measured round. This makes 30 jobs for the default run. The workflow can start up to 15 jobs at the same time. Runner capacity can delay some starts:
 
 ```sh
 gh workflow run kvlite-parallel-rounds.yml --repo ci-thing/dispatcher --ref main \
   -f kvlite_ref="$(git rev-parse HEAD)"
 ```
 
-Set `-f profile=large -f rounds=15` for the complete large profile. Select `-f rounds=1` for a quick check. The workflow also accepts `workload`, `engines`, and `storage` inputs. Each worker saves raw results and an environment record. The final `kvbench-combined` artifact contains all samples. Its `summary.csv` gives the median, minimum, and maximum `ns/op` for each case. Its `metrics.csv` also covers custom metrics, such as read rate and latency.
+Set `-f profile=large -f rounds=15` for the complete large profile. With all three engines, this starts 45 jobs. Select `-f rounds=1` for a short check. The workflow also accepts `workload`, `engines`, and `storage` inputs. Each worker saves raw results and an environment record. The final `kvbench-combined` artifact contains all samples. Its `summary.csv` gives the median, minimum, and maximum `ns/op` for each case. Its `metrics.csv` also covers custom metrics, such as read rate and latency. The engines run on separate machines in this workflow. Use the 15 samples and environment records when you compare engines. The full large run can take much longer than one job because runner capacity limits the number of jobs that run at once.
 
 ```sh
 gh run watch <run-id> --repo ci-thing/dispatcher --exit-status
