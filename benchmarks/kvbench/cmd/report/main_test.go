@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,7 +101,25 @@ func TestProfileReport(t *testing.T) {
 		t.Fatal(err)
 	}
 	profiles, err = readProfiles(dir, r)
-	if err != nil || !profiles[0].SparseCPU || !strings.Contains(markdown(report{Profiles: profiles}), "30ms (sparse)") {
+	if err != nil || !profiles[0].SparseCPU || !strings.Contains(markdown(report{Profiles: profiles}), "1 KVLite profiles have under 200ms") || strings.Contains(markdown(report{Profiles: profiles}), "kvlite.Get (2ms") {
 		t.Fatalf("sparse profile = %+v, error = %v", profiles, err)
+	}
+}
+
+func TestProfileLeadsStayShort(t *testing.T) {
+	var profiles []caseProfile
+	for i := range 12 {
+		profiles = append(profiles, caseProfile{
+			ID:           fmt.Sprintf("%04d", i+1),
+			Mode:         "durable",
+			Benchmark:    fmt.Sprintf("BenchmarkCase%d/scale=medium/kvlite", i),
+			Engine:       "kvlite",
+			SampledCPUMs: float64(1000 + i),
+			PeerGaps:     []peerGap{{Peer: "bbolt", SlowerByPct: 20}},
+		})
+	}
+	text := markdown(report{Profiles: profiles})
+	if strings.Count(text, "[CPU](profiles/") != 5 || !strings.Contains(text, "BenchmarkCase11") || strings.Contains(text, "BenchmarkCase0") {
+		t.Fatalf("profile leads = %q", text)
 	}
 }

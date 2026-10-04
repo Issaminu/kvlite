@@ -158,6 +158,30 @@ func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(
 	return nil
 }
 
+// scanMappedTreeReverse visits the main file from the largest key to the smallest key.
+// The caller must first prove that committed WAL pages cannot replace pages in the main file.
+func (db *DB) scanMappedTreeReverse(pageID page.ID, visit func(uint32, []byte, []byte) error) error {
+	data, err := db.readMainPage(pageID)
+	if err != nil {
+		return err
+	}
+	err = btree.VisitMappedLeafReverse(data, pageID, visit)
+	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
+		return err
+	}
+
+	branch, err := db.readNode(pageID)
+	if err != nil {
+		return err
+	}
+	for index := len(branch.Children) - 1; index >= 0; index-- {
+		if err := db.scanMappedTreeReverse(branch.Children[index], visit); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // prefixRangeEnd returns the smallest exclusive end for a prefix scan. For example, "acct/" ends at "acct0".
 // It returns nil when no finite end exists, such as for an empty prefix or a prefix that contains only 0xff bytes. It does not change prefix.
 func prefixRangeEnd(prefix []byte) []byte {
@@ -224,6 +248,47 @@ func (bucket *Bucket) ScanRange(start, end []byte, fn func(key, value []byte) er
 			return err
 		}
 		key, value, err = cursor.Next()
+	}
+	return err
+}
+
+// ScanReverse reads all entries in the bucket from the largest key to the smallest key.
+// It uses the transaction that owns bucket. Do not change the bucket until ScanReverse returns.
+// The key and value passed to fn are read-only and belong to the current transaction. Use [bytes.Clone] to keep them after the transaction ends.
+// A nested bucket has a nil value. A stored empty value has a non-nil value with length zero.
+// If fn returns an error, ScanReverse stops and returns that error. A nil fn returns [ErrScanCallbackRequired].
+func (bucket *Bucket) ScanReverse(fn func(key, value []byte) error) error {
+	if err := bucket.liveError(); err != nil {
+		return err
+	}
+	if fn == nil {
+		return ErrScanCallbackRequired
+	}
+	if bucket.tx.readOnly && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
+		rootPageID := bucket.rootPageID
+		if bucket.rootNode != nil {
+			rootPageID = bucket.rootNode.PageID()
+		}
+		return bucket.tx.db.scanMappedTreeReverse(rootPageID, func(flags uint32, key, value []byte) error {
+			if flags&btree.BucketLeafFlag != 0 {
+				return fn(key, nil)
+			}
+			if value == nil {
+				value = []byte{}
+			}
+			return fn(key, value)
+		})
+	}
+	cursor, err := bucket.Cursor()
+	if err != nil {
+		return err
+	}
+	key, value, err := cursor.Last()
+	for err == nil && key != nil {
+		if err := fn(key, value); err != nil {
+			return err
+		}
+		key, value, err = cursor.Prev()
 	}
 	return err
 }

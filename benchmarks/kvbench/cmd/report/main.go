@@ -384,7 +384,7 @@ func writeGaps(b *strings.Builder, peer, label string, rows []comparison) {
 func markdown(r report) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "# KVBench report\n\n%d measured samples per case.\n\n", r.ExpectedSamples)
-	b.WriteString("Matched engine gaps use median time. Clear gaps have nonoverlapping observed ranges. This is a useful lead, not proof of a stable speed difference. Full values are in [summary.csv](summary.csv), [comparisons.csv](comparisons.csv), and `report.json`.\n\n")
+	b.WriteString("Matched engine gaps use median time. Clear gaps have nonoverlapping observed ranges. This is a useful lead, not proof of a stable speed difference. Full values are in [summary.csv](summary.csv), [comparisons.csv](comparisons.csv), and `report.json`. KVLite checkpoints data during close, so close-after-writes includes more work than bbolt close.\n\n")
 	for _, mode := range []string{"durable", "no-commit-sync"} {
 		var timings []result
 		for _, row := range r.Results {
@@ -432,32 +432,48 @@ func markdown(r report) string {
 		}
 	}
 	if len(r.Profiles) > 0 {
-		b.WriteString("## Profiles\n\nProfiles are separate from the timing samples. CPU and allocation values are sampled estimates per repeat. Inclusive values contain called functions and can overlap. The table selects functions in the measured engine. It hides CPU rankings below 200ms of sampled CPU time and marks rankings below 1s as limited. Traces and wait files remain in the artifact; the short report omits their Go test and profiler wait activity. Redis profiles cover the Go client, not the Redis server.\n\n")
-		b.WriteString("| Mode and case | Timed median | Peer gap | Sampled CPU | CPU self | CPU inclusive | Allocation inclusive | Files |\n| --- | ---: | --- | ---: | --- | --- | --- | --- |\n")
+		var leads []caseProfile
+		sparse, limited := 0, 0
 		for _, p := range r.Profiles {
+			if p.Engine != "kvlite" {
+				continue
+			}
+			if p.SparseCPU {
+				sparse++
+				continue
+			}
+			if p.LimitedCPU {
+				limited++
+			}
+			for _, gap := range p.PeerGaps {
+				if gap.SlowerByPct > 0 && !gap.RangesOverlap {
+					leads = append(leads, p)
+					break
+				}
+			}
+		}
+		slices.SortFunc(leads, func(a, c caseProfile) int {
+			return cmp.Compare(c.SampledCPUMs, a.SampledCPUMs)
+		})
+		fmt.Fprintf(&b, "## Profile leads\n\n%d KVLite profiles have under 200ms of CPU samples; %d more have under 1s. These need more samples for detailed CPU rankings. The table shows up to five KVLite cases with a clear slower peer gap and at least 200ms of CPU samples. CPU totals cover all repeats. Function values are sampled estimates per repeat. Profiles also include setup and checks. Inclusive values contain called functions.\n\n", sparse, limited)
+		if len(leads) > 0 {
+			b.WriteString("| Case | Peer gap | Total CPU samples | CPU self per repeat | CPU inclusive per repeat | Allocation inclusive per repeat | Files |\n| --- | --- | ---: | --- | --- | --- | --- |\n")
+		}
+		for _, p := range leads[:min(5, len(leads))] {
 			var gaps []string
 			for _, gap := range p.PeerGaps {
-				value := fmt.Sprintf("%+.1f%% vs %s", gap.SlowerByPct, gap.Peer)
-				if gap.RangesOverlap {
-					value += " (ranges overlap)"
+				if gap.SlowerByPct > 0 && !gap.RangesOverlap {
+					gaps = append(gaps, fmt.Sprintf("+%.1f%% vs %s", gap.SlowerByPct, gap.Peer))
 				}
-				gaps = append(gaps, value)
 			}
 			cpuTime := fmt.Sprintf("%.0fms", p.SampledCPUMs)
 			cpuSelf, cpuStack := firstHotspot(p.CPUSelf), firstHotspot(p.CPUStack)
-			if p.SparseCPU {
-				cpuTime += " (sparse)"
-				cpuSelf, cpuStack = "—", "—"
-			} else if p.LimitedCPU {
+			if p.LimitedCPU {
 				cpuTime += " (limited)"
 			}
-			gapText := strings.Join(gaps, "<br>")
-			if gapText == "" {
-				gapText = "—"
-			}
-			fmt.Fprintf(&b, "| %s: %s | %s | %s | %s | %s | %s | %s | [CPU](profiles/%s/cpu-top.txt), [allocation](profiles/%s/alloc-cum.txt), [trace](profiles/%s/trace.out) |\n", p.Mode, p.Benchmark, formatNS(p.MedianNSPerOp), gapText, cpuTime, cpuSelf, cpuStack, firstHotspot(p.AllocStack), p.ID, p.ID, p.ID)
+			fmt.Fprintf(&b, "| %s: %s | %s | %s | %s | %s | %s | [CPU](profiles/%s/cpu-top.txt), [allocation](profiles/%s/alloc-cum.txt), [trace](profiles/%s/trace.out) |\n", p.Mode, p.Benchmark, strings.Join(gaps, "<br>"), cpuTime, cpuSelf, cpuStack, firstHotspot(p.AllocStack), p.ID, p.ID, p.ID)
 		}
-		b.WriteString("\nThe [profile index](profiles/index.tsv) maps each case to its raw profiles. The [test binary](profiles/kvbench.test) supports `go tool pprof`. `report.json` has up to three functions per profile metric.\n\n")
+		b.WriteString("\nThe [profile index](profiles/index.tsv) maps every case to its raw CPU, allocation, and trace files. The [test binary](profiles/kvbench.test) supports `go tool pprof`. `report.json` has up to three functions per profile metric. Redis profiles cover its Go client, not the Redis server.\n\n")
 	}
 	return b.String()
 }
