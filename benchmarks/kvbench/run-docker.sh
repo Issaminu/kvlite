@@ -487,7 +487,7 @@ if ((profile_enabled)); then
 			fi
 		done
 	done <"${profile_dir}/index.tsv"
-	docker cp "${go_name}:/benchmark-data/kvbench.test" "${profile_dir}/kvbench.test"
+	docker exec "${go_name}" cat /benchmark-data/kvbench.test >"${profile_dir}/kvbench.test"
 fi
 docker exec "${go_name}" /benchmark-data/kvbench-report report /benchmark-results
 echo "Report: ${results_dir}/report.md"
