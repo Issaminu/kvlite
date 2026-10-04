@@ -192,6 +192,9 @@ func (engine *kvliteEngine) VisitOrdered(_ context.Context, start, end []byte, r
 		if err != nil {
 			return err
 		}
+		if reverse && limit == 0 && len(start) == 0 && len(end) == 0 {
+			return bucket.ScanReverse(visit)
+		}
 		if !reverse && limit == 0 {
 			return bucket.ScanRange(start, end, visit)
 		}

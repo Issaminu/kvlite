@@ -181,6 +181,40 @@ func TestVisitMappedLeafRange_RejectsInvalidInput(t *testing.T) {
 	}
 }
 
+func TestVisitMappedLeafReverse(t *testing.T) {
+	leaf := NewLeafNode(page.ID(7))
+	for _, key := range []string{"a", "b", "c"} {
+		if err := leaf.InsertEntry(NewEntry(0, []byte(key), []byte("value"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := make([]byte, testNodePageSize)
+	copy(data, EncodeNode(leaf, testNodePageSize))
+	var keys []string
+	if err := VisitMappedLeafReverse(data, leaf.PageID(), func(_ uint32, key, _ []byte) error {
+		keys = append(keys, string(key))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(keys, []string{"c", "b", "a"}) {
+		t.Fatalf("reverse keys: got %q", keys)
+	}
+
+	bad := bytes.Clone(data)
+	binary.LittleEndian.PutUint32(bad[NodeHeaderSize+leafEntryDescriptorSize+encodedUint32Size:], 0)
+	if err := VisitMappedLeafReverse(bad, leaf.PageID(), func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid leaf: got %v, want ErrInvalid", err)
+	}
+	if err := VisitMappedLeafReverse(data, leaf.PageID()+1, func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("wrong page: got %v, want ErrInvalid", err)
+	}
+	branch := NewRootNode(page.ID(10), NewLeafNode(page.ID(8)), NewLeafNode(page.ID(9)), []byte("b"))
+	if err := VisitMappedLeafReverse(EncodeNode(branch, testNodePageSize), branch.PageID(), func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, ErrNotLeafNode) {
+		t.Fatalf("branch: got %v, want ErrNotLeafNode", err)
+	}
+}
+
 func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
 	node := NewLeafNode(page.ID(7))
 	encoded := EncodeNode(node, testNodePageSize)

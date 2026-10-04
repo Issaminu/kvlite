@@ -208,6 +208,52 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 	return nil
 }
 
+// VisitMappedLeafReverse visits one mapped leaf from its largest key to its smallest key.
+// The key and value slices refer to data.
+func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint32, []byte, []byte) error) error {
+	if len(data) < NodeHeaderSize {
+		return fmt.Errorf("read leaf page: %w", ErrInvalid)
+	}
+	if nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset])); nodeType != NodeTypeLeaf {
+		if nodeType == NodeTypeBranch {
+			return ErrNotLeafNode
+		}
+		return fmt.Errorf("read leaf type %d: %w", nodeType, ErrInvalid)
+	}
+	if pageID := page.ID(binary.LittleEndian.Uint64(data[nodePageIDOffset:nodeEntryCountOffset])); pageID != expectedPageID {
+		return fmt.Errorf("read leaf page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
+	}
+
+	entryCount := int(binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset]))
+	if entryCount > (len(data)-NodeHeaderSize)/leafEntryDescriptorSize {
+		return fmt.Errorf("read leaf entry count: %w", ErrInvalid)
+	}
+	payloadStart := NodeHeaderSize + entryCount*leafEntryDescriptorSize
+	if entryCount > 0 {
+		firstOffset := binary.LittleEndian.Uint32(data[NodeHeaderSize+encodedUint32Size : NodeHeaderSize+2*encodedUint32Size])
+		if uint64(firstOffset) != uint64(payloadStart) {
+			return fmt.Errorf("read leaf entry 0: %w", ErrInvalid)
+		}
+	}
+	var nextOffset uint64
+	for index := entryCount - 1; index >= 0; index-- {
+		descriptorStart := NodeHeaderSize + index*leafEntryDescriptorSize
+		descriptor := data[descriptorStart : descriptorStart+leafEntryDescriptorSize]
+		flags := binary.LittleEndian.Uint32(descriptor[:encodedUint32Size])
+		offset := uint64(binary.LittleEndian.Uint32(descriptor[encodedUint32Size : 2*encodedUint32Size]))
+		keyEnd := offset + uint64(binary.LittleEndian.Uint32(descriptor[2*encodedUint32Size:3*encodedUint32Size]))
+		valueEnd := keyEnd + uint64(binary.LittleEndian.Uint32(descriptor[3*encodedUint32Size:]))
+		if offset < uint64(payloadStart) || valueEnd > uint64(len(data)) || (index < entryCount-1 && valueEnd != nextOffset) {
+			return fmt.Errorf("read leaf entry %d: %w", index, ErrInvalid)
+		}
+		nextOffset = offset
+		if err := visit(flags, data[int(offset):int(keyEnd):int(keyEnd)], data[int(keyEnd):int(valueEnd):int(valueEnd)]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // LookupEncodedWALNode finds key in one compact node from a verified WAL record.
 // It checks each field that it reads.
 // It requires a zero node checksum.

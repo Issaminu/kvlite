@@ -194,7 +194,7 @@ A cursor visits values and nested bucket names in key order. A nested bucket has
 
 Use `Cursor.First`, `Cursor.Last`, or `Cursor.Seek` to select an entry. Use `Cursor.Next` or `Cursor.Prev` to continue.
 
-`Bucket.ScanPrefix` visits keys that start with one prefix. `Bucket.ScanRange` visits a half-open range. It includes the start key and excludes the end key.
+`Bucket.ScanPrefix` visits keys that start with one prefix. `Bucket.ScanRange` visits a half-open range. It includes the start key and excludes the end key. `Bucket.ScanReverse` visits every entry from the largest key to the smallest key.
 
 Do not change a bucket while one of its cursors or scans is in use. Create a new cursor after a bucket change.
 
@@ -224,7 +224,7 @@ KVLite copies keys and values during a write. The caller can reuse or change the
 
 `DB.Get` returns a copy. The caller can keep and change it.
 
-`Bucket.Get`, `Cursor`, `Bucket.ScanPrefix`, and `Bucket.ScanRange` return or pass read-only slices owned by the transaction. Use `bytes.Clone` when data must remain valid after the callback returns.
+`Bucket.Get`, `Cursor`, `Bucket.ScanPrefix`, `Bucket.ScanRange`, and `Bucket.ScanReverse` return or pass read-only slices owned by the transaction. Use `bytes.Clone` when data must remain valid after the callback returns.
 
 Clone a transaction-owned value before the transaction ends:
 

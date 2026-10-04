@@ -433,6 +433,77 @@ func TestBucketScan_FullPrefixPersistsAfterReopen(t *testing.T) {
 	}
 }
 
+func TestBucketScanReverse(t *testing.T) {
+	for _, mapped := range []bool{false, true} {
+		name := "wal"
+		if mapped {
+			name = "mapped"
+		}
+		t.Run(name, func(t *testing.T) {
+			path := t.TempDir() + "/database"
+			db, err := openDB(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepareCursorBucket(t, db)
+			if mapped {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = openDB(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer db.Close()
+
+			errStop := errors.New("stop scan")
+			err = db.View(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				var keys [][]byte
+				if err := bucket.ScanReverse(func(key, value []byte) error {
+					if string(key) == "nested" && value != nil {
+						t.Fatal("nested bucket has a value")
+					}
+					if string(key) == "empty" && value == nil {
+						t.Fatal("empty value is nil")
+					}
+					return collectScanKey(key, value, &keys)
+				}); err != nil {
+					return err
+				}
+				want := []string{"nested"}
+				for index := 39; index >= 0; index-- {
+					want = append(want, fmt.Sprintf("key-%02d", index))
+				}
+				want = append(want, "empty")
+				requireScanKeys(t, keys, want...)
+				if err := bucket.ScanReverse(nil); !errors.Is(err, ErrScanCallbackRequired) {
+					t.Fatalf("nil callback: got %v, want ErrScanCallbackRequired", err)
+				}
+				calls := 0
+				err = bucket.ScanReverse(func(_, _ []byte) error {
+					calls++
+					if calls == 2 {
+						return errStop
+					}
+					return nil
+				})
+				if !errors.Is(err, errStop) || calls != 2 {
+					t.Fatalf("callback stop: calls=%d err=%v", calls, err)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestBucketScan_Range(t *testing.T) {
 	db, err := openDB(t.TempDir() + "/database")
 	if err != nil {

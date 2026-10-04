@@ -12,7 +12,7 @@ See the repository [benchmark report](../../BENCHMARKS.md) for the latest full r
 
 ## Run benchmarks on GitHub Actions
 
-The [test workflow](../../.github/workflows/ci.yml) tests both Go modules on each pull request and push to main. The [KVBench workflow](../../.github/workflows/kvbench.yml) runs the Docker runner below on a remote machine. Pull requests use `light`, `focused`, and all three engines. Pushes to main use `medium`, `all`, and all three engines. Each run measures both durability modes and saves the raw results and environment record as a workflow artifact.
+The [test workflow](../../.github/workflows/ci.yml) tests both Go modules on each pull request and push to main. The [KVBench workflow](../../.github/workflows/kvbench.yml) runs the Docker runner below on a remote machine. Pull requests use `light`, `focused`, and all three engines. Pushes to main use `medium`, `all`, and all three engines. Normal runs measure both durability modes. Each run saves the raw results and environment record as a workflow artifact.
 
 To run a selected branch away from your computer, commit and push its changes. GitHub Actions cannot read changes that stay on your computer. After the workflow is on the default branch, start a manual run with the scale, workload, and engines you need:
 
@@ -20,6 +20,7 @@ To run a selected branch away from your computer, commit and push its changes. G
 gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=light -f workload=focused -f engines=kvlite
 gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=medium -f workload=all -f engines=kvlite,bbolt,redis
 gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=light -f workload=focused -f engines=kvlite -f profiling=true
+gh workflow run kvbench.yml --ref my-benchmark-branch -f scale=medium -f workload=all -f engines=kvlite,bbolt -f case='durable:BenchmarkLifecycle/scale=medium/close-after-writes' -f profiling=true
 gh run list --workflow kvbench.yml --branch my-benchmark-branch
 gh run watch 123456789
 gh run download 123456789
@@ -28,6 +29,8 @@ gh run download 123456789
 Replace the branch and run ID with your values. A manual run uses `medium`, `all`, and all three engines by default. The workflow accepts the `light`, `medium`, or `large` scale and the `focused`, `reads`, `writes`, `deletes`, `mixed`, or `all` workload. Select one or more engines with a comma-separated list. Each workflow run gets its own GitHub-hosted machine. Runs from different branches can start at the same time, subject to GitHub runner capacity.
 
 Set `profiling=true` to profile every selected case after the normal timing run. Leave it false for an ordinary timing run. The workflow saves the report and profiles in the same result artifact. Profiling a large, all-workload run can take much longer and produce large artifacts.
+
+Set `case` to time and profile one exact case. Copy the mode and case name from a report, without the final engine name. The mode is `durable` or `no-commit-sync`. The case must match the selected scale and workload. Select the engines to compare with `engines`. A case run records only the selected mode.
 
 Use the saved environment record and raw samples when you compare results. Shared runners can change timing between runs. Treat small differences between separate workflow runs as uncertain. The Docker runner changes engine and durability order within each run.
 
@@ -114,19 +117,20 @@ The Docker scales use up to four CPUs by default. Advanced runs can set `KVBENCH
 
 ## Read results and profile cases
 
-The Docker runner builds the Go report tool in its pinned Go container. After the measured rounds, it writes `report.md`, `report.json`, `summary.csv`, `metrics.csv`, and `comparisons.csv` beside the raw result files. The short report lists the largest KVLite gains and losses against each matched engine. The JSON file keeps every sample. The CSV files show the mean, median, minimum, and maximum for each case and metric.
+The Docker runner builds the Go report tool in its pinned Go container. After the measured rounds, it writes `report.md`, `report.json`, `summary.csv`, `metrics.csv`, and `comparisons.csv` beside the raw result files. The short report lists up to five clear gains and losses for each matched engine and durability mode. It puts cases with overlapping observed ranges in a separate count. The JSON file keeps every sample. The CSV files show the mean, median, minimum, and maximum for each case and metric.
 
-The gain and loss percentages compare medians. They do not prove that a difference is stable. Check the sample range and environment record before you make a performance claim. Cases without a matching peer have no comparison row.
+The gain and loss values compare medians. Large gaps use a ratio instead of a percentage. A clear gap means the observed ranges do not overlap. It does not prove that a difference is stable. Check the raw samples and environment record before you make a performance claim. Cases without a matching peer have no comparison row. The report compares engines in one run. It does not compare two commits.
 
 To profile every case selected by the scale, workload, durability modes, and engines, add `--profile`. For example:
 
 ```sh
 ./run-docker.sh light --workloads=focused --engines=kvlite --profile
+./run-docker.sh medium --engines=kvlite,bbolt --case=durable:BenchmarkLifecycle/scale=medium/close-after-writes --profile
 ```
 
-The runner finishes its normal unprofiled rounds first. It then runs each selected case again with CPU profiling, allocation profiling, and an execution trace. It repeats each profiled case once per measured round. The profiles cover the repeats together. The report divides sampled CPU time, allocated bytes, and traced wait time by the number of repeats. Its table shows top functions for each case; `report.json` lists the top three functions in each group. Raw profiles, traces, and full function lists are under `profiles/`. The report also includes the normal timing averages and matched-engine comparisons.
+The runner finishes its normal unprofiled rounds first. It then runs each selected case again with CPU profiling, allocation profiling, and an execution trace. It repeats each profiled case once per measured round. The profiles cover the repeats together. The report divides sampled CPU time and allocated bytes by the number of repeats. Its short table shows the leading engine function for CPU self time, CPU inclusive time, and inclusive allocation. It hides CPU rankings below 200 ms of sampled CPU time across all repeats. It marks rankings below 1 second as limited. `report.json` lists up to three functions for each measure. Raw profiles, traces, wait files, and full function lists are under `profiles/`. Use them to inspect the complete call path. The report also includes the normal timing values and matched-engine comparisons. Without an explicit workload, a direct `--case` run uses `all`.
 
-Profiles include fixture setup, final checks, and profiling overhead. CPU samples estimate time spent on the CPU; trace wait profiles estimate blocked time. Neither gives exact time for each function call. Use the unprofiled rounds to measure speed changes. A Redis profile covers its Go client process, not the Redis server process.
+Profiles include fixture setup, final checks, and profiling overhead. CPU samples estimate time spent on the CPU; trace wait profiles estimate blocked time. Neither gives exact time for each function call. The short report omits wait rankings because test and profiler activity can dominate them. Use the unprofiled rounds to measure speed changes. A Redis profile covers its Go client process, not the Redis server process.
 
 ## Fairness contract
 

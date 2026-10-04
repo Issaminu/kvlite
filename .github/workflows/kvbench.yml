@@ -20,6 +20,9 @@ on:
         description: Comma-separated engines (kvlite,bbolt,redis)
         type: string
         default: kvlite,bbolt,redis
+      case:
+        description: 'Optional exact case, for example durable:BenchmarkLifecycle/scale=medium/close-after-writes'
+        type: string
       profiling:
         description: Profile every selected benchmark case
         type: boolean
@@ -37,6 +40,7 @@ jobs:
       SCALE: ${{ github.event_name == 'pull_request' && 'light' || inputs.scale || 'medium' }}
       WORKLOAD: ${{ github.event_name == 'pull_request' && 'focused' || inputs.workload || 'all' }}
       ENGINES: ${{ inputs.engines || 'kvlite,bbolt,redis' }}
+      CASE: ${{ inputs.case || '' }}
       PROFILING: ${{ inputs.profiling || false }}
     steps:
       - uses: actions/checkout@v5
@@ -44,6 +48,9 @@ jobs:
       - name: Run KVBench
         run: |
           args=("$SCALE" "--engines=$ENGINES" "--workloads=$WORKLOAD")
+          if [[ -n "$CASE" ]]; then
+            args+=("--case=$CASE")
+          fi
           if [[ "$PROFILING" == true ]]; then
             args+=("--profile")
           fi
