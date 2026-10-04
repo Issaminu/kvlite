@@ -4875,6 +4875,77 @@ func TestBucket_SharedHandleSeesWrites(t *testing.T) {
 	}
 }
 
+func TestBucket_NestedHandlesSurviveSiblingChanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	err = db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		first, err := parent.CreateBucket([]byte("first"))
+		if err != nil {
+			return err
+		}
+		if got := mustNestedBucket(t, parent, []byte("first")); got != first {
+			t.Fatal("first lookup returned a different handle")
+		}
+		second, err := parent.CreateBucket([]byte("second"))
+		if err != nil {
+			return err
+		}
+		if got := mustNestedBucket(t, parent, []byte("first")); got != first {
+			t.Fatal("second child changed the first handle")
+		}
+		if got := mustNestedBucket(t, parent, []byte("second")); got != second {
+			t.Fatal("second lookup returned a different handle")
+		}
+		if err := parent.DeleteBucket([]byte("first")); err != nil {
+			return err
+		}
+		if _, err := first.Get([]byte("key")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted handle: got %v, want ErrBucketNotFound", err)
+		}
+		replacement, err := parent.CreateBucket([]byte("first"))
+		if err != nil {
+			return err
+		}
+		if got := mustNestedBucket(t, parent, []byte("first")); got != replacement || got == first {
+			t.Fatal("recreated child returned an old handle")
+		}
+		if got := mustNestedBucket(t, parent, []byte("second")); got != second {
+			t.Fatal("recreated child changed the second handle")
+		}
+		return replacement.Put([]byte("key"), []byte("value"))
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.View(func(tx *Tx) error {
+		parent := mustBucket(t, tx, []byte("parent"))
+		first := mustNestedBucket(t, parent, []byte("first"))
+		if got := mustNestedBucket(t, parent, []byte("first")); got != first {
+			t.Fatal("read transaction returned a different first handle")
+		}
+		second := mustNestedBucket(t, parent, []byte("second"))
+		if got := mustNestedBucket(t, parent, []byte("second")); got != second {
+			t.Fatal("read transaction returned a different second handle")
+		}
+		if got := mustBucketValue(t, first, []byte("key")); !bytes.Equal(got, []byte("value")) {
+			t.Fatalf("recreated child value: got %q, want value", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestGet_NilValueIsFoundNotMissing checks that a stored empty value differs from a missing key.
 func TestGet_NilValueIsFoundNotMissing(t *testing.T) {
 	path := tempfile()

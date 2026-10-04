@@ -10,6 +10,7 @@ import (
 )
 
 // cacheBucket registers b as the one handle for its name within this transaction.
+// Keep the first bucket directly. Store only other buckets in the map.
 func (tx *Tx) cacheBucket(b *Bucket) {
 	if tx.bucket == nil {
 		tx.bucket = b
@@ -17,7 +18,6 @@ func (tx *Tx) cacheBucket(b *Bucket) {
 	}
 	if tx.buckets == nil {
 		tx.buckets = make(map[string]*Bucket)
-		tx.buckets[string(tx.bucket.name)] = tx.bucket
 	}
 	tx.buckets[string(b.name)] = b
 }
@@ -33,7 +33,8 @@ type Bucket struct {
 	rootPageID   page.ID // Set only while a read-only bucket has not loaded rootNode.
 	rootNode     *btree.Node
 	parentBucket *Bucket
-	children     map[string]*Bucket // per-parent cache: one *Bucket handle per nested name
+	child        *Bucket            // First nested handle, kept without a map.
+	children     map[string]*Bucket // Other nested handles in this transaction.
 	treeVersion  uint64             // A cursor captures this value and rejects a stale path after a successful tree change.
 	deleted      bool
 }
@@ -52,7 +53,15 @@ func (bucket *Bucket) liveError() error {
 }
 
 // cacheChild registers b as the one handle for its name within this bucket.
+// A short read transaction often opens only one child at each level of a bucket
+// path. Keep that child directly so the read does not allocate a map at every
+// level and discard those maps when the transaction ends. Cache other children
+// in a map so repeated lookups still return the same handles.
 func (bucket *Bucket) cacheChild(b *Bucket) {
+	if bucket.child == nil {
+		bucket.child = b
+		return
+	}
 	if bucket.children == nil {
 		bucket.children = make(map[string]*Bucket)
 	}
@@ -262,6 +271,9 @@ func (bucket *Bucket) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if len(bucketName) == 0 {
 		return nil, ErrBucketNameRequired
 	}
+	if bucket.child != nil && bytes.Equal(bucket.child.name, bucketName) {
+		return bucket.child, nil
+	}
 	if b, ok := bucket.children[string(bucketName)]; ok {
 		return b, nil
 	}
@@ -428,6 +440,9 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 		}
 		delete(tx.buckets, string(bucketName))
 	} else {
+		if parent.child == target {
+			parent.child = nil
+		}
 		delete(parent.children, string(bucketName))
 	}
 	return nil
