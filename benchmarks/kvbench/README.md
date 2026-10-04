@@ -39,7 +39,7 @@ gh workflow run kvlite-parallel-rounds.yml --repo ci-thing/dispatcher --ref main
   -f kvlite_ref="$(git rev-parse HEAD)"
 ```
 
-Set `profile=large -f rounds=15` for the complete large profile. Select `rounds=1` for a quick check. The workflow also accepts `workload`, `engines`, and `storage` inputs. Each worker saves raw results and an environment record. The final `kvbench-combined` artifact contains all samples and `summary.csv`, with the median, minimum, and maximum `ns/op` for each case.
+Set `-f profile=large -f rounds=15` for the complete large profile. Select `-f rounds=1` for a quick check. The workflow also accepts `workload`, `engines`, and `storage` inputs. Each worker saves raw results and an environment record. The final `kvbench-combined` artifact contains all samples. Its `summary.csv` gives the median, minimum, and maximum `ns/op` for each case. Its `metrics.csv` also covers custom metrics, such as read rate and latency.
 
 ```sh
 gh run watch <run-id> --repo ci-thing/dispatcher --exit-status
