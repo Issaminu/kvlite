@@ -68,17 +68,17 @@ readonly benchmark_profile
 readonly engine_option
 case "${benchmark_profile}" in
 light)
-	readonly measured_count=3
+	measured_count=3
 	readonly samples_per_round=2
 	readonly warmup_count=1
 	;;
 medium)
-	readonly measured_count=10
+	measured_count=10
 	readonly samples_per_round=1
 	readonly warmup_count=1
 	;;
 large)
-	readonly measured_count=15
+	measured_count=15
 	readonly samples_per_round=1
 	readonly warmup_count=1
 	;;
@@ -87,6 +87,20 @@ large)
 	exit 1
 	;;
 esac
+if [[ -n "${KVBENCH_MEASURED_ROUNDS:-}" ]]; then
+	if [[ ! "${KVBENCH_MEASURED_ROUNDS}" =~ ^[1-9][0-9]*$ ]]; then
+		echo "KVBENCH_MEASURED_ROUNDS must be a positive integer" >&2
+		exit 1
+	fi
+	measured_count="${KVBENCH_MEASURED_ROUNDS}"
+fi
+readonly measured_count
+round_offset="${KVBENCH_ROUND_OFFSET:-0}"
+if [[ ! "${round_offset}" =~ ^(0|[1-9][0-9]*)$ ]]; then
+	echo "KVBENCH_ROUND_OFFSET must be a non-negative integer" >&2
+	exit 1
+fi
+readonly round_offset
 if [[ -z "${workload_option}" ]]; then
 	if [[ "${benchmark_profile}" == "light" ]]; then
 		workload_option="--workloads=focused"
@@ -364,6 +378,7 @@ verify_redis_reopen_after_kill() {
 	echo "Workloads: ${benchmark_workload}"
 	echo "Warm-up count: ${warmup_count}"
 	echo "Measured rounds: ${measured_count}"
+	echo "Round offset: ${round_offset}"
 	echo "Samples per round: ${samples_per_round}"
 	echo "Measured samples: $((measured_count * samples_per_round))"
 	echo "Benchmark filter: ${benchmark_filter}"
@@ -413,12 +428,12 @@ fi
 
 for ((round = 0; round < warmup_count; round++)); do
 	echo "Warm-up round $((round + 1)) of ${warmup_count}"
-	run_profile_round "${round}" run_warmup_round
+	run_profile_round "$((round + round_offset))" run_warmup_round
 done
 
 for ((round = 0; round < measured_count; round++)); do
 	echo "Measured round $((round + 1)) of ${measured_count}"
-	run_profile_round "${round}" run_round
+	run_profile_round "$((round + round_offset))" run_round
 done
 
 echo "Raw results: ${results_dir}"
