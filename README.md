@@ -2,7 +2,6 @@
   <img src="assets/logo/kvlite-logo.svg" alt="KVLite logo" width="480">
 </p>
 
-<h1 align="center">KVLite</h1>
 
 A blazingly-fast embedded key/value database for Go.
 
