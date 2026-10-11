@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/mascot/kvlite-mascot.png" alt="KVLite mascot carrying B+ tree pages" width="200">
+  <img src="assets/logo/kvlite-logo.svg" alt="KVLite logo" width="480">
 </p>
 
 <h1 align="center">KVLite</h1>
