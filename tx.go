@@ -59,7 +59,7 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 //
 // Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
 //
-// In [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch. If the WAL commit fails, each callback that depends on that commit receives the same error.
+// For a file database in [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch. If the WAL commit fails, each callback that depends on that commit receives the same error. A memory database commits each callback without a log or file operations.
 //
 // Do not start another transaction from fn. Use the Tx passed to fn. If fn panics, Update discards its changes before the panic continues.
 func (db *DB) Update(transaction func(tx *Tx) error) error {
@@ -70,7 +70,7 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	if db.options.ReadOnly {
 		return ErrDatabaseReadOnly
 	}
-	if db.options.Synchronous == SyncFull {
+	if db.memoryNodes == nil && db.options.Synchronous == SyncFull {
 		return db.submitDurableUpdate(transaction)
 	}
 	db.operationMu.Lock()
@@ -88,23 +88,33 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	if err := tx.prepareCommit(); err != nil {
 		return err
 	}
-	var retired map[page.ID]struct{}
-	if tx.allocationOwned {
-		retired = tx.allocation.walRetiredPages()
-	}
-
-	nodes, encodedMeta := makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
-	var allocationPages []wal.AllocationRecord
-	if tx.allocationOwned {
-		allocationPages = tx.allocation.pageRecords()
-	}
-	if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
-		return nil
-	}
-
-	needsCheckpoint, err := db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
-	if err != nil {
-		return err
+	needsCheckpoint := false
+	if db.memoryNodes != nil {
+		// Update holds the write lock until all node and allocation changes are visible.
+		// Retired nodes must leave memory before a later transaction can reuse their page IDs.
+		if tx.allocationOwned {
+			for pageID := range tx.allocation.retired {
+				delete(db.memoryNodes, pageID)
+			}
+		}
+	} else {
+		var retired map[page.ID]struct{}
+		if tx.allocationOwned {
+			retired = tx.allocation.walRetiredPages()
+		}
+		nodes, encodedMeta := makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
+		var allocationPages []wal.AllocationRecord
+		if tx.allocationOwned {
+			allocationPages = tx.allocation.pageRecords()
+		}
+		if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
+			return nil
+		}
+		var err error
+		needsCheckpoint, err = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
+		if err != nil {
+			return err
+		}
 	}
 	db.meta = tx.meta
 	db.rootNode = tx.rootNode
@@ -115,7 +125,11 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		db.stats.TailPagesReclaimed += tx.allocation.tailPagesRemoved
 	}
 	for _, dirty := range tx.store.dirty {
-		db.cacheWriteNode(dirty.final)
+		if db.memoryNodes != nil {
+			db.memoryNodes[dirty.final.PageID()] = dirty.final
+		} else {
+			db.cacheWriteNode(dirty.final)
+		}
 	}
 	if needsCheckpoint {
 		// The WAL is already durable. A checkpoint failure must not turn this

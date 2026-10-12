@@ -14,6 +14,7 @@ import (
 // Open can use the backup directly. No WAL file is required.
 // Backup works with writable and read-only handles.
 // It uses the source file permissions.
+// A memory database returns an error that matches [errors.ErrUnsupported] without file operations.
 // An empty path returns [ErrPathRequired]. An existing path or path+"-wal" returns an error that matches [os.ErrExist].
 //
 // Reads and writes can continue during the file copy.
@@ -40,6 +41,9 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	defer db.endOperation()
 	if path == "" {
 		return ErrPathRequired
+	}
+	if db.memoryNodes != nil {
+		return errors.ErrUnsupported
 	}
 	if err := backupPathAvailable(path); err != nil {
 		return err

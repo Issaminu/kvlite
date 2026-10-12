@@ -220,7 +220,7 @@ func (bucket *Bucket) ScanRange(start, end []byte, fn func(key, value []byte) er
 		return nil
 	}
 	// Mapped pages do not include newer page images from the WAL. Use the mapped scan only when the read-only view has no committed WAL overlay.
-	if bucket.tx.readOnly && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
+	if bucket.tx.readOnly && bucket.tx.db.wal != nil && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
 		rootPageID := bucket.rootPageID
 		if bucket.rootNode != nil {
 			// A read-only bucket clears rootPageID after it loads rootNode. The loaded node keeps the same page ID.
@@ -264,7 +264,7 @@ func (bucket *Bucket) ScanReverse(fn func(key, value []byte) error) error {
 	if fn == nil {
 		return ErrScanCallbackRequired
 	}
-	if bucket.tx.readOnly && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
+	if bucket.tx.readOnly && bucket.tx.db.wal != nil && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
 		rootPageID := bucket.rootPageID
 		if bucket.rootNode != nil {
 			rootPageID = bucket.rootNode.PageID()

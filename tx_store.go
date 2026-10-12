@@ -31,8 +31,8 @@ func (store *txTreeStore) PageSize() int64 {
 	return store.tx.meta.PageSize()
 }
 
-// LookupPage uses encoded pages for a read transaction.
-// A write transaction decodes and keeps each page that it reads.
+// LookupPage uses committed storage for a read transaction.
+// A write transaction keeps each node that it reads.
 func (store *txTreeStore) LookupPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
 	if store.tx.readOnly {
 		return store.tx.db.lookupCommittedPage(pageID, key)
@@ -155,10 +155,10 @@ func (store *txTreeStore) StageNode(node *btree.Node) {
 // normal allocator. Shrink retires only the surplus IDs. A body that fits one
 // page loses all continuation IDs. IDs need not be consecutive.
 //
-// Page IDs can stay the same because the WAL writes new page contents into
-// separate buffers. It publishes them only after the commit succeeds. This
-// function changes only private node and allocation state. The caller must
-// discard that state if preparation or the WAL commit fails.
+// This function changes only private node and allocation state.
+// A file database writes the changed pages to the WAL before it publishes them.
+// A memory database publishes the changed nodes without file operations.
+// The caller must discard private state if preparation or the WAL commit fails.
 func (tx *Tx) prepareCommit() error {
 	if tx.allocation != nil {
 		// A later batch callback can remove a node changed by an earlier callback.

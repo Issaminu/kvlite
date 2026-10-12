@@ -9,6 +9,8 @@ import (
 
 // Stats contains storage state and cumulative write counters for one open [DB] handle.
 // Obtain a reading with [DB.Stats]. Counters cover work by this handle, including checkpoints during Open.
+// A memory database reports logical page sizes and counts, not Go heap use.
+// Its file, WAL, and checkpoint fields are zero.
 type Stats struct {
 	// PageSize is the size of one database page in bytes.
 	PageSize int
@@ -46,20 +48,21 @@ type Stats struct {
 	ReusablePageCount uint64
 	// AllocationMetadataPageCount is the number of pages that store allocation bitmaps.
 	AllocationMetadataPageCount uint64
-	// LastPageID is the highest page ID in the logical database file.
+	// LastPageID is the highest logical database page ID.
 	LastPageID uint64
 	// PagesReused counts allocations from free pages since this handle opened.
 	PagesReused uint64
 	// PagesRetired counts tree pages freed by committed writes since this handle opened.
 	PagesRetired uint64
-	// TailPagesReclaimed counts pages removed from the logical file since this handle opened. Checkpoint later shrinks the main file.
+	// TailPagesReclaimed counts pages removed from the logical database tail since this handle opened. A file checkpoint later shrinks the main file.
 	TailPagesReclaimed uint64
 }
 
 // Stats returns storage state and cumulative write counters for this database handle.
 // Stats waits for an active write or checkpoint to finish. Do not call it from a transaction callback.
 // Use [Bucket.Stats] to inspect a bucket inside a callback.
-// Stats scans the allocation bitmap and reads the main-file and WAL sizes.
+// Stats scans the allocation bitmap. A file database also reads the main-file and WAL sizes.
+// A memory database reports logical page counts and DataSize. DataSize does not measure Go heap use.
 // Its cost grows with the allocation metadata. It does not start a checkpoint or scan tree pages.
 // It returns [ErrDatabaseNotOpen] after close starts, or a file-size read error.
 func (db *DB) Stats() (Stats, error) {
@@ -71,28 +74,31 @@ func (db *DB) Stats() (Stats, error) {
 	db.operationMu.RLock()
 	defer db.operationMu.RUnlock()
 
-	stats := db.wal.Stats()
 	result := db.stats
-	info, err := db.file.Stat()
-	if err != nil {
-		return Stats{}, err
-	}
 	result.PageSize = int(db.meta.PageSize())
+	var err error
 	result.DataSize, err = db.logicalFileSize()
 	if err != nil {
 		return Stats{}, err
 	}
-	result.FileSize = info.Size()
-	result.WALSize, err = db.wal.Size()
-	if err != nil {
-		return Stats{}, err
+	if db.wal != nil {
+		stats := db.wal.Stats()
+		info, err := db.file.Stat()
+		if err != nil {
+			return Stats{}, err
+		}
+		result.FileSize = info.Size()
+		result.WALSize, err = db.wal.Size()
+		if err != nil {
+			return Stats{}, err
+		}
+		result.WALPageCount = stats.CommittedRecordCount
+		result.WALBytesSinceCheckpoint = stats.BytesSinceCheckpoint
+		result.CheckpointThresholdBytes = stats.CheckpointThresholdBytes
+		result.WALBytesWritten = stats.TotalBytesWritten
+		result.WALCommitCount = stats.CommitCount
+		result.CheckpointCount = stats.CheckpointCount
 	}
-	result.WALPageCount = stats.CommittedRecordCount
-	result.WALBytesSinceCheckpoint = stats.BytesSinceCheckpoint
-	result.CheckpointThresholdBytes = stats.CheckpointThresholdBytes
-	result.WALBytesWritten = stats.TotalBytesWritten
-	result.WALCommitCount = stats.CommitCount
-	result.CheckpointCount = stats.CheckpointCount
 	result.AllocatedPageCount = db.allocation.allocatedPageCount()
 	result.LastPageID = uint64(db.meta.LastPage())
 	result.ReusablePageCount = result.LastPageID + 1 - result.AllocatedPageCount
@@ -120,6 +126,7 @@ func (s Stats) Sub(other *Stats) Stats {
 
 // BucketStats contains page, entry, and size counts for a bucket and all its nested buckets.
 // Values returned by [Bucket.Stats] are independent copies.
+// In a memory database, storage byte counts describe logical pages, not Go heap use.
 type BucketStats struct {
 	// BranchPageN is the number of branch pages, including nested buckets.
 	BranchPageN int

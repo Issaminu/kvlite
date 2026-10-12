@@ -8,7 +8,8 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// Sync controls storage synchronization for writes, checkpoints, and backups.
+// Sync controls storage synchronization for file database writes, checkpoints, and backups.
+// It does not select memory storage. Use [OpenMemory] for a database with no file operations.
 type Sync uint8
 
 const (
@@ -21,7 +22,7 @@ const (
 	// SyncNormal is a middle ground between write speed and durability. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes. Backup syncs its file and parent directory before it returns success.
 	SyncNormal
 
-	// SyncNone favors write speed over durability. It does not synchronize a new database or synchronize after commits, checkpoints, close, or backup. A system failure can lose committed updates or corrupt the database. Use this mode only when the data can be rebuilt.
+	// SyncNone writes database, log, and backup files without synchronizing them to storage. It does not synchronize a new database or synchronize after commits, checkpoints, close, or backup. A system failure can lose committed updates or corrupt the database. Use this mode only when the data can be rebuilt. Use [OpenMemory] to avoid file operations.
 	SyncNone
 
 	// defaultCheckpointPageCount keeps about 1,000 operating-system pages of data in the write-ahead log before KVLite starts a checkpoint. This limits log growth without running a checkpoint after every update.

@@ -83,11 +83,28 @@ The program prints:
 Ada
 ```
 
-Always check the error from `DB.Close`. A writable close moves committed data into the main database file and removes the write-ahead log.
+Always check the error from `DB.Close`. A writable file close moves committed data into the main database file and removes the write-ahead log.
+
+## Memory storage
+
+Use `OpenMemory` to create an empty database with no file operations:
+
+```go
+db := kvlite.OpenMemory()
+```
+
+Use the same buckets, transactions, cursors, and scans as in the quick start. Each call creates an independent, writable database. Call `DB.Close` when finished. Closing the database discards all data. Data is also lost when the process ends. `DB.Path` returns an empty string.
+
+Memory storage supports large keys and values with the same limits as file storage. It keeps complete decoded tree nodes in memory. It supports transaction rollback and concurrent calls on one `DB`.
+
+`DB.Stats` and `Bucket.Stats` report logical page sizes, page counts, and page reuse. These counts include reserved metadata and allocation pages. They do not measure Go heap use. File, WAL, and checkpoint fields are zero. `DB.Backup` returns an error that matches `errors.ErrUnsupported` without file operations.
+
+Storage and synchronization are separate choices. `Open` selects file storage. Its `Synchronous` option controls when file data is synchronized to storage. `SyncNone` still writes files. `OpenMemory` selects memory storage and needs no sync options.
 
 ## Features
 
 - Named and nested buckets store byte keys and values.
+- File storage and memory storage use the same data operations.
 - Delete plain keys or whole buckets. Later writes can reuse freed pages.
 - Read-only and read-write transactions provide a consistent view and atomic changes.
 - Cursors move forward or backward in byte-key order.
@@ -251,6 +268,8 @@ fmt.Println(string(saved))
 
 ## Durability and recovery
 
+This section applies to file databases opened with `Open`.
+
 For a database at `app.db`, KVLite can use two files:
 
 
@@ -271,7 +290,7 @@ KVLite records which database pages are in use. A later transaction can reuse a 
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SyncFull`   | Default. A non-empty update returns after KVLite synchronizes its log data to storage. Concurrent updates can share this work.                            |
 | `SyncNormal` | Synchronizes at a checkpoint or clean close. A system failure can lose recent committed updates from the operating-system cache.                          |
-| `SyncNone`   | Does not synchronize a new database or synchronize at commit, checkpoint, close, or backup. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
+| `SyncNone`   | Writes files without synchronizing them at open, commit, checkpoint, close, or backup. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
 
 
 These modes do not change transaction atomicity. They change when committed log data reaches storage.
@@ -291,6 +310,8 @@ options := &kvlite.Options{
 `DB.Stats()` returns storage state and cumulative write counters for the current open handle. Counters cover work by this handle, including recovery checkpoints during open. They start again with each new handle. Reading statistics scans allocation metadata and checks the main-file and WAL sizes. It does not start a checkpoint or scan tree pages. Do not call it from a transaction callback.
 
 The result includes page counts, logical database size, main-file size, WAL size, bytes appended since checkpoint, distinct pending WAL pages, and the checkpoint threshold. File sizes are byte lengths. They do not measure file-system block allocation. WAL bytes measure successful log appends, not physical storage writes.
+
+A memory database reports logical page counts and `DataSize`. These do not measure Go heap use. Its file, WAL, and checkpoint fields are zero. `Bucket.Stats` uses the same logical page rules in both storage modes.
 
 Normal reads do not collect statistics. There are no statistics locks, transaction counters, or phase timers. Write counters use the existing write lock. Detailed transaction collection is deferred.
 
@@ -405,7 +426,7 @@ cd benchmarks/kvbench
 
 ## Backup
 
-Use `DB.Backup` to save one committed database state to a new file. Reads and writes can continue during the copy. Writable and read-only handles can both create backups.
+Use `DB.Backup` to save one committed file database state to a new file. Reads and writes can continue during the copy. Writable and read-only file handles can both create backups. Memory databases return an error that matches `errors.ErrUnsupported` without file operations.
 
 ```go
 if err := db.Backup("backup.db"); err != nil {

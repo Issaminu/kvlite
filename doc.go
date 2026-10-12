@@ -2,9 +2,9 @@
 //
 // # Databases and buckets
 //
-// A [DB] stores data in a file. Each key and value belongs to a named [Bucket]. A bucket can also contain other buckets.
+// A [DB] stores data in a file or in memory. Each key and value belongs to a named [Bucket]. A bucket can also contain other buckets.
 //
-// Use [Open] to open a database. [DB.Get], [DB.Put], and [DB.Delete] read, write, and remove one value in an existing top-level bucket. [DB.DeleteBucket] removes a top-level bucket.
+// Use [Open] for a file database. Use [OpenMemory] for a new memory database with no file operations. Both use the same transactions and buckets. Closing a memory database discards all data. [DB.Get], [DB.Put], and [DB.Delete] read, write, and remove one value in an existing top-level bucket. [DB.DeleteBucket] removes a top-level bucket.
 //
 // # Transactions
 //
@@ -33,15 +33,15 @@
 //
 // [Tx.DeleteBucket] removes a top-level bucket in a write transaction. [Bucket.DeleteBucket] removes a nested bucket. Both operations remove all child buckets and values. A handle to a removed bucket cannot be used again in that transaction.
 //
-// A delete can make tree pages free. KVLite records free pages in the database file and can use them for later writes. A write cannot reuse a page retired by the same transaction. If the free pages are at the end of the file, a checkpoint can shorten the file. [DB.Stats] reports page counts and page reuse.
+// A delete can make tree pages free. KVLite can use them for later writes. A write cannot reuse a page retired by the same transaction. A file database records free pages in its file. If the free pages are at the end of the file, a checkpoint can shorten the file. A memory database releases removed nodes at commit. [DB.Stats] reports page counts and page reuse.
 //
 // # Entry sizes and continuation pages
 //
 // A key can have up to [MaxKeySize] bytes. A value can have up to [MaxValueSize] bytes.
 // An entry can exceed one database page. Large leaf values and branch separator keys use continuation pages. Each logical node keeps one first-page ID. Its continuation IDs come from the normal free-page allocator and need not be consecutive.
 //
-// Point reads search encoded entry offsets and fetch the required continuation pages. They do not decode the complete node. Writes and cursors decode nodeswhen they need their full contents. Memory use increases with the node size.
-// The WAL stores complete page images for changed continued nodes.
+// In a file database, point reads search encoded entry offsets and fetch the required continuation pages. They do not decode the complete node. Writes and cursors decode nodes when they need their full contents. Memory use increases with the node size.
+// The WAL stores complete page images for changed continued nodes in a file database. A memory database keeps complete decoded nodes and uses the same logical page-allocation rules.
 // A node keeps the continuation IDs it still needs. Growth adds pages. Shrink and deletion release pages through the same transaction and page-reuse rules.
 //
 // # Errors
@@ -50,7 +50,7 @@
 //
 // # Files and closing
 //
-// KVLite locks the database file while a [DB] is open. A writable DB prevents another KVLite DB from opening the same file. Read-only DBs can open the same file together.
+// KVLite locks the database file while a file [DB] is open. A writable DB prevents another KVLite DB from opening the same file. Read-only DBs can open the same file together. A memory database has no file lock.
 //
-// Committed writes first go to a write-ahead log beside the database file. [DB.Close] moves committed data into the database file and removes the log. Always check the error from Close.
+// In a file database, committed writes first go to a write-ahead log beside the database file. [DB.Close] moves committed data into the database file and removes the log. [SyncNone] still writes these files, but it does not synchronize them to storage. A memory database has no log and loses its data when closed or when the process ends. Always check the error from Close.
 package kvlite

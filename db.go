@@ -26,12 +26,13 @@ type writeNodeCacheEntry struct {
 	referenced bool
 }
 
-// DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
+// DB is an open handle to a KVLite database in a file or in memory. Create it with [Open] or [OpenMemory]. Its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
 type DB struct {
 	path              string
 	file              *os.File
 	meta              *page.Meta
 	rootNode          *btree.Node
+	memoryNodes       map[page.ID]*btree.Node          // A non-nil map owns all committed nodes of a memory database. It never evicts a live node.
 	writeNodes        map[page.ID]*writeNodeCacheEntry // Each committed node refers only to stable heap bytes that later write clones can share.
 	writeNodesMu      sync.RWMutex                     // Protects cache access by concurrent readers. Writers already hold operationMu exclusively.
 	writeNodeSlots    []page.ID
@@ -82,6 +83,7 @@ func (db *DB) endOperation() {
 // A read-only Open takes a shared database-file lock, so several read-only handles can open the database together. A writable Open takes an exclusive lock. Open waits for a conflicting handle to close unless a positive [Options.LockTimeout] expires.
 //
 // The caller must call [DB.Close] when the database is no longer needed and must check its error.
+// Use [OpenMemory] to create a database with no file operations.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if path == "" {
 		return nil, ErrPathRequired
@@ -258,7 +260,7 @@ func (db *DB) failOpen(err error) (*DB, error) {
 	return nil, err
 }
 
-// Close releases the database resources. For a writable database, it first checkpoints committed data into the database file and removes the write-ahead log, while a read-only database only closes its files.
+// Close releases the database resources. For a writable file database, it first checkpoints committed data into the database file and removes the write-ahead log. A read-only file database only closes its files. A memory database discards all data without file operations.
 //
 // Close prevents new data operations and waits for active operations to finish. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, the database remains open so the caller can retry, but some cleanup can remain incomplete.
 func (db *DB) Close() error {
@@ -289,6 +291,13 @@ func (db *DB) Close() error {
 }
 
 func (db *DB) close() error {
+	if db.memoryNodes != nil {
+		db.memoryNodes = nil
+		db.rootNode = nil
+		db.meta = nil
+		db.allocation = nil
+		return nil
+	}
 	if db.options.ReadOnly {
 		if err := db.unmapMainFile(); err != nil {
 			return err
@@ -322,7 +331,7 @@ func (db *DB) close() error {
 	return nil
 }
 
-// Path returns the database path passed to [Open]. It does not clean the path or convert it to an absolute path, and it remains available after [DB.Close].
+// Path returns the database path passed to [Open]. It returns an empty string for a database created by [OpenMemory]. It does not clean the path or convert it to an absolute path, and it remains available after [DB.Close].
 func (db *DB) Path() string {
 	return db.path
 }
@@ -433,8 +442,15 @@ func (db *DB) hasMeta() bool {
 	return fi.Size() > 0
 }
 
-// readNode decodes one committed node. The WAL image has priority over the main-file image.
+// readNode returns one committed node. A file database gives the WAL image priority over the main-file image.
 func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
+	if db.memoryNodes != nil {
+		node, ok := db.memoryNodes[pgid]
+		if !ok {
+			return nil, fmt.Errorf("read memory page %d: %w", pgid, page.ErrInvalid)
+		}
+		return node, nil
+	}
 	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
@@ -464,6 +480,9 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 // readOnlyNode reads a committed node and keeps decoded main-file nodes in the shared cache.
 // The caller must hold the database operation read lock or write lock.
 func (db *DB) readOnlyNode(pageID page.ID) (*btree.Node, error) {
+	if db.memoryNodes != nil {
+		return db.readNode(pageID)
+	}
 	if record, ok := db.wal.Lookup(pageID); ok {
 		return db.wal.CommittedPageToNode(&record)
 	}
@@ -480,8 +499,15 @@ func (db *DB) readOnlyNode(pageID page.ID) (*btree.Node, error) {
 }
 
 // visitCommittedNodeReferences checks one node and visits its child and storage pages.
-// It reads encoded pages without making a Node or copying large values.
+// It does not make a private node copy or copy large values.
 func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuation func(page.ID) error) error {
+	if db.memoryNodes != nil {
+		node, err := db.readNode(pageID)
+		if err != nil {
+			return err
+		}
+		return btree.VisitNodeReferences(node, visit, visitContinuation)
+	}
 	if record, ok := db.wal.Lookup(pageID); ok {
 		return db.wal.VisitCommittedPageReferences(&record, visit, visitContinuation)
 	}
@@ -537,8 +563,15 @@ func (db *DB) cacheWriteNode(node *btree.Node) {
 }
 
 // lookupCommittedPage searches one committed page.
-// A WAL page has priority over the main-file page with the same ID.
+// In a file database, a WAL page has priority over the main-file page with the same ID.
 func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
+	if db.memoryNodes != nil {
+		node, err := db.readNode(pageID)
+		if err != nil {
+			return btree.Entry{}, false, 0, err
+		}
+		return btree.LookupDecodedNode(node, key)
+	}
 	if record, ok := db.wal.Lookup(pageID); ok {
 		return db.wal.LookupCommittedPage(&record, key)
 	}
@@ -550,7 +583,7 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool
 }
 
 // findCommittedEntry searches one committed tree without decoding its pages.
-// Normal entries refer to the WAL or the mapped main file.
+// A found entry refers to committed storage owned by the database.
 // A continued leaf returns an owned value and can return an owned key.
 func (db *DB) findCommittedEntry(pageID page.ID, key []byte) (btree.Entry, bool, error) {
 	for {

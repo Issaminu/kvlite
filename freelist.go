@@ -362,7 +362,8 @@ func (changes *allocationChanges) dropEmptyTailSegments() {
 	}
 }
 
-// publish makes private segment changes visible after the WAL commit succeeds.
+// publish makes private segment changes visible at commit.
+// A file database must first complete its WAL commit.
 // The caller must exclude all other database operations.
 func (changes *allocationChanges) publish() *allocationBitmap {
 	bitmap := changes.base
