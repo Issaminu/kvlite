@@ -19,6 +19,9 @@ import (
 //
 // The caller must hold the exclusive database operation lock.
 func (db *DB) checkpointWAL() (err error) {
+	if db.activeBackups > 0 {
+		return nil
+	}
 	if db.wal.Stats().CommittedRecordCount == 0 {
 		return nil
 	}

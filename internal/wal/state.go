@@ -66,22 +66,7 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 			return err
 		}
 	}
-	records := make([]CommittedPage, 0, len(wal.overlay))
-	for _, record := range wal.overlay {
-		records = append(records, record)
-	}
-	// Sorting lets the writer combine adjacent pages into one I/O operation.
-	slices.SortFunc(records, func(left, right CommittedPage) int {
-		switch {
-		case left.Header.PageID < right.Header.PageID:
-			return -1
-		case left.Header.PageID > right.Header.PageID:
-			return 1
-		default:
-			return 0
-		}
-	})
-	if err := writeCheckpointRecordRuns(mainFile, records, wal.pageSize); err != nil {
+	if err := WriteCommittedPages(mainFile, wal.overlay, wal.pageSize); err != nil {
 		return err
 	}
 	info, err := mainFile.Stat()
@@ -109,6 +94,30 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 	wal.bytesSinceCheckpoint = 0
 	wal.checkpointCount++
 	return nil
+}
+
+// WriteCommittedPages writes complete page images to dst without changing the WAL.
+// The caller must keep pages, their nodes, and their payloads unchanged until it returns.
+func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageSize int64) error {
+	if pageSize <= 0 {
+		return page.ErrInvalid
+	}
+	records := make([]CommittedPage, 0, len(pages))
+	for _, record := range pages {
+		records = append(records, record)
+	}
+	// Sorting lets the writer combine adjacent pages into one I/O operation.
+	slices.SortFunc(records, func(left, right CommittedPage) int {
+		switch {
+		case left.Header.PageID < right.Header.PageID:
+			return -1
+		case left.Header.PageID > right.Header.PageID:
+			return 1
+		default:
+			return 0
+		}
+	})
+	return writeCheckpointRecordRuns(dst, records, pageSize)
 }
 
 // writeCheckpointRecordRuns combines adjacent, page-ID-ordered records into bounded writes.

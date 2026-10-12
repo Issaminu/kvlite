@@ -8,20 +8,20 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// Sync controls when committed write-ahead log data is synchronized to storage.
+// Sync controls storage synchronization for writes, checkpoints, and backups.
 type Sync uint8
 
 const (
 	// SyncDefault selects KVLite's default mode, SyncFull.
 	SyncDefault Sync = iota
 
-	// SyncFull favors durability over write speed. It waits for each non-empty write transaction to reach storage before [DB.Update] returns success. Concurrent updates can share one write-ahead log append and storage synchronization.
+	// SyncFull favors durability over write speed. It waits for each non-empty write transaction to reach storage before [DB.Update] returns success. Concurrent updates can share one write-ahead log append and storage synchronization. Backup syncs its file and parent directory before it returns success.
 	SyncFull
 
-	// SyncNormal is a middle ground between write speed and durability. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes.
+	// SyncNormal is a middle ground between write speed and durability. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes. Backup syncs its file and parent directory before it returns success.
 	SyncNormal
 
-	// SyncNone favors write speed over durability. It does not synchronize a new database or synchronize after commits, checkpoints, or close. A system failure can lose committed updates or corrupt the database. Use this mode only when the data can be rebuilt.
+	// SyncNone favors write speed over durability. It does not synchronize a new database or synchronize after commits, checkpoints, close, or backup. A system failure can lose committed updates or corrupt the database. Use this mode only when the data can be rebuilt.
 	SyncNone
 
 	// defaultCheckpointPageCount keeps about 1,000 operating-system pages of data in the write-ahead log before KVLite starts a checkpoint. This limits log growth without running a checkpoint after every update.
@@ -36,7 +36,7 @@ type Options struct {
 	// LockTimeout limits how long [Open] waits for a conflicting database-file lock. A zero value waits until the other handle closes, a positive value returns an error that matches [ErrDatabaseLocked] after that duration, and a negative value is invalid. KVLite holds the lock for the full [DB] lifetime, not for one transaction.
 	LockTimeout time.Duration
 
-	// Synchronous controls when KVLite synchronizes committed write-ahead log data. A zero value uses SyncFull.
+	// Synchronous controls when KVLite synchronizes committed write-ahead log data and backup files. A zero value uses SyncFull.
 	Synchronous Sync
 
 	// MaxWriteBatchSize limits how many SyncFull write callbacks can share one WAL commit. A zero value uses 100. A value of 1 prevents callbacks from sharing a commit.

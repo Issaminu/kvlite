@@ -40,6 +40,7 @@ type DB struct {
 	options           *Options
 	wal               *wal.WAL
 	operationMu       sync.RWMutex
+	activeBackups     int // Protected by operationMu. A backup keeps the main file unchanged.
 	lifecycleMu       sync.RWMutex
 	activeOperations  sync.WaitGroup
 	writeRequests     chan *writeRequest
