@@ -51,32 +51,45 @@ func NewTree(store Store) *Tree {
 	return &Tree{store: store}
 }
 
-// LookupNode searches one decoded node.
-// A leaf returns an entry and a zero child page ID.
-// A branch returns the selected child page ID.
-// The caller must validate key.
-func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
-	if node.IsLeaf() {
-		entry, found, err := node.FindEntryRef(key)
-		return entry, found, 0, err
+// FindEntryRef looks key up without copying the stored key or value.
+// It returns a zero entry with found false when the key is absent.
+// A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
+// An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
+func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
+	if err := validateLookupKey(key); err != nil {
+		return Entry{}, false, err
 	}
-	childIndex, err := node.FindChildIndex(key)
+
+	if root.IsLeaf() {
+		return root.FindEntryRef(key)
+	}
+	_, _, childPageID, err := LookupNode(root, key)
 	if err != nil {
-		return Entry{}, false, 0, err
+		return Entry{}, false, err
 	}
-	childPageID := node.Children[childIndex]
-	if childPageID == page.Meta0ID {
-		return Entry{}, false, 0, fmt.Errorf("read node child page ID %d: %w", childPageID, ErrInvalid)
-	}
-	return Entry{}, false, childPageID, nil
+	return tree.findEntryRefFromPage(childPageID, key)
 }
 
-// LookupDecodedNode validates key and searches one decoded node.
-func LookupDecodedNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
+// FindEntryRefFromPage starts at rootPageID without requiring a root Node.
+// A found entry refers to storage owned by the store.
+func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte) (Entry, bool, error) {
 	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, 0, err
+		return Entry{}, false, err
 	}
-	return LookupNode(node, key)
+	return tree.findEntryRefFromPage(rootPageID, key)
+}
+
+func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool, error) {
+	for {
+		entry, found, childPageID, err := tree.store.LookupPage(pageID, key)
+		if err != nil {
+			return Entry{}, false, err
+		}
+		if childPageID == 0 {
+			return entry, found, nil
+		}
+		pageID = childPageID
+	}
 }
 
 // validateEntry rejects an empty or oversized key, an oversized value, or an entry that cannot fit the tree's fixed-page representation.
@@ -227,47 +240,6 @@ func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pa
 		childIndex++
 	}
 	return nil
-}
-
-// FindEntryRef looks key up without copying the stored key or value.
-// It returns a zero entry with found false when the key is absent.
-// A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
-// An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
-func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
-	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, err
-	}
-
-	if root.IsLeaf() {
-		return root.FindEntryRef(key)
-	}
-	_, _, childPageID, err := LookupNode(root, key)
-	if err != nil {
-		return Entry{}, false, err
-	}
-	return tree.findEntryRefFromPage(childPageID, key)
-}
-
-// FindEntryRefFromPage starts at rootPageID without requiring a root Node.
-// A found entry refers to storage owned by the store.
-func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte) (Entry, bool, error) {
-	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, err
-	}
-	return tree.findEntryRefFromPage(rootPageID, key)
-}
-
-func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool, error) {
-	for {
-		entry, found, childPageID, err := tree.store.LookupPage(pageID, key)
-		if err != nil {
-			return Entry{}, false, err
-		}
-		if childPageID == 0 {
-			return entry, found, nil
-		}
-		pageID = childPageID
-	}
 }
 
 // DeleteEntry removes one non-bucket entry from the tree rooted at root.
@@ -600,61 +572,6 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 	return root, nil
 }
 
-// redistributionScore describes the two pages we would get by moving entries
-// between neighbors. The score is valid only if both pages fit. underfull says
-// how many more bytes the pages need to reach the target size. imbalance says
-// how far apart their sizes are. Smaller values are better.
-type redistributionScore struct {
-	underfull int64 // for nuking the Node and putting it's content in the left/right nodes. underfull is "how much of the left/right node's size remains to reach the 25% target (a quarter of a page's size)"
-	imbalance int64 // for NOT nuking the Node, and taking some of the left/right node's content into the Node. imbalance is "if we were to distribute some of the left/right node's content into the Node, what's the difference would be between the left/right size and the Node's size?"
-	valid     bool
-}
-
-// chooseSiblingRedistribution decides which neighbor should share entries with
-// node. It tries left with node and node with right on copies. The pages stay
-// unchanged until the caller makes the chosen move.
-//
-// First prefer the pair that leaves fewer bytes below the target size. If the
-// pairs tie, prefer the pair with sizes closer together. An exact tie selects
-// left. ok is false if neither pair can make two pages that fit.
-func chooseSiblingRedistribution(parent *Node, childIndex int, left, node, right *Node, pageSize, minimumSize int64) (useLeft, ok bool) {
-	leftScore := redistributionScore{}
-	if left != nil {
-		leftScore = scoreRedistribution(parent, childIndex-1, left, node, pageSize, minimumSize)
-	}
-	rightScore := redistributionScore{}
-	if right != nil {
-		rightScore = scoreRedistribution(parent, childIndex, node, right, pageSize, minimumSize)
-	}
-
-	if !leftScore.valid {
-		return false, rightScore.valid
-	}
-	if !rightScore.valid {
-		return true, true
-	}
-
-	if rightScore.underfull < leftScore.underfull ||
-		rightScore.underfull == leftScore.underfull && rightScore.imbalance < leftScore.imbalance {
-		return false, true
-	}
-	return true, true
-}
-
-// scoreRedistribution tries one move on copies and measures the result.
-// The real pages must stay unchanged while we compare the two neighbors.
-// separatorIndex selects the parent key between left and right.
-func scoreRedistribution(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) redistributionScore {
-	parent = parent.Clone()
-	left = left.Clone()
-	right = right.Clone()
-	if !redistributeChildren(parent, separatorIndex, left, right, pageSize, minimumSize) {
-		return redistributionScore{}
-	}
-	underfull, imbalance := redistributionPenalty(int64(left.EncodedSize()), int64(right.EncodedSize()), minimumSize)
-	return redistributionScore{underfull: underfull, imbalance: imbalance, valid: true}
-}
-
 // refreshMinimumSeparator gives a child its current key in the parent.
 // For example, if a child once started with "m" and now starts with "n", its
 // parent must store "n" to send later searches to the right child. The first
@@ -683,269 +600,4 @@ func (tree *Tree) subtreeMinimum(node *Node) ([]byte, error) {
 		}
 	}
 	return node.firstKey(), nil
-}
-
-// mergedChildrenSize checks if left can hold all of right before a merge.
-// It counts the bytes that the merged node would write. It changes no node.
-// For leaves, the parent key already occurs in right. For branches, the parent
-// key moves into the merged node, along with the child page IDs.
-func mergedChildrenSize(parent *Node, separatorIndex int, left, right *Node) int64 {
-	size := NodeHeaderSize
-	for _, entry := range left.entries {
-		size += entry.EncodedSize(left.IsLeaf())
-	}
-	for _, entry := range right.entries {
-		size += entry.EncodedSize(right.IsLeaf())
-	}
-	if !left.IsLeaf() {
-		// Each branch entry counts one child ID. A branch has one more child
-		// than entries, so count that last ID as well.
-		size += parent.entries[separatorIndex].EncodedSize(false)
-		size += page.IDSize
-	}
-	return int64(size)
-}
-
-// redistributeChildren moves entries between two adjacent pages that cannot
-// merge. It chooses a place to divide their entries, then changes both pages
-// and the parent key between them. It returns false without changes if no
-// division makes two pages that fit.
-//
-// For leaves, the parent must store the first key in the new right page.
-// For branches, the old parent key goes between the two entry lists. The chosen
-// dividing key then moves from the list into the parent.
-func redistributeChildren(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) bool {
-	if left.IsLeaf() {
-		entries := make([]Entry, 0, len(left.entries)+len(right.entries))
-		entries = append(entries, left.entries...)
-		entries = append(entries, right.entries...)
-		split := chooseLeafRedistribution(entries, pageSize, minimumSize)
-		if split < 0 {
-			return false
-		}
-		// Both pages share this new array. Keep an append to one page from
-		// changing entries in the other page.
-		left.entries = entries[:split:split]
-		right.entries = entries[split:len(entries):len(entries)]
-		parent.entries[separatorIndex] = Entry{key: slices.Clone(right.entries[0].key)}
-	} else {
-		// Branch entries route searches to child pages. Put the old parent
-		// key between these two groups before we select a new key for it.
-		entries := make([]Entry, 0, len(left.entries)+len(right.entries)+1)
-		entries = append(entries, left.entries...)
-		entries = append(entries, parent.entries[separatorIndex])
-		entries = append(entries, right.entries...)
-		children := make([]page.ID, 0, len(left.Children)+len(right.Children))
-		children = append(children, left.Children...)
-		children = append(children, right.Children...)
-		pivot := chooseBranchRedistribution(entries, pageSize, minimumSize)
-		if pivot < 0 {
-			return false
-		}
-		// The chosen key leaves the child pages and becomes the parent key.
-		// The children on either side of it must move with their keys.
-		parent.entries[separatorIndex] = Entry{key: slices.Clone(entries[pivot].key)}
-		left.entries = entries[:pivot:pivot]
-		right.entries = entries[pivot+1 : len(entries) : len(entries)]
-		left.Children = children[: pivot+1 : pivot+1]
-		right.Children = children[pivot+1 : len(children) : len(children)]
-	}
-	// These three pages now have different bytes. Their old checksums no
-	// longer match them.
-	left.header.Checksum = 0
-	right.header.Checksum = 0
-	parent.header.Checksum = 0
-	return true
-}
-
-// chooseLeafRedistribution finds where to divide the entries between two leaves.
-// It tries each place between keys. Each result must keep a key and fit in one
-// page. It first prefers the fewest bytes below the target across both pages.
-// It then prefers pages whose sizes are close. It returns -1 if no place works.
-func chooseLeafRedistribution(entries []Entry, pageSize, minimumSize int64) int {
-	if len(entries) < 2 {
-		return -1
-	}
-
-	// Keys and values can have different sizes. prefix[i] counts the bytes
-	// before entry i, so each possible division needs only two counts.
-	prefix := make([]int64, len(entries)+1)
-	for index := range entries {
-		prefix[index+1] = prefix[index] + int64(entries[index].EncodedSize(true))
-	}
-	best := -1
-	bestUnderfull, bestImbalance := int64(^uint64(0)>>1), int64(^uint64(0)>>1)
-	for split := 1; split < len(entries); split++ {
-		leftSize := int64(NodeHeaderSize) + prefix[split]
-		rightSize := int64(NodeHeaderSize) + prefix[len(entries)] - prefix[split]
-		if leftSize > pageSize || rightSize > pageSize {
-			continue
-		}
-		underfull, imbalance := redistributionPenalty(leftSize, rightSize, minimumSize)
-		if underfull < bestUnderfull || underfull == bestUnderfull && imbalance < bestImbalance {
-			best, bestUnderfull, bestImbalance = split, underfull, imbalance
-		}
-	}
-	return best
-}
-
-// chooseBranchRedistribution finds which key should move up to the parent.
-// The keys before it stay in the left branch. The keys after it stay in the
-// right branch. Each branch must keep a key, at least two children, and fit in
-// one page. It returns -1 if no key gives that result.
-func chooseBranchRedistribution(entries []Entry, pageSize, minimumSize int64) int {
-	// We need a key on each side of the key that moves up.
-	if len(entries) < 3 {
-		return -1
-	}
-
-	// prefix[i] counts the bytes before entry i. An entry's size includes
-	// one child page ID. The size calculations add the last child ID.
-	prefix := make([]int64, len(entries)+1)
-	for index := range entries {
-		prefix[index+1] = prefix[index] + int64(entries[index].EncodedSize(false))
-	}
-	best := -1
-	bestUnderfull, bestImbalance := int64(^uint64(0)>>1), int64(^uint64(0)>>1)
-	for pivot := 1; pivot < len(entries)-1; pivot++ {
-		// Do not count the key that moves up. Each branch also needs its
-		// last child ID after its last key.
-		leftSize := int64(NodeHeaderSize+page.IDSize) + prefix[pivot]
-		rightEntrySize := prefix[len(entries)] - prefix[pivot+1]
-		rightSize := int64(NodeHeaderSize+page.IDSize) + rightEntrySize
-		if leftSize > pageSize || rightSize > pageSize {
-			continue
-		}
-		underfull, imbalance := redistributionPenalty(leftSize, rightSize, minimumSize)
-		if underfull < bestUnderfull || underfull == bestUnderfull && imbalance < bestImbalance {
-			best, bestUnderfull, bestImbalance = pivot, underfull, imbalance
-		}
-	}
-	return best
-}
-
-// redistributionPenalty measures how well two pages use their space.
-// For a target of 64 bytes, pages of 40 and 80 bytes miss the target by 24
-// bytes in total. Their sizes differ by 40 bytes. Callers compare the first
-// result before the second, so they first try to make both pages less empty.
-func redistributionPenalty(leftSize, rightSize, minimumSize int64) (underfull, imbalance int64) {
-	underfull = max(minimumSize-leftSize, 0) + max(minimumSize-rightSize, 0)
-	return underfull, max(leftSize-rightSize, rightSize-leftSize)
-}
-
-// mergeChildren puts right into left and removes right from their parent.
-// The caller first checks that all data will fit in left. After this call,
-// the caller returns right's page to the store.
-//
-// For leaves, the parent's key is already the first key in right. For
-// branches, that key exists only in the parent. When branches join, the key
-// moves down between their two groups of keys.
-func mergeChildren(parent *Node, separatorIndex int, left, right *Node) {
-	if left.IsLeaf() {
-		left.entries = append(left.entries, right.entries...)
-	} else {
-		left.entries = append(left.entries, parent.entries[separatorIndex])
-		left.entries = append(left.entries, right.entries...)
-		left.Children = append(left.Children, right.Children...)
-	}
-	// The parent no longer needs a key or a child ID for the old right page.
-	parent.entries = slices.Delete(parent.entries, separatorIndex, separatorIndex+1)
-	removedChild := separatorIndex + 1
-	parent.Children = slices.Delete(parent.Children, removedChild, removedChild+1)
-	// Only the pages that stay in the tree need their checksums cleared.
-	left.header.Checksum = 0
-	parent.header.Checksum = 0
-}
-
-// NeedsSplit reports whether the encoded node is larger than one page.
-func (n *Node) NeedsSplit(pageSize int64) bool {
-	return int64(n.EncodedSize()) > pageSize
-}
-
-// EncodedSize reports the exact number of bytes that [EncodeNode] writes for n.
-func (n *Node) EncodedSize() int {
-	return NodeHeaderSize + nodePayloadSize(n)
-}
-
-// chooseSplitIndex selects a separator near half a page based on encoded entry bytes while preserving valid left and right node shapes.
-// A leaf keeps its separator as the first entry of the right node, while a branch promotes and removes its separator.
-func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
-	limit := int(pageSize / 2)
-	currSize := 0
-	separatorIndex := -1
-
-	for i, entry := range n.entries {
-		currSize += entry.EncodedSize(n.IsLeaf())
-		if currSize >= limit {
-			separatorIndex = i
-			break
-		}
-	}
-
-	if separatorIndex == -1 {
-		return -1, ErrNodeNotSaturated
-	}
-
-	// The leaf separator remains in the right node, so each side must keep at least one entry.
-	if n.IsLeaf() {
-		if len(n.entries) < 2 {
-			return -1, ErrNodeNotSaturated
-		}
-		return min(max(separatorIndex, 1), len(n.entries)-1), nil
-	}
-
-	if len(n.entries) < 2 {
-		return -1, ErrNodeNotSaturated
-	}
-	// Removing a separator from a two-entry branch leaves one side with no separator and one child page.
-	if len(n.entries) == 2 {
-		return min(max(separatorIndex, 0), 1), nil
-	}
-	return min(max(separatorIndex, 1), len(n.entries)-2), nil
-}
-
-// Split changes n into the left node and returns a new right node and its read-only separator key.
-// A leaf keeps the separator as the first entry of the right node.
-// A branch promotes the separator and removes it from both child nodes.
-// If n has too few entries to split, Split returns [ErrNodeNotSaturated] without changing n.
-func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
-	separatorIndex, err := n.chooseSplitIndex(pageSize)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rightNode := &Node{
-		header:   newNodeHeader(n.header.Type, newPageID),
-		Children: []page.ID{},
-	}
-
-	separator := n.entries[separatorIndex].key
-	if n.IsLeaf() {
-		rightNode.entries = slices.Clone(n.entries[separatorIndex:])
-		n.entries = n.entries[:separatorIndex]
-	} else {
-		rightNode.entries = slices.Clone(n.entries[separatorIndex+1:])
-		n.entries = n.entries[:separatorIndex]
-	}
-
-	if !n.IsLeaf() {
-		rightNode.Children = slices.Clone(n.Children[separatorIndex+1:])
-		n.Children = n.Children[:separatorIndex+1]
-	}
-	n.header.Checksum = 0
-
-	return rightNode, separator, nil
-}
-
-// InsertSplitChild inserts separator and rightNode immediately after the existing child at leftIndex.
-// parent must be a branch node, leftIndex must identify an existing child, and separator must remain read-only after the call.
-func (parent *Node) InsertSplitChild(leftIndex int, rightNode *Node, separator []byte) {
-	parent.entries = append(parent.entries, Entry{})
-	copy(parent.entries[leftIndex+1:], parent.entries[leftIndex:])
-	parent.entries[leftIndex] = Entry{key: separator}
-
-	parent.Children = append(parent.Children, 0)
-	copy(parent.Children[leftIndex+2:], parent.Children[leftIndex+1:])
-	parent.Children[leftIndex+1] = rightNode.PageID()
-	parent.header.Checksum = 0
 }
