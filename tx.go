@@ -85,16 +85,10 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	if err := transaction(tx); err != nil {
 		return err
 	}
-	var retired map[page.ID]struct{}
-	if tx.allocationOwned && len(tx.allocation.retired) != 0 {
-		// A deleted node must not also appear as a changed node in this commit.
-		for pageID := range tx.allocation.retired {
-			delete(tx.store.dirty, pageID)
-		}
-		if tx.allocation.finalize(tx.meta) {
-			tx.metaDirty = true
-		}
+	if err := tx.prepareCommit(); err != nil {
+		return err
 	}
+	var retired map[page.ID]struct{}
 	if tx.allocationOwned {
 		retired = tx.allocation.walRetiredPages()
 	}

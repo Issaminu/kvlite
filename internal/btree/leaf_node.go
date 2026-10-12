@@ -194,3 +194,20 @@ func (n *Node) splitLeaf(right *Node, index int) {
 	right.entries = slices.Clone(n.entries[index:])
 	n.entries = n.entries[:index]
 }
+
+// visitLeafReferences visits roots of nested buckets stored as leaf values.
+func visitLeafReferences(node *Node, visit func(page.ID) error) error {
+	for _, entry := range node.entries {
+		if entry.flags&BucketLeafFlag == 0 {
+			continue
+		}
+		child, err := page.DecodeID(entry.value)
+		if err != nil {
+			return err
+		}
+		if err := visit(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}

@@ -156,3 +156,82 @@ func TestApplyLeafDeletes_RejectsInvalidKeys(t *testing.T) {
 		t.Fatalf("branch delete: got %v, want invalid page", err)
 	}
 }
+
+// TestWALCommit_LargeNodeToSinglePage covers the full WAL write and read path.
+// The original is a decoded large node. Recovery needs only the final image.
+func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
+	const pageSize int64 = 128
+	path := t.TempDir() + "/wal"
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	base := btree.NewLeafNode(2)
+	for _, key := range []string{"a", "b", "c"} {
+		size := 16
+		if key == "b" {
+			size = 256
+		}
+		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), bytes.Repeat([]byte(key), size))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base.SetOverflowPages([]page.ID{7, 9})
+	target := base.Clone()
+	target.SetOverflowPages(nil)
+	if err := target.DeleteKeyIfPresent([]byte("b")); err != nil {
+		t.Fatal(err)
+	}
+	if int64(base.EncodedSize()) <= pageSize || int64(target.EncodedSize()) > pageSize {
+		t.Fatal("test must shrink a large node to one page")
+	}
+	config := Config{File: file, PageSize: pageSize, SyncOnCommit: true, SyncOnCheckpoint: true, CheckpointThresholdBytes: 1 << 20}
+	log := New(config)
+	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file, err = os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	config.File = file
+	log = New(config)
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 2 || records[0].Header.Type != RecordTypeNode || records[1].Header.Type != RecordTypeCommit || records[0].Header.TxID != records[1].Header.TxID {
+		t.Fatalf("WAL records: got %+v, want a complete node and its commit", records)
+	}
+	if !bytes.Equal(records[0].Payload, btree.EncodeWALNode(target)) {
+		t.Fatal("WAL did not store the complete final node")
+	}
+	log.LoadCommittedRecord(records[0])
+	mainFile, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mainFile.Close()
+	if err := log.Checkpoint(mainFile, 3*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, pageSize)
+	if _, err := mainFile.ReadAt(data, int64(target.PageID())*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := btree.DecodeNode(data, target.PageID(), pageSize, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(btree.EncodeWALNode(decoded), btree.EncodeWALNode(target)) {
+		t.Fatal("checkpoint did not preserve the final node")
+	}
+	if records, err := log.ReadRecords(); err != nil || len(records) != 0 {
+		t.Fatalf("WAL after checkpoint: got %d records, error %v", len(records), err)
+	}
+}

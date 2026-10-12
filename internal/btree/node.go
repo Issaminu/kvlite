@@ -10,7 +10,15 @@ import (
 // NodeHeaderSize is the 18-byte encoded size of a B+tree node header.
 const NodeHeaderSize = 18
 
-// NodeType identifies the body layout of a B+tree node.
+const (
+	nodeTypeOffset       = 0
+	nodePageIDOffset     = 2
+	nodeEntryCountOffset = 10
+	nodeChecksumOffset   = 14
+)
+
+// NodeType identifies the 16-bit type field of a tree file page.
+// A large leaf or branch adds overflowNodeFlag.
 type NodeType uint16
 
 const (
@@ -18,9 +26,16 @@ const (
 	NodeTypeLeaf NodeType = 1
 	// NodeTypeBranch identifies a node that stores separator keys and child page IDs.
 	NodeTypeBranch NodeType = 2
+	// NodeTypeContinuation identifies more body bytes of a large leaf or branch.
+	// It is a storage page of the same node, not a tree child.
+	NodeTypeContinuation NodeType = 3
 )
 
-// NodeHeader contains the fixed fields that identify and protect one B+tree node.
+// overflowNodeFlag marks the first page of a large leaf or branch. It is a modifier over the NodeTypeLeaf and NodeTypeBranch identifiers
+// Its type is 0x8001 for a leaf or 0x8002 for a branch.
+const overflowNodeFlag NodeType = 1 << 15
+
+// NodeHeader contains the decoded header fields of a leaf or branch node.
 // All fields use little-endian encoding:
 //
 //	[0:2]  node type, uint16
@@ -29,19 +44,54 @@ const (
 //	[14:18] CRC32C checksum, uint32
 //
 // Checksum covers bytes [0:14] and [18:pageSize]. It includes the node body and zero padding.
+// A continuation flag adds BodyLength and NextPageCount after the fixed header.
+// See leaf_codec.go and branch_codec.go for the extended layouts.
+// ContinuationNode has its own header.
 // A node change can make Checksum and EntryCount stale. [EncodeNode] and [EncodeWALNode] write the current entry count. [EncodeNode] also calculates a new checksum before it returns encoded bytes.
 type NodeHeader struct {
 	Type       NodeType
 	PageID     page.ID
 	EntryCount uint32
 	Checksum   uint32
+	// These fields occur only if the node has the continuation flag [overflowNodeFlag]
+	BodyLength    uint32
+	NextPageCount uint32
 }
 
-// Node contains one B+tree node and its header.
+// Node contains one logical B+tree node.
+// Its page ID names the first file page, even when the node spans pages.
+// continuationPageIDs keeps all later page IDs in body order. These are
+// storage pages of this node, not tree children. On disk, page-ID arrays
+// are distributed across the first page and later group-ending pages.
+// The store records the complete list so changes can retire the old pages
+// without reading the arrays again. A node that fits in one page has no list.
 type Node struct {
-	header   *NodeHeader
-	entries  []Entry
-	Children []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
+	header              *NodeHeader
+	entries             []Entry
+	Children            []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
+	continuationPageIDs []page.ID // only for branch/leaf nodes with overflow, or continuation nodes
+}
+
+// OverflowPages returns the IDs of pages after this node's first page.
+// The IDs follow logical body order. They are not child node IDs.
+// The returned slice belongs to n. The caller must not change it.
+func (n *Node) OverflowPages() []page.ID {
+	return n.continuationPageIDs
+}
+
+// SetOverflowPages records the IDs of pages after this node's first page.
+// It sets the continuation flag when ids is nonempty. Nil clears the flag
+// and the extended header fields. The caller gives ownership of ids
+// to n and must not change ids after this call.
+func (n *Node) SetOverflowPages(ids []page.ID) {
+	n.continuationPageIDs = ids
+	n.header.Type &^= overflowNodeFlag
+	if len(ids) > 0 {
+		n.header.Type |= overflowNodeFlag
+	} else {
+		n.header.BodyLength = 0
+		n.header.NextPageCount = 0
+	}
 }
 
 func newNodeHeader(nodeType NodeType, pgid page.ID) *NodeHeader {
@@ -53,7 +103,7 @@ func newNodeHeader(nodeType NodeType, pgid page.ID) *NodeHeader {
 
 // IsLeaf reports whether n stores key and value entries.
 func (n *Node) IsLeaf() bool {
-	return n.header.Type == NodeTypeLeaf
+	return n.header.Type & ^overflowNodeFlag == NodeTypeLeaf
 }
 
 func (n *Node) PageID() page.ID {
@@ -77,14 +127,16 @@ func (n *Node) EntryAt(index int) *Entry {
 }
 
 // Clone returns a structural copy of n with the same page ID.
-// The clone owns its entry and child lists but shares the immutable key and value bytes with n.
+// The clone owns its entry, child, and continuation page ID lists.
+// It shares the immutable key and value bytes with n.
 // Node changes must replace an entry or byte slice instead of changing shared bytes in place.
 func (n *Node) Clone() *Node {
 	header := *n.header
 	return &Node{
-		header:   &header,
-		entries:  slices.Clone(n.entries),
-		Children: slices.Clone(n.Children),
+		header:              &header,
+		entries:             slices.Clone(n.entries),
+		Children:            slices.Clone(n.Children),
+		continuationPageIDs: slices.Clone(n.continuationPageIDs),
 	}
 }
 
@@ -172,9 +224,17 @@ func LookupDecodedNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
 	return LookupNode(node, key)
 }
 
-// NeedsSplit reports whether the encoded node is larger than one page.
+// NeedsSplit reports whether the node exceeds one page and has enough entries to split.
+// A leaf needs two entries. A branch needs three keys so both results keep at
+// least two children. Fewer large entries use continuation pages. Splitting
+// a two-key branch would create a one-child side and make large-key inserts
+// grow the tree by one level at each split.
 func (n *Node) NeedsSplit(pageSize int64) bool {
-	return int64(n.EncodedSize()) > pageSize
+	minimum := 2
+	if !n.IsLeaf() {
+		minimum = 3
+	}
+	return len(n.entries) >= minimum && int64(n.EncodedSize()) > pageSize
 }
 
 // EncodedSize reports the exact number of bytes that [EncodeNode] writes for n.
@@ -378,4 +438,30 @@ func mergeChildren(parent *Node, separatorIndex int, left, right *Node) {
 	// Only the pages that stay in the tree need their checksums cleared.
 	left.header.Checksum = 0
 	parent.header.Checksum = 0
+}
+
+// WALBodyOffset selects the type-specific start of the compact WAL payload.
+func (n *Node) WALBodyOffset() int {
+	if n.IsLeaf() {
+		return leafBodyOffset(n)
+	}
+	return branchBodyOffset(n)
+}
+
+// VisitNodeReferences visits child nodes and continuation pages separately.
+// visit receives branch children or nested bucket roots. visitContinuation
+// receives storage pages of this node; these pages are not tree children.
+// Pass nil for visitContinuation when only child references are needed.
+func VisitNodeReferences(node *Node, visit, visitContinuation func(page.ID) error) error {
+	if visitContinuation != nil {
+		for _, id := range node.OverflowPages() {
+			if err := visitContinuation(id); err != nil {
+				return err
+			}
+		}
+	}
+	if node.IsLeaf() {
+		return visitLeafReferences(node, visit)
+	}
+	return visitBranchReferences(node, visit)
 }

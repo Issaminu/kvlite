@@ -133,9 +133,9 @@ func TestDeleteBenchmarkScales(t *testing.T) {
 		scale string
 		want  int
 	}{
-		{scale: "light", want: 4},
-		{scale: "medium", want: 4},
-		{scale: "large", want: 7},
+		{scale: "light", want: 5},
+		{scale: "medium", want: 5},
+		{scale: "large", want: 8},
 	} {
 		t.Run(test.scale, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", "all")
@@ -276,11 +276,11 @@ func TestWorkloadSelectsMatchingCases(t *testing.T) {
 		workload string
 		want     int
 	}{
-		{workload: "reads", want: 5},
-		{workload: "writes", want: 8},
-		{workload: "mixed", want: 2},
+		{workload: "reads", want: 8},
+		{workload: "writes", want: 12},
+		{workload: "mixed", want: 3},
 		{workload: "focused", want: 1},
-		{workload: "all", want: 15},
+		{workload: "all", want: 23},
 	}
 	for _, test := range tests {
 		t.Run(test.workload, func(t *testing.T) {
@@ -302,6 +302,8 @@ func TestLightScaleSelectsRepresentativeCoreCases(t *testing.T) {
 		"mixed/read=95/value=128/clients=8":           true,
 		"update/random/value=128/clients=1/batch=100": true,
 	}
+	want["read/random/value=65536/clients=1"] = true
+	want["update/random/value=65536/clients=1"] = true
 	cases := benchmarkCases()
 	if len(cases) != len(want) {
 		t.Fatalf("light cases are %d, want %d", len(cases), len(want))
@@ -371,6 +373,18 @@ func TestMediumScaleSelectsDecisionCoreCases(t *testing.T) {
 		"insert/random/value=128/clients=1/batch=100":           true,
 		"update/random/value=128/clients=8/batch=100":           true,
 	}
+	for _, name := range []string{
+		"read/random/value=65536/clients=1",
+		"update/random/value=65536/clients=1",
+		"insert/random/value=65536/clients=1",
+		"update/random/grow=128-65536/clients=1",
+		"update/random/shrink=65536-128/clients=1",
+		"read/random/key=32768/value=128/clients=1",
+		"read/random/value=1048576/clients=1",
+		"mixed/read=95/value=65536/clients=1",
+	} {
+		want[name] = true
+	}
 	cases := benchmarkCases()
 	if len(cases) != len(want) {
 		t.Fatalf("medium cases are %d, want %d", len(cases), len(want))
@@ -379,5 +393,43 @@ func TestMediumScaleSelectsDecisionCoreCases(t *testing.T) {
 		if !want[benchmarkCase.name] {
 			t.Errorf("unexpected medium case %q", benchmarkCase.name)
 		}
+	}
+}
+
+// TestLargeEntriesUseOperationWorkloads checks selection through the normal groups.
+func TestLargeEntriesUseOperationWorkloads(t *testing.T) {
+	t.Setenv("KVBENCH_SCALE", "medium")
+	for _, test := range []struct {
+		workload                string
+		pointCases, deleteCases int
+	}{
+		{"reads", 3, 0}, {"writes", 4, 1}, {"deletes", 0, 1}, {"mixed", 1, 0}, {"all", 8, 1}, {"focused", 0, 0},
+	} {
+		t.Run(test.workload, func(t *testing.T) {
+			t.Setenv("KVBENCH_WORKLOAD", test.workload)
+			pointCount, deleteCount := 0, 0
+			for _, c := range benchmarkCases() {
+				if c.valueBytes <= 16*1024 && c.setupValueBytes <= 16*1024 && c.keyBytes <= 16*1024 {
+					continue
+				}
+				pointCount++
+				if c.clients != 1 || c.batchSize != 1 || c.operations <= 0 || c.records <= 0 {
+					t.Fatalf("invalid large-entry case: %+v", c)
+				}
+			}
+			if workloadEnabled(benchmarkDelete) {
+				for _, c := range deleteBenchmarkCases() {
+					if c.valueBytes > 16*1024 {
+						deleteCount++
+						if c.missing || c.operations*c.batchSize >= c.records {
+							t.Fatal("large-entry delete must leave live values to check")
+						}
+					}
+				}
+			}
+			if pointCount != test.pointCases || deleteCount != test.deleteCases {
+				t.Fatalf("large-entry cases: point=%d delete=%d, want %d and %d", pointCount, deleteCount, test.pointCases, test.deleteCases)
+			}
+		})
 	}
 }

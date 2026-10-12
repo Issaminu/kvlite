@@ -2,8 +2,11 @@
 //
 // Leaf code is in leaf_node.go and leaf_codec.go.
 // Branch code is in branch_node.go and branch_codec.go.
+// Continuation pages use continuation_node.go and continuation_codec.go.
 // Shared node data, decoded reads, and balance rules are in node.go.
-// Shared page and WAL encoding, checksums, and reference reads are in node_codec.go.
+// Each type owns its page encoding, decoding, and mapped reads.
+// Leaf and branch codecs also own their compact WAL images.
+// node_codec.go selects a codec and provides shared byte and checksum operations.
 // Tree reads, inserts, deletes, and repair are in tree.go.
 // Ordered reads are in cursor.go.
 //

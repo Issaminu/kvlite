@@ -173,38 +173,38 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	var commitErr error
 	needsCheckpoint := false
 	if hasPendingWrites {
-		var retired map[page.ID]struct{}
-		if state.allocation != nil && len(state.allocation.retired) != 0 {
-			// Earlier callbacks can have changed a node that a later callback retired.
-			for pageID := range state.allocation.retired {
-				delete(state.dirty, pageID)
-			}
-			if state.allocation.finalize(state.meta) {
-				state.metaDirty = true
-			}
-		}
-		if state.allocation != nil {
-			retired = state.allocation.walRetiredPages()
-		}
-		// state.dirty contains the original and final image of each changed page. One WAL transaction gives all dependent callbacks the same commit result.
-		nodes, encodedMeta := makeWALCommitData(state.dirty, state.meta, state.metaDirty)
-		var allocationPages []wal.AllocationRecord
-		if state.allocation != nil {
-			allocationPages = state.allocation.pageRecords()
-		}
-		needsCheckpoint, commitErr = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
+		// Use the same page preparation as a direct write.
+		// Successful callbacks already gave state a private metadata image and private node images.
+		tx := Tx{db: db, meta: state.meta, allocation: state.allocation}
+		tx.store.dirty = state.dirty
+		commitErr = tx.prepareCommit()
+		state.metaDirty = state.metaDirty || tx.metaDirty
+		state.allocation = tx.allocation
 		if commitErr == nil {
-			// Publish the new state only after the WAL append and required synchronization succeed.
-			db.meta = state.meta
-			db.rootNode = state.rootNode
+			var retired map[page.ID]struct{}
 			if state.allocation != nil {
-				db.allocation = state.allocation.publish()
-				db.stats.PagesReused += state.allocation.pagesReused
-				db.stats.PagesRetired += state.allocation.pagesRetired
-				db.stats.TailPagesReclaimed += state.allocation.tailPagesRemoved
+				retired = state.allocation.walRetiredPages()
 			}
-			for _, dirty := range state.dirty {
-				db.cacheWriteNode(dirty.final)
+			// state.dirty contains the original and final image of each changed page. One WAL transaction gives all dependent callbacks the same commit result.
+			nodes, encodedMeta := makeWALCommitData(state.dirty, state.meta, state.metaDirty)
+			var allocationPages []wal.AllocationRecord
+			if state.allocation != nil {
+				allocationPages = state.allocation.pageRecords()
+			}
+			needsCheckpoint, commitErr = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
+			if commitErr == nil {
+				// Publish the new state only after the WAL append and required synchronization succeed.
+				db.meta = state.meta
+				db.rootNode = state.rootNode
+				if state.allocation != nil {
+					db.allocation = state.allocation.publish()
+					db.stats.PagesReused += state.allocation.pagesReused
+					db.stats.PagesRetired += state.allocation.pagesRetired
+					db.stats.TailPagesReclaimed += state.allocation.tailPagesRemoved
+				}
+				for _, dirty := range state.dirty {
+					db.cacheWriteNode(dirty.final)
+				}
 			}
 		}
 	}

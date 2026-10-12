@@ -25,6 +25,7 @@ type benchmarkCase struct {
 	operation       benchmarkOperation
 	operations      int
 	records         int
+	keyBytes        int // Zero uses the normal 16-byte key. Large keys share a prefix before their final index.
 	valueBytes      int
 	setupValueBytes int
 	order           keyOrder
@@ -171,6 +172,34 @@ func benchmarkCases() []benchmarkCase {
 			"insert/random/value=128/clients=1/batch=100":           true,
 			"update/random/value=128/clients=8/batch=100":           true,
 		}
+	}
+	if !focused {
+		// Large entries use the same read, write, and mixed operation paths.
+		largeRecords := scaleSizedValue(512, 128, 32)
+		largeReads := scaleSizedValue(5000, 1000, 200)
+		largeWrites := scaleSizedValue(1000, 200, 100)
+		largeCases := []benchmarkCase{
+			{name: "read/random/value=65536/clients=1", operation: benchmarkRead, records: largeRecords, operations: largeReads, valueBytes: 65536, hitPercent: 100},
+			{name: "update/random/value=65536/clients=1", operation: benchmarkUpdate, records: largeRecords, operations: largeWrites, valueBytes: 65536},
+			{name: "insert/random/value=65536/clients=1", operation: benchmarkInsert, records: largeRecords, operations: largeWrites, valueBytes: 65536},
+			{name: "update/random/grow=128-65536/clients=1", operation: benchmarkUpdate, records: largeRecords, operations: largeWrites, setupValueBytes: 128, valueBytes: 65536},
+			{name: "update/random/shrink=65536-128/clients=1", operation: benchmarkUpdate, records: largeRecords, operations: largeWrites, setupValueBytes: 65536, valueBytes: 128},
+			{name: "read/random/key=32768/value=128/clients=1", operation: benchmarkRead, records: largeRecords, operations: largeReads, keyBytes: 32768, valueBytes: 128, hitPercent: 100},
+			{name: "read/random/value=1048576/clients=1", operation: benchmarkRead, records: scaleSizedValue(64, 16, 4), operations: scaleSizedValue(1000, 200, 50), valueBytes: 1048576, hitPercent: 100},
+			{name: "mixed/read=95/value=65536/clients=1", operation: benchmarkMixed, records: largeRecords, operations: largeReads, valueBytes: 65536, readPercent: 95},
+		}
+		for i := range largeCases {
+			largeCases[i].order, largeCases[i].clients, largeCases[i].batchSize = keyOrderRandom, 1, 1
+		}
+		if lightScale() {
+			largeCases = largeCases[:2]
+		}
+		for _, c := range largeCases {
+			if selected != nil {
+				selected[c.name] = true
+			}
+		}
+		cases = append(cases, largeCases...)
 	}
 	scaleCases := cases[:0]
 	for _, benchmarkCase := range cases {
@@ -335,6 +364,18 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	operationPairs, err := makePairs(benchmarkCase.records, benchmarkCase.valueBytes, workload, benchmarkCase.order, 1)
 	if err != nil {
 		b.Fatal(err)
+	}
+	if benchmarkCase.keyBytes > 16 {
+		// Put the index at the end so comparisons traverse the shared large prefix.
+		// Apply the same key layout to the fixture and measured operations.
+		for _, pairs := range [][]Pair{setupPairs, operationPairs} {
+			for i := range pairs {
+				key := make([]byte, benchmarkCase.keyBytes)
+				copy(key[:8], pairs[i].Key[:8])
+				copy(key[len(key)-8:], pairs[i].Key[8:])
+				pairs[i].Key = key
+			}
+		}
 	}
 	if benchmarkCase.operation == benchmarkRead && benchmarkCase.hitPercent < 100 {
 		for index := range operationPairs {
@@ -530,6 +571,7 @@ func uniqueWrittenKeys(pairs []Pair, benchmarkCase benchmarkCase, schedule []sch
 }
 
 func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmarkCase benchmarkCase, schedule []scheduledOperation) error {
+	keyBytes := max(16, benchmarkCase.keyBytes)
 	run := func(start, end int) error {
 		for operation := start; operation < end; operation++ {
 			scheduled := schedule[operation]
@@ -537,7 +579,7 @@ func runBenchmarkOperations(b *testing.B, engine Engine, pairs []Pair, benchmark
 			switch benchmarkCase.operation {
 			case benchmarkRead:
 				_, err := engine.Get(b.Context(), pair.Key)
-				missing := len(pair.Key) != 16 || binary.BigEndian.Uint64(pair.Key[:8]) != 1
+				missing := len(pair.Key) != keyBytes || binary.BigEndian.Uint64(pair.Key[:8]) != 1
 				if missing && errors.Is(err, ErrKeyNotFound) {
 					continue
 				}

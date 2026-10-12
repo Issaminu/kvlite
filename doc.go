@@ -35,7 +35,14 @@
 //
 // A delete can make tree pages free. KVLite records free pages in the database file and can use them for later writes. A write cannot reuse a page retired by the same transaction. If the free pages are at the end of the file, a checkpoint can shorten the file. [DB.Stats] reports page counts and page reuse.
 //
-// Each key and value entry must fit in one database page. KVLite does not store large entries across pages.
+// # Entry sizes and continuation pages
+//
+// A key can have up to [MaxKeySize] bytes. A value can have up to [MaxValueSize] bytes.
+// An entry can exceed one database page. Large leaf values and branch separator keys use continuation pages. Each logical node keeps one first-page ID. Its continuation IDs come from the normal free-page allocator and need not be consecutive.
+//
+// Point reads search encoded entry offsets and fetch the required continuation pages. They do not decode the complete node. Writes and cursors decode nodeswhen they need their full contents. Memory use increases with the node size.
+// The WAL stores complete page images for changed continued nodes.
+// A node keeps the continuation IDs it still needs. Growth adds pages. Shrink and deletion release pages through the same transaction and page-reuse rules.
 //
 // # Errors
 //

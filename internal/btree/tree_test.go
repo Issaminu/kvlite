@@ -102,21 +102,36 @@ func TestTreePutEntryReturnsAllocationError(t *testing.T) {
 	}
 }
 
-// TestTreePutEntry_RejectsKeyThatCannotFitBranch checks the branch separator
-// limit without changing the database page-size policy.
-func TestTreePutEntry_RejectsKeyThatCannotFitBranch(t *testing.T) {
+// TestTreePutEntry_AcceptsKeyBeyondOnePage checks that large branch separators
+// remain valid without changing the tree's page-size policy.
+func TestTreePutEntry_AcceptsKeyBeyondOnePage(t *testing.T) {
 	const pageSize int64 = 128
 	store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
 	tree := NewTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
-
-	key := bytes.Repeat([]byte("k"), 88)
-	if _, err := tree.PutEntry(root, NewEntry(0, key, nil)); !errors.Is(err, ErrEntryTooLarge) {
-		t.Fatalf("PutEntry error: got %v, want ErrEntryTooLarge", err)
+	for i := 0; i < 12; i++ {
+		key := bytes.Repeat([]byte{byte('a' + i)}, 256)
+		var err error
+		root, err = tree.PutEntry(root, NewEntry(0, key, []byte("value")))
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
-	if got := len(root.entries); got != 0 {
-		t.Fatalf("root entry count: got %d, want 0", got)
+	for i := 0; i < 12; i++ {
+		key := bytes.Repeat([]byte{byte('a' + i)}, 256)
+		entry, found, err := tree.FindEntryRef(root, key)
+		if err != nil || !found || !bytes.Equal(entry.Value(), []byte("value")) {
+			t.Fatalf("key %d: found=%t, error=%v", i, found, err)
+		}
+	}
+	for _, node := range store.nodes {
+		if node.EntryCount() == 0 {
+			t.Fatal("split produced an empty node")
+		}
+		if !node.IsLeaf() && len(node.Children) < 2 {
+			t.Fatal("split produced a one-child branch")
+		}
 	}
 }
 

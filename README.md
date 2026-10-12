@@ -368,22 +368,6 @@ cd benchmarks/kvbench
 ./run-docker.sh
 ```
 
-## Current limits
-
-- Each key/value entry must fit in one database page. KVLite does not use overflow pages for large values.
-- One database file can have one writable handle or several read-only handles. It cannot have both at the same time.
-- A write transaction waits for active read transactions on the same `DB`.
-- KVLite does not provide a backup, repair, or full database-check API.
-- KVLite does not promise file-format compatibility between pre-release versions.
-
-Check the page-size limit with `errors.Is`:
-
-```go
-err := db.Put([]byte("users"), []byte("large"), value)
-if errors.Is(err, kvlite.ErrEntryTooLargeForPage) {
-	// Store a smaller value or store the value outside KVLite.
-}
-```
 
 
 

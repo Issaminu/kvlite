@@ -293,8 +293,10 @@ func (bucket *Bucket) lookupBucket(bucketName []byte) (*Bucket, error) {
 //
 // Put copies key and value before it returns, and it treats a nil value as empty.
 // It returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the transaction callback returns.
-// An empty key returns [ErrKeyRequired], while oversized data returns [ErrKeyTooLarge], [ErrValueTooLarge], or [ErrEntryTooLargeForPage].
-// [ErrEntryTooLargeForPage] also applies when the entry fits a leaf but its key cannot fit a required branch separator.
+// An empty key returns [ErrKeyRequired].
+// A key larger than [MaxKeySize] returns [ErrKeyTooLarge].
+// A value larger than [MaxValueSize] returns [ErrValueTooLarge].
+// Larger leaf values and branch keys use continuation pages at commit.
 // If key names a nested bucket, Put returns [ErrIncompatibleValue] instead of replacing it.
 // A returned error does not change the bucket, so the caller can continue to use the transaction.
 func (bucket *Bucket) Put(key, value []byte) error {
@@ -428,10 +430,14 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 		parent.setRoot(newRoot)
 	}
 
+	// pages is the complete checked physical ownership set, including continuations.
+	// Retire each ID once; FreePage would also retire an owning node's continuations.
 	for _, pageID := range pages {
-		if err := tx.store.FreePage(pageID); err != nil {
+		if err := tx.writableAllocation().retire(pageID); err != nil {
 			return err
 		}
+		delete(tx.store.nodes, pageID)
+		delete(tx.store.dirty, pageID)
 	}
 	target.deleted = true
 	if parent == nil {
@@ -455,27 +461,33 @@ func (tx *Tx) collectBucketPages(root page.ID) ([]page.ID, error) {
 	stack := []page.ID{root}
 	seen := make(map[page.ID]struct{})
 	var pages []page.ID
+	addPage := func(pageID page.ID) error {
+		if _, exists := seen[pageID]; exists {
+			return fmt.Errorf("bucket page %d has more than one owner: %w", pageID, ErrInvalid)
+		}
+		if pageID < firstTreePageID || allocation.isSegmentPage(pageID) || !allocation.allocated(pageID) {
+			return fmt.Errorf("bucket page %d is not allocated tree data: %w", pageID, ErrInvalid)
+		}
+		if _, retired := allocation.retired[pageID]; retired {
+			return fmt.Errorf("bucket page %d is already retired: %w", pageID, ErrInvalid)
+		}
+		seen[pageID] = struct{}{}
+		pages = append(pages, pageID)
+		return nil
+	}
 	for len(stack) != 0 {
 		last := len(stack) - 1
 		pageID := stack[last]
 		stack = stack[:last]
-		if _, exists := seen[pageID]; exists {
-			return nil, fmt.Errorf("bucket page %d has more than one owner: %w", pageID, ErrInvalid)
+		if err := addPage(pageID); err != nil {
+			return nil, err
 		}
-		if pageID < firstTreePageID || allocation.isSegmentPage(pageID) || !allocation.allocated(pageID) {
-			return nil, fmt.Errorf("bucket page %d is not allocated tree data: %w", pageID, ErrInvalid)
-		}
-		if _, retired := allocation.retired[pageID]; retired {
-			return nil, fmt.Errorf("bucket page %d is already retired: %w", pageID, ErrInvalid)
-		}
-		seen[pageID] = struct{}{}
 		if err := tx.store.VisitNodeReferences(pageID, func(child page.ID) error {
 			stack = append(stack, child)
 			return nil
-		}); err != nil {
+		}, addPage); err != nil {
 			return nil, err
 		}
-		pages = append(pages, pageID)
 	}
 	return pages, nil
 }

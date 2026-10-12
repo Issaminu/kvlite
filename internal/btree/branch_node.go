@@ -114,3 +114,13 @@ func (n *Node) splitBranch(right *Node, index int) {
 	right.Children = slices.Clone(n.Children[index+1:])
 	n.Children = n.Children[:index+1]
 }
+
+// visitBranchReferences visits each child page of a decoded branch.
+func visitBranchReferences(node *Node, visit func(page.ID) error) error {
+	for _, child := range node.Children {
+		if err := visit(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}

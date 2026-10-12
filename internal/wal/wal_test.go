@@ -25,7 +25,7 @@ func TestWALValidationErrors(t *testing.T) {
 	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1); !errors.Is(err, ErrNodePageMismatch) {
 		t.Fatalf("changed node page ID: got %v, want ErrNodePageMismatch", err)
 	}
-	if _, err := CommittedPageToNode(&CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
+	if _, err := log.CommittedPageToNode(&CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
 		t.Fatalf("page without payload: got %v, want ErrRecordPayloadRequired", err)
 	}
 }
@@ -756,7 +756,7 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 		if _, err := mainFile.ReadAt(pageContent, int64(pageID)*64); err != nil {
 			t.Fatal(err)
 		}
-		node, err := btree.DecodeNode(pageContent, pageID, 64)
+		node, err := btree.DecodeNode(pageContent, pageID, 64, nil)
 		if err != nil {
 			t.Fatalf("decode checkpoint page %d: %v", pageID, err)
 		}
@@ -895,5 +895,127 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 	}
 	if !IsCommitMarker(commitMarker) {
 		t.Fatal("encoded transaction does not end with a commit marker")
+	}
+}
+
+func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
+	const pageSize int64 = 64
+	original := btree.NewLeafNode(3)
+	if err := original.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("old"))); err != nil {
+		t.Fatal(err)
+	}
+	final := original.Clone()
+	if err := final.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 200))); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]page.ID, btree.NodePageCount(final, pageSize))
+	ids[0] = final.PageID()
+	for index := 1; index < len(ids); index++ {
+		ids[index] = page.ID(400 - index*7)
+	}
+	final.SetOverflowPages(ids[1:])
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: pageSize, SyncOnCommit: true})
+	if _, err := log.Commit([]NodeRecord{{Final: original}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	syncErr := errors.New("injected continuation sync failure")
+	log.SetSyncFileForTesting(func() error { return syncErr })
+	changes := []NodeRecord{{Original: original, Final: final}}
+	if _, err := log.Commit(changes, nil, nil, nil); !errors.Is(err, syncErr) {
+		t.Fatalf("failed commit: %v", err)
+	}
+	after, err := file.Stat()
+	if err != nil || after.Size() != before.Size() || log.nextTxid != 2 {
+		t.Fatalf("failed append was not rolled back: %v", err)
+	}
+	if record, ok := log.Lookup(ids[0]); !ok || record.Node != original || len(log.overlay) != 1 {
+		t.Fatal("failed commit changed the overlay")
+	}
+	log.SetSyncFileForTesting(nil)
+	if _, err := log.Commit(changes, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil || len(records) != len(ids)+3 || log.nextTxid != 3 || len(log.overlay) != len(ids) {
+		t.Fatalf("retry: %d records, %v", len(records), err)
+	}
+	for _, record := range records[2 : len(records)-1] {
+		if record.Header.TxID != 2 || record.Header.Type != RecordTypeNode {
+			t.Fatal("retry changed the page record type or transaction ID")
+		}
+	}
+	if !IsCommitMarker(&records[len(records)-1]) || records[len(records)-1].Header.TxID != 2 {
+		t.Fatal("retry lacks its commit marker")
+	}
+}
+
+func TestCommittedPageToNodeRejectsInvalidContinuationPayloads(t *testing.T) {
+	const pageSize int64 = 64
+	node := btree.NewLeafNode(3)
+	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 200))); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]page.ID, btree.NodePageCount(node, pageSize))
+	for i := range ids {
+		ids[i] = page.ID(3 + i*7)
+	}
+	images, err := btree.EncodeWALNodePages(node, pageSize, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fault := range []string{"missing", "first-short", "middle-short", "last-short", "last-extra", "checksum", "page-id", "page-type"} {
+		t.Run(fault, func(t *testing.T) {
+			log := New(Config{PageSize: pageSize})
+			for i, id := range ids {
+				log.LoadCommittedRecord(WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: id}, Payload: bytes.Clone(images[i])})
+			}
+			lastID := ids[len(ids)-1]
+			record, _ := log.Lookup(lastID)
+			want := btree.ErrInvalid
+			switch fault {
+			case "missing":
+				delete(log.overlay, lastID)
+				want = ErrRecordPayloadRequired
+			case "first-short", "middle-short", "last-short":
+				id := lastID
+				if fault == "first-short" {
+					id = ids[0]
+				}
+				if fault == "middle-short" {
+					id = ids[1]
+				}
+				short, _ := log.Lookup(id)
+				short.Payload = short.Payload[:len(short.Payload)-1]
+				log.overlay[id] = short
+			case "last-extra":
+				record.Payload = append(record.Payload, 0)
+				log.overlay[lastID] = record
+			case "checksum":
+				binary.LittleEndian.PutUint32(record.Payload[10:14], 1)
+			case "page-id":
+				binary.LittleEndian.PutUint64(record.Payload[2:10], uint64(lastID+1))
+			case "page-type":
+				binary.LittleEndian.PutUint16(record.Payload[:2], uint16(btree.NodeTypeLeaf))
+			}
+			first, _ := log.Lookup(ids[0])
+			if _, err := log.CommittedPageToNode(&first); !errors.Is(err, want) {
+				t.Fatalf("%s: got %v, want %v", fault, err, want)
+			}
+			if _, _, _, err := log.LookupCommittedPage(&first, []byte("key")); !errors.Is(err, want) {
+				t.Fatalf("direct lookup %s: got %v, want %v", fault, err, want)
+			}
+		})
+	}
+	if _, err := btree.DecodeWALNode(images[0], ids[0], pageSize, nil); !errors.Is(err, btree.ErrInvalid) {
+		t.Fatalf("missing continuation reader: %v", err)
 	}
 }

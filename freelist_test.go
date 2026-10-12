@@ -41,6 +41,15 @@ func (db *DB) validatePageOwnership() error {
 		if err != nil {
 			return err
 		}
+		for _, id := range node.OverflowPages() {
+			if _, exists := visited[id]; exists {
+				return fmt.Errorf("continuation page %d has more than one owner: %w", id, ErrInvalid)
+			}
+			if !db.allocation.allocated(id) {
+				return fmt.Errorf("reachable continuation page %d is free: %w", id, ErrInvalid)
+			}
+			visited[id] = struct{}{}
+		}
 		if !node.IsLeaf() {
 			pending = append(pending, node.Children...)
 			continue

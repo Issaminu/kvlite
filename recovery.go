@@ -181,7 +181,7 @@ func (db *DB) materializeWALNodeChanges(records []wal.WALRecord) ([]wal.WALRecor
 		if err != nil {
 			return nil, 0, fmt.Errorf("read page %d for WAL change: %w", pageID, err)
 		}
-		node, err := btree.DecodeNode(slices.Clone(mainPage), pageID, db.meta.PageSize())
+		node, err := btree.DecodeNode(slices.Clone(mainPage), pageID, db.meta.PageSize(), nil)
 		if err != nil {
 			return nil, 0, fmt.Errorf("decode page %d for WAL change: %w", pageID, err)
 		}

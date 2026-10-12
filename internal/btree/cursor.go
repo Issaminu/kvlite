@@ -56,7 +56,10 @@ func (cursor *Cursor) First() (*Entry, bool, error) {
 		return nil, false, err
 	}
 
-	// Entry zero is the smallest entry in the leaf. position handles an empty leaf.
+	// Skip empty leaves before selecting the smallest entry.
+	if leaf.EntryCount() == 0 {
+		return cursor.moveToNextLeaf()
+	}
 	return cursor.position(leaf, 0)
 }
 
@@ -74,7 +77,10 @@ func (cursor *Cursor) Last() (*Entry, bool, error) {
 		return nil, false, err
 	}
 
-	// The final leaf entry is the largest entry in the tree. position handles an empty leaf.
+	// Skip empty leaves before selecting the largest entry.
+	if leaf.EntryCount() == 0 {
+		return cursor.moveToPreviousLeaf()
+	}
 	return cursor.position(leaf, len(leaf.entries)-1)
 }
 
@@ -231,10 +237,12 @@ func (cursor *Cursor) descendLast(node *Node) (*Node, error) {
 // It returns a nil entry and clears the current position when no later subtree exists.
 func (cursor *Cursor) moveToNextLeaf() (*Entry, bool, error) {
 	// Start with the parent nearest the leaf. It is the first place where a later subtree can exist.
-	for index := len(cursor.path) - 1; index >= 0; index-- {
+	for len(cursor.path) > 0 {
+		index := len(cursor.path) - 1
 		frame := &cursor.path[index]
 		if frame.childIndex+1 >= len(frame.node.Children) {
 			// This branch has no later child. Continue with its parent.
+			cursor.path = cursor.path[:index]
 			continue
 		}
 
@@ -251,6 +259,10 @@ func (cursor *Cursor) moveToNextLeaf() (*Entry, bool, error) {
 		if err != nil {
 			return nil, false, err
 		}
+		// An empty leaf does not mark the end of the tree.
+		if leaf.EntryCount() == 0 {
+			continue
+		}
 		return cursor.position(leaf, 0)
 	}
 
@@ -265,10 +277,12 @@ func (cursor *Cursor) moveToNextLeaf() (*Entry, bool, error) {
 // It returns a nil entry and clears the current position when no earlier subtree exists.
 func (cursor *Cursor) moveToPreviousLeaf() (*Entry, bool, error) {
 	// Start with the parent nearest the leaf. It is the first place where an earlier subtree can exist.
-	for index := len(cursor.path) - 1; index >= 0; index-- {
+	for len(cursor.path) > 0 {
+		index := len(cursor.path) - 1
 		frame := &cursor.path[index]
 		if frame.childIndex == 0 {
 			// This branch has no earlier child. Continue with its parent.
+			cursor.path = cursor.path[:index]
 			continue
 		}
 
@@ -284,6 +298,10 @@ func (cursor *Cursor) moveToPreviousLeaf() (*Entry, bool, error) {
 		leaf, err := cursor.descendLast(node)
 		if err != nil {
 			return nil, false, err
+		}
+		// An empty leaf does not mark the end of the tree.
+		if leaf.EntryCount() == 0 {
+			continue
 		}
 		return cursor.position(leaf, leaf.EntryCount()-1)
 	}

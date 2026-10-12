@@ -1,6 +1,8 @@
 package kvlite
 
 import (
+	"fmt"
+
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -67,14 +69,14 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 }
 
 // VisitNodeReferences visits one node without decoding a committed main page.
-func (store *txTreeStore) VisitNodeReferences(pageID page.ID, visit func(page.ID) error) error {
+func (store *txTreeStore) VisitNodeReferences(pageID page.ID, visit, visitContinuation func(page.ID) error) error {
 	if node, ok := store.nodes[pageID]; ok {
-		return btree.VisitNodeReferences(node, visit)
+		return btree.VisitNodeReferences(node, visit, visitContinuation)
 	}
 	if dirty, ok := store.baseDirty[pageID]; ok {
-		return btree.VisitNodeReferences(dirty.final, visit)
+		return btree.VisitNodeReferences(dirty.final, visit, visitContinuation)
 	}
-	return store.tx.db.visitCommittedNodeReferences(pageID, visit)
+	return store.tx.db.visitCommittedNodeReferences(pageID, visit, visitContinuation)
 }
 
 func (store *txTreeStore) AllocatePage() (page.ID, error) {
@@ -89,11 +91,23 @@ func (store *txTreeStore) AllocatePage() (page.ID, error) {
 	return pageID, nil
 }
 
-// FreePage marks a tree page for release at commit.
+// FreePage marks a removed tree node and all of its continuation pages for release at commit.
 // It drops any private node image so the WAL does not write a page that the tree no longer owns.
 // The page stays allocated until commit preparation, so this transaction cannot reuse it early.
 func (store *txTreeStore) FreePage(pageID page.ID) error {
-	if err := store.tx.writableAllocation().retire(pageID); err != nil {
+	node, err := store.ReadNode(pageID)
+	if err != nil {
+		return err
+	}
+	allocation := store.tx.writableAllocation()
+	if node != nil {
+		for _, id := range node.OverflowPages() {
+			if err := allocation.retire(id); err != nil {
+				return err
+			}
+		}
+	}
+	if err := allocation.retire(pageID); err != nil {
 		return err
 	}
 	delete(store.nodes, pageID)
@@ -126,4 +140,67 @@ func (store *txTreeStore) StageNode(node *btree.Node) {
 	// Keep the mutable node here. The commit path encodes its final state once after the callback succeeds.
 	store.nodes[node.PageID()] = node
 	store.dirty[node.PageID()] = dirty
+}
+
+// prepareCommit assigns continuation pages after all tree changes finish.
+// It serves direct writes and write batches. The first leaf or branch page
+// keeps its ID. Each changed node keeps as many of its committed continuation
+// IDs as its final body needs. Growth allocates additional pages through the
+// normal allocator. Shrink retires only the surplus IDs. A body that fits one
+// page loses all continuation IDs. IDs need not be consecutive.
+//
+// Page IDs can stay the same because the WAL writes new page contents into
+// separate buffers. It publishes them only after the commit succeeds. This
+// function changes only private node and allocation state. The caller must
+// discard that state if preparation or the WAL commit fails.
+func (tx *Tx) prepareCommit() error {
+	if tx.allocation != nil {
+		// A later batch callback can remove a node changed by an earlier callback.
+		for id := range tx.allocation.retired {
+			delete(tx.store.dirty, id)
+		}
+	}
+	for _, change := range tx.store.dirty {
+		count := btree.NodePageCount(change.final, tx.meta.PageSize())
+		if count == 0 {
+			return fmt.Errorf("node %d cannot hold a continuation ID: %w", change.final.PageID(), btree.ErrInvalid)
+		}
+		var previous []page.ID
+		if change.original != nil {
+			previous = change.original.OverflowPages()
+		}
+		required := count - 1
+		var ids []page.ID
+		if required > 0 {
+			ids = make([]page.ID, required)
+			copy(ids, previous)
+		}
+		if required != len(previous) {
+			allocation := tx.writableAllocation()
+			// Retired IDs stay allocated until every node's new IDs are assigned.
+			for _, id := range previous[min(required, len(previous)):] {
+				if err := allocation.retire(id); err != nil {
+					return err
+				}
+			}
+			for i := len(previous); i < required; i++ {
+				id, err := allocation.allocate(tx.meta.LastPage())
+				if err != nil {
+					return err
+				}
+				ids[i] = id
+				if id > tx.meta.LastPage() {
+					tx.meta.SetLastPage(id)
+					tx.metaDirty = true
+				}
+			}
+		}
+		change.final.SetOverflowPages(ids)
+	}
+	if tx.allocation != nil && len(tx.allocation.retired) != 0 {
+		if tx.writableAllocation().finalize(tx.meta) {
+			tx.metaDirty = true
+		}
+	}
+	return nil
 }

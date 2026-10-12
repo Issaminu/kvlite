@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -130,7 +131,7 @@ func TestDecodeNode_RejectsCorruptedPageBeforePayloadDecode(t *testing.T) {
 	encoded := EncodeNode(node, testNodePageSize)
 	encoded[len(encoded)-1] ^= 0xff
 
-	if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize); !errors.Is(err, page.ErrChecksum) {
+	if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize, nil); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("DecodeNode error: got %v, want ErrChecksum", err)
 	}
 }
@@ -149,7 +150,7 @@ func TestDecodeNode_RejectsCorruptedPagePaddingBeforePayloadDecode(t *testing.T)
 	data := encoded.Bytes()
 	data[len(data)-1] ^= 0xff
 
-	if _, err := DecodeNode(data, node.PageID(), pageSize); !errors.Is(err, page.ErrChecksum) {
+	if _, err := DecodeNode(data, node.PageID(), pageSize, nil); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("DecodeNode error: got %v, want ErrChecksum", err)
 	}
 }
@@ -158,7 +159,7 @@ func TestDecodeNode_RejectsHeaderForWrongPage(t *testing.T) {
 	node := NewLeafNode(page.ID(7))
 	encoded := EncodeNode(node, testNodePageSize)
 
-	if _, err := DecodeNode(encoded, page.ID(8), testNodePageSize); !errors.Is(err, page.ErrInvalid) {
+	if _, err := DecodeNode(encoded, page.ID(8), testNodePageSize, nil); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("DecodeNode error: got %v, want ErrInvalid", err)
 	}
 }
@@ -168,7 +169,7 @@ func TestDecodeNode_RejectsInvalidProtectedNodeHeader(t *testing.T) {
 	encoded := EncodeNode(node, testNodePageSize)
 	binary.LittleEndian.PutUint16(encoded[nodeTypeOffset:nodePageIDOffset], 3)
 	resealNodeForTest(encoded, testNodePageSize)
-	if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize); !errors.Is(err, page.ErrInvalid) {
+	if _, err := DecodeNode(encoded, node.PageID(), testNodePageSize, nil); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("DecodeNode error: got %v, want %v", err, page.ErrInvalid)
 	}
 }
@@ -194,7 +195,7 @@ func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	var decoded *Node
 	var decodeErr error
 	if got := testing.AllocsPerRun(100, func() {
-		decoded, decodeErr = DecodeNode(encoded, node.PageID(), testNodePageSize)
+		decoded, decodeErr = DecodeNode(encoded, node.PageID(), testNodePageSize, nil)
 	}); got != 3 {
 		t.Fatalf("DecodeNode allocations: got %v, want 3", got)
 	}
@@ -217,7 +218,7 @@ func TestDecodeNode_EntrySlicesCannotGrowIntoEncodedData(t *testing.T) {
 	encoded := EncodeNode(node, testNodePageSize)
 	encodedBeforeAppend := bytes.Clone(encoded)
 
-	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize)
+	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -234,7 +235,7 @@ func TestDecodeNode_RejectsEntryCountLargerThanInputCanContain(t *testing.T) {
 	binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], ^uint32(0))
 	resealNodeForTest(data, testNodePageSize)
 
-	if _, err := DecodeNode(data, 1, testNodePageSize); err == nil {
+	if _, err := DecodeNode(data, 1, testNodePageSize, nil); err == nil {
 		t.Fatal("DecodeNode accepted an entry count larger than the input")
 	}
 }
@@ -396,7 +397,7 @@ func fixedBranchImageForTest() []byte {
 }
 
 func TestDecodeWALNode_DecodesFixedDirectories(t *testing.T) {
-	leaf, err := DecodeWALNode(fixedLeafImageForTest(), 7)
+	leaf, err := DecodeWALNode(fixedLeafImageForTest(), 7, 4096, nil)
 	if err != nil {
 		t.Fatalf("decode fixed leaf: %v", err)
 	}
@@ -408,7 +409,7 @@ func TestDecodeWALNode_DecodesFixedDirectories(t *testing.T) {
 		t.Fatalf("fixed leaf entry: found=%t value=%q err=%v", found, entry.Value(), err)
 	}
 
-	branch, err := DecodeWALNode(fixedBranchImageForTest(), 7)
+	branch, err := DecodeWALNode(fixedBranchImageForTest(), 7, 4096, nil)
 	if err != nil {
 		t.Fatalf("decode fixed branch: %v", err)
 	}
@@ -503,7 +504,7 @@ func TestDecodeWALNode_RejectsInvalidFixedDirectory(t *testing.T) {
 				data = append(data, 0)
 			}
 			testCase.change(data)
-			if _, err := DecodeWALNode(data, 7); !errors.Is(err, ErrInvalid) {
+			if _, err := DecodeWALNode(data, 7, 4096, nil); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("DecodeWALNode error: got %v, want ErrInvalid", err)
 			}
 		})
@@ -514,7 +515,7 @@ func TestDecodeWALNode_RejectsEmptyStoredKey(t *testing.T) {
 	node := NewLeafNode(7)
 	node.entries = append(node.entries, NewEntry(0, nil, []byte("value")))
 
-	if _, err := DecodeWALNode(EncodeWALNode(node), node.PageID()); !errors.Is(err, ErrInvalid) {
+	if _, err := DecodeWALNode(EncodeWALNode(node), node.PageID(), 4096, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("DecodeWALNode error: got %v, want ErrInvalid", err)
 	}
 }
@@ -530,11 +531,11 @@ func TestLookupEncodedWALNode_UsesLeafDirectoryBinarySearch(t *testing.T) {
 	const firstLeafEntryOffsetField = NodeHeaderSize + encodedUint32Size
 	binary.LittleEndian.PutUint32(data[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
 
-	entry, found, child, err := LookupEncodedWALNode(data, node.PageID(), []byte("h"))
+	entry, found, child, err := LookupEncodedWALNode(data, node.PageID(), []byte("h"), 4096, nil)
 	if err != nil || !found || child != 0 || !bytes.Equal(entry.Value(), []byte{7}) {
 		t.Fatalf("binary leaf lookup: found=%t child=%d value=%v err=%v", found, child, entry.Value(), err)
 	}
-	if _, err := DecodeWALNode(data, node.PageID()); !errors.Is(err, ErrInvalid) {
+	if _, err := DecodeWALNode(data, node.PageID(), 4096, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("full leaf decode error: got %v, want ErrInvalid", err)
 	}
 }
@@ -552,11 +553,11 @@ func TestLookupEncodedWALNode_UsesBranchDirectoryBinarySearch(t *testing.T) {
 	const firstBranchEntryOffsetField = NodeHeaderSize
 	binary.LittleEndian.PutUint32(data[firstBranchEntryOffsetField:firstBranchEntryOffsetField+4], ^uint32(0))
 
-	_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte("z"))
+	_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte("z"), 4096, nil)
 	if err != nil || found || child != 18 {
 		t.Fatalf("binary branch lookup: found=%t child=%d err=%v", found, child, err)
 	}
-	if _, err := DecodeWALNode(data, root.PageID()); !errors.Is(err, ErrInvalid) {
+	if _, err := DecodeWALNode(data, root.PageID(), 4096, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("full branch decode error: got %v, want ErrInvalid", err)
 	}
 }
@@ -574,9 +575,9 @@ func TestVisitNodeReferencesChecksMappedAndWALPages(t *testing.T) {
 		add := func(id page.ID) error { refs = append(refs, id); return nil }
 		var err error
 		if mapped {
-			err = VisitMappedNodeReferences(data, 7, 4096, add)
+			err = VisitMappedNodeReferences(data, 7, 4096, nil, add, nil)
 		} else {
-			err = VisitWALNodeReferences(data, 7, add)
+			err = VisitWALNodeReferences(data, 7, 4096, nil, add, nil)
 		}
 		return refs, err
 	}
@@ -594,7 +595,7 @@ func TestVisitNodeReferencesChecksMappedAndWALPages(t *testing.T) {
 	}
 	data := EncodeNode(leaf, 4096)
 	data[len(data)-1] ^= 1
-	if err := VisitMappedNodeReferences(data, 7, 4096, func(page.ID) error { return nil }); !errors.Is(err, page.ErrChecksum) {
+	if err := VisitMappedNodeReferences(data, 7, 4096, nil, func(page.ID) error { return nil }, nil); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("damaged page: %v", err)
 	}
 }
@@ -605,10 +606,10 @@ func TestVisitNodeReferencesReadsBranchChildren(t *testing.T) {
 	branch := NewRootNode(2, left, right, []byte("middle"))
 	data := EncodeNode(branch, 4096)
 	var refs []page.ID
-	err := VisitMappedNodeReferences(data, 2, 4096, func(id page.ID) error {
+	err := VisitMappedNodeReferences(data, 2, 4096, nil, func(id page.ID) error {
 		refs = append(refs, id)
 		return nil
-	})
+	}, nil)
 	if err != nil || !slices.Equal(refs, []page.ID{3, 4}) {
 		t.Fatalf("branch refs=%v, err=%v", refs, err)
 	}
@@ -624,7 +625,7 @@ func TestEncodeWALNode_LeavesDatabasePageChecksumUnset(t *testing.T) {
 	if got := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset:NodeHeaderSize]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
-	decoded, err := DecodeWALNode(encoded, node.PageID())
+	decoded, err := DecodeWALNode(encoded, node.PageID(), 4096, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -663,7 +664,7 @@ func TestLookupEncodedWALNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 	var child page.ID
 	var lookupErr error
 	if got := testing.AllocsPerRun(100, func() {
-		entry, found, child, lookupErr = LookupEncodedWALNode(data, node.PageID(), []byte("beta"))
+		entry, found, child, lookupErr = LookupEncodedWALNode(data, node.PageID(), []byte("beta"), 4096, nil)
 	}); got != 0 {
 		t.Fatalf("LookupEncodedWALNode allocations: got %v, want 0", got)
 	}
@@ -689,7 +690,7 @@ func TestLookupEncodedWALNode_SelectsBranchChild(t *testing.T) {
 		{key: "z", wantChild: 11},
 	} {
 		t.Run(testCase.key, func(t *testing.T) {
-			_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte(testCase.key))
+			_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte(testCase.key), 4096, nil)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -697,5 +698,535 @@ func TestLookupEncodedWALNode_SelectsBranchChild(t *testing.T) {
 				t.Fatalf("branch lookup: found=%t child=%d, want false and %d", found, child, testCase.wantChild)
 			}
 		})
+	}
+}
+
+func TestNodeClone_OwnsContinuationPageIDs(t *testing.T) {
+	base := NewLeafNode(2)
+	base.SetOverflowPages([]page.ID{7, 9})
+	clone := base.Clone()
+	clone.continuationPageIDs[0] = 11
+	if !slices.Equal(base.OverflowPages(), []page.ID{7, 9}) {
+		t.Fatalf("clone changed original page IDs: %v", base.OverflowPages())
+	}
+	clone.SetOverflowPages(nil)
+	if len(clone.OverflowPages()) != 0 || len(base.OverflowPages()) != 2 {
+		t.Fatal("clearing clone page IDs changed the original node")
+	}
+}
+
+func TestEncodeNodePages_RejectsInvalidIDs(t *testing.T) {
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 80))); err != nil {
+		t.Fatal(err)
+	}
+	for _, ids := range [][]page.ID{{8, 42}, {9, 42, 91}, {8, 42, 42}, {8, 1, 91}} {
+		if _, err := EncodeNodePages(node, 64, ids); !errors.Is(err, page.ErrInvalid) {
+			t.Fatalf("invalid IDs %v: got %v", ids, err)
+		}
+	}
+}
+
+func TestNodePageCount_RequiresSpaceForContinuationID(t *testing.T) {
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 80))); err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int64{0, 26, 27, 34} {
+		if got := NodePageCount(node, size); got != 0 {
+			t.Fatalf("page size %d cannot hold an ID and body byte: got %d pages", size, got)
+		}
+		if _, err := EncodeNodePages(node, size, []page.ID{8, 42}); !errors.Is(err, page.ErrInvalid) {
+			t.Fatalf("page size %d: got %v", size, err)
+		}
+	}
+}
+
+func TestNodePages_FileRoundTrip(t *testing.T) {
+	branch := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), []byte("a"))
+	branch.entries = []Entry{
+		NewEntry(0, bytes.Repeat([]byte("a"), 50), nil),
+		NewEntry(0, bytes.Repeat([]byte("b"), 50), nil),
+		NewEntry(0, bytes.Repeat([]byte("c"), 50), nil),
+		NewEntry(0, []byte("d"), nil),
+		NewEntry(0, bytes.Repeat([]byte("e"), 50), nil),
+	}
+	branch.Children = []page.ID{20, 21, 22, 23, 24, 25}
+	for _, test := range []struct {
+		name                 string
+		valueSize, wantPages int
+		branch               bool
+		pageSize             int64
+	}{
+		{"below two-page capacity", 56, 2, false, 64},
+		{"exact two-page capacity", 57, 2, false, 64},
+		{"above two-page capacity", 58, 3, false, 64},
+		{"leaf with many groups", 2048, 55, false, 64},
+		{"branch with many groups", 0, 8, true, 64},
+		{"smallest overflow pages", 57, 9, false, 35},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pageSize := test.pageSize
+			node := branch
+			if !test.branch {
+				node = NewLeafNode(8)
+				if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), test.valueSize))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if got := NodePageCount(node, pageSize); got != test.wantPages {
+				t.Fatalf("page count: got %d, want %d", got, test.wantPages)
+			}
+			ids := make([]page.ID, test.wantPages)
+			ids[0] = node.PageID()
+			for i := 1; i < len(ids); i++ {
+				ids[i] = page.ID(42 + i*3)
+			}
+			pages, err := EncodeNodePages(node, pageSize, ids)
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := t.TempDir() + "/pages"
+			file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			for i, data := range pages {
+				if page.ID(binary.LittleEndian.Uint64(data[2:10])) != ids[i] {
+					t.Fatal("encoder changed page order")
+				}
+				if _, err := file.WriteAt(data, int64(ids[i])*pageSize); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := file.Close(); err != nil {
+				t.Fatal(err)
+			}
+			file, err = os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+
+			read := func(id page.ID) ([]byte, error) {
+				data := make([]byte, pageSize)
+				_, err := file.ReadAt(data, int64(id)*pageSize)
+				return data, err
+			}
+			first, err := read(node.PageID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, err := DecodeNode(first, node.PageID(), pageSize, read)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(EncodeWALNode(decoded), EncodeWALNode(node)) || !slices.Equal(decoded.OverflowPages(), ids[1:]) || decoded.IsLeaf() != node.IsLeaf() {
+				t.Fatal("node round trip changed its contents or continuation IDs")
+			}
+			queries := [][]byte{[]byte("0"), []byte("z")}
+			for i := 0; i < node.EntryCount(); i++ {
+				queries = append(queries, node.EntryAt(i).Key())
+			}
+			for _, key := range queries {
+				want, found, child, err := LookupNode(node, key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				got, gotFound, gotChild, err := LookupMappedNode(first, node.PageID(), key, read)
+				if err != nil || gotFound != found || gotChild != child || (found && !bytes.Equal(got.Value(), want.Value())) {
+					t.Fatalf("mapped lookup %q differs: found=%v child=%d error=%v", key, gotFound, gotChild, err)
+				}
+			}
+		})
+	}
+}
+
+func TestNodePages_MappedLookupSkipsLargeValue(t *testing.T) {
+	leaf := NewLeafNode(8)
+	if err := leaf.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 2048))); err != nil {
+		t.Fatal(err)
+	}
+	branch := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), bytes.Repeat([]byte("k"), MaxKeySize))
+	for _, testCase := range []struct {
+		node   *Node
+		forWAL bool
+	}{{leaf, false}, {branch, false}, {leaf, true}, {branch, true}} {
+		node, forWAL := testCase.node, testCase.forWAL
+		size := int64(64)
+		if !node.IsLeaf() {
+			size = 4096
+		}
+		ids := make([]page.ID, NodePageCount(node, size))
+		ids[0] = 8
+		for i := 1; i < len(ids); i++ {
+			ids[i] = page.ID(42 + i*3)
+		}
+		pages, err := EncodeNodePages(node, size, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if forWAL {
+			pages, err = EncodeWALNodePages(node, size, ids)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		reads := 0
+		read := func(id page.ID) ([]byte, error) {
+			reads++
+			for i, got := range ids {
+				if id == got {
+					return pages[i], nil
+				}
+			}
+			return nil, ErrInvalid
+		}
+		var found bool
+		var child page.ID
+		query := []byte("z")
+		allocations := testing.AllocsPerRun(100, func() {
+			if forWAL {
+				_, found, child, err = LookupEncodedWALNode(pages[0], 8, query, size, read)
+			} else {
+				_, found, child, err = LookupMappedNode(pages[0], 8, query, read)
+			}
+		})
+		if err != nil || found || (node.IsLeaf() && child != 0) || (!node.IsLeaf() && child != 21) {
+			t.Fatalf("mapped lookup: found=%v child=%d err=%v", found, child, err)
+		}
+		if allocations != 0 {
+			t.Fatalf("mapped lookup allocated %v times", allocations)
+		}
+		if (node.IsLeaf() && reads > 202) || (!node.IsLeaf() && reads != 0) {
+			t.Fatalf("mapped lookup read unneeded pages: %d", reads)
+		}
+	}
+}
+
+func TestNodePages_RejectsDamageAndCycles(t *testing.T) {
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 80))); err != nil {
+		t.Fatal(err)
+	}
+	ids := []page.ID{8, 42, 91}
+	pages, err := EncodeNodePages(node, 64, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(id page.ID) ([]byte, error) {
+		for i, got := range ids {
+			if got == id {
+				return pages[i], nil
+			}
+		}
+		return nil, ErrInvalid
+	}
+	invalid := bytes.Clone(pages[0])
+	binary.LittleEndian.PutUint32(invalid[22:26], ^uint32(0))
+	binary.LittleEndian.PutUint32(invalid[14:18], pageChecksum(invalid, 64, nodeChecksumOffset))
+	if _, _, _, err := ReadMappedLeafNode(invalid, 8, 64); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("invalid node ID array with valid CRC: %v", err)
+	}
+	if _, err := DecodeNode(invalid, 8, 64, read); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("decode invalid node ID array: %v", err)
+	}
+	if _, err := DecodeNode(pages[0], 8, 64, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatal("continued node accepted no reader")
+	}
+	pages[1][63] ^= 1
+	if _, err := DecodeNode(pages[0], 8, 64, read); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("full decode missed damaged tail: %v", err)
+	}
+	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("mapped lookup missed damaged tail: %v", err)
+	}
+	pages[1][63] ^= 1
+	pages[2][63] ^= 1
+	sealContinuationPage(pages[2])
+	if _, err := DecodeNode(pages[0], 8, 64, read); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("full decode missed nonzero padding with valid CRC: %v", err)
+	}
+	pages[2][63] ^= 1
+	sealContinuationPage(pages[2])
+	binary.LittleEndian.PutUint64(pages[0][26:34], 8)
+	binary.LittleEndian.PutUint32(pages[0][14:18], pageChecksum(pages[0], 64, nodeChecksumOffset))
+	if _, err := DecodeNode(pages[0], 8, 64, read); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("full decode missed self link: %v", err)
+	}
+	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("mapped lookup missed self link: %v", err)
+	}
+}
+
+func TestNodePages_SinglePageAndShrink(t *testing.T) {
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), 80))); err != nil {
+		t.Fatal(err)
+	}
+	ids := []page.ID{8, 42, 91}
+	pages, err := EncodeNodePages(node, 64, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	read := func(id page.ID) ([]byte, error) {
+		for i, got := range ids {
+			if got == id {
+				return pages[i], nil
+			}
+		}
+		return nil, ErrInvalid
+	}
+	node, err = DecodeNode(pages[0], 8, 64, read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if node.header.Type != NodeTypeLeaf|overflowNodeFlag || !node.IsLeaf() {
+		t.Fatal("continued leaf lost its type")
+	}
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), 22))); err != nil {
+		t.Fatal(err)
+	}
+	node.SetOverflowPages(nil)
+	if node.header.Type != NodeTypeLeaf || node.header.BodyLength != 0 || node.header.NextPageCount != 0 {
+		t.Fatal("normal node kept continuation header fields")
+	}
+	if NodePageCount(node, 64) != 1 {
+		t.Fatal("small node still requires continuations")
+	}
+	pages, err = EncodeNodePages(node, 64, []page.ID{8})
+	if err != nil || len(pages) != 1 || binary.LittleEndian.Uint16(pages[0][:2]) != uint16(NodeTypeLeaf) {
+		t.Fatalf("normal page encoding: %v", err)
+	}
+	small, err := DecodeNode(pages[0], 8, 64, nil)
+	if err != nil || len(small.OverflowPages()) != 0 || !small.IsLeaf() {
+		t.Fatalf("normal page decode: %v", err)
+	}
+}
+
+// TestNodePages_LookupAcrossBoundaries checks the same lookup for ordinary and
+// continued nodes. Small pages split descriptors, child IDs, keys, and values.
+func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
+	for _, branch := range []bool{false, true} {
+		for _, testCase := range []struct {
+			pageSize int64
+			forWAL   bool
+		}{
+			{35, false}, {64, false}, {128, false}, {4096, false},
+			{35, true}, {64, true}, {128, true}, {4096, true},
+		} {
+			pageSize, forWAL := testCase.pageSize, testCase.forWAL
+			t.Run(fmt.Sprintf("branch=%v/page=%d/WAL=%t", branch, pageSize, forWAL), func(t *testing.T) {
+				node := NewLeafNode(8)
+				if branch {
+					node.header.Type = NodeTypeBranch
+					node.Children = []page.ID{1000}
+				}
+				for i := 0; i < 12; i++ {
+					key := append([]byte(fmt.Sprintf("%06d", i)), bytes.Repeat([]byte{'k'}, i%3*35+1)...)
+					value := bytes.Repeat([]byte{'v'}, []int{0, 1, 80, 257}[i%4])
+					if branch {
+						value = nil
+						node.Children = append(node.Children, page.ID(1001+i))
+					}
+					node.entries = append(node.entries, NewEntry(0, key, value))
+				}
+				ids := make([]page.ID, NodePageCount(node, pageSize))
+				ids[0] = node.PageID()
+				for i := 1; i < len(ids); i++ {
+					ids[i] = page.ID(42 + i*3)
+				}
+				pages, err := EncodeNodePages(node, pageSize, ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if forWAL {
+					pages, err = EncodeWALNodePages(node, pageSize, ids)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				mapped := make(map[page.ID][]byte, len(ids))
+				for i, id := range ids {
+					mapped[id] = pages[i]
+				}
+				read := func(id page.ID) ([]byte, error) {
+					if data, ok := mapped[id]; ok {
+						return data, nil
+					}
+					return nil, ErrInvalid
+				}
+				var decoded *Node
+				if forWAL {
+					decoded, err = DecodeWALNode(pages[0], node.PageID(), pageSize, read)
+				} else {
+					decoded, err = DecodeNode(pages[0], node.PageID(), pageSize, read)
+				}
+				if err != nil || !bytes.Equal(EncodeWALNode(decoded), EncodeWALNode(node)) || !slices.Equal(decoded.OverflowPages(), ids[1:]) {
+					t.Fatalf("full decode: %v", err)
+				}
+				queries := [][]byte{[]byte("0"), []byte("z")}
+				for _, entry := range node.entries {
+					queries = append(queries, entry.key, entry.key[:6], append(bytes.Clone(entry.key), 0))
+				}
+				for _, query := range queries {
+					want, found, child, err := LookupNode(node, query)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var got Entry
+					var gotFound bool
+					var gotChild page.ID
+					if forWAL {
+						got, gotFound, gotChild, err = LookupEncodedWALNode(pages[0], node.PageID(), query, pageSize, read)
+					} else {
+						got, gotFound, gotChild, err = LookupMappedNode(pages[0], node.PageID(), query, read)
+					}
+					if err != nil || gotFound != found || gotChild != child || (found && (got.flags != want.flags || !bytes.Equal(got.key, want.key) || !bytes.Equal(got.value, want.value))) {
+						t.Fatalf("lookup %q: found=%v child=%d error=%v", query, gotFound, gotChild, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestNodePages_RejectsTooSmallContinuedPage checks a valid checksum with a
+// continued header that cannot hold a page ID. Full decode must return an error.
+func TestNodePages_RejectsTooSmallContinuedPage(t *testing.T) {
+	for _, branch := range []bool{false, true} {
+		data := make([]byte, 27)
+		kind := NodeTypeLeaf
+		if branch {
+			kind = NodeTypeBranch
+		}
+		binary.LittleEndian.PutUint16(data[:2], uint16(kind|overflowNodeFlag))
+		binary.LittleEndian.PutUint64(data[2:10], 8)
+		binary.LittleEndian.PutUint32(data[18:22], 80)
+		binary.LittleEndian.PutUint32(data[14:18], pageChecksum(data, 27, nodeChecksumOffset))
+		read := func(page.ID) ([]byte, error) {
+			t.Fatal("invalid first page followed an ID")
+			return nil, ErrInvalid
+		}
+		if _, err := DecodeNode(data, 8, 27, read); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("decode small continued page: %v", err)
+		}
+		if _, _, _, err := LookupMappedNode(data, 8, []byte("key"), read); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("lookup small continued page: %v", err)
+		}
+	}
+}
+
+// TestVisitContinuedNodeReferences checks child and storage ownership at page boundaries.
+func TestVisitContinuedNodeReferences(t *testing.T) {
+	for _, pageSize := range []int64{35, 64, 128, 4096} {
+		for _, forWAL := range []bool{false, true} {
+			for _, branch := range []bool{false, true} {
+				t.Run(fmt.Sprintf("size=%d/WAL=%t/branch=%t", pageSize, forWAL, branch), func(t *testing.T) {
+					node := NewLeafNode(7)
+					expected := []page.ID{9}
+					if branch {
+						node = NewRootNode(7, NewLeafNode(3), NewLeafNode(4), bytes.Repeat([]byte("a"), int(pageSize)+7))
+						node.InsertSplitChild(1, NewLeafNode(5), bytes.Repeat([]byte("z"), int(pageSize)+7))
+						expected = []page.ID{3, 4, 5}
+					} else {
+						if err := node.InsertEntry(NewEntry(BucketLeafFlag, bytes.Repeat([]byte("a"), int(pageSize)+7), page.EncodeID(9))); err != nil {
+							t.Fatal(err)
+						}
+						if err := node.InsertEntry(NewEntry(0, bytes.Repeat([]byte("z"), int(pageSize)+7), bytes.Repeat([]byte("v"), 10*int(pageSize)))); err != nil {
+							t.Fatal(err)
+						}
+					}
+					ids := make([]page.ID, NodePageCount(node, pageSize))
+					ids[0] = 7
+					for i := 1; i < len(ids); i++ {
+						ids[i] = page.ID(20 + i*11)
+					}
+					var images [][]byte
+					var err error
+					if forWAL {
+						images, err = EncodeWALNodePages(node, pageSize, ids)
+					} else {
+						images, err = EncodeNodePages(node, pageSize, ids)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					pages := make(map[page.ID][]byte, len(ids))
+					for i, id := range ids {
+						pages[id] = images[i]
+					}
+					read := func(id page.ID) ([]byte, error) {
+						data, ok := pages[id]
+						if !ok {
+							return nil, ErrInvalid
+						}
+						return data, nil
+					}
+					var children, continuations []page.ID
+					visit := func(id page.ID) error { children = append(children, id); return nil }
+					own := func(id page.ID) error { continuations = append(continuations, id); return nil }
+					check := func() error {
+						children, continuations = nil, nil
+						if forWAL {
+							return VisitWALNodeReferences(images[0], 7, pageSize, read, visit, own)
+						}
+						return VisitMappedNodeReferences(images[0], 7, pageSize, read, visit, own)
+					}
+					if err := check(); err != nil {
+						t.Fatal(err)
+					}
+					if !slices.Equal(children, expected) || !slices.Equal(continuations, ids[1:]) {
+						t.Fatalf("children=%v, continuation IDs=%v", children, continuations)
+					}
+					// Missing value pages must fail even when no nested root is stored there.
+					last := ids[len(ids)-1]
+					saved := pages[last]
+					delete(pages, last)
+					if err := check(); err == nil {
+						t.Fatal("visitor accepted a missing continuation")
+					}
+					pages[last] = saved
+					if !forWAL {
+						pages[last] = bytes.Clone(saved)
+						pages[last][len(saved)-1] ^= 1
+						if err := check(); !errors.Is(err, page.ErrChecksum) {
+							t.Fatalf("damaged continuation: %v", err)
+						}
+						pages[last] = saved
+					}
+					if err := check(); err != nil {
+						t.Fatal(err)
+					}
+					stop := errors.New("stop ownership visit")
+					if forWAL {
+						err = VisitWALNodeReferences(images[0], 7, pageSize, read, visit, func(page.ID) error { return stop })
+					} else {
+						err = VisitMappedNodeReferences(images[0], 7, pageSize, read, visit, func(page.ID) error { return stop })
+					}
+					if !errors.Is(err, stop) {
+						t.Fatalf("callback error: %v", err)
+					}
+					// Valid checksums cannot make duplicate keys a valid node body.
+					node.entries[1].key = bytes.Clone(node.entries[0].key)
+					if forWAL {
+						images, err = EncodeWALNodePages(node, pageSize, ids)
+					} else {
+						images, err = EncodeNodePages(node, pageSize, ids)
+					}
+					if err != nil {
+						t.Fatal(err)
+					}
+					for i, id := range ids {
+						pages[id] = images[i]
+					}
+					if err := check(); !errors.Is(err, ErrInvalid) {
+						t.Fatalf("duplicate keys: %v", err)
+					}
+
+				})
+			}
+		}
 	}
 }

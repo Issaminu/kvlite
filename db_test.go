@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,6 +31,219 @@ import (
 
 var testBucketName = []byte("test-data")
 var errDiscardTx = errors.New("discard transaction")
+
+func TestContinuedMainFileReads(t *testing.T) {
+	for _, testCase := range []struct {
+		mapped, fromWAL bool
+	}{{true, false}, {false, false}, {true, true}, {false, true}} {
+		mapped, fromWAL := testCase.mapped, testCase.fromWAL
+		t.Run(fmt.Sprintf("mapped=%t/WAL=%t", mapped, fromWAL), func(t *testing.T) {
+			path, bucketName, entries, _ := writeContinuedReadDatabase(t)
+			db, err := Open(path, 0600, &Options{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if fromWAL {
+				// WAL values differ from the main file. Get must use the WAL tree.
+				for _, id := range []page.ID{db.meta.Root(), 4, 5, 6} {
+					data, err := db.readMainPage(id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					node, err := btree.DecodeNode(bytes.Clone(data), id, db.meta.PageSize(), db.readMainPage)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if id == 5 || id == 6 {
+						for index := 0; index < node.EntryCount(); index++ {
+							node.EntryAt(index).Value()[0] ^= 1
+						}
+					}
+					ids := append([]page.ID{id}, node.OverflowPages()...)
+					images, err := btree.EncodeWALNodePages(node, db.meta.PageSize(), ids)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for index, pageID := range ids {
+						db.wal.LoadCommittedRecord(wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: pageID}, Payload: images[index]})
+					}
+				}
+				for _, entry := range entries {
+					entry.Value()[0] ^= 1
+				}
+			}
+			if !mapped {
+				if err := db.unmapMainFile(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, entry := range entries {
+				value, err := db.Get(bucketName, entry.Key())
+				if err != nil || !bytes.Equal(value, entry.Value()) {
+					t.Fatalf("Get(%q): got %q, %v", entry.Key(), value, err)
+				}
+				value[0] ^= 1
+				again, err := db.Get(bucketName, entry.Key())
+				if err != nil || !bytes.Equal(again, entry.Value()) {
+					t.Fatalf("Get result changed stored bytes: %v", err)
+				}
+			}
+			if _, err := db.Get(bucketName, []byte("missing")); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("missing key: %v", err)
+			}
+			// Point reads must not decode the bucket's branch or leaves.
+			if len(db.writeNodes) != 1 {
+				t.Fatalf("point reads cached %d nodes, want only the catalog root", len(db.writeNodes))
+			}
+			if err := db.View(func(tx *Tx) error {
+				bucket := mustBucket(t, tx, bucketName)
+				for _, entry := range entries {
+					value, err := bucket.Get(entry.Key())
+					if err != nil || !bytes.Equal(value, entry.Value()) {
+						t.Fatalf("Bucket.Get(%q): %v", entry.Key(), err)
+					}
+				}
+				cursor, err := bucket.Cursor()
+				if err != nil {
+					return err
+				}
+				key, value, err := cursor.First()
+				for _, entry := range entries {
+					if err != nil || !bytes.Equal(key, entry.Key()) || !bytes.Equal(value, entry.Value()) {
+						t.Fatalf("forward cursor: got %q, %v", key, err)
+					}
+					key, value, err = cursor.Next()
+				}
+				if err != nil || key != nil {
+					t.Fatalf("cursor end: got %q, %v", key, err)
+				}
+				key, value, err = cursor.Last()
+				for index := len(entries) - 1; index >= 0; index-- {
+					entry := entries[index]
+					if err != nil || !bytes.Equal(key, entry.Key()) || !bytes.Equal(value, entry.Value()) {
+						t.Fatalf("reverse cursor: got %q, %v", key, err)
+					}
+					key, value, err = cursor.Prev()
+				}
+				if err != nil || key != nil {
+					t.Fatalf("cursor start: got %q, %v", key, err)
+				}
+				key, value, err = cursor.Seek(entries[1].Key())
+				if err != nil || !bytes.Equal(key, entries[1].Key()) || !bytes.Equal(value, entries[1].Value()) {
+					t.Fatalf("cursor seek: got %q, %v", key, err)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestContinuedMainFileReadsRejectDamagedPage(t *testing.T) {
+	path, bucketName, entries, continuationID := writeContinuedReadDatabase(t)
+	file, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Change body bytes without updating the continuation page's checksum.
+	if _, err := file.WriteAt([]byte{0xff}, int64(continuationID)*64+63); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Get(bucketName, entries[1].Key()); !errors.Is(err, ErrChecksum) {
+		t.Fatalf("damaged mapped value: got %v, want checksum error", err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		cursor, err := mustBucket(t, tx, bucketName).Cursor()
+		if err != nil {
+			return err
+		}
+		_, _, err = cursor.Last()
+		return err
+	}); !errors.Is(err, ErrChecksum) {
+		t.Fatalf("damaged decoded leaf: got %v, want checksum error", err)
+	}
+}
+
+// writeContinuedReadDatabase writes a catalog, a branch, and two leaves.
+// The catalog, branch, and right leaf need continuation pages. The small
+// pages force several ID groups. Storage IDs have gaps and change direction.
+// This fixture tests reads independently of the pending insertion/WAL work.
+func writeContinuedReadDatabase(t *testing.T) (string, []byte, []btree.Entry, page.ID) {
+	t.Helper()
+	const pageSize int64 = 64
+	path := filepath.Join(t.TempDir(), "continued.db")
+	bucketName := bytes.Repeat([]byte("b"), 128)
+	entries := []btree.Entry{
+		btree.NewEntry(0, []byte("a"), []byte("left")),
+		btree.NewEntry(0, bytes.Repeat([]byte("m"), 128), bytes.Repeat([]byte("v"), 1500)),
+		btree.NewEntry(0, []byte("z"), []byte("last")),
+	}
+	meta := page.NewMeta(pageSize)
+	catalog := btree.NewLeafNode(meta.Root())
+	left, right := btree.NewLeafNode(5), btree.NewLeafNode(6)
+	for index, entry := range entries {
+		node := right
+		if index == 0 {
+			node = left
+		}
+		if err := node.InsertEntry(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	branch := btree.NewRootNode(4, left, right, entries[1].Key())
+	if err := catalog.InsertEntry(btree.NewEntry(btree.BucketLeafFlag, bucketName, page.EncodeID(branch.PageID()))); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	write := func(id page.ID, data []byte) {
+		if _, err := file.WriteAt(data, int64(id)*pageSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+	allocation := newAllocationBitmap(pageSize)
+	nextID := page.ID(7)
+	var damagedPageID page.ID
+	for _, node := range []*btree.Node{catalog, branch, left, right} {
+		ids := make([]page.ID, btree.NodePageCount(node, pageSize))
+		ids[0] = node.PageID()
+		for index := 1; index < len(ids); index++ {
+			ids[index] = nextID
+			nextID = 7 + (nextID-7+73)%300
+		}
+		encoded, err := btree.EncodeNodePages(node, pageSize, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for index, id := range ids {
+			write(id, encoded[index])
+			allocation.markAllocated(id)
+			meta.SetLastPage(max(meta.LastPage(), id))
+		}
+		if node == right {
+			damagedPageID = ids[len(ids)-1]
+		}
+	}
+	write(firstAllocationSegmentID, allocation.encodeSegment(0))
+	meta.RefreshChecksum()
+	for _, id := range []page.ID{page.Meta0ID, page.Meta1ID} {
+		write(id, page.EncodeMeta(meta))
+	}
+	return path, bucketName, entries, damagedPageID
+}
 
 func TestMakeWALCommitData_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 	meta := page.NewMeta(4096)
@@ -610,14 +824,14 @@ func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rejectedKey := []byte("too-large")
-	rejectedValue := bytes.Repeat([]byte("v"), int(db.meta.PageSize()))
+	rejectedKey := bytes.Repeat([]byte("k"), MaxKeySize+1)
+	rejectedValue := []byte("value")
 	err = db.Update(func(tx *Tx) error {
 		bucket := mustBucket(t, tx, testBucketName)
 		beforeMeta := page.EncodeMeta(tx.meta)
 
-		if err := bucket.Put(rejectedKey, rejectedValue); !errors.Is(err, ErrEntryTooLargeForPage) {
-			t.Fatalf("oversized Put: got %v, want ErrEntryTooLargeForPage", err)
+		if err := bucket.Put(rejectedKey, rejectedValue); !errors.Is(err, ErrKeyTooLarge) {
+			t.Fatalf("oversized Put: got %v, want ErrKeyTooLarge", err)
 		}
 		if afterMeta := page.EncodeMeta(tx.meta); !bytes.Equal(afterMeta, beforeMeta) {
 			t.Fatal("rejected Put changed transaction metadata")
@@ -629,8 +843,8 @@ func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := db.Get(testBucketName, rejectedKey); !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("rejected key lookup: got %v, want ErrKeyNotFound", err)
+	if _, err := db.Get(testBucketName, rejectedKey); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("rejected key lookup: got %v, want ErrKeyTooLarge", err)
 	}
 	if got, err := db.Get(testBucketName, []byte("good")); err != nil || !bytes.Equal(got, []byte("value")) {
 		t.Fatalf("valid write after rejected Put: got %q, err %v", got, err)
@@ -5209,39 +5423,51 @@ func TestWAL_OverlayRecordsCarryCommittedTxid(t *testing.T) {
 	}
 }
 
-// TestPut_EntryTooLargeForPageReturnsClearError checks the error for an entry that cannot fit in one page.
-func TestPut_EntryTooLargeForPageReturnsClearError(t *testing.T) {
-	path := tempfile()
+// TestPut_EntryBeyondOnePage checks that a value can use continuation pages.
+func TestPut_EntryBeyondOnePage(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
 	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-
-	huge := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
-	if err := db.Put(testBucketName, []byte("k"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
-		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
+	value := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
+	if err := db.Put(testBucketName, []byte("k"), value); err != nil {
+		t.Fatal(err)
+	}
+	got, err := db.Get(testBucketName, []byte("k"))
+	if err != nil || !bytes.Equal(got, value) {
+		t.Fatalf("large value: length=%d, error=%v", len(got), err)
 	}
 }
 
-func TestPut_EntryTooLargeForPageDoesNotChangeDatabase(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-	defer os.RemoveAll(path + "-wal")
-
+func TestPut_KeyTooLargeDoesNotChangeDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
 	db, err := openDB(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-
-	huge := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
-	if err := db.Put(testBucketName, []byte("large"), huge); !errors.Is(err, ErrEntryTooLargeForPage) {
-		t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
+	before := page.EncodeMeta(db.meta)
+	key := bytes.Repeat([]byte("k"), MaxKeySize+1)
+	if err := db.Put(testBucketName, key, []byte("value")); !errors.Is(err, ErrKeyTooLarge) {
+		t.Fatalf("Put: %v", err)
 	}
-
-	if _, err := db.Get(testBucketName, []byte("large")); !errors.Is(err, ErrKeyNotFound) {
-		t.Fatalf("failed Put changed the database: expected ErrKeyNotFound, got %v", err)
+	if !bytes.Equal(before, page.EncodeMeta(db.meta)) {
+		t.Fatal("rejected Put changed metadata")
+	}
+	if err := db.View(func(tx *Tx) error {
+		cursor, err := mustBucket(t, tx, testBucketName).Cursor()
+		if err != nil {
+			return err
+		}
+		key, _, err := cursor.First()
+		if key != nil {
+			t.Fatal("rejected Put added an entry")
+		}
+		return err
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -6396,10 +6622,10 @@ func TestAudit_RejectedTxPutDoesNotChangeReadableState(t *testing.T) {
 	}
 	defer db.Close()
 
-	large := bytes.Repeat([]byte("x"), int(db.meta.PageSize()))
+	large := bytes.Repeat([]byte("x"), MaxKeySize+1)
 	err = db.Update(func(tx *Tx) error {
-		if err := mustBucket(t, tx, testBucketName).Put([]byte("rejected"), large); !errors.Is(err, ErrEntryTooLargeForPage) {
-			t.Fatalf("expected ErrEntryTooLargeForPage, got %v", err)
+		if err := mustBucket(t, tx, testBucketName).Put(large, nil); !errors.Is(err, ErrKeyTooLarge) {
+			t.Fatalf("expected ErrKeyTooLarge, got %v", err)
 		}
 		return nil
 	})
@@ -7135,4 +7361,903 @@ func TestDeleteBatchRejectsBucketAndRollsBack(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// TestPut_ContinuedTree covers leaf and branch writes through both commit paths.
+func TestPut_ContinuedTree(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncFull} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "continued.db")
+			options := &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30}
+			db, err := Open(path, 0600, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { db.Close() }()
+			keys := make([][]byte, 20)
+			values := make([][]byte, len(keys))
+			// The last value spans hundreds of continuation pages.
+			for i := range keys {
+				keys[i] = bytes.Repeat([]byte{byte('a' + i)}, MaxKeySize)
+				values[i] = bytes.Repeat([]byte{byte(i)}, 3*int(db.meta.PageSize())+i)
+			}
+			values[len(values)-1] = bytes.Repeat([]byte("v"), 520*int(db.meta.PageSize()))
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for i := range keys {
+					if err := bucket.Put(keys[i], values[i]); err != nil {
+						return err
+					}
+					got, err := bucket.Get(keys[i])
+					if err != nil || !bytes.Equal(got, values[i]) {
+						t.Fatalf("transaction read %d: %v", i, err)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			check := func() {
+				t.Helper()
+				for i := range keys {
+					got, err := db.Get(testBucketName, keys[i])
+					if err != nil || !bytes.Equal(got, values[i]) {
+						t.Fatalf("Get %d: length=%d, error=%v", i, len(got), err)
+					}
+				}
+				if err := db.View(func(tx *Tx) error {
+					bucket := mustBucket(t, tx, testBucketName)
+					cursor, err := bucket.Cursor()
+					if err != nil {
+						return err
+					}
+					index := 0
+					for key, value, err := cursor.First(); key != nil || err != nil; key, value, err = cursor.Next() {
+						if err != nil {
+							return err
+						}
+						if index >= len(keys) || !bytes.Equal(key, keys[index]) || !bytes.Equal(value, values[index]) {
+							t.Fatalf("cursor entry %d differs", index)
+						}
+						index++
+					}
+					if index != len(keys) {
+						t.Fatalf("cursor count: %d", index)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			check()
+			oldBranches := make(map[page.ID][]page.ID)
+			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+				if !node.IsLeaf() {
+					oldBranches[node.PageID()] = slices.Clone(node.OverflowPages())
+				}
+			})
+			// Another leaf split grows a committed branch with large separator keys.
+			key := bytes.Repeat([]byte("z"), MaxKeySize)
+			value := []byte("last")
+			if err := db.Put(testBucketName, key, value); err != nil {
+				t.Fatal(err)
+			}
+			keys, values = append(keys, key), append(values, value)
+			grew := false
+			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+				previous, found := oldBranches[node.PageID()]
+				if !found {
+					return
+				}
+				ids := node.OverflowPages()
+				kept := min(len(ids), len(previous))
+				if !slices.Equal(ids[:kept], previous[:kept]) {
+					t.Fatal("branch update replaced existing continuation IDs")
+				}
+				grew = grew || len(ids) > len(previous)
+				delete(oldBranches, node.PageID())
+			})
+			if !grew || len(oldBranches) != 0 {
+				t.Fatalf("branch growth=%t, missing original branches=%d", grew, len(oldBranches))
+			}
+			check()
+			leaves, branches := 0, 0
+			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+				if len(node.OverflowPages()) == 0 {
+					t.Fatal("large node has no continuation pages")
+				}
+				if node.IsLeaf() {
+					leaves++
+				} else {
+					branches++
+					if len(node.Children) < 2 {
+						t.Fatal("branch has fewer than two children")
+					}
+				}
+			})
+			if leaves != len(keys) || branches < 2 {
+				t.Fatalf("tree shape: %d leaves, %d branches", leaves, branches)
+			}
+			// Rebuild encoded WAL records. Cached decoded nodes must not hide read errors.
+			records, err := db.wal.ReadRecords()
+			if err != nil {
+				t.Fatal(err)
+			}
+			committed, err := committedWALRecords(records)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.wal.ClearCommittedRecordsForTesting()
+			if err := db.loadCommittedIntoOverlay(committed); err != nil {
+				t.Fatal(err)
+			}
+			check()
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			check()
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err = Open(path, 0600, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			check()
+		})
+	}
+}
+
+// TestPut_ContinuationPageOwnership checks growth, splits, replacement, and reuse.
+func TestPut_ContinuationPageOwnership(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncFull} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.Update(func(tx *Tx) error {
+				_, err := tx.CreateBucket(testBucketName)
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			small := []byte("small")
+			large := bytes.Repeat([]byte("v"), 3*int(db.meta.PageSize()))
+			put := func(key string, value []byte) {
+				t.Helper()
+				if err := db.Put(testBucketName, []byte(key), value); err != nil {
+					t.Fatal(err)
+				}
+				got, err := db.Get(testBucketName, []byte(key))
+				if err != nil || !bytes.Equal(got, value) {
+					t.Fatalf("Get %s: %v", key, err)
+				}
+			}
+			findLeaf := func(key string) *btree.Node {
+				t.Helper()
+				node := mustBucketRoot(t, db, testBucketName)
+				for !node.IsLeaf() {
+					_, _, child, err := btree.LookupNode(node, []byte(key))
+					if err != nil {
+						t.Fatal(err)
+					}
+					node, err = db.readNode(child)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				return node
+			}
+			checkReleased := func(ids []page.ID) {
+				t.Helper()
+				for _, id := range ids {
+					if db.allocation.allocated(id) {
+						t.Fatalf("old continuation %d is still allocated", id)
+					}
+					if _, ok := db.wal.Lookup(id); ok {
+						t.Fatalf("old continuation %d is still in the WAL view", id)
+					}
+				}
+			}
+			put("a", small)
+			head := findLeaf("a").PageID()
+			put("a", large)
+			first := findLeaf("a")
+			if first.PageID() != head || len(first.OverflowPages()) == 0 {
+				t.Fatal("growth changed first page or omitted continuation pages")
+			}
+			old := slices.Clone(first.OverflowPages())
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			last := db.meta.LastPage()
+			reusedBefore, retiredBefore := db.stats.PagesReused, db.stats.PagesRetired
+			replacement := bytes.Repeat([]byte("r"), len(large))
+			put("a", replacement)
+			if !slices.Equal(findLeaf("a").OverflowPages(), old) {
+				t.Fatal("same-size replacement changed continuation IDs")
+			}
+			if db.meta.LastPage() != last || db.stats.PagesReused != reusedBefore || db.stats.PagesRetired != retiredBefore {
+				t.Fatal("same-size replacement changed allocation state")
+			}
+			if !slices.Equal(first.OverflowPages(), old) {
+				t.Fatal("replacement changed the original node's IDs")
+			}
+			put("b", large)
+			if !slices.Equal(findLeaf("a").OverflowPages(), old) {
+				t.Fatal("split replaced the left node's continuation IDs")
+			}
+			first = findLeaf("a")
+			if first.PageID() != head {
+				t.Fatal("split changed the left page ID")
+			}
+			old = slices.Clone(first.OverflowPages())
+			put("a", small)
+			first = findLeaf("a")
+			if first.PageID() != head || len(first.OverflowPages()) != 0 {
+				t.Fatal("shrink kept continuation pages or changed first page")
+			}
+			checkReleased(old)
+			second := findLeaf("b")
+			secondHead := second.PageID()
+			secondOld := slices.Clone(second.OverflowPages())
+			// Keep existing IDs and append reused low IDs. The list must have a gap.
+			larger := bytes.Repeat([]byte("w"), 6*int(db.meta.PageSize()))
+			put("b", larger)
+			second = findLeaf("b")
+			if second.PageID() != secondHead {
+				t.Fatal("replacement changed first page")
+			}
+			ids := second.OverflowPages()
+			if len(ids) <= len(secondOld) || !slices.Equal(ids[:len(secondOld)], secondOld) {
+				t.Fatal("growth replaced existing continuation IDs")
+			}
+			reused, gap := false, false
+			for i, id := range ids {
+				if slices.Contains(old, id) {
+					reused = true
+				}
+				if i > 0 && id != ids[i-1]+1 {
+					gap = true
+				}
+				if !db.allocation.allocated(id) {
+					t.Fatalf("new continuation %d is free", id)
+				}
+			}
+			if !reused || !gap {
+				t.Fatalf("reuse=%t, non-consecutive IDs=%t", reused, gap)
+			}
+			old = slices.Clone(ids)
+			put("b", bytes.Repeat([]byte("s"), 2*int(db.meta.PageSize())))
+			kept := slices.Clone(findLeaf("b").OverflowPages())
+			if len(kept) == 0 || len(kept) >= len(old) || !slices.Equal(kept, old[:len(kept)]) {
+				t.Fatal("shrink replaced the kept continuation IDs")
+			}
+			checkReleased(old[len(kept):])
+			old = kept
+			put("b", small)
+			checkReleased(old)
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"a", "b"} {
+				value, err := db.Get(testBucketName, []byte(key))
+				if err != nil || !bytes.Equal(value, small) {
+					t.Fatalf("checkpoint read %s: %v", key, err)
+				}
+			}
+		})
+	}
+}
+
+// TestPut_ContinuedCommitFailure keeps the old data and allocation state on failure.
+func TestPut_ContinuedCommitFailure(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("key"), []byte("small"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	small := []byte("small")
+	large := bytes.Repeat([]byte("v"), 3*int(db.meta.PageSize()))
+	replacement := bytes.Repeat([]byte("r"), len(large))
+	larger := bytes.Repeat([]byte("g"), 5*int(db.meta.PageSize()))
+	shorter := bytes.Repeat([]byte("s"), 2*int(db.meta.PageSize()))
+	for _, transition := range []struct{ before, after []byte }{{small, large}, {large, replacement}, {large, larger}, {large, shorter}, {large, small}} {
+		if err := db.Put(testBucketName, []byte("key"), transition.before); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.checkpointWAL(); err != nil {
+			t.Fatal(err)
+		}
+		root := mustBucketRoot(t, db, testBucketName)
+		original, err := db.readNode(root.PageID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids := slices.Clone(original.OverflowPages())
+		meta := page.EncodeMeta(db.meta)
+		db.wal.SetSyncFileForTesting(func() error { return errDiscardTx })
+		err = db.Put(testBucketName, []byte("key"), transition.after)
+		db.wal.SetSyncFileForTesting(nil)
+		if !errors.Is(err, errDiscardTx) {
+			t.Fatalf("commit error: %v", err)
+		}
+		got, err := db.Get(testBucketName, []byte("key"))
+		if err != nil || !bytes.Equal(got, transition.before) {
+			t.Fatalf("failed commit changed readable bytes: %v", err)
+		}
+		current, err := db.readNode(root.PageID())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids, current.OverflowPages()) || !bytes.Equal(meta, page.EncodeMeta(db.meta)) {
+			t.Fatal("failed commit changed page ownership or metadata")
+		}
+		for _, id := range ids {
+			if !db.allocation.allocated(id) {
+				t.Fatalf("failed commit freed continuation %d", id)
+			}
+		}
+	}
+}
+
+// TestPut_ContinuedWriteBatch commits successful callbacks and drops a failed one.
+func TestPut_ContinuedWriteBatch(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	first := bytes.Repeat([]byte("a"), 3*int(db.meta.PageSize()))
+	final := bytes.Repeat([]byte("b"), 4*int(db.meta.PageSize()))
+	callbacks := []func(*Tx) error{
+		func(tx *Tx) error {
+			bucket, err := tx.CreateBucket(testBucketName)
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte("a"), first)
+		},
+		func(tx *Tx) error {
+			bucket := mustBucket(t, tx, testBucketName)
+			if err := bucket.Put([]byte("a"), final); err != nil {
+				return err
+			}
+			if err := bucket.Put([]byte("discarded"), final); err != nil {
+				return err
+			}
+			return errDiscardTx
+		},
+		func(tx *Tx) error {
+			bucket := mustBucket(t, tx, testBucketName)
+			got, err := bucket.Get([]byte("a"))
+			if err != nil || !bytes.Equal(got, first) {
+				t.Fatalf("failed callback changed batch state: %v", err)
+			}
+			if err := bucket.Put([]byte("a"), final); err != nil {
+				return err
+			}
+			return bucket.Put([]byte("b"), final)
+		},
+	}
+	requests := make([]*writeRequest, len(callbacks))
+	for i, callback := range callbacks {
+		requests[i] = &writeRequest{transaction: callback, result: make(chan writeResult, 1)}
+	}
+	syncs := 0
+	db.wal.SetSyncFileForTesting(func() error { syncs++; return nil })
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	db.wal.SetSyncFileForTesting(nil)
+	if syncs != 1 {
+		t.Fatalf("batch sync count: %d", syncs)
+	}
+	for i, request := range requests {
+		result := <-request.result
+		if i == 1 {
+			if !errors.Is(result.err, errDiscardTx) {
+				t.Fatalf("failed callback error: %v", result.err)
+			}
+		} else if result.err != nil {
+			t.Fatal(result.err)
+		}
+	}
+	for _, key := range []string{"a", "b"} {
+		got, err := db.Get(testBucketName, []byte(key))
+		if err != nil || !bytes.Equal(got, final) {
+			t.Fatalf("batch Get %s: %v", key, err)
+		}
+	}
+	if _, err := db.Get(testBucketName, []byte("discarded")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("failed callback key: %v", err)
+	}
+}
+
+// TestDelete_ContinuedTree releases removed leaves and branches and repairs the root.
+func TestDelete_ContinuedTree(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%t", batch), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			keys := make([][]byte, 12)
+			value := bytes.Repeat([]byte("v"), 3*int(db.meta.PageSize()))
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for i := range keys {
+					keys[i] = bytes.Repeat([]byte{byte('a' + i)}, MaxKeySize)
+					if err := bucket.Put(keys[i], value); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			remaining := make([]bool, len(keys))
+			for i := range remaining {
+				remaining[i] = true
+			}
+			order := []int{0, 11, 5, 6, 1, 10, 2, 9, 3, 8, 4, 7}
+			for offset := 0; offset < len(order); {
+				count := 1
+				if batch {
+					count = 2
+				}
+				deleted := make([][]byte, count)
+				for i := range deleted {
+					deleted[i] = keys[order[offset+i]]
+					remaining[order[offset+i]] = false
+				}
+				if err := db.Update(func(tx *Tx) error {
+					bucket := mustBucket(t, tx, testBucketName)
+					if batch {
+						return bucket.DeleteBatch(deleted)
+					}
+					return bucket.Delete(deleted[0])
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.validatePageOwnership(); err != nil {
+					t.Fatal(err)
+				}
+				for i, key := range keys {
+					got, err := db.Get(testBucketName, key)
+					if remaining[i] {
+						if err != nil || !bytes.Equal(got, value) {
+							t.Fatalf("remaining key %d: %v", i, err)
+						}
+					} else if !errors.Is(err, ErrKeyNotFound) {
+						t.Fatalf("deleted key %d: %v", i, err)
+					}
+				}
+				offset += count
+			}
+			root := mustBucketRoot(t, db, testBucketName)
+			if !root.IsLeaf() || root.EntryCount() != 0 || len(root.OverflowPages()) != 0 {
+				t.Fatal("empty bucket did not become a normal leaf")
+			}
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestDeleteBucket_ContinuedPages checks mapped, WAL, and private node ownership.
+func TestDeleteBucket_ContinuedPages(t *testing.T) {
+	for _, checkpoint := range []bool{false, true} {
+		t.Run(fmt.Sprintf("checkpoint=%t", checkpoint), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { db.Close() }()
+			value := bytes.Repeat([]byte("v"), 3*int(db.meta.PageSize()))
+			if err := db.Update(func(tx *Tx) error {
+				parent, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				child, err := parent.CreateBucket([]byte("child"))
+				if err != nil {
+					return err
+				}
+				grandchild, err := child.CreateBucket(bytes.Repeat([]byte("z"), MaxKeySize))
+				if err != nil {
+					return err
+				}
+				for i := 0; i < 8; i++ {
+					key := bytes.Repeat([]byte{byte('a' + i)}, MaxKeySize)
+					if err := child.Put(key, value); err != nil {
+						return err
+					}
+					if err := grandchild.Put(key, value); err != nil {
+						return err
+					}
+				}
+				_, err = tx.CreateBucket([]byte("keep"))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if checkpoint {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(path, 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := db.allocation.allocatedPageCount()
+			// A failed callback must keep every page owned by the nested tree.
+			err = db.Update(func(tx *Tx) error {
+				parent := mustBucket(t, tx, testBucketName)
+				if err := parent.DeleteBucket([]byte("child")); err != nil {
+					return err
+				}
+				return errDiscardTx
+			})
+			if !errors.Is(err, errDiscardTx) {
+				t.Fatalf("rollback: %v", err)
+			}
+			if db.allocation.allocatedPageCount() != before {
+				t.Fatal("rollback changed allocation")
+			}
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
+			}
+			db.wal.SetSyncFileForTesting(func() error { return errDiscardTx })
+			err = db.Update(func(tx *Tx) error { return mustBucket(t, tx, testBucketName).DeleteBucket([]byte("child")) })
+			db.wal.SetSyncFileForTesting(nil)
+			if !errors.Is(err, errDiscardTx) {
+				t.Fatalf("failed sync: %v", err)
+			}
+			if db.allocation.allocatedPageCount() != before {
+				t.Fatal("failed sync changed allocation")
+			}
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				parent := mustBucket(t, tx, testBucketName)
+				child, err := parent.Bucket([]byte("child"))
+				if err != nil {
+					return err
+				}
+				// Visit a changed private leaf before the whole nested bucket is removed.
+				if err := child.Put(bytes.Repeat([]byte("a"), MaxKeySize), []byte("changed")); err != nil {
+					return err
+				}
+				return parent.DeleteBucket([]byte("child"))
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if db.allocation.allocatedPageCount() >= before {
+				t.Fatal("bucket deletion did not release pages")
+			}
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// TestRecovery_ContinuedDeletesAndReuse replays file snapshots before checkpoint.
+// It checks replay and commit-marker handling, not physical power-loss behavior.
+func TestRecovery_ContinuedDeletesAndReuse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	keys := make([][]byte, 8)
+	value := bytes.Repeat([]byte("v"), 3*int(db.meta.PageSize()))
+	if err := db.Update(func(tx *Tx) error {
+		keep, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		remove, err := tx.CreateBucket([]byte("remove"))
+		if err != nil {
+			return err
+		}
+		for i := range keys {
+			keys[i] = bytes.Repeat([]byte{byte('a' + i)}, MaxKeySize)
+			if err := keep.Put(keys[i], value); err != nil {
+				return err
+			}
+			if err := remove.Put(keys[i], value); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	base, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		if err := mustBucket(t, tx, testBucketName).DeleteBatch(keys[1:7]); err != nil {
+			return err
+		}
+		return tx.DeleteBucket([]byte("remove"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	reusedBefore := db.stats.PagesReused
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("replacement"))
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("key"), value)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if db.stats.PagesReused <= reusedBefore {
+		t.Fatal("replacement did not reuse freed pages")
+	}
+	log, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Keep the WAL after writing main-file pages to test interrupted cleanup.
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readOnlyWAL, err := os.Open(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.wal.ReplaceFileForTesting(readOnlyWAL)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	afterCheckpoint, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retainedLog, err := os.ReadFile(path + "-wal")
+	if err != nil || !bytes.Equal(retainedLog, log) {
+		t.Fatalf("checkpoint changed the retained WAL: %v", err)
+	}
+	partial := bytes.Clone(base)
+	boundary := len(afterCheckpoint) / int(db.meta.PageSize()) / 2 * int(db.meta.PageSize())
+	copy(partial[:boundary], afterCheckpoint[:boundary])
+	for state, main := range [][]byte{base, partial, afterCheckpoint} {
+		for _, readOnly := range []bool{false, true} {
+			for _, committed := range []bool{false, true} {
+				if state != 0 && !committed {
+					continue
+				}
+				t.Run(fmt.Sprintf("main=%d/readOnly=%t/committed=%t", state, readOnly, committed), func(t *testing.T) {
+					crash := filepath.Join(t.TempDir(), "database")
+					replay := log
+					if !committed {
+						replay = log[:len(log)-wal.HeaderSize-wal.ChecksumSize]
+					}
+					if err := os.WriteFile(crash, main, 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(crash+"-wal", replay, 0600); err != nil {
+						t.Fatal(err)
+					}
+					recovered, err := Open(crash, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer recovered.Close()
+					for i, key := range keys {
+						got, err := recovered.Get(testBucketName, key)
+						if i == 0 || i == 7 {
+							if err != nil || !bytes.Equal(got, value) {
+								t.Fatalf("surviving key %d: %v", i, err)
+							}
+						} else if !errors.Is(err, ErrKeyNotFound) {
+							t.Fatalf("deleted key %d: %v", i, err)
+						}
+					}
+					if _, err := recovered.Get([]byte("remove"), keys[0]); !errors.Is(err, ErrBucketNotFound) {
+						t.Fatalf("deleted bucket: %v", err)
+					}
+					got, err := recovered.Get([]byte("replacement"), []byte("key"))
+					if committed {
+						if err != nil || !bytes.Equal(got, value) {
+							t.Fatalf("replacement: %v", err)
+						}
+					} else if !errors.Is(err, ErrBucketNotFound) {
+						t.Fatalf("uncommitted replacement: %v", err)
+					}
+					if err := recovered.validatePageOwnership(); err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		}
+	}
+}
+
+// TestDeleteBucket_ContinuedReadFailure keeps the bucket when a descendant is damaged.
+func TestDeleteBucket_ContinuedReadFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	options := &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30}
+	db, err := Open(path, 0600, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if db != nil {
+			db.Close()
+		}
+	}()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < 3; i++ {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%d", i), bytes.Repeat([]byte("v"), 3*int(tx.meta.PageSize()))); err != nil {
+				return err
+			}
+		}
+		_, err = tx.CreateBucket([]byte("keep"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var tail page.ID
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+		if node.IsLeaf() {
+			ids := node.OverflowPages()
+			tail = ids[len(ids)-1]
+		}
+	})
+	offset := int64(tail)*db.meta.PageSize() + btree.ContinuationHeaderSize
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var original [1]byte
+	if _, err := db.file.ReadAt(original[:], offset); err != nil {
+		t.Fatal(err)
+	}
+	damaged := []byte{original[0] ^ 1}
+	if _, err := db.file.WriteAt(damaged, offset); err != nil {
+		t.Fatal(err)
+	}
+	allocated, retired := db.allocation.allocatedPageCount(), db.stats.PagesRetired
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.DeleteBucket(testBucketName); !errors.Is(err, ErrChecksum) {
+			t.Fatalf("damaged descendant: %v", err)
+		}
+		if _, err := tx.Bucket(testBucketName); err != nil {
+			t.Fatalf("failed deletion removed the name: %v", err)
+		}
+		return mustBucket(t, tx, []byte("keep")).Put([]byte("after-error"), []byte("ok"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if db.allocation.allocatedPageCount() != allocated || db.stats.PagesRetired != retired {
+		t.Fatal("read failure retired pages")
+	}
+	if _, err := db.file.WriteAt(original[:], offset); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.DeleteBucket(testBucketName); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPut_MaxValueSize checks the declared limit through write, checkpoint, and reopen.
+// Run it separately with KVLITE_TEST_MAX_VALUE=1. It uses several GiB of memory.
+func TestPut_MaxValueSize(t *testing.T) {
+	if os.Getenv("KVLITE_TEST_MAX_VALUE") != "1" {
+		t.Skip("set KVLITE_TEST_MAX_VALUE=1 for the maximum-value test")
+	}
+	if strconv.IntSize < 64 {
+		t.Skip("the maximum-value test needs a 64-bit address space")
+	}
+	path := filepath.Join(t.TempDir(), "maximum.db")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if db != nil {
+			db.Close()
+		}
+	}()
+	if err := db.Update(func(tx *Tx) error { _, err := tx.CreateBucket(testBucketName); return err }); err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte("k"), MaxKeySize)
+	value := make([]byte, MaxValueSize+1)
+	before := page.EncodeMeta(db.meta)
+	if err := db.Put(testBucketName, key, value); !errors.Is(err, ErrValueTooLarge) {
+		t.Fatalf("value above limit: %v", err)
+	}
+	if !bytes.Equal(before, page.EncodeMeta(db.meta)) {
+		t.Fatal("rejected value changed metadata")
+	}
+	value = value[:MaxValueSize]
+	// Nonzero markers cross page and ID-array boundaries. The final byte stays zero.
+	for at := 0; at < len(value); at += 1 << 20 {
+		value[at] = byte(at>>20) + 1
+	}
+	value[len(value)-2] = 0x7f
+	table := crc32.MakeTable(crc32.Castagnoli)
+	expected := crc32.Checksum(value, table)
+	if err := db.Put(testBucketName, key, value); err != nil {
+		t.Fatal(err)
+	}
+	value = nil
+	check := func() {
+		t.Helper()
+		got, err := db.Get(testBucketName, key)
+		if err != nil || len(got) != MaxValueSize {
+			t.Fatalf("maximum read: length=%d, error=%v", len(got), err)
+		}
+		if crc32.Checksum(got, table) != expected {
+			t.Fatal("maximum value bytes differ")
+		}
+	}
+	check()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check()
 }

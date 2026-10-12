@@ -1,12 +1,24 @@
 # KVLite benchmark suite
 
-This suite compares KVLite, bbolt, and Redis at the caller API boundary. It uses fixed work and checks each durability mode before and after each timed write case.
+KVBench measures database operations through the public APIs of KVLite, bbolt, and Redis. Each engine receives the same keys, values, and operation sequence. The suite checks stored results and the configured write synchronization settings.
+
+A case defines one measurement, such as random reads with 128-byte values and one client. A client runs a sequence of database calls. Several clients can make calls at the same time.
+
+A workload selects operation groups, such as reads or writes. A scale selects cases, data sizes, and the number of samples.
+
+A fixture is the initial data loaded before measurement. One sample times the fixed operation sequence for one case.
+
+One round runs the selected engines and modes. A warm-up round runs first. Its samples do not enter the reported results.
+
+The durability mode selects whether a successful write waits for storage synchronization.
+
+KVLite and bbolt run inside the Go process. Redis uses a separate server and a network connection.
 
 The suite has three result groups:
 
-- Matched three-engine tests cover point operations, key deletion, transactions, enumeration, access distribution, latency, and storage size.
-- Ordered and native-bucket tests compare KVLite and bbolt. Redis does not provide the required ordered cursor or bucket API.
-- Life-cycle tests compare the two embedded engines. The Redis server life cycle does not fit inside the Go client benchmark.
+- All three engines run point operations, key deletion, transactions, scans, latency tests, and storage-size checks. A point operation reads or changes one key.
+- KVLite and bbolt also run ordered reads and bucket tests. A bucket contains named key/value entries. The Redis API does not provide these operations.
+- KVLite and bbolt run open, close, and recovery tests. These tests cannot measure the separate Redis server through a Go client call.
 
 See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-03 report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
 
@@ -77,9 +89,9 @@ The workload values have these meanings:
 - `writes` runs update, insert, delete, reuse, and space-recovery workloads.
 - `deletes` runs key delete, bucket delete, reuse, and space-recovery workloads.
 - `mixed` runs workloads that combine reads and writes.
-- `all` runs every workload, including life-cycle cases. It is the medium and large default.
+- `all` runs every group available at the selected scale. It is the medium and large default.
 
-The modifier selects measured work. Read fixtures still use the same durable setup before measurement. Options can appear in any order.
+The workload selects the operations to measure. The suite loads the initial data with write synchronization enabled. It then opens or configures the engine in the selected mode. Options can appear in any order.
 
 Select where the runner stores benchmark data:
 
@@ -93,15 +105,17 @@ The `storage` modifier is independent of the scale and workload. `tmpfs` uses co
 
 | Scale | Scope | Warm-up | Measurement | Default workload | Default storage | Use |
 | --- | --- | ---: | --- | --- | --- | --- |
-| `light` | One representative case from every comparison group | 1 | 3 rounds with 2 samples each | `focused` | `tmpfs` | Quick repeated comparison |
-| `medium` | A selected decision set from every comparison group | 1 | 10 fixed-work runs | `all` | `volume` | Repeated engineering comparisons |
-| `large` | Every case variant at the standard work size | 1 | 15 fixed-work runs | `all` | `volume` | Release and publication results |
+| `light` | Small case set; `focused` by default | 1 | 3 rounds with 2 samples each | `focused` | `tmpfs` | Quick repeated comparison |
+| `medium` | Selected cases from each group | 1 | 10 fixed-work runs | `all` | `volume` | Repeated engineering comparisons |
+| `large` | Complete case set for the selected workload | 1 | 15 fixed-work runs | `all` | `volume` | Release and publication results |
 
-The light scale compares the selected engines in Docker. It skips pre-run test passes. Its wider workloads use 1,000 records, 1,000 point reads, 100 point writes, 1,000 mixed operations, and 320 concurrent point writes. It runs one warm-up and records six samples for each selected engine and durability mode.
+The light scale skips the test runs that precede measurement at medium and large. The default `focused` workload measures point reads, combined writes, and point deletes. Use `--workloads=all` to include the other groups and large entries.
+
+The ordinary light cases use 1,000 stored records. They measure 1,000 point reads, 100 point writes, 1,000 mixed operations, or 320 writes across several clients. Large-entry cases use smaller data sets, as shown below. Light collects six samples per selected case and engine.
 
 The focused workload selects five data paths: random point read, random point update, random point insert, random 10-key batch update, and random point delete of an existing key with one client. Each sample uses at least 100,000 reads, 1,000 fixed write cycles, and 1,000 point deletes at the light scale. The three write paths run in one cycle and report one combined signal. Point deletes report a separate result. The cases run in durable and no-sync modes. KVLite, bbolt, and Redis run the same operations. Focused uses one CPU by default. `KVBENCH_CPUSET` can select a different CPU set. Mixed, scan, lifecycle, and collection work remain in the wider workloads. Use `light --workloads=focused` for quick repeated code-regression comparisons.
 
-The medium scale uses 3,000 records for its main cases. It uses 10,000 point reads, 200 single-client point writes, 640 concurrent point writes, and 2,000 mixed operations. It keeps 15 core cases. These cases cover misses, sequential and random reads, large values, value growth, inserts, updates, concurrency, mixed work, and batches.
+The ordinary medium cases use 3,000 stored records. They measure 10,000 point reads, 200 writes with one client, 640 writes across several clients, or 2,000 mixed operations. The core group has 15 ordinary cases and eight large-entry cases. The selected workload determines which cases run.
 
 The large scale uses the full case matrix. It uses 10,000 records, 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations.
 
@@ -119,7 +133,11 @@ The Docker scales use up to four CPUs by default. Advanced runs can set `KVBENCH
 
 The Docker runner builds the Go report tool in its pinned Go container. After the measured rounds, it writes `report.md`, `report.json`, `summary.csv`, `metrics.csv`, and `comparisons.csv` beside the raw result files. The short report lists up to five clear gains and losses for each matched engine and durability mode. It puts cases with overlapping observed ranges in a separate count. The JSON file keeps every sample. The CSV files show the mean, median, minimum, and maximum for each case and metric.
 
-The gain and loss values compare medians. Large gaps use a ratio instead of a percentage. A clear gap means the observed ranges do not overlap. It does not prove that a difference is stable. Check the raw samples and environment record before you make a performance claim. Cases without a matching peer have no comparison row. The report compares engines in one run. It does not compare two commits.
+Compare the same operation, key size, value size, client count, and batch size. For example, a read with a 64 KiB value returns 512 times as many value bytes as a read with a 128-byte value. Their times do not measure a code change. Use the same scale, storage mode, and environment when you compare two versions.
+
+The runner saves `git diff HEAD` and a source hash file. The patch includes staged and unstaged changes. The hashes identify the files used by the run. A run with local changes measures that source state. The commit ID alone does not identify its source.
+
+The gain and loss values compare medians. A median is the middle value after sorting the samples. For an even sample count, it is the mean of the two middle values. Large gaps use a ratio instead of a percentage. A clear gap means the observed ranges do not overlap. It does not prove that a difference is stable. Check the raw samples and environment record before you make a performance claim. Cases without a matching peer have no comparison row. The report compares engines in one run. It does not compare two commits.
 
 To profile every case selected by the scale, workload, durability modes, and engines, add `--profile`. For example:
 
@@ -131,6 +149,50 @@ To profile every case selected by the scale, workload, durability modes, and eng
 The runner finishes its normal unprofiled rounds first. It then runs each selected case again with CPU profiling, allocation profiling, and an execution trace. It repeats each profiled case once per measured round. The profiles cover the repeats together. The report divides sampled CPU time and allocated bytes by the number of repeats. Its short table shows the leading engine function for CPU self time, CPU inclusive time, and inclusive allocation. It hides CPU rankings below 200 ms of sampled CPU time across all repeats. It marks rankings below 1 second as limited. `report.json` lists up to three functions for each measure. Raw profiles, traces, wait files, and full function lists are under `profiles/`. Use them to inspect the complete call path. The report also includes the normal timing values and matched-engine comparisons. Without an explicit workload, a direct `--case` run uses `all`.
 
 Profiles include fixture setup, final checks, and profiling overhead. CPU samples estimate time spent on the CPU; trace wait profiles estimate blocked time. Neither gives exact time for each function call. The short report omits wait rankings because test and profiler activity can dominate them. Use the unprofiled rounds to measure speed changes. A Redis profile covers its Go client process, not the Redis server process.
+
+## Large-entry cases
+
+Large-entry cases measure keys or values that need more than one KVLite page. A continuation page stores part of the same leaf or branch node. These cases belong to the existing operation workloads.
+
+Run all light cases for KVLite and bbolt with disk-backed storage:
+
+```sh
+./run-docker.sh light --workloads=all --engines=kvlite,bbolt --storage=volume
+```
+
+Light includes 64 KiB value reads, updates, and deletes when their operation workload is selected. The `focused` workload excludes large entries. Medium and large add the cases in this table.
+
+| Workload | Large-entry cases at medium and large |
+| --- | --- |
+| `reads` | 64 KiB values; 1 MiB values; 32 KiB keys with 128-byte values |
+| `writes` | 64 KiB value updates and inserts; growth from 128 bytes to 64 KiB; shrink from 64 KiB to 128 bytes; large-value deletes |
+| `deletes` | Delete half the keys with 64 KiB values |
+| `mixed` | 95% reads and 5% updates with 64 KiB values |
+| `all` | Every case above |
+
+Each large-entry case uses one client. Each write or delete call changes one key. `BenchmarkAcknowledgedOperations` runs the reads, writes, and mixed cases. `BenchmarkDeleteOperations` runs the delete case. The suite checks the values that remain after deletion.
+
+The 64 KiB value cases and the 32 KiB key case use these work sizes. The read, write, and mixed counts are operations per sample. The delete count is half the initial record count.
+
+| Scale | Initial records | Reads | Writes | Mixed operations | Deletes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `light` | 32 | 200 | 100 | Not selected | 16 |
+| `medium` | 128 | 1,000 | 200 | 1,000 | 64 |
+| `large` | 512 | 5,000 | 1,000 | 5,000 | 256 |
+
+The write schedule can visit the same key more than once. A growth or shrink case changes a key's value size on its first update. Later updates of that key keep the new size.
+
+The 1 MiB value-read case uses 16 records and 200 reads at medium. It uses 64 records and 1,000 reads at large. Light excludes this case and the 32 KiB key case.
+
+The 32 KiB keys differ only in their final eight bytes. KVLite must compare their common first bytes across continuation pages to select the correct tree child.
+
+The suite loads the data, closes each embedded database, and reopens it before measurement. KVLite reads its main database file and verifies page checksums. Both KVLite and the bbolt adapter return a value copy. The caller can change that copy without changing the stored value. Redis receives the same keys and values, but its storage pages differ from those of the embedded engines.
+
+Use `--workloads=reads`, `writes`, `deletes`, or `mixed` to select one operation group. Use `--case` to select one exact case. For example, measure only the light 64 KiB value read:
+
+```sh
+./run-docker.sh light --engines=kvlite,bbolt --storage=volume --case=durable:BenchmarkAcknowledgedOperations/scale=light/durable/read/random/value=65536/clients=1
+```
 
 ## Fairness contract
 
@@ -229,14 +291,18 @@ KVLite can reuse free pages inside its file. Checkpoint can release a free file 
 
 ## Metrics
 
+Time metrics use nanoseconds. Rate metrics count completed work per second. Storage metrics use bytes.
+
+KVLite stores tree pages in its main database file. Its write-ahead log (WAL) records changes for recovery. Redis uses an append-only file (AOF) to record commands for recovery. bbolt has no separate log file. The storage metrics below count these files.
+
 | Metric                                           | Meaning                                                                                                                     |
 | ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `ns/op`                                          | Time for one logical benchmark iteration. Fixed-work subtests also report a named rate.                                     |
+| `ns/op` | Nanoseconds per reported operation. Point cases report one API call. Transaction, scan, and life-cycle cases can report a complete sequence. Check the case name and its rate metric before comparison. |
 | `ack-keys/s`                                     | Keys acknowledged each second. A write batch counts each key.                                                               |
 | `transactions/s`, `cycle-keys/s`                 | Delete calls or changed keys each second in the named case.                                                                  |
 | `delete-ack-ns`, `post-ack-miss-p50-ns`, `post-ack-miss-p95-ns`, `post-ack-miss-p99-ns` | Delete time and time for the next read to return a miss.                            |
 | `keys/s`, `reads/s`, `entries/s`, `operations/s` | Completed work for the named suite.                                                                                         |
-| `p50-ns`, `p95-ns`, `p99-ns`, `max-ns`           | Caller-visible operation latency in the latency suite.                                                                      |
+| `p50-ns`, `p95-ns`, `p99-ns`, `max-ns` | Operation latency. For example, `p99-ns` gives the time at the 99th percentile of the recorded calls. `max-ns` is the longest recorded call. |
 | `primary-B`                                      | Main database-file bytes. Redis reports zero because AOF is its tested persistent file.                                     |
 | `log-B`                                          | KVLite WAL bytes or Redis AOF bytes. bbolt reports zero because it has no separate log file.                                |
 | `persistent-B`                                   | `primary-B + log-B`.                                                                                                        |

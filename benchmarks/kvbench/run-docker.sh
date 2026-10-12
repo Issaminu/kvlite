@@ -445,7 +445,7 @@ verify_redis_reopen_after_kill() {
 	docker info --format 'Container OS: {{.OperatingSystem}}; kernel: {{.KernelVersion}}; storage driver: {{.Driver}}; CPUs: {{.NCPU}}'
 } | tee "${results_dir}/environment.txt"
 
-git -C "${repository_dir}" diff --binary >"${results_dir}/working-tree.patch"
+git -C "${repository_dir}" diff HEAD --binary >"${results_dir}/working-tree.patch"
 git -C "${repository_dir}" ls-files --others --exclude-standard -- . \
 	':(exclude)benchmarks/kvbench/benchmark-results*.md' >"${results_dir}/untracked-files.txt"
 if [[ -s "${results_dir}/untracked-files.txt" ]]; then

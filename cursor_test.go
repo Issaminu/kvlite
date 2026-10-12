@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 var cursorAllocationSink *Cursor
@@ -664,5 +667,141 @@ func TestCursor_TraversalPersistsAfterReopen(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestCursor_EmptyLeaves checks complete reads through a stored tree with gaps.
+// It keeps empty leaves in the fixture so a merge cannot remove the condition.
+func TestCursor_EmptyLeaves(t *testing.T) {
+	for _, empty := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty=%t", empty), func(t *testing.T) {
+			path := t.TempDir() + "/database"
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { db.Close() }()
+			name := []byte("gaps")
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(name)
+				if err != nil {
+					return err
+				}
+				// Eight leaves form a complete tree. Only leaves b and f have data.
+				// The other leaves include empty subtrees and empty boundary leaves.
+				var build func(int, int, page.ID) (*btree.Node, error)
+				build = func(first, end int, id page.ID) (*btree.Node, error) {
+					var node *btree.Node
+					if end-first == 1 {
+						node = btree.NewLeafNode(id)
+						if !empty && (first == 1 || first == 5) {
+							key := []byte{byte('a' + first)}
+							if err := node.InsertEntry(btree.NewEntry(0, key, append([]byte("value-"), key...))); err != nil {
+								return nil, err
+							}
+						}
+					} else {
+						middle := (first + end) / 2
+						children := make([]*btree.Node, 2)
+						for i, bounds := range [][2]int{{first, middle}, {middle, end}} {
+							childID, err := tx.store.AllocatePage()
+							if err != nil {
+								return nil, err
+							}
+							children[i], err = build(bounds[0], bounds[1], childID)
+							if err != nil {
+								return nil, err
+							}
+						}
+						node = btree.NewRootNode(id, children[0], children[1], []byte{byte('a' + middle)})
+					}
+					tx.store.StageNode(node)
+					return node, nil
+				}
+				root, err := build(0, 8, bucket.rootNode.PageID())
+				if err != nil {
+					return err
+				}
+				bucket.setRoot(root)
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			check := func(tx *Tx) error {
+				bucket, err := tx.Bucket(name)
+				if err != nil {
+					return err
+				}
+				cursor, err := bucket.Cursor()
+				if err != nil {
+					return err
+				}
+				for _, reverse := range []bool{false, true} {
+					want := []string{"b", "f"}
+					first, next := cursor.First, cursor.Next
+					if reverse {
+						want = []string{"f", "b"}
+						first, next = cursor.Last, cursor.Prev
+					}
+					if empty {
+						want = nil
+					}
+					key, value, err := first()
+					for _, expected := range want {
+						if err != nil || string(key) != expected || string(value) != "value-"+expected {
+							t.Fatalf("reverse=%t: got %q=%q err=%v, want %s", reverse, key, value, err, expected)
+						}
+						key, value, err = next()
+					}
+					if err != nil || key != nil || value != nil {
+						t.Fatalf("reverse=%t: end key=%q value=%q err=%v", reverse, key, value, err)
+					}
+					count := 0
+					visit := func(key, value []byte) error {
+						if count >= len(want) || string(key) != want[count] || string(value) != "value-"+want[count] {
+							t.Fatalf("reverse=%t: unexpected scan key=%q value=%q", reverse, key, value)
+						}
+						count++
+						return nil
+					}
+					if reverse {
+						err = bucket.ScanReverse(visit)
+					} else {
+						err = bucket.ScanRange(nil, nil, visit)
+					}
+					if err != nil || count != len(want) {
+						t.Fatalf("reverse=%t: scan count=%d err=%v, want %d", reverse, count, err, len(want))
+					}
+				}
+				for _, test := range []struct{ target, want string }{{"a", "b"}, {"c", "f"}, {"g", ""}} {
+					want := test.want
+					if empty {
+						want = ""
+					}
+					key, _, err := cursor.Seek([]byte(test.target))
+					if err != nil || string(key) != want || (want == "" && key != nil) {
+						t.Fatalf("seek %s: key=%q err=%v, want %s", test.target, key, err, want)
+					}
+				}
+				return nil
+			}
+			for phase := range 2 {
+				if err := db.View(check); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Update(check); err != nil {
+					t.Fatal(err)
+				}
+				if phase == 0 {
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+		})
 	}
 }

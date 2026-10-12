@@ -26,7 +26,7 @@ type Store interface {
 	// AllocatePage returns a page ID that is not in use by another node.
 	// It returns an error when the store cannot allocate a page.
 	AllocatePage() (page.ID, error)
-	// FreePage retires a removed tree page.
+	// FreePage retires a removed tree node and all of its continuation pages.
 	FreePage(page.ID) error
 	// StageNode makes a private node visible to later reads and records its final image for commit.
 	StageNode(*Node)
@@ -92,24 +92,14 @@ func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool,
 	}
 }
 
-// validateEntry rejects an empty or oversized key, an oversized value, or an entry that cannot fit the tree's fixed-page representation.
-// A leaf stores the full key and value.
-// A later split can promote the key into a branch separator, where the smallest valid branch stores the separator and two child page IDs.
-// Both forms must fit before insertion starts.
+// validateEntry checks the key and value limits before insertion changes a node.
+// Entries larger than one page use continuation pages at commit.
 func (tree *Tree) validateEntry(entry Entry) error {
 	if err := validateLookupKey(entry.Key()); err != nil {
 		return err
 	}
 	if len(entry.Value()) > MaxValueSize {
 		return ErrValueTooLarge
-	}
-	pageSize := int(tree.store.PageSize())
-
-	leafSize := NodeHeaderSize + entry.EncodedSize(true)
-	// A one-entry branch stores two child page IDs.
-	branchSize := NodeHeaderSize + page.IDSize + entry.EncodedSize(false)
-	if leafSize > pageSize || branchSize > pageSize {
-		return fmt.Errorf("%w: key %q, page size %d bytes", ErrEntryTooLarge, entry.Key(), tree.store.PageSize())
 	}
 	return nil
 }
@@ -223,7 +213,8 @@ func (tree *Tree) splitNode(node *Node, pageSize int64) (*Node, []byte, error) {
 	return rightNode, separator, nil
 }
 
-// splitChildIntoSiblings splits one child until each result fits in one page.
+// splitChildIntoSiblings splits one child until the right result fits or cannot split.
+// A leaf with one large entry or a branch with fewer than three keys uses continuation pages.
 // child must be the private node at parent.Children[childIndex].
 // Each split keeps the left half at the current index and inserts the right half at the next index.
 // parent must also be private because each split adds one separator and one child page ID to it.
@@ -413,7 +404,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 
 		// When the node has enough data, only its first key can require a
 		// change higher in the tree.
-		if int64(node.EncodedSize()) >= minimumSize {
+		if node.EntryCount() != 0 && int64(node.EncodedSize()) >= minimumSize {
 			if !minimumChanged {
 				return root, nil
 			}
@@ -467,8 +458,10 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 
 		// Try the left neighbor first. Either merge returns one page, so
 		// choosing left when both fit gives a predictable result. Count
-		// bytes because entries can have different sizes.
-		if left != nil && mergedChildrenSize(parent, step.childIndex-1, left, node) <= pageSize {
+		// bytes because entries can have different sizes. An empty node
+		// must merge even with a large neighbor. The result can use
+		// continuation pages; the empty page can then be released.
+		if left != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex-1, left, node) <= pageSize) {
 			left = tree.store.WritableNode(left)
 			mergeChildren(parent, step.childIndex-1, left, node)
 			if err := tree.store.FreePage(node.PageID()); err != nil {
@@ -478,7 +471,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			// The left page stays in the tree. It still holds the parent's
 			// first key, so no earlier parent needs a new key.
 			minimumChanged = false
-		} else if right != nil && mergedChildrenSize(parent, step.childIndex, node, right) <= pageSize {
+		} else if right != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex, node, right) <= pageSize) {
 			mergeChildren(parent, step.childIndex, node, right)
 			if minimumChanged && step.childIndex > 0 {
 				// The delete may have emptied node. Before the merge, it had

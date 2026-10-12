@@ -14,6 +14,7 @@ import (
 type deleteBenchmarkCase struct {
 	name       string
 	records    int
+	valueBytes int // Zero uses the normal 128-byte value.
 	operations int
 	order      keyOrder
 	clients    int
@@ -39,6 +40,8 @@ func deleteBenchmarkCases() []deleteBenchmarkCase {
 			deleteBenchmarkCase{name: "existing/random/clients=1/batch=1000", records: records, operations: records / 1_000, order: keyOrderRandom, clients: 1, batchSize: 1_000},
 		)
 	}
+	largeRecords := scaleSizedValue(512, 128, 32)
+	cases = append(cases, deleteBenchmarkCase{name: "existing/random/value=65536/clients=1", records: largeRecords, operations: largeRecords / 2, valueBytes: 65536, order: keyOrderRandom, clients: 1, batchSize: 1})
 	return cases
 }
 
@@ -49,7 +52,11 @@ func BenchmarkDeleteOperations(b *testing.B) {
 	environment := readBenchmarkEnvironment(b)
 	for _, benchmarkCase := range deleteBenchmarkCases() {
 		runScaledBenchmark(b, string(environment.mode)+"/"+benchmarkCase.name+"/"+string(environment.kind), func(b *testing.B) {
-			setup, err := makePairs(benchmarkCase.records, 128, 1, keyOrderSequential, 1)
+			valueBytes := benchmarkCase.valueBytes
+			if valueBytes == 0 {
+				valueBytes = 128
+			}
+			setup, err := makePairs(benchmarkCase.records, valueBytes, 1, keyOrderSequential, 1)
 			if err != nil {
 				b.Fatal(err)
 			}
@@ -57,7 +64,7 @@ func BenchmarkDeleteOperations(b *testing.B) {
 			if benchmarkCase.missing {
 				workload = 2
 			}
-			operations, err := makePairs(benchmarkCase.records, 128, workload, benchmarkCase.order, 1)
+			operations, err := makePairs(benchmarkCase.records, valueBytes, workload, benchmarkCase.order, 1)
 			if err != nil {
 				b.Fatal(err)
 			}

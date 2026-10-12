@@ -20,7 +20,7 @@ const (
 	RecordTypeCommit RecordType = 0
 	// RecordTypeMeta stores one complete metadata image.
 	RecordTypeMeta RecordType = 1
-	// RecordTypeNode stores one complete compact data-node image.
+	// RecordTypeNode stores one complete node-page image.
 	RecordTypeNode RecordType = 2
 	// RecordTypePatch stores replacement ranges for one existing data node.
 	RecordTypePatch RecordType = 3
@@ -47,6 +47,9 @@ type RecordHeader struct {
 
 // NodeRecord carries one changed data node from a write transaction to [WAL.Commit].
 // WAL.Commit compares Original and Final and writes a page patch or leaf-delete record when it is smaller than the complete final image.
+// Commit uses full records if Original or Final has continuation pages.
+// Final must have allocated continuation IDs, set with [btree.Node.SetOverflowPages].
+// A single-page image has different offsets from a page with continuation IDs.
 // NodeRecord exists only in memory. The WAL file does not store this structure.
 type NodeRecord struct {
 	// Original is the committed node before the transaction.
@@ -54,6 +57,10 @@ type NodeRecord struct {
 	Original *btree.Node
 	// Final is the private node image to commit.
 	Final *btree.Node
+	// continuedNodePageImages holds compact WAL images only for a continued Final.
+	// It is nil and unused when Final has no continuation pages.
+	// Element 0 is Final's first leaf or branch page. Each later element is one continuation page, in body order.
+	continuedNodePageImages [][]byte
 }
 
 // AllocationRecord carries one complete allocation segment page to [WAL.Commit].
@@ -65,7 +72,7 @@ type AllocationRecord struct {
 
 // WALRecord represents one record in the WAL file format.
 // [WAL.ReadRecords] returns WALRecord values during recovery.
-// Header.Type defines whether Payload contains a complete node or allocation page,
+// Header.Type defines whether Payload contains a compact node, complete physical page,
 // page-patch ranges, leaf-delete keys, encoded metadata, or no bytes for a commit marker.
 type WALRecord struct {
 	Header RecordHeader

@@ -180,7 +180,7 @@ func ApplyLeafDeletes(base, keys []byte, pageID page.ID) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	node, err := btree.DecodeWALNode(base, pageID)
+	node, err := btree.DecodeWALNode(base, pageID, int64(len(base)), nil)
 	if err != nil {
 		return nil, err
 	}

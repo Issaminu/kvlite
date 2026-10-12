@@ -479,7 +479,7 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
-		node, err := wal.CommittedPageToNode(&record)
+		node, err := db.wal.CommittedPageToNode(&record)
 		if err != nil {
 			return nil, err
 		}
@@ -494,7 +494,7 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize())
+	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize(), db.readMainPage)
 	if err != nil {
 		return nil, err
 	}
@@ -502,26 +502,20 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	return node, nil
 }
 
-// visitCommittedNodeReferences checks one committed node and visits its children.
-// It reads mapped pages without making a private node copy.
-func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit func(page.ID) error) error {
+// visitCommittedNodeReferences checks one node and visits its child and storage pages.
+// It reads encoded pages without making a Node or copying large values.
+func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuation func(page.ID) error) error {
 	if record, ok := db.wal.Lookup(pageID); ok {
-		if record.Node != nil {
-			return btree.VisitNodeReferences(record.Node, visit)
-		}
-		if record.Payload == nil {
-			return wal.ErrRecordPayloadRequired
-		}
-		return btree.VisitWALNodeReferences(record.Payload, pageID, visit)
+		return db.wal.VisitCommittedPageReferences(&record, visit, visitContinuation)
 	}
 	if node, ok := db.cachedWriteNode(pageID); ok {
-		return btree.VisitNodeReferences(node, visit)
+		return btree.VisitNodeReferences(node, visit, visitContinuation)
 	}
 	data, err := db.readMainPage(pageID)
 	if err != nil {
 		return err
 	}
-	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), visit)
+	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), db.readMainPage, visit, visitContinuation)
 }
 
 // cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
@@ -569,20 +563,18 @@ func (db *DB) cacheWriteNode(node *btree.Node) {
 // A WAL page has priority over the main-file page with the same ID.
 func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
 	if record, ok := db.wal.Lookup(pageID); ok {
-		if record.Node != nil {
-			return btree.LookupDecodedNode(record.Node, key)
-		}
-		return btree.LookupEncodedWALNode(record.Payload, pageID, key)
+		return db.wal.LookupCommittedPage(&record, key)
 	}
 	data, err := db.readMainPage(pageID)
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key)
+	return btree.LookupMappedNode(data, pageID, key, db.readMainPage)
 }
 
 // findCommittedEntry searches one committed tree without decoding its pages.
-// A found entry refers to the WAL or the mapped main file.
+// Normal entries refer to the WAL or the mapped main file.
+// A continued leaf returns an owned value and can return an owned key.
 func (db *DB) findCommittedEntry(pageID page.ID, key []byte) (btree.Entry, bool, error) {
 	for {
 		entry, found, childPageID, err := db.lookupCommittedPage(pageID, key)
