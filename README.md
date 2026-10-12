@@ -5,7 +5,7 @@
 
 A blazingly-fast embedded key/value database for Go.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/Issaminu/kvlite.svg)](https://pkg.go.dev/github.com/Issaminu/kvlite) [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod) [![Benchmark results](https://img.shields.io/badge/benchmarks-results-2563EB)](BENCHMARKS.md) [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Go Reference](https://pkg.go.dev/badge/github.com/Issaminu/kvlite.svg)](https://pkg.go.dev/github.com/Issaminu/kvlite) [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod) [![Benchmark results](https://img.shields.io/badge/benchmarks-results-2563EB)](BENCHMARKS.md) [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Issaminu/kvlite)
 
 KVLite uses a paged B+ tree. It supports transactions, nested buckets, key and bucket deletion, page reuse, ordered cursors, prefix scans, range scans, and read-only database handles.
 
