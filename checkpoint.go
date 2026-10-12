@@ -13,14 +13,21 @@ import (
 // SyncNone does not issue storage sync calls.
 // The WAL removes its committed state only after the required steps succeed.
 // A failed write or sync can be retried.
+// Checkpoint failures are recorded for [DB.Stats], including WAL cleanup and mapping failures.
 //
 // The checkpoint refreshes the mapping before another operation can read it.
 //
 // The caller must hold the exclusive database operation lock.
-func (db *DB) checkpointWAL() error {
+func (db *DB) checkpointWAL() (err error) {
 	if db.wal.Stats().CommittedRecordCount == 0 {
 		return nil
 	}
+	defer func() {
+		db.stats.LastCheckpointError = err
+		if err != nil {
+			db.stats.CheckpointFailureCount++
+		}
+	}()
 	targetSize, err := db.logicalFileSize()
 	if err != nil {
 		return err

@@ -274,8 +274,8 @@ func TestLeafDeleteWALReplayAfterCheckpointWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.wal.ReplaceFileForTesting(readOnlyLog)
-	if err := db.checkpointWAL(); err != nil {
-		t.Fatal(err)
+	if err := db.checkpointWAL(); err == nil {
+		t.Fatal("checkpoint did not report the WAL cleanup failure")
 	}
 	if err := readOnlyLog.Close(); err != nil {
 		t.Fatal(err)
@@ -338,8 +338,8 @@ func TestLeafDeleteWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.wal.ReplaceFileForTesting(readOnlyLog)
-	if err := db.checkpointWAL(); err != nil {
-		t.Fatal(err)
+	if err := db.checkpointWAL(); err == nil {
+		t.Fatal("checkpoint did not report the WAL cleanup failure")
 	}
 	if err := readOnlyLog.Close(); err != nil {
 		t.Fatal(err)

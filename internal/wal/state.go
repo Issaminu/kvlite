@@ -53,7 +53,7 @@ func New(config Config) *WAL {
 // Checkpoint removes a free suffix before it syncs mainFile and clears the WAL.
 // When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
 // A main-file write, truncate, or required sync failure leaves the overlay and WAL available for a later retry.
-// A WAL truncate failure leaves the overlay in memory for cleanup retry but does not make the committed transaction fail.
+// A WAL truncate failure returns an error and keeps the overlay for cleanup retry.
 func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 	if len(wal.overlay) == 0 {
 		return nil
@@ -103,7 +103,7 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 	}
 	if err := wal.Truncate(); err != nil {
 		// Keep the overlay so WAL cleanup can be retried.
-		return nil
+		return err
 	}
 	clear(wal.overlay)
 	wal.bytesSinceCheckpoint = 0
@@ -212,6 +212,7 @@ type Stats struct {
 	CheckpointThresholdBytes uint64
 	BytesSinceCheckpoint     uint64
 	TotalBytesWritten        uint64
+	CommitCount              uint64
 	CheckpointCount          uint64
 	CommittedRecordCount     int
 	NextTxID                 TxID
@@ -222,10 +223,24 @@ func (wal *WAL) Stats() Stats {
 		CheckpointThresholdBytes: wal.checkpointThresholdBytes,
 		BytesSinceCheckpoint:     wal.bytesSinceCheckpoint,
 		TotalBytesWritten:        wal.totalBytesWritten,
+		CommitCount:              wal.commitCount,
 		CheckpointCount:          wal.checkpointCount,
 		CommittedRecordCount:     len(wal.overlay),
 		NextTxID:                 wal.nextTxid,
 	}
+}
+
+// Size returns the current WAL file size in bytes.
+// It returns zero when a read-only database has no WAL file.
+func (wal *WAL) Size() (int64, error) {
+	if wal.file == nil {
+		return 0, nil
+	}
+	info, err := wal.file.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
 }
 
 func (wal *WAL) CommittedRecords() map[page.ID]CommittedPage {

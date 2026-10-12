@@ -26,28 +26,6 @@ type writeNodeCacheEntry struct {
 	referenced bool
 }
 
-// Stats contains current page counts and cumulative page work for one open [DB] handle.
-type Stats struct {
-	// WALBytesWritten is the total size of successful WAL transaction appends. A checkpoint does not decrease this value.
-	WALBytesWritten uint64
-	// CheckpointCount is the number of checkpoints that wrote all committed pages and cleared the WAL.
-	CheckpointCount uint64
-	// AllocatedPageCount is the number of pages that contain metadata, allocation data, or live tree data.
-	AllocatedPageCount uint64
-	// ReusablePageCount is the number of free pages at or below LastPageID.
-	ReusablePageCount uint64
-	// AllocationMetadataPageCount is the number of pages that store allocation bitmaps.
-	AllocationMetadataPageCount uint64
-	// LastPageID is the highest page ID in the logical database file.
-	LastPageID uint64
-	// PagesReused counts allocations from free pages since this handle opened.
-	PagesReused uint64
-	// PagesRetired counts tree pages freed by committed writes since this handle opened.
-	PagesRetired uint64
-	// TailPagesReclaimed counts pages removed from the logical file since this handle opened. Checkpoint later shrinks the main file.
-	TailPagesReclaimed uint64
-}
-
 // DB is an open handle to a KVLite database and its write-ahead log. A DB must be created by [Open] because its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
 type DB struct {
 	path              string
@@ -55,6 +33,7 @@ type DB struct {
 	meta              *page.Meta
 	rootNode          *btree.Node
 	writeNodes        map[page.ID]*writeNodeCacheEntry // Each committed node refers only to stable heap bytes that later write clones can share.
+	writeNodesMu      sync.RWMutex                     // Protects cache access by concurrent readers. Writers already hold operationMu exclusively.
 	writeNodeSlots    []page.ID
 	nextWriteNodeSlot int
 	mappedFile        []byte
@@ -347,27 +326,6 @@ func (db *DB) Path() string {
 	return db.path
 }
 
-// Stats returns current page counts and cumulative page work for this database handle. It waits for an active write or checkpoint to finish. It returns [ErrDatabaseNotOpen] after close starts. Counting allocated pages scans the allocation bitmap.
-func (db *DB) Stats() (Stats, error) {
-	if err := db.beginOperation(); err != nil {
-		return Stats{}, err
-	}
-	defer db.endOperation()
-
-	db.operationMu.RLock()
-	defer db.operationMu.RUnlock()
-
-	stats := db.wal.Stats()
-	result := db.stats
-	result.WALBytesWritten = stats.TotalBytesWritten
-	result.CheckpointCount = stats.CheckpointCount
-	result.AllocatedPageCount = db.allocation.allocatedPageCount()
-	result.LastPageID = uint64(db.meta.LastPage())
-	result.ReusablePageCount = result.LastPageID + 1 - result.AllocatedPageCount
-	result.AllocationMetadataPageCount = uint64(len(db.allocation.segments))
-	return result, nil
-}
-
 // Put stores value under key in the top-level bucket named bucketName.
 // It is equivalent to resolving the bucket and calling [Bucket.Put] inside
 // [DB.Update], so it replaces an existing value atomically and returns any
@@ -502,6 +460,24 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	return node, nil
 }
 
+// readOnlyNode reads a committed node and keeps decoded main-file nodes in the shared cache.
+// The caller must hold the database operation read lock or write lock.
+func (db *DB) readOnlyNode(pageID page.ID) (*btree.Node, error) {
+	if record, ok := db.wal.Lookup(pageID); ok {
+		return db.wal.CommittedPageToNode(&record)
+	}
+	db.writeNodesMu.RLock()
+	if entry, ok := db.writeNodes[pageID]; ok {
+		node := entry.node
+		db.writeNodesMu.RUnlock()
+		return node, nil
+	}
+	db.writeNodesMu.RUnlock()
+	db.writeNodesMu.Lock()
+	defer db.writeNodesMu.Unlock()
+	return db.readNode(pageID)
+}
+
 // visitCommittedNodeReferences checks one node and visits its child and storage pages.
 // It reads encoded pages without making a Node or copying large values.
 func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuation func(page.ID) error) error {
@@ -519,7 +495,7 @@ func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuat
 }
 
 // cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
-// The caller must have exclusive access to database state. Open has this access before it returns. Writes use the database operation lock.
+// The caller must hold the database operation write lock, or its read lock with writeNodesMu locked for writing. Open can call this before other goroutines can use the handle.
 func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {
 	entry, ok := db.writeNodes[pageID]
 	if !ok {
@@ -530,7 +506,7 @@ func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {
 }
 
 // cacheWriteNode keeps an immutable committed node for later write transactions. It keeps at most [maxCachedWriteNodePages] nodes.
-// The caller must have exclusive access to database state. Open has this access before it returns. Writes use the database operation lock.
+// The caller must hold the database operation write lock, or its read lock with writeNodesMu locked for writing. Open can call this before other goroutines can use the handle.
 func (db *DB) cacheWriteNode(node *btree.Node) {
 	pageID := node.PageID()
 	if entry, ok := db.writeNodes[pageID]; ok {

@@ -36,6 +36,7 @@ type WAL struct {
 	checkpointThresholdBytes uint64
 	bytesSinceCheckpoint     uint64
 	totalBytesWritten        uint64
+	commitCount              uint64
 	checkpointCount          uint64
 	overlay                  map[page.ID]CommittedPage // Committed pages that are not yet checkpointed.
 	nextTxid                 TxID                      // sequence number stamped on the next committed transaction
@@ -116,6 +117,7 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 			wal.overlay[pageID] = CommittedPage{Header: header, Payload: encodedMeta}
 		}
 	}
+	wal.commitCount++
 	wal.nextTxid++
 	return needsCheckpoint, nil
 }

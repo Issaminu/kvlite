@@ -58,7 +58,13 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 		return dirty.final, nil
 	}
 
-	node, err := store.tx.db.readNode(pageID)
+	var node *btree.Node
+	var err error
+	if store.tx.readOnly {
+		node, err = store.tx.db.readOnlyNode(pageID)
+	} else {
+		node, err = store.tx.db.readNode(pageID)
+	}
 	if err != nil {
 		return nil, err
 	}

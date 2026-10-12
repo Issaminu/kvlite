@@ -1290,8 +1290,15 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	}
 	db.wal.ReplaceFileForTesting(readOnlyWAL)
 
-	if err := db.checkpointWAL(); err != nil {
-		t.Fatalf("checkpoint returned an error after the main-file write: %v", err)
+	if err := db.checkpointWAL(); err == nil {
+		t.Fatal("checkpoint did not report the WAL cleanup failure")
+	}
+	stats, err := db.Stats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.CheckpointFailureCount != 1 || stats.LastCheckpointError == nil || stats.WALPageCount == 0 {
+		t.Fatalf("checkpoint failure state: %+v", stats)
 	}
 	walAfter, err := os.ReadFile(path + "-wal")
 	if err != nil {
@@ -1302,6 +1309,17 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	}
 	if got, err := db.Get(testBucketName, []byte("k")); err != nil || !bytes.Equal(got, []byte("value")) {
 		t.Fatalf("committed value missing after WAL cleanup failure: got %q, err %v", got, err)
+	}
+	if err := readOnlyWAL.Close(); err != nil {
+		t.Fatal(err)
+	}
+	writableWAL, err := os.OpenFile(path+"-wal", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.wal.ReplaceFileForTesting(writableWAL)
+	if err := db.Close(); err != nil {
+		t.Fatalf("retry close after WAL cleanup failure: %v", err)
 	}
 }
 
@@ -8051,8 +8069,8 @@ func TestRecovery_ContinuedDeletesAndReuse(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.wal.ReplaceFileForTesting(readOnlyWAL)
-	if err := db.checkpointWAL(); err != nil {
-		t.Fatal(err)
+	if err := db.checkpointWAL(); err == nil {
+		t.Fatal("expected WAL cleanup error")
 	}
 	afterCheckpoint, err := os.ReadFile(path)
 	if err != nil {

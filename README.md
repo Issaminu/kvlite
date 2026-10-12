@@ -286,6 +286,38 @@ options := &kvlite.Options{
 
 
 
+## Statistics
+
+`DB.Stats()` returns storage state and cumulative write counters for the current open handle. Counters cover work by this handle, including recovery checkpoints during open. They start again with each new handle. Reading statistics scans allocation metadata and checks the main-file and WAL sizes. It does not start a checkpoint or scan tree pages. Do not call it from a transaction callback.
+
+The result includes page counts, logical database size, main-file size, WAL size, bytes appended since checkpoint, distinct pending WAL pages, and the checkpoint threshold. File sizes are byte lengths. They do not measure file-system block allocation. WAL bytes measure successful log appends, not physical storage writes.
+
+Normal reads do not collect statistics. There are no statistics locks, transaction counters, or phase timers. Write counters use the existing write lock. Detailed transaction collection is deferred.
+
+Use `Stats.Sub` to measure work between two readings from the same open handle:
+
+```go
+before, err := db.Stats()
+if err != nil {
+	return err
+}
+if err := db.Put([]byte("users"), []byte("alice"), []byte("active")); err != nil {
+	return err
+}
+after, err := db.Stats()
+if err != nil {
+	return err
+}
+work := after.Sub(&before)
+fmt.Printf("WAL bytes: %d, commits: %d\n", work.WALBytesWritten, work.WALCommitCount)
+```
+
+`Sub` subtracts cumulative counters. It keeps the current storage state and checkpoint error. `WALCommitCount` counts successful nonempty commits. Several concurrent updates can share one commit. Failed commits and recovered transactions do not count. `WALBytesSinceCheckpoint` counts bytes appended in this handle, including a new WAL header. `WALSize` also includes any bytes recovered during open.
+
+`CheckpointFailureCount` counts failed checkpoint attempts, including WAL cleanup and mapping failures. `LastCheckpointError` reports the last nonempty attempt. A later successful attempt clears the error but keeps the failure count. An automatic checkpoint failure does not fail a write that already committed. Close returns a checkpoint failure so the caller can retry it.
+
+Inside a callback, use `bucket.Stats()` for page counts, plain entry counts, tree depth, and used bytes. It scans the selected bucket and all nested buckets. It includes earlier writes in the same transaction. A large scan can delay a writer. `KeyN` excludes bucket names. `BucketN` includes the selected bucket. `Depth` is the greatest individual tree depth. Bucket nesting does not add tree levels. `KeyBytes` includes leaf keys and bucket names. `ValueBytes` includes plain values. Page counts exclude continuation pages. Storage byte counts include their headers, page IDs, and required page space. Inside a write callback, these counts include continuation pages needed at commit. Used page bytes include headers and exclude padding. Subtract used bytes from reserved bytes to calculate unused space.
+
 ## Concurrency and file locks
 
 Several `DB.View` callbacks can run at the same time. A `DB.Update` callback runs alone. It waits for active views. New views wait for it.

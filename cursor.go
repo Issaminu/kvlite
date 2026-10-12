@@ -134,7 +134,7 @@ func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(
 	}
 
 	// A branch contains child page IDs instead of values. Decode only the branch so the scan can select its children.
-	branch, err := db.readNode(pageID)
+	branch, err := db.readOnlyNode(pageID)
 	if err != nil {
 		return err
 	}
@@ -170,7 +170,7 @@ func (db *DB) scanMappedTreeReverse(pageID page.ID, visit func(uint32, []byte, [
 		return err
 	}
 
-	branch, err := db.readNode(pageID)
+	branch, err := db.readOnlyNode(pageID)
 	if err != nil {
 		return err
 	}
