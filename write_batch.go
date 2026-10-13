@@ -174,8 +174,13 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	needsCheckpoint := false
 	if hasPendingWrites {
 		// Use the same page preparation as a direct write.
-		// Successful callbacks already gave state a private metadata image and private node images.
-		tx := Tx{db: db, meta: state.meta, allocation: state.allocation}
+		// All callbacks have finished. Preparation can reuse the batch's private allocation changes.
+		tx := Tx{
+			db:              db,
+			meta:            state.meta,
+			allocation:      state.allocation,
+			allocationOwned: state.allocation != nil,
+		}
 		tx.store.dirty = state.dirty
 		commitErr = tx.prepareCommit()
 		state.metaDirty = state.metaDirty || tx.metaDirty

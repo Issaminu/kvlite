@@ -6444,6 +6444,49 @@ func TestWriteBatch_LaterCallbackSeesEarlierWrite(t *testing.T) {
 	}
 }
 
+func TestWriteBatch_RetirementReusesPrivateAllocationPage(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	original := db.allocation.segments[0].data
+	wantOriginal := bytes.Clone(original)
+	var private *allocationSegment
+	request := &writeRequest{
+		transaction: func(tx *Tx) error {
+			name := []byte("temporary")
+			if _, err := tx.CreateBucket(name); err != nil {
+				return err
+			}
+			if err := tx.DeleteBucket(name); err != nil {
+				return err
+			}
+			private = tx.allocation.dirtySegments[0]
+			return nil
+		},
+		result: make(chan writeResult, 1),
+	}
+	db.operationMu.Lock()
+	db.executeWriteBatch([]*writeRequest{request})
+	db.operationMu.Unlock()
+	if result := <-request.result; result.err != nil || result.panicked || result.goexited {
+		t.Fatalf("write result: %+v", result)
+	}
+	if private == nil || &private.data[0] == &original[0] {
+		t.Fatal("callback did not make a private allocation page")
+	}
+	if &db.allocation.segments[0].data[0] != &private.data[0] {
+		t.Fatal("batch preparation copied the private allocation page again")
+	}
+	if !bytes.Equal(original, wantOriginal) {
+		t.Fatal("batch preparation changed the original allocation page")
+	}
+	if db.allocation.allocated(4) {
+		t.Fatal("retired bucket page is still allocated")
+	}
+}
+
 func TestWriteBatch_CallbackErrorDiscardsOnlyItsChanges(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
