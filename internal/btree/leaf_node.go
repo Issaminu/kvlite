@@ -86,6 +86,7 @@ func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
 
 // applyInsert changes a leaf after prepareInsert has accepted the operation.
 func (n *Node) applyInsert(prepared leafInsert) {
+	n.encodedSize = 0
 	n.header.Checksum = 0
 	if prepared.found {
 		n.entries[prepared.index].flags = prepared.entry.flags
@@ -123,6 +124,7 @@ func (n *Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
 }
 
 func (n *Node) applyDelete(index int) {
+	n.encodedSize = 0
 	n.entries = slices.Delete(n.entries, index, index+1)
 	n.header.Checksum = 0
 }
@@ -185,12 +187,14 @@ func redistributeLeaves(parent *Node, separatorIndex int, left, right *Node, pag
 	left.entries = entries[:split:split]
 	right.entries = entries[split:len(entries):len(entries)]
 	parent.entries[separatorIndex] = Entry{key: slices.Clone(right.entries[0].key)}
+	left.encodedSize, right.encodedSize, parent.encodedSize = 0, 0, 0
 
 	return true
 }
 
 // splitLeaf keeps the separator as the first key of the new right leaf.
 func (n *Node) splitLeaf(right *Node, index int) {
+	n.encodedSize, right.encodedSize = 0, 0
 	right.entries = slices.Clone(n.entries[index:])
 	n.entries = n.entries[:index]
 }

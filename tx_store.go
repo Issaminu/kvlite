@@ -167,6 +167,8 @@ func (tx *Tx) prepareCommit() error {
 		}
 	}
 	for _, change := range tx.store.dirty {
+		// The final node stays unchanged through WAL encoding. Reuse its exact size.
+		change.final.CacheEncodedSize()
 		count := btree.NodePageCount(change.final, tx.meta.PageSize())
 		if count == 0 {
 			return fmt.Errorf("node %d cannot hold a continuation ID: %w", change.final.PageID(), btree.ErrInvalid)

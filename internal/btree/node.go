@@ -70,6 +70,7 @@ type Node struct {
 	entries             []Entry
 	Children            []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
 	continuationPageIDs []page.ID // only for branch/leaf nodes with overflow, or continuation nodes
+	encodedSize         int       // Zero means unknown. Entry-list changes clear the saved size.
 }
 
 // OverflowPages returns the IDs of pages after this node's first page.
@@ -122,6 +123,7 @@ func (n *Node) EntryCount() int {
 // EntryAt returns the entry at index without copying it.
 // The returned entry refers to storage owned by the node.
 // It remains valid until the node changes its entry list.
+// The caller must not replace the entry or change its slices.
 func (n *Node) EntryAt(index int) *Entry {
 	return &n.entries[index]
 }
@@ -237,17 +239,29 @@ func LookupDecodedNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
 // least two children. Fewer large entries use continuation pages. Splitting
 // a two-key branch would create a one-child side and make large-key inserts
 // grow the tree by one level at each split.
+// This saves the size for commit preparation. The caller must own the node.
 func (n *Node) NeedsSplit(pageSize int64) bool {
 	minimum := 2
 	if !n.IsLeaf() {
 		minimum = 3
 	}
-	return len(n.entries) >= minimum && int64(n.EncodedSize()) > pageSize
+	return len(n.entries) >= minimum && int64(n.CacheEncodedSize()) > pageSize
 }
 
 // EncodedSize reports the exact number of bytes that [EncodeNode] writes for n.
 func (n *Node) EncodedSize() int {
+	if n.encodedSize != 0 {
+		return n.encodedSize
+	}
 	return NodeHeaderSize + nodePayloadSize(n)
+}
+
+// CacheEncodedSize saves the current size for page counting and encoding.
+// The caller must have exclusive access to n. Readers use EncodedSize, which changes no state.
+// Node mutations clear the saved size. Clone starts without a saved size.
+func (n *Node) CacheEncodedSize() int {
+	n.encodedSize = n.EncodedSize()
+	return n.encodedSize
 }
 
 // chooseSplitIndex selects a separator near half a page based on encoded entry bytes while preserving valid left and right node shapes.
@@ -432,6 +446,8 @@ func redistributionPenalty(leftSize, rightSize, minimumSize int64) (underfull, i
 // branches, that key exists only in the parent. When branches join, the key
 // moves down between their two groups of keys.
 func mergeChildren(parent *Node, separatorIndex int, left, right *Node) {
+	left.encodedSize = 0
+	parent.encodedSize = 0
 	if left.IsLeaf() {
 		left.entries = append(left.entries, right.entries...)
 	} else {

@@ -29,6 +29,7 @@ func (n *Node) FindChildIndex(key []byte) (int, error) {
 }
 
 func (n *Node) setSeparator(index int, key []byte) {
+	n.encodedSize = 0
 	n.entries[index].key = slices.Clone(key)
 	n.header.Checksum = 0
 }
@@ -36,6 +37,7 @@ func (n *Node) setSeparator(index int, key []byte) {
 // InsertSplitChild inserts separator and rightNode immediately after the existing child at leftIndex.
 // parent must be a branch node, leftIndex must identify an existing child, and separator must remain read-only after the call.
 func (parent *Node) InsertSplitChild(leftIndex int, rightNode *Node, separator []byte) {
+	parent.encodedSize = 0
 	parent.entries = append(parent.entries, Entry{})
 	copy(parent.entries[leftIndex+1:], parent.entries[leftIndex:])
 	parent.entries[leftIndex] = Entry{key: separator}
@@ -103,12 +105,14 @@ func redistributeBranches(parent *Node, separatorIndex int, left, right *Node, p
 	right.entries = entries[pivot+1 : len(entries) : len(entries)]
 	left.Children = children[: pivot+1 : pivot+1]
 	right.Children = children[pivot+1 : len(children) : len(children)]
+	left.encodedSize, right.encodedSize, parent.encodedSize = 0, 0, 0
 
 	return true
 }
 
 // splitBranch removes the promoted separator and moves its right children together.
 func (n *Node) splitBranch(right *Node, index int) {
+	n.encodedSize, right.encodedSize = 0, 0
 	right.entries = slices.Clone(n.entries[index+1:])
 	n.entries = n.entries[:index]
 	right.Children = slices.Clone(n.Children[index+1:])

@@ -37,7 +37,7 @@ func leafPayloadSize(node *Node) int {
 	}
 	return size
 }
-func leafEncodedSize(node *Node) int { return NodeHeaderSize + leafPayloadSize(node) }
+func leafEncodedSize(node *Node) int { return node.EncodedSize() }
 func leafBodyOffset(node *Node) int {
 	return NodeHeaderSize + len(node.entries)*leafEntryDescriptorSize
 }
@@ -269,10 +269,11 @@ func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage f
 }
 
 func leafPageCount(node *Node, pageSize int64) int {
-	if pageSize >= NodeHeaderSize && int64(leafEncodedSize(node)) <= pageSize {
+	size := leafEncodedSize(node)
+	if pageSize >= NodeHeaderSize && int64(size) <= pageSize {
 		return 1
 	}
-	return continuationPageCount(leafPayloadSize(node), pageSize, leafContinuationHeaderSize)
+	return continuationPageCount(size-NodeHeaderSize, pageSize, leafContinuationHeaderSize)
 }
 
 // EncodeLeafNodePages writes this leaf and its continuation pages into owned buffers.

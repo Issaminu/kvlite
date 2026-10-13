@@ -36,7 +36,7 @@ func branchPayloadSize(node *Node) int {
 	}
 	return size
 }
-func branchEncodedSize(node *Node) int { return NodeHeaderSize + branchPayloadSize(node) }
+func branchEncodedSize(node *Node) int { return node.EncodedSize() }
 func branchBodyOffset(node *Node) int {
 	return NodeHeaderSize + len(node.entries)*branchEntryDescriptorSize
 }
@@ -264,10 +264,11 @@ func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 }
 
 func branchPageCount(node *Node, pageSize int64) int {
-	if pageSize >= NodeHeaderSize && int64(branchEncodedSize(node)) <= pageSize {
+	size := branchEncodedSize(node)
+	if pageSize >= NodeHeaderSize && int64(size) <= pageSize {
 		return 1
 	}
-	return continuationPageCount(branchPayloadSize(node), pageSize, branchContinuationHeaderSize)
+	return continuationPageCount(size-NodeHeaderSize, pageSize, branchContinuationHeaderSize)
 }
 
 // EncodeBranchNodePages writes this branch and its continuation pages into owned buffers.

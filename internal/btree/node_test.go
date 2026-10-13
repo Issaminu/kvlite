@@ -268,6 +268,103 @@ func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 	}
 }
 
+func TestNodeSavedSizeTracksMutations(t *testing.T) {
+	check := func(node *Node) {
+		t.Helper()
+		want := NodeHeaderSize + nodePayloadSize(node)
+		if got := node.EncodedSize(); got != want {
+			t.Fatalf("node %d size: got %d, want %d", node.PageID(), got, want)
+		}
+		if got := len(EncodeWALNode(node)); got != want {
+			t.Fatalf("node %d WAL size: got %d, want %d", node.PageID(), got, want)
+		}
+		node.CacheEncodedSize()
+	}
+	leaf := NewLeafNode(8)
+	for _, key := range []string{"a", "m", "z"} {
+		if err := leaf.InsertEntry(NewEntry(0, []byte(key), bytes.Repeat([]byte("v"), 64))); err != nil {
+			t.Fatal(err)
+		}
+		check(leaf)
+	}
+	if err := leaf.InsertEntry(NewEntry(0, []byte("m"), []byte("short"))); err != nil {
+		t.Fatal(err)
+	}
+	check(leaf)
+	if err := leaf.DeleteKeyIfPresent([]byte("m")); err != nil {
+		t.Fatal(err)
+	}
+	check(leaf)
+	clone := leaf.Clone()
+	if err := clone.InsertEntry(NewEntry(0, []byte("a"), []byte("clone"))); err != nil {
+		t.Fatal(err)
+	}
+	check(clone)
+	check(leaf)
+	right, separator, err := leaf.Split(9, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(leaf)
+	check(right)
+	parent := NewRootNode(10, leaf, right, separator)
+	check(parent)
+	parent.InsertSplitChild(1, NewLeafNode(11), []byte("zz"))
+	check(parent)
+	parent.setSeparator(0, []byte("middle"))
+	check(parent)
+	parent.InsertSplitChild(2, NewLeafNode(12), []byte("zzz"))
+	check(parent)
+	branchRight, _, err := parent.Split(13, 64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(parent)
+	check(branchRight)
+
+	left, right := NewLeafNode(20), NewLeafNode(21)
+	for index, key := range []string{"a", "m", "n-longer", "z"} {
+		node := right
+		if index == 0 {
+			node = left
+		}
+		if err := node.InsertEntry(NewEntry(0, []byte(key), []byte("value"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent = NewRootNode(22, left, right, []byte("m"))
+	check(left)
+	check(right)
+	check(parent)
+	if !redistributeChildren(parent, 0, left, right, 256, 64) {
+		t.Fatal("redistribution failed")
+	}
+	check(left)
+	check(right)
+	check(parent)
+	mergeChildren(parent, 0, left, right)
+	check(left)
+	check(parent)
+
+	left = NewRootNode(30, NewLeafNode(40), NewLeafNode(41), []byte("a"))
+	right = NewRootNode(31, NewLeafNode(42), NewLeafNode(43), []byte("n-longer"))
+	right.InsertSplitChild(1, NewLeafNode(44), []byte("u-long"))
+	right.InsertSplitChild(2, NewLeafNode(45), []byte("z"))
+	parent = NewRootNode(32, left, right, []byte("m"))
+	check(left)
+	check(right)
+	check(parent)
+	if !redistributeChildren(parent, 0, left, right, 256, 64) {
+		t.Fatal("branch redistribution failed")
+	}
+	check(left)
+	check(right)
+	check(parent)
+	mergeChildren(parent, 0, left, right)
+	check(left)
+	check(parent)
+}
+
 func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
 	node := &Node{
 		header: newNodeHeader(NodeTypeLeaf, 0),
