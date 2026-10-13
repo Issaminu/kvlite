@@ -274,9 +274,60 @@ func EncodeNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error
 // value bytes, including trailing zeros, stay intact. The caller owns the images.
 func EncodeWALNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
 	if node.IsLeaf() {
-		return encodeLeafNodePages(node, pageSize, ids, true)
+		return encodeLeafNodePages(node, pageSize, ids, true, nil)
 	}
-	return encodeBranchNodePages(node, pageSize, ids, true)
+	return encodeBranchNodePages(node, pageSize, ids, true, nil)
+}
+
+// WALNodePagesEncodedSize returns the total bytes in compact WAL page images.
+// It excludes WAL record headers and checksums. It returns zero if the node
+// cannot fit the required page headers. Page IDs are not checked here.
+func WALNodePagesEncodedSize(node *Node, pageSize int64) int {
+	count := NodePageCount(node, pageSize)
+	if count == 0 {
+		return 0
+	}
+	size := WALNodeEncodedSize(node)
+	if count == 1 {
+		return size
+	}
+	firstHeader := leafContinuationHeaderSize
+	if !node.IsLeaf() {
+		firstHeader = branchContinuationHeaderSize
+	}
+	return size - NodeHeaderSize + firstHeader + (count-1)*(ContinuationHeaderSize+page.IDSize)
+}
+
+// EncodeWALNodePagesInto writes compact WAL images into caller-owned pages.
+// ids has the same requirements as EncodeWALNodePages. Each destination has
+// pageSize bytes, except the last, which can omit padding. Destinations must
+// not overlap each other or node data.
+// The encoder shortens the last slice to remove padding. It can change pages
+// before an error. The caller must keep successful images unchanged while used.
+func EncodeWALNodePagesInto(node *Node, pageSize int64, ids []page.ID, pages [][]byte) error {
+	if len(pages) == 0 || len(pages) != len(ids) {
+		return ErrInvalid
+	}
+	size := WALNodePagesEncodedSize(node, pageSize)
+	if size == 0 || len(pages) != NodePageCount(node, pageSize) {
+		return ErrInvalid
+	}
+	for i, data := range pages {
+		minimum := int(pageSize)
+		if i == len(pages)-1 {
+			minimum = size - i*int(pageSize)
+		}
+		if len(data) < minimum || int64(len(data)) > pageSize {
+			return ErrInvalid
+		}
+	}
+	var err error
+	if node.IsLeaf() {
+		_, err = encodeLeafNodePages(node, pageSize, ids, true, pages)
+	} else {
+		_, err = encodeBranchNodePages(node, pageSize, ids, true, pages)
+	}
+	return err
 }
 
 // VerifyNodeIDAndSetChecksum verifies the ID and sets the selected page checksum.

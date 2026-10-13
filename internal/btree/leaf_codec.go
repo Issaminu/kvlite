@@ -283,10 +283,10 @@ func leafPageCount(node *Node, pageSize int64) int {
 // ids must start with node.PageID and contain exactly leafPageCount distinct non-metadata IDs.
 // The caller must own the allocated IDs. Encoding does not change node or ids.
 func EncodeLeafNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
-	return encodeLeafNodePages(node, pageSize, ids, false)
+	return encodeLeafNodePages(node, pageSize, ids, false, nil)
 }
 
-func encodeLeafNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool) ([][]byte, error) {
+func encodeLeafNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool, pages [][]byte) ([][]byte, error) {
 	encodedSize := leafEncodedSize(node)
 	if node.header.Type & ^overflowNodeFlag != NodeTypeLeaf || uint64(encodedSize) > uint64(^uint32(0)) ||
 		len(ids) == 0 || len(ids) != leafPageCount(node, pageSize) || ids[0] != node.PageID() || page.IsMetaID(ids[0]) {
@@ -297,14 +297,23 @@ func encodeLeafNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool)
 		if forWAL {
 			size = encodedSize
 		}
-		data := make([]byte, size)
+		var data []byte
+		if pages == nil {
+			data = make([]byte, size)
+		} else {
+			data = pages[0][:size:size]
+		}
 		encodeLeafWALNode(data[:encodedSize], node)
 		if !forWAL {
 			binary.LittleEndian.PutUint32(data[14:18], pageChecksum(data, pageSize, nodeChecksumOffset))
 		}
-		return [][]byte{data}, nil
+		if pages == nil {
+			pages = make([][]byte, 1)
+		}
+		pages[0] = data
+		return pages, nil
 	}
-	pages, err := allocateContinuationPages(ids, pageSize, leafContinuationHeaderSize)
+	pages, err := prepareContinuationPages(ids, pageSize, leafContinuationHeaderSize, pages)
 	if err != nil {
 		return nil, err
 	}

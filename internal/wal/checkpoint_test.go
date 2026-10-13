@@ -23,6 +23,84 @@ type checkpointWriter struct {
 	writes []checkpointWrite
 }
 
+func TestWALCommit_MixedContinuedImagesKeepOwnedBytes(t *testing.T) {
+	const pageSize = 64
+	file, err := os.Create(filepath.Join(t.TempDir(), "wal"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: pageSize, CheckpointThresholdBytes: ^uint64(0)})
+	// Warm reusable storage before a transaction with owned continuation images.
+	log.encodingBuffer = make([]byte, 0, 4096)
+	nodes := []NodeRecord{
+		{Final: btree.NewLeafNode(3)},
+		{Final: btree.NewRootNode(100, btree.NewLeafNode(4), btree.NewLeafNode(5), make([]byte, 200))},
+		{Final: btree.NewLeafNode(200)},
+		{Final: btree.NewLeafNode(300)},
+	}
+	if err := nodes[2].Final.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 200))); err != nil {
+		t.Fatal(err)
+	}
+	allocation := []AllocationRecord{{PageID: 400, Payload: make([]byte, pageSize)}}
+	meta := []byte("meta")
+	want := make(map[page.ID][]byte)
+	var expected []byte
+	for _, record := range nodes {
+		ids := make([]page.ID, btree.NodePageCount(record.Final, pageSize))
+		for i := range ids {
+			ids[i] = record.Final.PageID() + page.ID(i)
+		}
+		record.Final.SetOverflowPages(ids[1:])
+		images, err := btree.EncodeWALNodePages(record.Final, pageSize, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, data := range images {
+			want[ids[i]] = data
+			expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: 1}, data)
+		}
+	}
+	expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeAllocation, PageID: 400, TxID: 1}, allocation[0].Payload)
+	for _, id := range []page.ID{page.Meta0ID, page.Meta1ID} {
+		expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeMeta, PageID: id, TxID: 1}, meta)
+	}
+	expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeCommit, TxID: 1}, nil)
+	if _, err := log.Commit(nodes, allocation, meta, nil); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(file.Name())
+	if err != nil || !bytes.Equal(got[walFileHeaderSize:], expected) {
+		t.Fatalf("mixed WAL transaction changed: %v", err)
+	}
+	// A later large transaction must not reuse any retained payload storage.
+	other := btree.NewRootNode(500, btree.NewLeafNode(4), btree.NewLeafNode(5), bytes.Repeat([]byte{0xff}, 1000))
+	ids := make([]page.ID, btree.NodePageCount(other, pageSize)-1)
+	for i := range ids {
+		ids[i] = page.ID(501 + i)
+	}
+	other.SetOverflowPages(ids)
+	if _, err := log.Commit([]NodeRecord{{Final: other}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	clear(log.encodingBuffer[:cap(log.encodingBuffer)])
+	for id, expected := range want {
+		record, ok := log.Lookup(id)
+		if !ok {
+			t.Fatalf("committed page %d is missing", id)
+		}
+		if record.Node != nil {
+			continue
+		}
+		if !bytes.Equal(record.Payload, expected) || cap(record.Payload) != len(record.Payload) {
+			t.Fatalf("committed page %d changed after a later commit", id)
+		}
+	}
+	if _, err := log.ReadRecords(); err != nil {
+		t.Fatalf("read mixed WAL records: %v", err)
+	}
+}
+
 func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
 	const pageSize int64 = 64
 	for _, size := range []int{0, 56, 57, 58, 1000} {

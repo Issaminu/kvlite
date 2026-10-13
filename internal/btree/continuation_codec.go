@@ -280,11 +280,15 @@ func continuationPageCount(bodySize int, pageSize int64, firstHeaderSize int) in
 	return (bodySize - extra + capacity - 1) / capacity
 }
 
-// allocateContinuationPages allocates page buffers and writes only the grouped ID arrays.
+// prepareContinuationPages writes headers and grouped continuation IDs.
+// It uses supplied destinations or allocates page buffers when pages is nil.
 // The owning codec writes the first page's type-specific fields and body.
 // Continuation pages get their own header here. Their checksums follow body encoding.
-func allocateContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int) ([][]byte, error) {
-	pages := make([][]byte, len(ids))
+func prepareContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int, pages [][]byte) ([][]byte, error) {
+	allocate := pages == nil
+	if allocate {
+		pages = make([][]byte, len(ids))
+	}
 	seen := make(map[page.ID]struct{}, len(ids))
 	chunkSize := min(max(1<<20, int(pageSize)), len(ids)*int(pageSize))
 	var chunk []byte
@@ -297,15 +301,22 @@ func allocateContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize in
 			return nil, ErrInvalid
 		}
 		seen[id] = struct{}{}
-		if len(chunk) < int(pageSize) {
-			chunk = make([]byte, min(chunkSize, (len(ids)-i)*int(pageSize)))
+		var data []byte
+		if allocate {
+			if len(chunk) < int(pageSize) {
+				chunk = make([]byte, min(chunkSize, (len(ids)-i)*int(pageSize)))
+			}
+			data = chunk[:int(pageSize):int(pageSize)]
+			chunk = chunk[int(pageSize):]
+		} else {
+			data = pages[i]
 		}
-		data := chunk[:int(pageSize):int(pageSize)]
-		chunk = chunk[int(pageSize):]
 		fixed := ContinuationHeaderSize
 		if i == 0 {
 			fixed = firstHeaderSize
 		}
+		// Supplied buffers can contain old header fields, including checksums.
+		clear(data[:fixed])
 		var nextIDs []page.ID
 		if i == arrayPageIndex {
 			count := min(len(ids)-i-1, (int(pageSize)-fixed-1)/page.IDSize)

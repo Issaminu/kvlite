@@ -278,10 +278,10 @@ func branchPageCount(node *Node, pageSize int64) int {
 // ids must start with node.PageID and contain exactly branchPageCount distinct non-metadata IDs.
 // The caller must own the allocated IDs. Encoding does not change node or ids.
 func EncodeBranchNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
-	return encodeBranchNodePages(node, pageSize, ids, false)
+	return encodeBranchNodePages(node, pageSize, ids, false, nil)
 }
 
-func encodeBranchNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool) ([][]byte, error) {
+func encodeBranchNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool, pages [][]byte) ([][]byte, error) {
 	encodedSize := branchEncodedSize(node)
 	if node.header.Type & ^overflowNodeFlag != NodeTypeBranch || uint64(encodedSize) > uint64(^uint32(0)) ||
 		len(ids) == 0 || len(ids) != branchPageCount(node, pageSize) || ids[0] != node.PageID() || page.IsMetaID(ids[0]) {
@@ -292,14 +292,23 @@ func encodeBranchNodePages(node *Node, pageSize int64, ids []page.ID, forWAL boo
 		if forWAL {
 			size = encodedSize
 		}
-		data := make([]byte, size)
+		var data []byte
+		if pages == nil {
+			data = make([]byte, size)
+		} else {
+			data = pages[0][:size:size]
+		}
 		encodeBranchWALNode(data[:encodedSize], node)
 		if !forWAL {
 			binary.LittleEndian.PutUint32(data[14:18], pageChecksum(data, pageSize, nodeChecksumOffset))
 		}
-		return [][]byte{data}, nil
+		if pages == nil {
+			pages = make([][]byte, 1)
+		}
+		pages[0] = data
+		return pages, nil
 	}
-	pages, err := allocateContinuationPages(ids, pageSize, branchContinuationHeaderSize)
+	pages, err := prepareContinuationPages(ids, pageSize, branchContinuationHeaderSize, pages)
 	if err != nil {
 		return nil, err
 	}

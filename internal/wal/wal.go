@@ -135,6 +135,7 @@ func (wal *WAL) releaseEncodingBuffer() {
 // encodeTransaction encodes changed nodes, allocation pages, optional metadata, and one commit marker.
 func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, txid TxID) ([]byte, error) {
 	transactionSize := HeaderSize + ChecksumSize
+	ownsTransaction := false
 	for index := range nodes {
 		record := &nodes[index]
 		record.continuedNodePageImages = nil
@@ -142,15 +143,12 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 			return nil, ErrNodeRecordMissingFinal
 		}
 		if len(record.Final.OverflowPages()) != 0 {
-			ids := append([]page.ID{record.Final.PageID()}, record.Final.OverflowPages()...)
-			var err error
-			record.continuedNodePageImages, err = btree.EncodeWALNodePages(record.Final, wal.pageSize, ids)
-			if err != nil {
-				return nil, err
+			count := len(record.Final.OverflowPages()) + 1
+			if count != btree.NodePageCount(record.Final, wal.pageSize) {
+				return nil, btree.ErrInvalid
 			}
-			for _, data := range record.continuedNodePageImages {
-				transactionSize += HeaderSize + len(data) + ChecksumSize
-			}
+			transactionSize += count*(HeaderSize+ChecksumSize) + btree.WALNodePagesEncodedSize(record.Final, wal.pageSize)
+			ownsTransaction = true
 			continue
 		}
 		// Size for the complete final image: patches are only written when smaller, so this is a safe upper bound for the encoding buffer capacity.
@@ -174,7 +172,9 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	}
 
 	transaction := wal.encodingBuffer[:0]
-	if cap(transaction) < transactionSize {
+	// Continued payloads borrow this transaction after Commit succeeds.
+	// Never reuse their storage for another transaction.
+	if ownsTransaction || cap(transaction) < transactionSize {
 		transaction = make([]byte, 0, transactionSize)
 	}
 	for index := range nodes {
@@ -196,12 +196,14 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 		}
 	}
 	transaction = appendEncodedPayloadRecord(transaction, RecordHeader{Type: RecordTypeCommit, TxID: txid}, nil)
-	wal.encodingBuffer = transaction[:0]
+	if !ownsTransaction {
+		wal.encodingBuffer = transaction[:0]
+	}
 	return transaction, nil
 }
 
 // appendNodeRecord appends a complete node image or a smaller patch or leaf-delete record.
-// Continued nodes use the page images prepared by encodeTransaction.
+// Continued nodes encode directly into transaction-owned page images.
 // TODO: Review all cases that write full node images to the WAL, including
 // leaf, branch, and overflow pages. Identify why each case cannot use a patch.
 // Use patches where they are smaller and preserve recovery, checkpoint, and
@@ -212,12 +214,8 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	if record.Original != nil && record.Original.PageID() != header.PageID {
 		return nil, fmt.Errorf("WAL node page %d, original page %d: %w", header.PageID, record.Original.PageID(), ErrNodePageMismatch)
 	}
-	if len(record.continuedNodePageImages) != 0 {
-		for _, data := range record.continuedNodePageImages {
-			header.PageID = page.ID(binary.LittleEndian.Uint64(data[2:10]))
-			transaction = appendEncodedPayloadRecord(transaction, header, data)
-		}
-		return transaction, nil
+	if len(record.Final.OverflowPages()) != 0 {
+		return wal.appendContinuedNodeRecords(transaction, record, txid)
 	}
 	if record.Original == nil {
 		return appendEncodedNodeRecord(transaction, header, record.Final), nil
@@ -252,6 +250,36 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	// Use the complete image when the direct scan cannot report fixed-offset changes,
 	// or when the patch is not smaller than the complete image.
 	return appendEncodedNodeRecord(transaction, header, record.Final), nil
+}
+
+// appendContinuedNodeRecords leaves record headers and checksums between the
+// page destinations. Each published payload borrows its own record's bytes.
+func (wal *WAL) appendContinuedNodeRecords(transaction []byte, record *NodeRecord, txid TxID) ([]byte, error) {
+	ids := append([]page.ID{record.Final.PageID()}, record.Final.OverflowPages()...)
+	pages := make([][]byte, len(ids))
+	start := len(transaction)
+	stride := HeaderSize + int(wal.pageSize) + ChecksumSize
+	imageBytes := btree.WALNodePagesEncodedSize(record.Final, wal.pageSize)
+	transaction = transaction[:start+imageBytes+len(ids)*(HeaderSize+ChecksumSize)]
+	for i := range pages {
+		payloadStart := start + i*stride + HeaderSize
+		size := min(int(wal.pageSize), imageBytes-i*int(wal.pageSize))
+		end := payloadStart + size
+		pages[i] = transaction[payloadStart:end:end]
+	}
+	if err := btree.EncodeWALNodePagesInto(record.Final, wal.pageSize, ids, pages); err != nil {
+		return nil, err
+	}
+	record.continuedNodePageImages = pages
+	end := start
+	for i, data := range pages {
+		headerStart := start + i*stride
+		header := RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: txid}
+		appendRecordHeader(transaction[:headerStart], header, len(data))
+		payloadStart := headerStart + HeaderSize
+		end = len(appendRecordChecksum(transaction[:payloadStart+len(data)], headerStart, payloadStart))
+	}
+	return transaction[:end], nil
 }
 
 // appendLeafNodePatch scans one leaf once and appends changed value bytes.
