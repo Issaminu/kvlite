@@ -157,7 +157,7 @@ func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
 				}
 				defer main.Close()
 				targetSize := int64(slices.Max(ids)+1) * pageSize
-				if err := log.Checkpoint(main, targetSize); err != nil {
+				if err := log.Checkpoint(main, targetSize, true); err != nil {
 					t.Fatal(err)
 				}
 				readPage := func(id page.ID) ([]byte, error) {
@@ -219,7 +219,7 @@ func TestCheckpointRejectsInvalidNodePageBeforeWriting(t *testing.T) {
 			records := []CommittedPage{{Header: RecordHeader{Type: RecordTypeNode, PageID: 3}, Payload: btree.EncodeWALNode(first)}, bad}
 			writer := &checkpointWriter{}
 			wantErr := page.ErrInvalid
-			if err := writeCheckpointRecordRuns(writer, records, pageSize); !errors.Is(err, wantErr) {
+			if err := writeCheckpointRecordRuns(writer, records, pageSize, true); !errors.Is(err, wantErr) {
 				t.Fatalf("checkpoint: got %v, want %v", err, wantErr)
 			}
 			if len(writer.writes) != 0 {
@@ -257,7 +257,7 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 	}}
 	writer := &checkpointWriter{}
 
-	if err := writeCheckpointRecordRuns(writer, records, pageSize); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	if len(writer.writes) != 1 {
@@ -290,7 +290,7 @@ func TestWriteCheckpointRecordRuns_ValidatesAllNodesBeforeWriting(t *testing.T) 
 	binary.LittleEndian.PutUint32(records[2].Payload[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
 
 	writer := &checkpointWriter{}
-	if err := writeCheckpointRecordRuns(writer, records, pageSize); !errors.Is(err, btree.ErrInvalid) {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true); !errors.Is(err, btree.ErrInvalid) {
 		t.Fatalf("checkpoint error: got %v, want ErrInvalid", err)
 	}
 	if len(writer.writes) != 0 {
@@ -312,7 +312,7 @@ func TestWriteCheckpointRecordRuns_CombinesAdjacentPages(t *testing.T) {
 	}
 	writer := &checkpointWriter{}
 
-	if err := writeCheckpointRecordRuns(writer, records, 4); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, 4, true); err != nil {
 		t.Fatal(err)
 	}
 
@@ -339,7 +339,7 @@ func TestWriteCheckpointRecordRuns_LimitsContiguousWriteSize(t *testing.T) {
 	}
 	writer := &checkpointWriter{}
 
-	if err := writeCheckpointRecordRuns(writer, records, pageSize); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true); err != nil {
 		t.Fatal(err)
 	}
 

@@ -20,10 +20,17 @@ const (
 )
 
 const (
-	// MetaSize is the encoded size of three uint32 fields and four uint64 fields.
-	MetaSize = 44
+	// MetaSize is the encoded size of four uint32 fields and four uint64 fields.
+	MetaSize = 48
 	// The final metadata field is one CRC32C checksum.
 	metaChecksumSize = 4
+)
+
+// metaFlags stores one enabled setting in each bit of the metadata flags field.
+type metaFlags uint32
+
+const (
+	metaFlagDataPageChecksums metaFlags = 1 << iota
 )
 
 type Meta struct {
@@ -33,6 +40,7 @@ type Meta struct {
 	pgid       ID
 	root       ID // pgid of the root node
 	generation uint64
+	flags      metaFlags
 	checksum   uint32
 }
 
@@ -58,6 +66,7 @@ func EncodeMeta(meta *Meta) []byte {
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.pgid))
 	data = binary.LittleEndian.AppendUint64(data, uint64(meta.root))
 	data = binary.LittleEndian.AppendUint64(data, meta.generation)
+	data = binary.LittleEndian.AppendUint32(data, uint32(meta.flags))
 	data = binary.LittleEndian.AppendUint32(data, meta.checksum)
 	return data
 }
@@ -67,7 +76,7 @@ func DecodeMeta(data []byte) (*Meta, error) {
 		return nil, fmt.Errorf("decode meta: got %d bytes, want %d: %w", len(data), MetaSize, ErrInvalid)
 	}
 
-	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], generation[32:40], and checksum[40:44].
+	// Layout: magic[0:4], version[4:8], pageSize[8:16], pgid[16:24], root[24:32], generation[32:40], flags[40:44], and checksum[44:48].
 	return &Meta{
 		magic:      binary.LittleEndian.Uint32(data[0:4]),
 		version:    binary.LittleEndian.Uint32(data[4:8]),
@@ -75,7 +84,8 @@ func DecodeMeta(data []byte) (*Meta, error) {
 		pgid:       ID(binary.LittleEndian.Uint64(data[16:24])),
 		root:       ID(binary.LittleEndian.Uint64(data[24:32])),
 		generation: binary.LittleEndian.Uint64(data[32:40]),
-		checksum:   binary.LittleEndian.Uint32(data[40:44]),
+		flags:      metaFlags(binary.LittleEndian.Uint32(data[40:44])),
+		checksum:   binary.LittleEndian.Uint32(data[44:48]),
 	}, nil
 }
 
@@ -113,6 +123,20 @@ func (m *Meta) SetLastPage(pageID ID) {
 	m.pgid = pageID
 }
 
+// DataPageChecksums reports whether this file stores and checks data-page checksums.
+func (m *Meta) DataPageChecksums() bool {
+	return m.flags&metaFlagDataPageChecksums != 0
+}
+
+// SetDataPageChecksums selects the data-page checksum mode for a new file.
+// RefreshChecksum seals the changed metadata before it is stored.
+func (m *Meta) SetDataPageChecksums(enabled bool) {
+	m.flags &^= metaFlagDataPageChecksums
+	if enabled {
+		m.flags |= metaFlagDataPageChecksums
+	}
+}
+
 func (m *Meta) RefreshChecksum() {
 	m.checksum = m.generateChecksum()
 }
@@ -126,6 +150,9 @@ func (m *Meta) Validate() error {
 	}
 	if m.checksum != m.generateChecksum() {
 		return ErrChecksum
+	}
+	if m.flags&^metaFlagDataPageChecksums != 0 {
+		return ErrInvalid
 	}
 	return nil
 }

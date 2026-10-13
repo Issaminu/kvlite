@@ -186,7 +186,7 @@ The 1 MiB value-read case uses 16 records and 200 reads at medium. It uses 64 re
 
 The 32 KiB keys differ only in their final eight bytes. KVLite must compare their common first bytes across continuation pages to select the correct tree child.
 
-The suite loads the data, closes each embedded database, and reopens it before measurement. KVLite reads its main database file and verifies page checksums. Both KVLite and the bbolt adapter return a value copy. The caller can change that copy without changing the stored value. Redis receives the same keys and values, but its storage pages differ from those of the embedded engines.
+The suite loads the data, closes each embedded database, and reopens it before measurement. KVLite reads its main database file. This harness uses the default `DataPageChecksums=false` for new files. It skips data-page checksum calculation and checks. Metadata, allocation pages, and WAL records retain their checksums. Historical results use the policy of their recorded source commit. Both KVLite and the bbolt adapter return a value copy. The caller can change that copy without changing the stored value. Redis receives the same keys and values, but its storage pages differ from those of the embedded engines.
 
 Use `--workloads=reads`, `writes`, `deletes`, or `mixed` to select one operation group. Use `--case` to select one exact case. For example, measure only the light 64 KiB value read:
 

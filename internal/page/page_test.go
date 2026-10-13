@@ -36,7 +36,7 @@ func TestIDCodec_UsesExactlyEightLittleEndianBytes(t *testing.T) {
 
 func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 	// Distinct field values make the order and width of every field visible.
-	meta := &Meta{magic: 1, version: 2, pageSize: 3, pgid: 4, root: 5, generation: 6, checksum: 7}
+	meta := &Meta{magic: 1, version: 2, pageSize: 3, pgid: 4, root: 5, generation: 6, flags: 7, checksum: 8}
 	want := []byte{
 		1, 0, 0, 0,
 		2, 0, 0, 0,
@@ -45,6 +45,7 @@ func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		5, 0, 0, 0, 0, 0, 0, 0,
 		6, 0, 0, 0, 0, 0, 0, 0,
 		7, 0, 0, 0,
+		8, 0, 0, 0,
 	}
 
 	encoded := EncodeMeta(meta)
@@ -60,8 +61,8 @@ func TestMetaCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		t.Fatalf("decode meta: got %+v, want %+v", decoded, meta)
 	}
 
-	// The seven metadata fields occupy exactly 44 bytes.
-	for _, size := range []int{43, 45} {
+	// The eight metadata fields occupy exactly 48 bytes.
+	for _, size := range []int{47, 49} {
 		if _, err := DecodeMeta(make([]byte, size)); !errors.Is(err, ErrInvalid) {
 			t.Errorf("decode %d bytes: got %v, want ErrInvalid", size, err)
 		}
@@ -75,6 +76,46 @@ func TestMetaChecksum_UsesCRC32C(t *testing.T) {
 	want := crc32.Checksum(encoded[:MetaSize-metaChecksumSize], crc32.MakeTable(crc32.Castagnoli))
 	if got := binary.LittleEndian.Uint32(encoded[MetaSize-metaChecksumSize:]); got != want {
 		t.Fatalf("metadata checksum: got %x, want CRC32C %x", got, want)
+	}
+}
+
+func TestMetaChecksum_ProtectsDataPageMode(t *testing.T) {
+	meta := NewMeta(4096)
+	meta.SetDataPageChecksums(true)
+	meta.RefreshChecksum()
+	encoded := EncodeMeta(meta)
+	decoded, err := DecodeMeta(encoded)
+	if err != nil || !decoded.DataPageChecksums() || decoded.Validate() != nil {
+		t.Fatalf("stored checksum mode: %v", err)
+	}
+	encoded[40] = 0
+	decoded, err = DecodeMeta(encoded)
+	if err != nil || !errors.Is(decoded.Validate(), ErrChecksum) {
+		t.Fatalf("changed checksum mode: %v", err)
+	}
+	meta.flags = 2
+	meta.RefreshChecksum()
+	if err := meta.Validate(); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("unknown metadata flag: got %v, want invalid", err)
+	}
+}
+
+func TestMetaFlags_DataPageChecksumsPreservesOtherBits(t *testing.T) {
+	const otherFlag metaFlags = 1 << 31
+	meta := NewMeta(4096)
+	meta.flags = otherFlag
+	meta.SetDataPageChecksums(true)
+	if !meta.DataPageChecksums() || meta.flags != otherFlag|metaFlagDataPageChecksums {
+		t.Fatalf("enable checksum bit: got flags %x", meta.flags)
+	}
+	meta.RefreshChecksum()
+	decoded, err := DecodeMeta(EncodeMeta(meta))
+	if err != nil || decoded.flags != meta.flags {
+		t.Fatalf("stored flags: %v", err)
+	}
+	decoded.SetDataPageChecksums(false)
+	if decoded.DataPageChecksums() || decoded.flags != otherFlag {
+		t.Fatalf("disable checksum bit: got flags %x", decoded.flags)
 	}
 }
 

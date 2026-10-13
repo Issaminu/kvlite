@@ -99,7 +99,7 @@ func readLeafNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) (N
 		if h.Checksum != 0 {
 			return NodeHeader{}, nil, nil, ErrInvalid
 		}
-	} else if h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return NodeHeader{}, nil, nil, fmt.Errorf("node page %d: %w", id, page.ErrChecksum)
 	}
 	start := fixed + int(h.NextPageCount)*page.IDSize
@@ -156,7 +156,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 		if stored != 0 {
 			return nil, fmt.Errorf("read WAL node checksum %x: %w", stored, ErrInvalid)
 		}
-	} else if stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if stored != 0 && stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
 	node, _, _, _, err := readEncodedLeaf(data, id, stored, nil, true, !forWAL, nil, nil, true)
@@ -173,7 +173,7 @@ func DecodeWALLeafNode(data []byte, id page.ID, pageSize int64, readPage func(pa
 }
 
 // LookupMappedLeafNode searches a leaf's encoded directory without creating a Node.
-// Normal pages return borrowed entry bytes and require no checksum calculation.
+// Normal pages return borrowed entry bytes. Nonzero page checksums are checked.
 // Continued pages check each visited page. A found leaf value owns its bytes.
 // A continued key borrows the first page if it fits there; otherwise it owns a copy.
 // Set includeKey to false to omit the returned key and its copy.
@@ -217,6 +217,8 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 		if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
+	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset); err != nil {
+		return Entry{}, false, 0, err
 	}
 	_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, !forWAL, nil, nil, includeKey)
 	return entry, found, child, err
@@ -541,7 +543,7 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 }
 
 // VisitMappedLeafRange visits entries in the half-open range [start, end).
-// It checks descriptor offsets and byte bounds. It does not check the page checksum or unused padding.
+// It checks descriptor offsets, byte bounds, and a nonzero page checksum.
 // The key and value passed to visit refer to data.
 func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
 	if len(data) < NodeHeaderSize {
@@ -557,6 +559,9 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 		return fmt.Errorf("read leaf page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
 	}
 
+	if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset); err != nil {
+		return err
+	}
 	entryCount := int(binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset]))
 	if entryCount > (len(data)-NodeHeaderSize)/leafEntryDescriptorSize {
 		return fmt.Errorf("read leaf entry count: %w", ErrInvalid)
@@ -604,6 +609,9 @@ func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint
 		return fmt.Errorf("read leaf page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
 	}
 
+	if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset); err != nil {
+		return err
+	}
 	entryCount := int(binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset]))
 	if entryCount > (len(data)-NodeHeaderSize)/leafEntryDescriptorSize {
 		return fmt.Errorf("read leaf entry count: %w", ErrInvalid)

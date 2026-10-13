@@ -110,7 +110,7 @@ Storage and synchronization are separate choices. `Open` selects file storage. I
 - Cursors move forward or backward in byte-key order.
 - Prefix and half-open range scans visit entries in byte-key order.
 - A redo write-ahead log supports recovery after an unclean close.
-- CRC32C checksums protect metadata, B+ tree pages, and log records.
+- CRC32C checksums protect metadata, allocation pages, and log records. Data-page checksums are optional.
 - Two metadata pages let KVLite recover when one valid copy remains.
 - One open `DB` accepts concurrent method calls.
 - Durable concurrent updates can share one log write and storage sync.
@@ -282,6 +282,18 @@ For a database at `app.db`, KVLite can use two files:
 A writable open creates the log. A clean writable close removes it. An application or system failure can leave the log beside the main file.
 
 `Open` validates metadata and checksums. It replays complete committed log transactions. It ignores an incomplete final transaction. A checksum error in committed data stops recovery and returns an error.
+
+Data-page checksum calculation and checks are disabled by default. Enable them when you create a file:
+
+```go
+db, err := kvlite.Open("app.db", 0o600, &kvlite.Options{
+	DataPageChecksums: true,
+})
+```
+
+This option covers leaf, branch, and continuation pages. The file stores the mode. `Open` uses that stored mode for an existing file and ignores this option. Backup preserves the mode. Rebuild into a new file to change it.
+
+Without data-page checksums, damaged key or value bytes can pass unnoticed. Metadata, allocation pages, and WAL records retain their checksums in both modes. The option does not change storage synchronization or checkpoint ordering.
 
 KVLite records which database pages are in use. A later transaction can reuse a tree page that an earlier transaction freed. When free pages reach the end of the file, a checkpoint can shorten the main file. `DB.Stats` reports allocated pages, reusable pages, retired pages, and reused pages.
 

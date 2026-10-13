@@ -48,13 +48,14 @@ func New(config Config) *WAL {
 }
 
 // Checkpoint copies the committed overlay into mainFile and then clears the WAL contents.
+// dataPageChecksums selects checksum calculation for data pages only.
 // It borrows mainFile and does not close it.
 // targetSize is the byte length through the last allocated database page.
 // Checkpoint removes a free suffix before it syncs mainFile and clears the WAL.
 // When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
 // A main-file write, truncate, or required sync failure leaves the overlay and WAL available for a later retry.
 // A WAL truncate failure returns an error and keeps the overlay for cleanup retry.
-func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
+func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64, dataPageChecksums bool) error {
 	if len(wal.overlay) == 0 {
 		return nil
 	}
@@ -66,7 +67,7 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 			return err
 		}
 	}
-	if err := WriteCommittedPages(mainFile, wal.overlay, wal.pageSize); err != nil {
+	if err := WriteCommittedPages(mainFile, wal.overlay, wal.pageSize, dataPageChecksums); err != nil {
 		return err
 	}
 	info, err := mainFile.Stat()
@@ -97,8 +98,9 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64) error {
 }
 
 // WriteCommittedPages writes complete page images to dst without changing the WAL.
+// dataPageChecksums selects checksum calculation for data pages only.
 // The caller must keep pages, their nodes, and their payloads unchanged until it returns.
-func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageSize int64) error {
+func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageSize int64, dataPageChecksums bool) error {
 	if pageSize <= 0 {
 		return page.ErrInvalid
 	}
@@ -117,13 +119,13 @@ func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageS
 			return 0
 		}
 	})
-	return writeCheckpointRecordRuns(dst, records, pageSize)
+	return writeCheckpointRecordRuns(dst, records, pageSize, dataPageChecksums)
 }
 
 // writeCheckpointRecordRuns combines adjacent, page-ID-ordered records into bounded writes.
 // records must contain unique page IDs in ascending order.
 // It pads each WAL image to pageSize because the WAL omits unused page bytes but the main file stores fixed-size pages.
-func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pageSize int64) error {
+func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pageSize int64, dataPageChecksums bool) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -194,7 +196,7 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pa
 			copy(pageData, record.Payload)
 		}
 		if record.Header.Type == RecordTypeNode {
-			if err := btree.VerifyNodeIDAndSetChecksum(pageData, pageID); err != nil {
+			if err := btree.VerifyNodeIDAndSetChecksum(pageData, pageID, dataPageChecksums); err != nil {
 				return err
 			}
 		}

@@ -121,6 +121,7 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	var walPageSize int64
 	if isNew {
 		db.meta = page.NewMeta(int64(os.Getpagesize()))
+		db.meta.SetDataPageChecksums(db.options.DataPageChecksums)
 		walPageSize = db.meta.PageSize()
 	} else {
 		db.meta, walPageSize, mainMetaErr = db.readValidMainMeta()
@@ -431,7 +432,7 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 func (db *DB) persistNode(node *btree.Node) error {
 	offset := int64(node.PageID()) * db.meta.PageSize()
 	writer := io.NewOffsetWriter(db.file, offset)
-	if err := btree.WriteNode(writer, node, db.meta.PageSize(), true); err != nil {
+	if err := btree.WriteNode(writer, node, db.meta.PageSize(), true, db.meta.DataPageChecksums()); err != nil {
 		return fmt.Errorf("write node: %w", err)
 	}
 	return nil
@@ -468,11 +469,11 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 		return node, nil
 	}
 
-	data, err := db.readMainPage(pgid)
+	data, err := db.readMainNodePage(pgid)
 	if err != nil {
 		return nil, err
 	}
-	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize(), db.readMainPage)
+	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize(), db.readMainNodePage)
 	if err != nil {
 		return nil, err
 	}
@@ -517,11 +518,11 @@ func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuat
 	if node, ok := db.cachedWriteNode(pageID); ok {
 		return btree.VisitNodeReferences(node, visit, visitContinuation)
 	}
-	data, err := db.readMainPage(pageID)
+	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return err
 	}
-	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), db.readMainPage, visit, visitContinuation)
+	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), db.readMainNodePage, visit, visitContinuation)
 }
 
 // cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
@@ -579,11 +580,11 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte, includeKey bool) (
 	if record, ok := db.wal.Lookup(pageID); ok {
 		return db.wal.LookupCommittedPage(&record, key, includeKey)
 	}
-	data, err := db.readMainPage(pageID)
+	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key, db.readMainPage, includeKey)
+	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey)
 }
 
 // findCommittedEntry searches one committed tree for Get.

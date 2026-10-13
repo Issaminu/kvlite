@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -81,6 +82,19 @@ func (db *DB) readMainPage(pageID page.ID) ([]byte, error) {
 	}
 	if n != len(data) {
 		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
+}
+
+// readMainNodePage reads one data page and checks its stored checksum mode.
+// The codec checks a nonzero checksum before it uses protected page contents.
+func (db *DB) readMainNodePage(pageID page.ID) ([]byte, error) {
+	data, err := db.readMainPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	if err := btree.CheckNodeChecksumMode(data, db.meta.DataPageChecksums()); err != nil {
+		return nil, fmt.Errorf("read data page %d: %w", pageID, err)
 	}
 	return data, nil
 }

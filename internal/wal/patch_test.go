@@ -217,7 +217,7 @@ func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer mainFile.Close()
-	if err := log.Checkpoint(mainFile, 3*pageSize); err != nil {
+	if err := log.Checkpoint(mainFile, 3*pageSize, true); err != nil {
 		t.Fatal(err)
 	}
 	data := make([]byte, pageSize)

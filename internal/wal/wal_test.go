@@ -673,7 +673,7 @@ func TestWALCommit_WritesTreeAllocationAndMetadataTogether(t *testing.T) {
 	if committed, ok := log.CommittedRecord(2); !ok || committed.Header.Type != RecordTypeAllocation || !bytes.Equal(committed.Payload, image) {
 		t.Fatalf("committed allocation page: got %+v, found %t", committed, ok)
 	}
-	if err := log.Checkpoint(mainFile, 4*64); err != nil {
+	if err := log.Checkpoint(mainFile, 4*64, true); err != nil {
 		t.Fatal(err)
 	}
 	got := make([]byte, len(image))
@@ -735,7 +735,7 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 	}
 	writtenBytes := log.Stats().TotalBytesWritten
 
-	if err := log.Checkpoint(mainFile, 34*64); err != nil {
+	if err := log.Checkpoint(mainFile, 34*64, true); err != nil {
 		t.Fatal(err)
 	}
 	stats := log.Stats()
@@ -745,7 +745,7 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 	if got := stats.CheckpointCount; got != 1 {
 		t.Fatalf("checkpoint count: got %d, want 1", got)
 	}
-	if err := log.Checkpoint(mainFile, 34*64); err != nil {
+	if err := log.Checkpoint(mainFile, 34*64, true); err != nil {
 		t.Fatal(err)
 	}
 	if got := log.Stats().CheckpointCount; got != 1 {
@@ -783,13 +783,13 @@ func TestWALCheckpoint_MissingLastPageKeepsWAL(t *testing.T) {
 	if _, err := log.Commit([]NodeRecord{{Final: btree.NewLeafNode(3)}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := log.Checkpoint(mainFile, 5*64); !errors.Is(err, page.ErrInvalid) {
+	if err := log.Checkpoint(mainFile, 5*64, true); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("checkpoint with missing last page: got %v, want %v", err, page.ErrInvalid)
 	}
 	if _, ok := log.CommittedRecord(3); !ok {
 		t.Fatal("failed checkpoint removed the committed page")
 	}
-	if err := log.Checkpoint(mainFile, 4*64); err != nil {
+	if err := log.Checkpoint(mainFile, 4*64, true); err != nil {
 		t.Fatal(err)
 	}
 }

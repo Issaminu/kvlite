@@ -93,7 +93,7 @@ func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
 	if err != nil {
 		return err
 	}
-	return db.wal.Checkpoint(db.file, targetSize)
+	return db.wal.Checkpoint(db.file, targetSize, db.meta.DataPageChecksums())
 }
 
 func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
@@ -177,7 +177,7 @@ func (db *DB) materializeWALNodeChanges(records []wal.WALRecord) ([]wal.WALRecor
 	lastRecord := make(map[page.ID]int)
 	lastFullRecord := make(map[page.ID]int)
 	loadMain := func(pageID page.ID) ([]byte, uint32, error) {
-		mainPage, err := db.readMainPage(pageID)
+		mainPage, err := db.readMainNodePage(pageID)
 		if err != nil {
 			return nil, 0, fmt.Errorf("read page %d for WAL change: %w", pageID, err)
 		}

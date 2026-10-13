@@ -28,6 +28,7 @@ func mappedNodeType(data []byte) NodeType {
 // pageChecksum calculates CRC32C with a format-supplied checksum offset.
 // Missing bytes before pageSize are zero padding. The four checksum bytes are skipped.
 // The caller must provide a full header with that checksum field.
+// A CRC result of zero is stored as one. Zero marks an unchecked data page.
 func pageChecksum(data []byte, pageSize int64, checksumOffset int) uint32 {
 	sum := checksum.Sum32(data[:checksumOffset], data[checksumOffset+encodedUint32Size:])
 	for remaining := pageSize - int64(len(data)); remaining > 0; {
@@ -35,7 +36,42 @@ func pageChecksum(data []byte, pageSize int64, checksumOffset int) uint32 {
 		sum = checksum.Update32(sum, checksumZeroBlock[:n])
 		remaining -= n
 	}
+	if sum == 0 {
+		return 1
+	}
 	return sum
+}
+
+// CheckNodeChecksumMode checks whether a data page has the file's checksum mode.
+// It checks the page type and checksum field. It does not calculate a checksum.
+func CheckNodeChecksumMode(data []byte, enabled bool) error {
+	offset := nodeChecksumOffset
+	switch mappedNodeType(data) {
+	case NodeTypeLeaf, NodeTypeBranch, NodeTypeLeaf | overflowNodeFlag, NodeTypeBranch | overflowNodeFlag:
+	case NodeTypeContinuation:
+		offset = continuationChecksumOffset
+	default:
+		return ErrInvalid
+	}
+	if len(data) < offset+encodedUint32Size {
+		return ErrInvalid
+	}
+	if (binary.LittleEndian.Uint32(data[offset:offset+encodedUint32Size]) != 0) != enabled {
+		return page.ErrChecksum
+	}
+	return nil
+}
+
+// checkPageChecksum checks a nonzero data-page checksum. Zero skips calculation.
+func checkPageChecksum(data []byte, pageSize int64, offset int) error {
+	if len(data) < offset+encodedUint32Size || int64(len(data)) > pageSize {
+		return ErrInvalid
+	}
+	stored := binary.LittleEndian.Uint32(data[offset : offset+encodedUint32Size])
+	if stored != 0 && stored != pageChecksum(data, pageSize, offset) {
+		return page.ErrChecksum
+	}
+	return nil
 }
 
 // DecodeNode selects the leaf or branch codec and verifies the complete node.
@@ -222,29 +258,35 @@ func EncodeWALNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, er
 	return encodeBranchNodePages(node, pageSize, ids, true)
 }
 
-// VerifyNodeIDAndSetChecksum verifies the ID and seals the selected page format.
+// VerifyNodeIDAndSetChecksum verifies the ID and sets the selected page checksum.
+// enabled calculates a checksum. Otherwise the checksum field is zero.
 // It does not validate the body. len(data) is the page size.
-func VerifyNodeIDAndSetChecksum(data []byte, id page.ID) error {
+func VerifyNodeIDAndSetChecksum(data []byte, id page.ID, enabled bool) error {
 	if mappedNodeType(data) == NodeTypeContinuation {
-		return verifyPageIDAndSetChecksum(data, id, ContinuationHeaderSize, continuationChecksumOffset)
+		return verifyPageIDAndSetChecksum(data, id, ContinuationHeaderSize, continuationChecksumOffset, enabled)
 	}
-	return verifyPageIDAndSetChecksum(data, id, NodeHeaderSize, nodeChecksumOffset)
+	return verifyPageIDAndSetChecksum(data, id, NodeHeaderSize, nodeChecksumOffset, enabled)
 }
 
 // verifyPageIDAndSetChecksum uses the ID field shared by all page types.
 // The owning format supplies its minimum header length and checksum position.
-func verifyPageIDAndSetChecksum(data []byte, id page.ID, headerSize, checksumOffset int) error {
+func verifyPageIDAndSetChecksum(data []byte, id page.ID, headerSize, checksumOffset int, enabled bool) error {
 	if len(data) < headerSize {
 		return fmt.Errorf("set node checksum: read header: %w", ErrInvalid)
 	}
 	if got := page.ID(binary.LittleEndian.Uint64(data[2:10])); got != id {
 		return fmt.Errorf("set node checksum: read page ID %d, want %d: %w", got, id, ErrInvalid)
 	}
-	binary.LittleEndian.PutUint32(data[checksumOffset:checksumOffset+encodedUint32Size], pageChecksum(data, int64(len(data)), checksumOffset))
+	var sum uint32
+	if enabled {
+		sum = pageChecksum(data, int64(len(data)), checksumOffset)
+	}
+	binary.LittleEndian.PutUint32(data[checksumOffset:checksumOffset+encodedUint32Size], sum)
 	return nil
 }
 
-// WriteNode writes a node with a checksum for pageSize bytes.
+// WriteNode writes a node for pageSize bytes.
+// dataPageChecksums calculates a checksum. Otherwise the checksum field is zero.
 // If shouldPad is true, it adds zeros and writes pageSize bytes.
 // If shouldPad is false, it does not write the zeros.
 // The checksum still covers the missing zeros.
@@ -252,8 +294,14 @@ func verifyPageIDAndSetChecksum(data []byte, id page.ID, headerSize, checksumOff
 // WriteNode stores the checksum in the node header.
 // It returns ErrNodeTooLarge if the node is larger than pageSize.
 // It completes partial writes or returns the writer error.
-func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad bool) error {
-	encoded := EncodeNode(node, pageSize)
+func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad, dataPageChecksums bool) error {
+	var encoded []byte
+	if dataPageChecksums {
+		encoded = EncodeNode(node, pageSize)
+	} else {
+		encoded = EncodeWALNode(node)
+		node.header.Checksum = 0
+	}
 	currNodeSize := len(encoded)
 
 	if int64(currNodeSize) > pageSize {

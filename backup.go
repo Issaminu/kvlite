@@ -61,6 +61,7 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 		return err
 	}
 	pageSize := db.meta.PageSize()
+	dataPageChecksums := db.meta.DataPageChecksums()
 	pages := db.wal.CommittedRecords()
 	db.activeBackups++
 	db.operationMu.Unlock()
@@ -90,7 +91,7 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	if n != length {
 		return io.ErrUnexpectedEOF
 	}
-	if err := wal.WriteCommittedPages(temp, pages, pageSize); err != nil {
+	if err := wal.WriteCommittedPages(temp, pages, pageSize, dataPageChecksums); err != nil {
 		return err
 	}
 	backupInfo, err := temp.Stat()

@@ -126,6 +126,7 @@ func TestVisitMappedLeafReverse(t *testing.T) {
 
 	bad := bytes.Clone(data)
 	binary.LittleEndian.PutUint32(bad[NodeHeaderSize+leafEntryDescriptorSize+encodedUint32Size:], 0)
+	binary.LittleEndian.PutUint32(bad[nodeChecksumOffset:NodeHeaderSize], pageChecksum(bad, testNodePageSize, nodeChecksumOffset))
 	if err := VisitMappedLeafReverse(bad, leaf.PageID(), func(uint32, []byte, []byte) error { return nil }); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("invalid leaf: got %v, want ErrInvalid", err)
 	}

@@ -189,6 +189,7 @@ func writeContinuedReadDatabase(t *testing.T) (string, []byte, []btree.Entry, pa
 		btree.NewEntry(0, []byte("z"), []byte("last")),
 	}
 	meta := page.NewMeta(pageSize)
+	meta.SetDataPageChecksums(true)
 	catalog := btree.NewLeafNode(meta.Root())
 	left, right := btree.NewLeafNode(5), btree.NewLeafNode(6)
 	for index, entry := range entries {
@@ -459,9 +460,9 @@ func tempfile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("kvlite-%d.db", time.Now().UnixNano()))
 }
 
-// openDB opens a database for tests in SyncNone mode, so repeated storage syncs do not dominate the suite. Tests that require synchronized storage use [Open] with the default SyncFull mode.
+// openDB opens a protected test database in SyncNone mode. Tests that require synchronized storage use [Open] with the default SyncFull mode.
 func openDB(path string) (*DB, error) {
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: true})
 	if err != nil {
 		return nil, err
 	}
@@ -507,6 +508,8 @@ func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
 	defer file.Close()
 
 	meta := page.NewMeta(pageSize)
+	meta.SetDataPageChecksums(true)
+	meta.RefreshChecksum()
 	encodedMeta := page.EncodeMeta(meta)
 	for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
 		if _, err := file.WriteAt(encodedMeta, int64(pageID)*pageSize); err != nil {
@@ -518,7 +521,7 @@ func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
 		t.Fatal(err)
 	}
 	root := btree.NewLeafNode(meta.Root())
-	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true); err != nil {
+	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true, true); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -8238,7 +8241,7 @@ func TestRecovery_ContinuedDeletesAndReuse(t *testing.T) {
 // TestDeleteBucket_ContinuedReadFailure keeps the bucket when a descendant is damaged.
 func TestDeleteBucket_ContinuedReadFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	options := &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30}
+	options := &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30, DataPageChecksums: true}
 	db, err := Open(path, 0600, options)
 	if err != nil {
 		t.Fatal(err)

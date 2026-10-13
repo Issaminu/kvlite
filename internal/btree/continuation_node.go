@@ -19,6 +19,7 @@ const continuationChecksumOffset = 10
 //	[18:18+8*N]    N*8    next page IDs in body order
 //	[18+8*N:P]     rest   body fragment, including final-page padding
 //
+// A zero checksum marks an unchecked main-file page. A calculated CRC of zero is stored as one.
 // N=0 means no ID array. An array's last page can contain another array.
 // Every page holds body bytes. There is no entry count or body-length field.
 type ContinuationHeader struct {

@@ -98,7 +98,7 @@ func readBranchNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) 
 		if h.Checksum != 0 {
 			return NodeHeader{}, nil, nil, ErrInvalid
 		}
-	} else if h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return NodeHeader{}, nil, nil, fmt.Errorf("node page %d: %w", id, page.ErrChecksum)
 	}
 	start := fixed + int(h.NextPageCount)*page.IDSize
@@ -155,7 +155,7 @@ func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(pag
 		if stored != 0 {
 			return nil, fmt.Errorf("read WAL node checksum %x: %w", stored, ErrInvalid)
 		}
-	} else if stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if stored != 0 && stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
 	node, _, _, _, err := readEncodedBranch(data, id, stored, nil, true, !forWAL, nil, nil)
@@ -172,7 +172,7 @@ func DecodeWALBranchNode(data []byte, id page.ID, pageSize int64, readPage func(
 }
 
 // LookupMappedBranchNode searches a branch's encoded directory without creating a Node.
-// Each search returns the selected child page ID. Normal pages do not calculate a checksum.
+// Each search returns the selected child page ID. Nonzero page checksums are checked.
 // Continued pages check each visited page and do not copy the complete body.
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage must keep continuation bytes unchanged until the lookup returns.
@@ -212,6 +212,8 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 		if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
+	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset); err != nil {
+		return Entry{}, false, 0, err
 	}
 	_, entry, found, child, err := readEncodedBranch(data, id, 0, key, false, !forWAL, nil, nil)
 	return entry, found, child, err

@@ -97,7 +97,7 @@ func TestNodeCodec_UsesProtectedNodeHeader(t *testing.T) {
 	}
 
 	var pageData bytes.Buffer
-	if err := WriteNode(&pageData, node, pageSize, true); err != nil {
+	if err := WriteNode(&pageData, node, pageSize, true, true); err != nil {
 		t.Fatal(err)
 	}
 	encoded := pageData.Bytes()
@@ -136,6 +136,103 @@ func TestDecodeNode_RejectsCorruptedPageBeforePayloadDecode(t *testing.T) {
 	}
 }
 
+func TestPageChecksum_ZeroCRCUsesNonzeroMarker(t *testing.T) {
+	const pageSize int64 = 64
+	node := NewLeafNode(7)
+	// This value makes the raw CRC32C zero for this page layout.
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte{0xac, 0x3e, 0xdf, 0xeb})); err != nil {
+		t.Fatal(err)
+	}
+	var encoded bytes.Buffer
+	if err := WriteNode(&encoded, node, pageSize, true, true); err != nil {
+		t.Fatal(err)
+	}
+	data := encoded.Bytes()
+	table := crc32.MakeTable(crc32.Castagnoli)
+	raw := crc32.Update(0, table, data[:nodeChecksumOffset])
+	raw = crc32.Update(raw, table, data[NodeHeaderSize:])
+	if raw != 0 || binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]) != 1 {
+		t.Fatalf("raw CRC=%x, stored=%x; want zero and one", raw, data[nodeChecksumOffset:NodeHeaderSize])
+	}
+	if _, err := DecodeNode(data, 7, pageSize, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _, err := LookupMappedNode(data, 7, []byte("k"), nil, false); err != nil || !found {
+		t.Fatalf("zero-CRC lookup: found=%t, %v", found, err)
+	}
+}
+
+func TestLookupMappedNode_ChecksOrdinaryPageChecksum(t *testing.T) {
+	for _, branch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("branch=%t", branch), func(t *testing.T) {
+			node := NewLeafNode(7)
+			if branch {
+				node = NewRootNode(7, NewLeafNode(8), NewLeafNode(9), []byte("middle"))
+			} else if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+				t.Fatal(err)
+			}
+			data := make([]byte, 4096)
+			copy(data, EncodeNode(node, 4096))
+			data[len(data)-1] ^= 1
+			if _, _, _, err := LookupMappedNode(data, 7, []byte("key"), nil, false); !errors.Is(err, page.ErrChecksum) {
+				t.Fatalf("damaged ordinary page: got %v, want checksum error", err)
+			}
+		})
+	}
+}
+
+func TestUncheckedNodePages_KeepStructuralChecks(t *testing.T) {
+	const pageSize int64 = 64
+	for _, branch := range []bool{false, true} {
+		for _, continued := range []bool{false, true} {
+			t.Run(fmt.Sprintf("branch=%t/continued=%t", branch, continued), func(t *testing.T) {
+				key, value := []byte("k"), []byte("v")
+				if continued {
+					key, value = bytes.Repeat(key, 128), bytes.Repeat(value, 500)
+				}
+				node := NewLeafNode(7)
+				if branch {
+					node = NewRootNode(7, NewLeafNode(8), NewLeafNode(9), key)
+				} else if err := node.InsertEntry(NewEntry(0, key, value)); err != nil {
+					t.Fatal(err)
+				}
+				ids := make([]page.ID, NodePageCount(node, pageSize))
+				for i := range ids {
+					ids[i] = 7 + page.ID(i)*3
+				}
+				pages, err := EncodeNodePages(node, pageSize, ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i, data := range pages {
+					if err := VerifyNodeIDAndSetChecksum(data, ids[i], false); err != nil {
+						t.Fatal(err)
+					}
+				}
+				read := func(id page.ID) ([]byte, error) {
+					for i, want := range ids {
+						if id == want {
+							return pages[i], nil
+						}
+					}
+					return nil, ErrInvalid
+				}
+				decoded, err := DecodeNode(pages[0], 7, pageSize, read)
+				if err != nil || decoded.EntryCount() != node.EntryCount() {
+					t.Fatalf("unchecked decode: %v", err)
+				}
+				if _, _, _, err := LookupMappedNode(pages[0], 7, key, read, false); err != nil {
+					t.Fatal(err)
+				}
+				binary.LittleEndian.PutUint32(pages[0][nodeEntryCountOffset:nodeChecksumOffset], ^uint32(0))
+				if _, err := DecodeNode(pages[0], 7, pageSize, read); !errors.Is(err, ErrInvalid) {
+					t.Fatalf("unchecked invalid count: got %v, want invalid", err)
+				}
+			})
+		}
+	}
+}
+
 func TestDecodeNode_RejectsCorruptedPagePaddingBeforePayloadDecode(t *testing.T) {
 	const pageSize int64 = 64
 	node := NewLeafNode(page.ID(7))
@@ -144,7 +241,7 @@ func TestDecodeNode_RejectsCorruptedPagePaddingBeforePayloadDecode(t *testing.T)
 	}
 
 	var encoded bytes.Buffer
-	if err := WriteNode(&encoded, node, pageSize, true); err != nil {
+	if err := WriteNode(&encoded, node, pageSize, true, true); err != nil {
 		t.Fatal(err)
 	}
 	data := encoded.Bytes()
@@ -406,7 +503,7 @@ func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	}
 
 	writer := new(oneByteWriter)
-	if err := WriteNode(writer, node, pageSize, true); err != nil {
+	if err := WriteNode(writer, node, pageSize, true, true); err != nil {
 		t.Fatal(err)
 	}
 	if writer.Len() != int(pageSize) {
@@ -435,7 +532,7 @@ func BenchmarkWriteNode(b *testing.B) {
 			b.ReportAllocs()
 			b.SetBytes(pageSize)
 			for b.Loop() {
-				if err := WriteNode(io.Discard, node, pageSize, true); err != nil {
+				if err := WriteNode(io.Discard, node, pageSize, true, true); err != nil {
 					b.Fatal(err)
 				}
 			}

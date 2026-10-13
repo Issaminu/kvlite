@@ -33,7 +33,7 @@ func readContinuationNodeHeader(data []byte, id page.ID, pageSize int64, forWAL 
 		if h.Checksum != 0 {
 			return ContinuationHeader{}, nil, nil, ErrInvalid
 		}
-	} else if h.Checksum != pageChecksum(data, pageSize, continuationChecksumOffset) {
+	} else if h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, continuationChecksumOffset) {
 		return ContinuationHeader{}, nil, nil, fmt.Errorf("continuation page %d: %w", id, page.ErrChecksum)
 	}
 	// Each eight-byte ID must leave at least one byte for body data.

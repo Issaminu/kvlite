@@ -44,6 +44,7 @@ const overflowNodeFlag NodeType = 1 << 15
 //	[14:18] CRC32C checksum, uint32
 //
 // Checksum covers bytes [0:14] and [18:pageSize]. It includes the node body and zero padding.
+// Zero marks an unchecked main-file page. A calculated CRC of zero is stored as one.
 // A continuation flag adds BodyLength and NextPageCount after the fixed header.
 // See leaf_codec.go and branch_codec.go for the extended layouts.
 // ContinuationNode has its own header.

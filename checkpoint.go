@@ -41,7 +41,7 @@ func (db *DB) checkpointWAL() (err error) {
 			return err
 		}
 	}
-	checkpointErr := db.wal.Checkpoint(db.file, targetSize)
+	checkpointErr := db.wal.Checkpoint(db.file, targetSize, db.meta.DataPageChecksums())
 	mapErr := db.refreshMainFileMapping()
 	return errors.Join(checkpointErr, mapErr)
 }

@@ -902,6 +902,7 @@ func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
 	bitmap.markAllocated(highPage)
 
 	meta := page.NewMeta(pageSize)
+	meta.SetDataPageChecksums(true)
 	meta.SetLastPage(highPage)
 	meta.RefreshChecksum()
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0600)
@@ -922,7 +923,7 @@ func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
 		}
 	}
 	root := btree.NewLeafNode(firstTreePageID)
-	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(firstTreePageID)*pageSize), root, pageSize, true); err != nil {
+	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(firstTreePageID)*pageSize), root, pageSize, true, true); err != nil {
 		_ = file.Close()
 		t.Fatal(err)
 	}

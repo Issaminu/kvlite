@@ -34,6 +34,13 @@ type Options struct {
 	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. Because this mode cannot write, [DB.Update], [DB.Put], [DB.Delete], and [DB.DeleteBucket] return [ErrDatabaseReadOnly].
 	ReadOnly bool
 
+	// DataPageChecksums enables checksum calculation and checks for leaf, branch, and continuation pages in a new file.
+	// The default is false. The DB file stores this choice.
+	// Open uses the stored choice for an existing file and ignores this option.
+	// Rebuild the file to change its mode.
+	// Without these checks, damaged key and value bytes can pass unnoticed. Metadata, allocation pages, and WAL records always retain their checksums.
+	DataPageChecksums bool
+
 	// LockTimeout limits how long [Open] waits for a conflicting database-file lock. A zero value waits until the other handle closes, a positive value returns an error that matches [ErrDatabaseLocked] after that duration, and a negative value is invalid. KVLite holds the lock for the full [DB] lifetime, not for one transaction.
 	LockTimeout time.Duration
 

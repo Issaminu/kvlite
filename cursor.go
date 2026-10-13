@@ -124,7 +124,7 @@ func (bucket *Bucket) ScanPrefix(prefix []byte, fn func(key, value []byte) error
 // It reads leaf entries from page bytes and decodes only branch pages. The caller must first prove that committed WAL pages cannot replace pages in the main file.
 // The key and value passed to visit refer to database page bytes. They remain valid while the current database operation holds its read lock.
 func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
-	data, err := db.readMainPage(pageID)
+	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return err
 	}
@@ -161,7 +161,7 @@ func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(
 // scanMappedTreeReverse visits the main file from the largest key to the smallest key.
 // The caller must first prove that committed WAL pages cannot replace pages in the main file.
 func (db *DB) scanMappedTreeReverse(pageID page.ID, visit func(uint32, []byte, []byte) error) error {
-	data, err := db.readMainPage(pageID)
+	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return err
 	}
