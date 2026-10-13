@@ -12,7 +12,7 @@ type Tx struct {
 	meta            *page.Meta
 	rootNode        *btree.Node
 	store           txTreeStore
-	tree            *btree.Tree
+	tree            btree.Tree
 	allocation      *allocationChanges
 	allocationOwned bool
 	metaDirty       bool
@@ -32,7 +32,7 @@ func newTx(db *DB, readOnly bool) *Tx {
 	tx.store = txTreeStore{
 		tx: tx,
 	}
-	tx.tree = btree.NewTree(&tx.store)
+	tx.tree = *btree.NewTree(&tx.store)
 	return tx
 }
 
@@ -46,7 +46,7 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 		nodes:     make(map[page.ID]*btree.Node),
 		dirty:     make(map[page.ID]dirtyNode),
 	}
-	tx.tree = btree.NewTree(&tx.store)
+	tx.tree = *btree.NewTree(&tx.store)
 
 	// B+tree writes clone this read-only root before they change it.
 	tx.store.nodes[baseRoot.PageID()] = baseRoot

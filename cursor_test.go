@@ -12,6 +12,118 @@ import (
 
 var cursorAllocationSink *Cursor
 
+// BenchmarkCursorReadSetup includes one View, bucket lookup, and cursor per read.
+// Setup and a complete traversal warm the database before measurement.
+func BenchmarkCursorReadSetup(b *testing.B) {
+	for _, storage := range []string{"file", "memory"} {
+		b.Run(storage, func(b *testing.B) {
+			path := b.TempDir() + "/database"
+			var db *DB
+			if storage == "memory" {
+				db = OpenMemory()
+			} else {
+				var err error
+				db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			keys := make([][]byte, 1_000)
+			value := bytes.Repeat([]byte("v"), 128)
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for i := range keys {
+					keys[i] = fmt.Appendf(nil, "key-%08d", i)
+					if err := bucket.Put(keys[i], value); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+			if storage == "file" {
+				if err := db.Close(); err != nil {
+					b.Fatal(err)
+				}
+				var err error
+				db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.Cleanup(func() { db.Close() })
+			read := func(tx *Tx, start, count int) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				cursor, err := bucket.Cursor()
+				if err != nil {
+					return err
+				}
+				key, got, err := cursor.Seek(keys[start])
+				for i := range count {
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(key, keys[start+i]) || !bytes.Equal(got, value) {
+						return fmt.Errorf("cursor returned the wrong entry at %d", start+i)
+					}
+					if i+1 < count {
+						key, got, err = cursor.Next()
+					}
+				}
+				return nil
+			}
+			if err := db.View(func(tx *Tx) error { return read(tx, 0, len(keys)) }); err != nil {
+				b.Fatal(err)
+			}
+			b.Run("empty-view", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := db.View(func(*Tx) error { return nil }); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			b.Run("point-get", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					got, err := db.Get(testBucketName, keys[0])
+					if err != nil || !bytes.Equal(got, value) {
+						b.Fatalf("point read: %q, %v", got, err)
+					}
+				}
+			})
+			b.Run("empty-update", func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := db.Update(func(*Tx) error { return nil }); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+			for _, count := range []int{1, 10, 100} {
+				b.Run(fmt.Sprintf("entries=%d", count), func(b *testing.B) {
+					iteration := 0
+					b.ReportAllocs()
+					for b.Loop() {
+						start := iteration % (len(keys) - count + 1)
+						if err := db.View(func(tx *Tx) error { return read(tx, start, count) }); err != nil {
+							b.Fatal(err)
+						}
+						iteration++
+					}
+				})
+			}
+		})
+	}
+}
+
 func prepareCursorBucket(t *testing.T, db *DB) {
 	t.Helper()
 	err := db.Update(func(tx *Tx) error {
