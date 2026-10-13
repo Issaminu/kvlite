@@ -23,6 +23,116 @@ type checkpointWriter struct {
 	writes []checkpointWrite
 }
 
+func TestWALCheckpoint_ReusesBuffersAfterWriteFailure(t *testing.T) {
+	for _, checksums := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
+			const pageSize = 4096
+			dir := t.TempDir()
+			mainPath := filepath.Join(dir, "main")
+			main, err := os.Create(mainPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = main.Close() }()
+			file, err := os.Create(filepath.Join(dir, "wal"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			log := New(Config{File: file, PageSize: pageSize})
+			var nodes []NodeRecord
+			for id := page.ID(3); id <= 5; id++ {
+				node := btree.NewLeafNode(id)
+				if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), bytes.Repeat([]byte{0xff}, 4000))); err != nil {
+					t.Fatal(err)
+				}
+				nodes = append(nodes, NodeRecord{Final: node})
+			}
+			if _, err := log.Commit(nodes, nil, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.Checkpoint(main, 6*pageSize, checksums); err != nil {
+				t.Fatal(err)
+			}
+			buffer := log.checkpointBuffers.data[:cap(log.checkpointBuffers.data)]
+			records := log.checkpointBuffers.records[:cap(log.checkpointBuffers.records)]
+			short := btree.NewLeafNode(3)
+			if err := short.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("x"))); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := log.Commit([]NodeRecord{{Final: short}}, nil, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := main.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.Checkpoint(main, 6*pageSize, checksums); err == nil {
+				t.Fatal("checkpoint to a closed file succeeded")
+			}
+			if len(log.overlay) != 1 {
+				t.Fatal("failed checkpoint discarded committed data")
+			}
+			for _, record := range records {
+				if record.Header != (RecordHeader{}) || record.Node != nil || record.Payload != nil {
+					t.Fatal("checkpoint scratch records retained committed references")
+				}
+			}
+			main, err = os.OpenFile(mainPath, os.O_RDWR, 0600)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := log.Checkpoint(main, 6*pageSize, checksums); err != nil {
+				t.Fatal(err)
+			}
+			if &buffer[0] != &log.checkpointBuffers.data[:1][0] || &records[0] != &log.checkpointBuffers.records[:1][0] {
+				t.Fatal("checkpoint replaced reusable storage")
+			}
+			data := make([]byte, pageSize)
+			if _, err := main.ReadAt(data, 3*pageSize); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(data[btree.WALNodeEncodedSize(short):], make([]byte, pageSize-btree.WALNodeEncodedSize(short))) {
+				t.Fatal("reused buffer left old value bytes in page padding")
+			}
+			decoded, err := btree.DecodeNode(data, 3, pageSize, nil, checksums)
+			if err != nil || !bytes.Equal(decoded.EntryAt(0).Value(), []byte("x")) {
+				t.Fatalf("read retried checkpoint: %v", err)
+			}
+			if len(log.overlay) != 0 || log.Stats().CheckpointCount != 2 {
+				t.Fatal("successful retry did not finish checkpoint cleanup")
+			}
+			if err := log.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if log.checkpointBuffers.data != nil || log.checkpointBuffers.records != nil {
+				t.Fatal("closed WAL retained checkpoint storage")
+			}
+		})
+	}
+}
+
+func TestCheckpointBuffers_BoundsRetainedStorage(t *testing.T) {
+	var buffers checkpointBuffers
+	pages := make(map[page.ID]CommittedPage, maxRetainedCheckpointRecords+1)
+	for i := range maxRetainedCheckpointRecords + 1 {
+		id := page.ID(3 + i)
+		pages[id] = CommittedPage{Header: RecordHeader{Type: RecordTypeAllocation, PageID: id}, Payload: make([]byte, 64)}
+	}
+	if err := buffers.writeCommittedPages(&checkpointWriter{}, pages, 64, false); err != nil {
+		t.Fatal(err)
+	}
+	if buffers.records != nil {
+		t.Fatal("checkpoint retained an oversized record array")
+	}
+	pages = map[page.ID]CommittedPage{3: {Header: RecordHeader{Type: RecordTypeAllocation, PageID: 3}}}
+	if err := buffers.writeCommittedPages(&checkpointWriter{}, pages, 2*checkpointWriteBatchBytes, false); err != nil {
+		t.Fatal(err)
+	}
+	if int64(cap(buffers.data)) > checkpointWriteBatchBytes {
+		t.Fatal("checkpoint retained an oversized page buffer")
+	}
+}
+
 func TestWALCommit_MixedContinuedImagesKeepOwnedBytes(t *testing.T) {
 	const pageSize = 64
 	file, err := os.Create(filepath.Join(t.TempDir(), "wal"))
@@ -297,7 +407,7 @@ func TestCheckpointRejectsInvalidNodePageBeforeWriting(t *testing.T) {
 			records := []CommittedPage{{Header: RecordHeader{Type: RecordTypeNode, PageID: 3}, Payload: btree.EncodeWALNode(first)}, bad}
 			writer := &checkpointWriter{}
 			wantErr := page.ErrInvalid
-			if err := writeCheckpointRecordRuns(writer, records, pageSize, true); !errors.Is(err, wantErr) {
+			if err := writeCheckpointRecordRuns(writer, records, pageSize, true, nil); !errors.Is(err, wantErr) {
 				t.Fatalf("checkpoint: got %v, want %v", err, wantErr)
 			}
 			if len(writer.writes) != 0 {
@@ -335,7 +445,7 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 	}}
 	writer := &checkpointWriter{}
 
-	if err := writeCheckpointRecordRuns(writer, records, pageSize, true); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(writer.writes) != 1 {
@@ -368,7 +478,7 @@ func TestWriteCheckpointRecordRuns_ValidatesAllNodesBeforeWriting(t *testing.T) 
 	binary.LittleEndian.PutUint32(records[2].Payload[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
 
 	writer := &checkpointWriter{}
-	if err := writeCheckpointRecordRuns(writer, records, pageSize, true); !errors.Is(err, btree.ErrInvalid) {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true, nil); !errors.Is(err, btree.ErrInvalid) {
 		t.Fatalf("checkpoint error: got %v, want ErrInvalid", err)
 	}
 	if len(writer.writes) != 0 {
@@ -390,7 +500,7 @@ func TestWriteCheckpointRecordRuns_CombinesAdjacentPages(t *testing.T) {
 	}
 	writer := &checkpointWriter{}
 
-	if err := writeCheckpointRecordRuns(writer, records, 4, true); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, 4, true, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -417,7 +527,7 @@ func TestWriteCheckpointRecordRuns_LimitsContiguousWriteSize(t *testing.T) {
 	}
 	writer := &checkpointWriter{}
 
-	if err := writeCheckpointRecordRuns(writer, records, pageSize, true); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true, nil); err != nil {
 		t.Fatal(err)
 	}
 

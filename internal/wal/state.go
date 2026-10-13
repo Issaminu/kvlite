@@ -15,6 +15,16 @@ import (
 // A database page larger than this limit still requires one complete-page write.
 const checkpointWriteBatchBytes int64 = 1 << 20
 
+// maxRetainedCheckpointRecords bounds the record array kept between checkpoints.
+const maxRetainedCheckpointRecords = 4096
+
+// checkpointBuffers belongs to one WAL. Backup uses separate local storage.
+// records must not retain node or payload references between calls.
+type checkpointBuffers struct {
+	records []CommittedPage
+	data    []byte
+}
+
 type Config struct {
 	Path                     string
 	File                     *os.File
@@ -67,7 +77,7 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64, dataPageChecksum
 			return err
 		}
 	}
-	if err := WriteCommittedPages(mainFile, wal.overlay, wal.pageSize, dataPageChecksums); err != nil {
+	if err := wal.checkpointBuffers.writeCommittedPages(mainFile, wal.overlay, wal.pageSize, dataPageChecksums); err != nil {
 		return err
 	}
 	info, err := mainFile.Stat()
@@ -101,10 +111,26 @@ func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64, dataPageChecksum
 // dataPageChecksums selects checksum calculation for data pages only.
 // The caller must keep pages, their nodes, and their payloads unchanged until it returns.
 func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageSize int64, dataPageChecksums bool) error {
+	var buffers checkpointBuffers
+	return buffers.writeCommittedPages(dst, pages, pageSize, dataPageChecksums)
+}
+
+func (buffers *checkpointBuffers) writeCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageSize int64, dataPageChecksums bool) error {
 	if pageSize <= 0 {
 		return page.ErrInvalid
 	}
-	records := make([]CommittedPage, 0, len(pages))
+	records := buffers.records[:0]
+	if cap(records) < len(pages) {
+		records = make([]CommittedPage, 0, len(pages))
+	}
+	defer func() {
+		clear(records)
+		if cap(records) <= maxRetainedCheckpointRecords {
+			buffers.records = records[:0]
+		} else {
+			buffers.records = nil
+		}
+	}()
 	for _, record := range pages {
 		records = append(records, record)
 	}
@@ -119,13 +145,15 @@ func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageS
 			return 0
 		}
 	})
-	return writeCheckpointRecordRuns(dst, records, pageSize, dataPageChecksums)
+	return writeCheckpointRecordRuns(dst, records, pageSize, dataPageChecksums, &buffers.data)
 }
 
 // writeCheckpointRecordRuns combines adjacent, page-ID-ordered records into bounded writes.
 // records must contain unique page IDs in ascending order.
-// It pads each WAL image to pageSize because the WAL omits unused page bytes but the main file stores fixed-size pages.
-func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pageSize int64, dataPageChecksums bool) error {
+// It pads each WAL image to pageSize because the WAL omits unused page bytes.
+// reusableBuffer can be nil. Otherwise it keeps at most checkpointWriteBatchBytes.
+// The writer must not retain the supplied write buffers after WriteAt returns.
+func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pageSize int64, dataPageChecksums bool, reusableBuffer *[]byte) error {
 	if len(records) == 0 {
 		return nil
 	}
@@ -152,7 +180,17 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pa
 	if pagesPerBatch > int64(len(records)) {
 		pagesPerBatch = int64(len(records))
 	}
-	buffer := make([]byte, 0, pagesPerBatch*pageSize)
+	bufferSize := int(pagesPerBatch * pageSize)
+	var buffer []byte
+	if reusableBuffer != nil && int64(bufferSize) <= checkpointWriteBatchBytes {
+		if cap(*reusableBuffer) < bufferSize {
+			*reusableBuffer = make([]byte, 0, bufferSize)
+		}
+		buffer = (*reusableBuffer)[:0:bufferSize]
+	} else {
+		// A page larger than the write limit needs temporary storage for one page.
+		buffer = make([]byte, 0, bufferSize)
+	}
 	startPageID := records[0].Header.PageID
 	previousPageID := startPageID
 
@@ -290,5 +328,9 @@ func (wal *WAL) Close() error {
 	if wal.file == nil {
 		return nil
 	}
-	return wal.file.Close()
+	err := wal.file.Close()
+	if err == nil {
+		wal.checkpointBuffers = checkpointBuffers{}
+	}
+	return err
 }

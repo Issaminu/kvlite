@@ -43,6 +43,7 @@ type WAL struct {
 	hasUnsyncedWrites        bool                      // true when WAL bytes were appended after the last successful sync
 	appendOffset             int64                     // byte offset of the next WAL append; independent of the file read/write cursor
 	encodingBuffer           []byte                    // reusable transaction encoding buffer; capacity may be cleared after large commits
+	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
 	pagePatch                PagePatch                 // reusable page patch; encoded into encodingBuffer before reuse
 	appendFailure            error                     // set when rollback truncate fails; blocks later commits until [WAL.Truncate] succeeds
 	syncFile                 func() error              // syncFile is a test hook for sync failures and call counts.
@@ -480,7 +481,7 @@ func (wal *WAL) Truncate() error {
 // Important: only delete the file when running db.Close()
 func (wal *WAL) Delete() error {
 	// close the file before deletion
-	err := wal.file.Close()
+	err := wal.Close()
 	if err != nil {
 		return err
 	}
