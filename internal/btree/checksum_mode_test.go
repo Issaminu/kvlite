@@ -65,11 +65,11 @@ func TestMainReaders_DisabledChecksumFields(t *testing.T) {
 				if err := VisitMappedNodeReferences(images[0], 7, pageSize, read, func(page.ID) error { return nil }, nil, false); err != nil {
 					t.Fatalf("unchecked references: %v", err)
 				}
-				if !branch && !continued {
-					if err := VisitMappedLeafRange(images[0], 7, nil, nil, func(uint32, []byte, []byte) error { return nil }, false); err != nil {
+				if !branch {
+					if err := VisitMappedLeafRange(images[0], 7, nil, nil, func(uint32, []byte, []byte) error { return nil }, false, read); err != nil {
 						t.Fatal(err)
 					}
-					if err := VisitMappedLeafReverse(images[0], 7, func(uint32, []byte, []byte) error { return nil }, false); err != nil {
+					if err := VisitMappedLeafReverse(images[0], 7, func(uint32, []byte, []byte) error { return nil }, false, read); err != nil {
 						t.Fatal(err)
 					}
 				}

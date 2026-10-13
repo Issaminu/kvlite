@@ -229,9 +229,6 @@ func TestSetDataPageChecksums_RetainedMismatch(t *testing.T) {
 				if _, _, err := cursor.First(); err != nil {
 					return err
 				}
-				if continued {
-					return nil
-				}
 				for _, scan := range []func() error{
 					func() error { return b.ScanPrefix(nil, func(_, _ []byte) error { return nil }) },
 					func() error { return b.ScanReverse(func(_, _ []byte) error { return nil }) },

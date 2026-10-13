@@ -805,3 +805,129 @@ func TestCursor_EmptyLeaves(t *testing.T) {
 		})
 	}
 }
+
+func TestBucketScans_ContinuedAfterReopen(t *testing.T) {
+	for _, checksums := range []bool{false, true} {
+		for _, largeKeys := range []bool{false, true} {
+			t.Run(fmt.Sprintf("checksums=%t/largeKeys=%t", checksums, largeKeys), func(t *testing.T) {
+				path := t.TempDir() + "/database"
+				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums, CheckpointThresholdBytes: 1 << 30})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { db.Close() }()
+				keys := [][]byte{[]byte("a"), []byte("m"), []byte("z")}
+				values := [][]byte{[]byte("first"), bytes.Repeat([]byte("v"), 64<<10), []byte("last")}
+				if largeKeys {
+					for i := range keys {
+						keys[i] = bytes.Repeat(keys[i], MaxKeySize)
+						values[i] = []byte("value")
+					}
+				}
+				if err := db.Update(func(tx *Tx) error {
+					bucket, err := tx.CreateBucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					for i := range keys {
+						if err := bucket.Put(keys[i], values[i]); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				check := func(tx *Tx) error {
+					bucket, err := tx.Bucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					index := 0
+					err = bucket.ScanRange(nil, nil, func(key, value []byte) error {
+						if index >= len(keys) || !bytes.Equal(key, keys[index]) || !bytes.Equal(value, values[index]) {
+							return fmt.Errorf("wrong scan entry %d", index)
+						}
+						index++
+						return nil
+					})
+					if err != nil {
+						return err
+					}
+					if index != len(keys) {
+						return fmt.Errorf("scan returned %d entries, want %d", index, len(keys))
+					}
+					index = len(keys) - 1
+					err = bucket.ScanReverse(func(key, value []byte) error {
+						if index < 0 || !bytes.Equal(key, keys[index]) || !bytes.Equal(value, values[index]) {
+							return fmt.Errorf("wrong reverse scan entry %d", index)
+						}
+						index--
+						return nil
+					})
+					if err != nil {
+						return err
+					}
+					if index != -1 {
+						return fmt.Errorf("reverse scan stopped at entry %d", index)
+					}
+					index = 1
+					if err := bucket.ScanRange(keys[1], keys[2], func(key, value []byte) error {
+						if index != 1 || !bytes.Equal(key, keys[1]) || !bytes.Equal(value, values[1]) {
+							return errors.New("wrong bounded scan entry")
+						}
+						index++
+						return nil
+					}); err != nil {
+						return err
+					}
+					if index != 2 {
+						return errors.New("bounded scan omitted its entry")
+					}
+					count := 0
+					if err := bucket.ScanPrefix([]byte("m"), func(key, value []byte) error {
+						if !bytes.Equal(key, keys[1]) || !bytes.Equal(value, values[1]) {
+							return errors.New("wrong prefix scan entry")
+						}
+						count++
+						return nil
+					}); err != nil {
+						return err
+					}
+					if count != 1 {
+						return fmt.Errorf("prefix scan returned %d entries", count)
+					}
+					stop := errors.New("stop continued scan")
+					for _, reverse := range []bool{false, true} {
+						count = 0
+						visit := func(_, _ []byte) error { count++; return stop }
+						if reverse {
+							err = bucket.ScanReverse(visit)
+						} else {
+							err = bucket.ScanRange(keys[1], nil, visit)
+						}
+						if !errors.Is(err, stop) || count != 1 {
+							return fmt.Errorf("stop scan: count=%d, err=%v", count, err)
+						}
+					}
+					return nil
+				}
+				for phase := range 2 {
+					if err := db.View(check); err != nil {
+						t.Fatalf("phase %d: %v", phase, err)
+					}
+					if phase == 0 {
+						if err := db.Close(); err != nil {
+							t.Fatal(err)
+						}
+						db, err = Open(path, 0600, &Options{ReadOnly: true})
+						if err != nil {
+							t.Fatal(err)
+						}
+					}
+				}
+			})
+		}
+	}
+}

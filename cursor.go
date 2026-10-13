@@ -121,14 +121,15 @@ func (bucket *Bucket) ScanPrefix(prefix []byte, fn func(key, value []byte) error
 }
 
 // scanMappedTreeRange visits entries in the half-open range [start, end) from the main database file.
-// It reads leaf entries from page bytes and decodes only branch pages. The caller must first prove that committed WAL pages cannot replace pages in the main file.
-// The key and value passed to visit refer to database page bytes. They remain valid while the current database operation holds its read lock.
+// It reads ordinary leaf entries from page bytes. It decodes branches and continued leaves.
+// The caller must first prove that committed WAL pages cannot replace pages in the main file.
+// Results borrow page bytes or a decoded continuation body. They remain valid while the current database operation holds its read lock.
 func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
 	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return err
 	}
-	err = btree.VisitMappedLeafRange(data, pageID, start, end, visit, db.meta.DataPageChecksums())
+	err = btree.VisitMappedLeafRange(data, pageID, start, end, visit, db.meta.DataPageChecksums(), db.readMainNodePage)
 	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
 		return err
 	}
@@ -165,7 +166,7 @@ func (db *DB) scanMappedTreeReverse(pageID page.ID, visit func(uint32, []byte, [
 	if err != nil {
 		return err
 	}
-	err = btree.VisitMappedLeafReverse(data, pageID, visit, db.meta.DataPageChecksums())
+	err = btree.VisitMappedLeafReverse(data, pageID, visit, db.meta.DataPageChecksums(), db.readMainNodePage)
 	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
 		return err
 	}

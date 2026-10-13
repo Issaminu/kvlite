@@ -172,6 +172,22 @@ func TestContinuedMainFileReadsRejectDamagedPage(t *testing.T) {
 	}); !errors.Is(err, ErrChecksum) {
 		t.Fatalf("damaged decoded leaf: got %v, want checksum error", err)
 	}
+	for _, reverse := range []bool{false, true} {
+		err := db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket(bucketName)
+			if err != nil {
+				return err
+			}
+			visit := func(_, _ []byte) error { return nil }
+			if reverse {
+				return bucket.ScanReverse(visit)
+			}
+			return bucket.ScanRange(nil, nil, visit)
+		})
+		if !errors.Is(err, ErrChecksum) {
+			t.Fatalf("damaged scan, reverse=%t: got %v, want checksum error", reverse, err)
+		}
+	}
 }
 
 // writeContinuedReadDatabase writes a catalog, a branch, and two leaves.

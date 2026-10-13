@@ -545,13 +545,35 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 
 // VisitMappedLeafRange visits entries in the half-open range [start, end).
 // It checks descriptor offsets and byte bounds. checksums selects nonzero checksum checks.
-// The key and value passed to visit refer to data.
-func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error, checksums bool) error {
+// Normal leaf results borrow data. Continued leaf results borrow a decoded body.
+// readPage supplies continuation pages. Pass nil for a normal leaf.
+func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error, checksums bool, readPage func(page.ID) ([]byte, error)) error {
 	if len(data) < NodeHeaderSize {
 		return fmt.Errorf("read leaf page: %w", ErrInvalid)
 	}
-	if nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset])); nodeType != NodeTypeLeaf {
-		if nodeType == NodeTypeBranch {
+	nodeType := mappedNodeType(data)
+	if nodeType == NodeTypeLeaf|overflowNodeFlag {
+		node, err := DecodeLeafNode(data, expectedPageID, int64(len(data)), readPage, checksums)
+		if err != nil {
+			return err
+		}
+		for index := range node.EntryCount() {
+			entry := node.EntryAt(index)
+			key := entry.Key()
+			if len(start) > 0 && bytes.Compare(key, start) < 0 {
+				continue
+			}
+			if len(end) > 0 && bytes.Compare(key, end) >= 0 {
+				return nil
+			}
+			if err := visit(entry.Flags(), key, entry.Value()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if nodeType != NodeTypeLeaf {
+		if nodeType == NodeTypeBranch || nodeType == NodeTypeBranch|overflowNodeFlag {
 			return ErrNotLeafNode
 		}
 		return fmt.Errorf("read leaf type %d: %w", nodeType, ErrInvalid)
@@ -595,13 +617,29 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 }
 
 // VisitMappedLeafReverse visits one mapped leaf from its largest key to its smallest key.
-// The key and value slices refer to data. checksums selects nonzero checksum checks.
-func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint32, []byte, []byte) error, checksums bool) error {
+// Normal leaf results borrow data. Continued leaf results borrow a decoded body.
+// checksums selects nonzero checksum checks. readPage supplies continuation pages.
+// Pass nil for readPage when the leaf has no continuation pages.
+func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint32, []byte, []byte) error, checksums bool, readPage func(page.ID) ([]byte, error)) error {
 	if len(data) < NodeHeaderSize {
 		return fmt.Errorf("read leaf page: %w", ErrInvalid)
 	}
-	if nodeType := NodeType(binary.LittleEndian.Uint16(data[nodeTypeOffset:nodePageIDOffset])); nodeType != NodeTypeLeaf {
-		if nodeType == NodeTypeBranch {
+	nodeType := mappedNodeType(data)
+	if nodeType == NodeTypeLeaf|overflowNodeFlag {
+		node, err := DecodeLeafNode(data, expectedPageID, int64(len(data)), readPage, checksums)
+		if err != nil {
+			return err
+		}
+		for index := node.EntryCount() - 1; index >= 0; index-- {
+			entry := node.EntryAt(index)
+			if err := visit(entry.Flags(), entry.Key(), entry.Value()); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if nodeType != NodeTypeLeaf {
+		if nodeType == NodeTypeBranch || nodeType == NodeTypeBranch|overflowNodeFlag {
 			return ErrNotLeafNode
 		}
 		return fmt.Errorf("read leaf type %d: %w", nodeType, ErrInvalid)
