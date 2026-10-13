@@ -57,10 +57,6 @@ type NodeRecord struct {
 	Original *btree.Node
 	// Final is the private node image to commit.
 	Final *btree.Node
-	// continuedNodePageImages holds compact WAL images only for a continued Final.
-	// It is nil and unused when Final has no continuation pages.
-	// Element 0 is Final's first leaf or branch page. Each later element is one continuation page, in body order.
-	continuedNodePageImages [][]byte
 }
 
 // AllocationRecord carries one complete allocation segment page to [WAL.Commit].

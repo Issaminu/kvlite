@@ -2946,6 +2946,27 @@ func TestOpen_MetaInitWriteError(t *testing.T) {
 }
 
 // BenchmarkPut_Sequential measures writes with ascending keys and tree splits.
+// BenchmarkMakeWALCommitData measures the change list without encoding or file writes.
+func BenchmarkMakeWALCommitData(b *testing.B) {
+	for _, count := range []int{1, 128, 1024} {
+		b.Run(fmt.Sprintf("nodes=%d", count), func(b *testing.B) {
+			dirty := make(map[page.ID]dirtyNode, count)
+			for i := range count {
+				node := btree.NewLeafNode(page.ID(i + 3))
+				dirty[node.PageID()] = dirtyNode{original: node, final: node}
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				nodes, meta := makeWALCommitData(dirty, nil, false)
+				if len(nodes) != count || meta != nil || nodes[0].Final == nil {
+					b.Fatal("invalid WAL change list")
+				}
+			}
+		})
+	}
+}
+
 func BenchmarkPut_Sequential(b *testing.B) {
 	path := tempfile()
 	defer os.RemoveAll(path)

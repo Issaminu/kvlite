@@ -35,7 +35,7 @@ func BenchmarkEncodeTransaction(b *testing.B) {
 				b.SetBytes(int64(size))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
+					if _, _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
 						b.Fatal(err)
 					}
 					log.releaseEncodingBuffer()

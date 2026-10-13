@@ -283,7 +283,7 @@ func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
 				}
 				if len(ids) > 1 {
 					// Reusing the transaction buffer must not change committed pages.
-					if _, err := log.encodeTransaction(nil, nil, []byte("meta"), log.nextTxid); err != nil {
+					if _, _, err := log.encodeTransaction(nil, nil, []byte("meta"), log.nextTxid); err != nil {
 						t.Fatal(err)
 					}
 					for index, id := range ids {

@@ -19,10 +19,10 @@ func TestWALValidationErrors(t *testing.T) {
 	}
 
 	log := New(Config{PageSize: 64})
-	if _, err := log.encodeTransaction([]NodeRecord{{}}, nil, nil, 1); !errors.Is(err, ErrNodeRecordMissingFinal) {
+	if _, _, err := log.encodeTransaction([]NodeRecord{{}}, nil, nil, 1); !errors.Is(err, ErrNodeRecordMissingFinal) {
 		t.Fatalf("node without final state: got %v, want ErrNodeRecordMissingFinal", err)
 	}
-	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1); !errors.Is(err, ErrNodePageMismatch) {
+	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1, nil); !errors.Is(err, ErrNodePageMismatch) {
 		t.Fatalf("changed node page ID: got %v, want ErrNodePageMismatch", err)
 	}
 	if _, err := log.CommittedPageToNode(&CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
@@ -383,12 +383,12 @@ func TestWALEncodeTransaction_ReusesBuffer(t *testing.T) {
 		nextTxid: 1,
 	}
 	encodedMeta := []byte("value")
-	if _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
+	if _, _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
+		if _, _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
 			panic(err)
 		}
 	})
@@ -409,12 +409,12 @@ func TestWALEncodeTransaction_ReusesNodePatchBuffers(t *testing.T) {
 
 	log := &WAL{pageSize: 128, nextTxid: 1}
 	nodes := []NodeRecord{{Original: base, Final: target}}
-	if _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
+	if _, _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
+		if _, _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 			panic(err)
 		}
 	})
@@ -870,7 +870,7 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 		pageSize: pageSize,
 		nextTxid: transactionID,
 	}
-	transaction, err := log.encodeTransaction(nil, nil, []byte("meta"), transactionID)
+	transaction, _, err := log.encodeTransaction(nil, nil, []byte("meta"), transactionID)
 	if err != nil {
 		t.Fatal(err)
 	}
