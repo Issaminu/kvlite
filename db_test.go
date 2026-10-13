@@ -38,7 +38,7 @@ func TestContinuedMainFileReads(t *testing.T) {
 	}{{true, false}, {false, false}, {true, true}, {false, true}} {
 		mapped, fromWAL := testCase.mapped, testCase.fromWAL
 		t.Run(fmt.Sprintf("mapped=%t/WAL=%t", mapped, fromWAL), func(t *testing.T) {
-			path, bucketName, entries, _ := writeContinuedReadDatabase(t)
+			path, bucketName, entries, _ := writeContinuedReadDatabase(t, false)
 			db, err := Open(path, 0600, &Options{ReadOnly: true})
 			if err != nil {
 				t.Fatal(err)
@@ -51,7 +51,7 @@ func TestContinuedMainFileReads(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					node, err := btree.DecodeNode(bytes.Clone(data), id, db.meta.PageSize(), db.readMainPage)
+					node, err := btree.DecodeNode(bytes.Clone(data), id, db.meta.PageSize(), db.readMainPage, db.meta.DataPageChecksums())
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -142,7 +142,7 @@ func TestContinuedMainFileReads(t *testing.T) {
 }
 
 func TestContinuedMainFileReadsRejectDamagedPage(t *testing.T) {
-	path, bucketName, entries, continuationID := writeContinuedReadDatabase(t)
+	path, bucketName, entries, continuationID := writeContinuedReadDatabase(t, true)
 	file, err := os.OpenFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +178,7 @@ func TestContinuedMainFileReadsRejectDamagedPage(t *testing.T) {
 // The catalog, branch, and right leaf need continuation pages. The small
 // pages force several ID groups. Storage IDs have gaps and change direction.
 // This fixture tests reads independently of the pending insertion/WAL work.
-func writeContinuedReadDatabase(t *testing.T) (string, []byte, []btree.Entry, page.ID) {
+func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, []btree.Entry, page.ID) {
 	t.Helper()
 	const pageSize int64 = 64
 	path := filepath.Join(t.TempDir(), "continued.db")
@@ -189,7 +189,7 @@ func writeContinuedReadDatabase(t *testing.T) (string, []byte, []btree.Entry, pa
 		btree.NewEntry(0, []byte("z"), []byte("last")),
 	}
 	meta := page.NewMeta(pageSize)
-	meta.SetDataPageChecksums(true)
+	meta.SetDataPageChecksums(checksums)
 	catalog := btree.NewLeafNode(meta.Root())
 	left, right := btree.NewLeafNode(5), btree.NewLeafNode(6)
 	for index, entry := range entries {
@@ -225,12 +225,24 @@ func writeContinuedReadDatabase(t *testing.T) (string, []byte, []btree.Entry, pa
 			ids[index] = nextID
 			nextID = 7 + (nextID-7+73)%300
 		}
-		encoded, err := btree.EncodeNodePages(node, pageSize, ids)
+		var encoded [][]byte
+		var err error
+		if checksums {
+			encoded, err = btree.EncodeNodePages(node, pageSize, ids)
+		} else {
+			encoded, err = btree.EncodeWALNodePages(node, pageSize, ids)
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
 		for index, id := range ids {
-			write(id, encoded[index])
+			data := encoded[index]
+			if len(data) < int(pageSize) {
+				padded := make([]byte, pageSize)
+				copy(padded, data)
+				data = padded
+			}
+			write(id, data)
 			allocation.markAllocated(id)
 			meta.SetLastPage(max(meta.LastPage(), id))
 		}
@@ -460,9 +472,16 @@ func tempfile() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("kvlite-%d.db", time.Now().UnixNano()))
 }
 
-// openDB opens a protected test database in SyncNone mode. Tests that require synchronized storage use [Open] with the default SyncFull mode.
+// openDB opens a test database in SyncNone mode with the default checksum policy.
+// Tests that require synchronized storage use Open with the default SyncFull mode.
 func openDB(path string) (*DB, error) {
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: true})
+	return openDBWithChecksums(path, false)
+}
+
+// openDBWithChecksums selects data-page protection when creating a test file.
+// Existing files retain their stored mode.
+func openDBWithChecksums(path string, enabled bool) (*DB, error) {
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: enabled})
 	if err != nil {
 		return nil, err
 	}
@@ -508,7 +527,6 @@ func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
 	defer file.Close()
 
 	meta := page.NewMeta(pageSize)
-	meta.SetDataPageChecksums(true)
 	meta.RefreshChecksum()
 	encodedMeta := page.EncodeMeta(meta)
 	for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
@@ -521,7 +539,7 @@ func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
 		t.Fatal(err)
 	}
 	root := btree.NewLeafNode(meta.Root())
-	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true, true); err != nil {
+	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true, false); err != nil {
 		t.Fatal(err)
 	}
 	if err := file.Sync(); err != nil {
@@ -2571,7 +2589,7 @@ func TestOpen_ErrChecksumForCorruptedBTreePage(t *testing.T) {
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
 
-	db, err := openDB(path)
+	db, err := openDBWithChecksums(path, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7225,10 +7243,6 @@ func TestAudit_MainNodeLookupCannotCrossPageBoundary(t *testing.T) {
 	valueSizeOffset := btree.NodeHeaderSize + leafDescriptorValueSizeFieldOffset
 	binary.LittleEndian.PutUint32(pageData[valueSizeOffset:valueSizeOffset+4], uint32(pageSize))
 
-	checksumTable := crc32.MakeTable(crc32.Castagnoli)
-	checksum := crc32.Update(0, checksumTable, pageData[:btree.NodeHeaderSize-4])
-	checksum = crc32.Update(checksum, checksumTable, pageData[btree.NodeHeaderSize:])
-	binary.LittleEndian.PutUint32(pageData[btree.NodeHeaderSize-4:btree.NodeHeaderSize], checksum)
 	if _, err := file.WriteAt(pageData, pageOffset); err != nil {
 		_ = file.Close()
 		t.Fatal(err)

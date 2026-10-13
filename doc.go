@@ -54,5 +54,11 @@
 //
 // In a file database, committed writes first go to a write-ahead log beside the database file. [DB.Close] moves committed data into the database file and removes the log. [SyncNone] still writes these files, but it does not synchronize them to storage. A memory database has no log and loses its data when closed or when the process ends. Always check the error from Close.
 //
-// Data-page checksum calculation and checks are off by default. Set [Options.DataPageChecksums] when creating a file to enable them. The file keeps this mode on reopen and backup. Metadata, allocation pages, and log records always retain their checksums. Without data-page checksums, damaged key and value bytes can pass unnoticed.
+// Data-page checksum calculation and checks are off by default. Set [Options.DataPageChecksums] when creating a file to enable them.
+// The file keeps this mode on reopen and backup.
+// Use [DB.SetDataPageChecksums] to change an existing file.
+// Disabling changes metadata without scanning data pages.
+// Enabling checks and protects allocated data pages before it commits the new mode.
+// Metadata, allocation pages, and log records always retain their checksums.
+// Without data-page checksums, damaged key and value bytes can pass unnoticed.
 package kvlite

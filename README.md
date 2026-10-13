@@ -291,7 +291,17 @@ db, err := kvlite.Open("app.db", 0o600, &kvlite.Options{
 })
 ```
 
-This option covers leaf, branch, and continuation pages. The file stores the mode. `Open` uses that stored mode for an existing file and ignores this option. Backup preserves the mode. Rebuild into a new file to change it.
+This option covers leaf, branch, and continuation pages. The file stores the mode. `Open` uses that stored mode for an existing file and ignores this option. Backup preserves the mode. Use `DB.SetDataPageChecksums` to change an existing file:
+
+```go
+if err := db.SetDataPageChecksums(false); err != nil {
+	return err
+}
+```
+
+Disabling commits the metadata flag without scanning data pages. Untouched pages keep their old checksum fields. Changed pages receive zero. Disabled reads ignore either value.
+
+Enabling waits for active backups and blocks other operations while it checks and protects allocated data pages. It checks retained nonzero checksums and calculates missing checksums. It commits the enabled flag only after conversion finishes. A conversion error leaves the mode disabled and permits a later retry. Checksums cannot prove that previously unchecked data was correct. Selecting the current mode does no conversion. Do not call this method inside a transaction callback. Read-only and memory databases cannot change the mode.
 
 Without data-page checksums, damaged key or value bytes can pass unnoticed. Metadata, allocation pages, and WAL records retain their checksums in both modes. The option does not change storage synchronization or checkpoint ordering.
 

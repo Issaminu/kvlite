@@ -28,7 +28,7 @@ func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
 		t.Fatalf("encode branch payload: got %x, want %x", encoded[NodeHeaderSize:], want)
 	}
 
-	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize, nil)
+	decoded, err := DecodeNode(encoded, node.PageID(), testNodePageSize, nil, true)
 	if err != nil {
 		t.Fatalf("decode branch: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestLookupMappedNode_SelectsBranchChild(t *testing.T) {
 	data := make([]byte, testNodePageSize)
 	copy(data, EncodeNode(root, testNodePageSize))
 
-	_, found, child, err := LookupMappedNode(data, root.PageID(), []byte("z"), nil, true)
+	_, found, child, err := LookupMappedNode(data, root.PageID(), []byte("z"), nil, true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,13 +78,13 @@ func TestBranchCodecRejectsLeaf(t *testing.T) {
 			t.Fatal("wrong type followed continuation IDs")
 			return nil, ErrInvalid
 		}
-		if _, err := DecodeBranchNode(pages[0], 8, 64, read); !errors.Is(err, ErrInvalid) {
+		if _, err := DecodeBranchNode(pages[0], 8, 64, read, true); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("decode wrong type: %v", err)
 		}
-		if _, _, _, err := ReadMappedBranchNode(pages[0], 8, 64); !errors.Is(err, ErrInvalid) {
+		if _, _, _, err := ReadMappedBranchNode(pages[0], 8, 64, true); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("mapped header wrong type: %v", err)
 		}
-		if _, _, _, err := LookupMappedBranchNode(pages[0], 8, []byte("k"), read); !errors.Is(err, ErrInvalid) {
+		if _, _, _, err := LookupMappedBranchNode(pages[0], 8, []byte("k"), read, true); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("mapped lookup wrong type: %v", err)
 		}
 		if _, err := DecodeWALBranchNode(EncodeWALNode(node), 8, 4096, nil); !errors.Is(err, ErrInvalid) {

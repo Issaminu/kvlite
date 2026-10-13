@@ -63,11 +63,17 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	pageSize := db.meta.PageSize()
 	dataPageChecksums := db.meta.DataPageChecksums()
 	pages := db.wal.CommittedRecords()
+	if db.activeBackups == 0 {
+		db.backupsDone = make(chan struct{})
+	}
 	db.activeBackups++
 	db.operationMu.Unlock()
 	defer func() {
 		db.operationMu.Lock()
 		db.activeBackups--
+		if db.activeBackups == 0 {
+			close(db.backupsDone)
+		}
 		db.operationMu.Unlock()
 	}()
 

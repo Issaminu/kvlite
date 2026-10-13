@@ -19,6 +19,13 @@ import (
 //
 // The caller must hold the exclusive database operation lock.
 func (db *DB) checkpointWAL() (err error) {
+	return db.checkpointWALWithChecksums(db.meta.DataPageChecksums())
+}
+
+// checkpointWALWithChecksums selects data-page protection for this checkpoint.
+// Checksum conversion uses true while the committed file mode remains disabled.
+// The caller must hold the exclusive database operation lock.
+func (db *DB) checkpointWALWithChecksums(enabled bool) (err error) {
 	if db.activeBackups > 0 {
 		return nil
 	}
@@ -41,7 +48,7 @@ func (db *DB) checkpointWAL() (err error) {
 			return err
 		}
 	}
-	checkpointErr := db.wal.Checkpoint(db.file, targetSize, db.meta.DataPageChecksums())
+	checkpointErr := db.wal.Checkpoint(db.file, targetSize, enabled)
 	mapErr := db.refreshMainFileMapping()
 	return errors.Join(checkpointErr, mapErr)
 }

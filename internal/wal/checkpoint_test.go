@@ -175,7 +175,7 @@ func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				decoded, err := btree.DecodeNode(first, node.PageID(), pageSize, readPage)
+				decoded, err := btree.DecodeNode(first, node.PageID(), pageSize, readPage, true)
 				if err != nil || decoded.EntryCount() != 1 || !bytes.Equal(decoded.EntryAt(0).Key(), key) || !slices.Equal(decoded.Children, node.Children) || !slices.Equal(decoded.OverflowPages(), ids[1:]) {
 					t.Fatalf("decode checkpointed node: %v", err)
 				}
@@ -264,11 +264,11 @@ func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 		t.Fatalf("checkpoint writes: got %d, want 1", len(writer.writes))
 	}
 	pageData := writer.writes[0].data
-	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize, nil); err != nil {
+	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize, nil, true); err != nil {
 		t.Fatalf("decode checkpoint page: %v", err)
 	}
 	pageData[len(pageData)-1] ^= 0xff
-	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize, nil); !errors.Is(err, page.ErrChecksum) {
+	if _, err := btree.DecodeNode(pageData, node.PageID(), pageSize, nil, true); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("decode corrupted checkpoint page: got %v, want ErrChecksum", err)
 	}
 }

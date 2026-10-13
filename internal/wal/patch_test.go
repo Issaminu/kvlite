@@ -224,7 +224,7 @@ func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
 	if _, err := mainFile.ReadAt(data, int64(target.PageID())*pageSize); err != nil {
 		t.Fatal(err)
 	}
-	decoded, err := btree.DecodeNode(data, target.PageID(), pageSize, nil)
+	decoded, err := btree.DecodeNode(data, target.PageID(), pageSize, nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}

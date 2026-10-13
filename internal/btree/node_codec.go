@@ -42,8 +42,9 @@ func pageChecksum(data []byte, pageSize int64, checksumOffset int) uint32 {
 	return sum
 }
 
-// CheckNodeChecksumMode checks whether a data page has the file's checksum mode.
-// It checks the page type and checksum field. It does not calculate a checksum.
+// CheckNodeChecksumMode checks the page type and checksum field bounds.
+// Enabled mode requires a nonzero field. Disabled mode accepts any field value.
+// It does not calculate a checksum.
 func CheckNodeChecksumMode(data []byte, enabled bool) error {
 	offset := nodeChecksumOffset
 	switch mappedNodeType(data) {
@@ -56,19 +57,36 @@ func CheckNodeChecksumMode(data []byte, enabled bool) error {
 	if len(data) < offset+encodedUint32Size {
 		return ErrInvalid
 	}
-	if (binary.LittleEndian.Uint32(data[offset:offset+encodedUint32Size]) != 0) != enabled {
+	if enabled && binary.LittleEndian.Uint32(data[offset:offset+encodedUint32Size]) == 0 {
 		return page.ErrChecksum
 	}
 	return nil
 }
 
-// checkPageChecksum checks a nonzero data-page checksum. Zero skips calculation.
-func checkPageChecksum(data []byte, pageSize int64, offset int) error {
+// CheckNodeChecksum verifies a required checksum and page ID without decoding the body.
+// Checksum conversion uses it before publishing the enabled mode.
+func CheckNodeChecksum(data []byte, id page.ID) error {
+	if err := CheckNodeChecksumMode(data, true); err != nil {
+		return err
+	}
+	if page.ID(binary.LittleEndian.Uint64(data[2:10])) != id {
+		return ErrInvalid
+	}
+	offset := nodeChecksumOffset
+	if mappedNodeType(data) == NodeTypeContinuation {
+		offset = continuationChecksumOffset
+	}
+	return checkPageChecksum(data, int64(len(data)), offset, true)
+}
+
+// checkPageChecksum checks a nonzero data-page checksum when checksums is true.
+// Zero skips calculation. The database mode check rejects zero in enabled files.
+func checkPageChecksum(data []byte, pageSize int64, offset int, checksums bool) error {
 	if len(data) < offset+encodedUint32Size || int64(len(data)) > pageSize {
 		return ErrInvalid
 	}
 	stored := binary.LittleEndian.Uint32(data[offset : offset+encodedUint32Size])
-	if stored != 0 && stored != pageChecksum(data, pageSize, offset) {
+	if checksums && stored != 0 && stored != pageChecksum(data, pageSize, offset) {
 		return page.ErrChecksum
 	}
 	return nil
@@ -78,11 +96,12 @@ func checkPageChecksum(data []byte, pageSize int64, offset int) error {
 // readPage supplies continuation pages. Pass nil for a normal node.
 // A continued node requires a non-nil readPage function.
 // The returned node owns data or a rebuilt logical body. Do not change its owned bytes.
-func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
+// checksums selects verification of nonzero checksum fields.
+func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), checksums bool) (*Node, error) {
 	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
-		return DecodeBranchNode(data, id, pageSize, readPage)
+		return DecodeBranchNode(data, id, pageSize, readPage, checksums)
 	}
-	return DecodeLeafNode(data, id, pageSize, readPage)
+	return DecodeLeafNode(data, id, pageSize, readPage, checksums)
 }
 
 // LookupMappedNode selects the leaf or branch mapped lookup.
@@ -93,14 +112,15 @@ func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) 
 // Keep data unchanged while a result uses its borrowed bytes.
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage keeps visited continuation pages unchanged until this call returns.
-func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
+// checksums selects verification of nonzero checksum fields.
+func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
 	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
-		return LookupMappedBranchNode(data, id, key, readPage)
+		return LookupMappedBranchNode(data, id, key, readPage, checksums)
 	}
-	return LookupMappedLeafNode(data, id, key, readPage, includeKey)
+	return LookupMappedLeafNode(data, id, key, readPage, includeKey, checksums)
 }
 
 // EncodeNode selects the node's codec and updates its checksum.
@@ -143,13 +163,13 @@ func ValidateWALNode(data []byte, id page.ID) error {
 	case NodeTypeBranch:
 		return validateWALBranchNode(data, id)
 	case NodeTypeLeaf | overflowNodeFlag:
-		_, _, _, err := readLeafNodeHeader(data, id, int64(len(data)), true)
+		_, _, _, err := readLeafNodeHeader(data, id, int64(len(data)), true, false)
 		return err
 	case NodeTypeBranch | overflowNodeFlag:
-		_, _, _, err := readBranchNodeHeader(data, id, int64(len(data)), true)
+		_, _, _, err := readBranchNodeHeader(data, id, int64(len(data)), true, false)
 		return err
 	case NodeTypeContinuation:
-		_, _, _, err := readContinuationNodeHeader(data, id, int64(len(data)), true)
+		_, _, _, err := readContinuationNodeHeader(data, id, int64(len(data)), true, false)
 		return err
 	default:
 		return ErrInvalid
@@ -207,15 +227,16 @@ func encodeWALNode(data []byte, node *Node) {
 
 // VisitMappedNodeReferences checks a main-file node and its continuation pages.
 // visit receives branch children or nested bucket roots. visitContinuation
-// receives continuation IDs. All page checksums and the full body are checked.
+// receives continuation IDs. The full body is checked.
+// checksums selects nonzero checksum checks for each page.
 // readPage supplies continuation pages. Pass nil for a normal node.
 // No Node or complete body copy is created. Callbacks can run before an error;
 // the caller must finish all checks before it changes ownership.
-func VisitMappedNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error) error {
+func VisitMappedNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, checksums bool) error {
 	if mappedNodeType(data) & ^overflowNodeFlag == NodeTypeBranch {
-		return visitBranchNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false)
+		return visitBranchNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false, checksums)
 	}
-	return visitLeafNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false)
+	return visitLeafNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false, checksums)
 }
 
 // VisitWALNodeReferences checks a node from verified compact WAL records.
@@ -224,9 +245,9 @@ func VisitMappedNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 // zero. This checks the complete body without creating a Node or copying values.
 func VisitWALNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error) error {
 	if mappedNodeType(data) & ^overflowNodeFlag == NodeTypeBranch {
-		return visitBranchNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true)
+		return visitBranchNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true, false)
 	}
-	return visitLeafNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true)
+	return visitLeafNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true, false)
 }
 
 // NodePageCount selects the codec's count, including its first page.

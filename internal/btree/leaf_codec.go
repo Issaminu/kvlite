@@ -69,12 +69,13 @@ func encodeLeafWALNode(data []byte, node *Node) {
 // The byte slices borrow data and cannot grow into other fields.
 // A continued first page has its own body-length and next-ID fields.
 // The continuation codec checks each later page separately.
-func ReadMappedLeafNode(data []byte, id page.ID, pageSize int64) (NodeHeader, []byte, []byte, error) {
-	return readLeafNodeHeader(data, id, pageSize, false)
+// checksums selects verification of nonzero checksum fields.
+func ReadMappedLeafNode(data []byte, id page.ID, pageSize int64, checksums bool) (NodeHeader, []byte, []byte, error) {
+	return readLeafNodeHeader(data, id, pageSize, false, checksums)
 }
 
 // readLeafNodeHeader shares header checks between mapped pages and verified WAL payloads.
-func readLeafNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) (NodeHeader, []byte, []byte, error) {
+func readLeafNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksums bool) (NodeHeader, []byte, []byte, error) {
 	if len(data) < NodeHeaderSize || int64(len(data)) > pageSize {
 		return NodeHeader{}, nil, nil, ErrInvalid
 	}
@@ -99,7 +100,7 @@ func readLeafNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) (N
 		if h.Checksum != 0 {
 			return NodeHeader{}, nil, nil, ErrInvalid
 		}
-	} else if h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if checksums && h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return NodeHeader{}, nil, nil, fmt.Errorf("node page %d: %w", id, page.ErrChecksum)
 	}
 	start := fixed + int(h.NextPageCount)*page.IDSize
@@ -111,19 +112,19 @@ func readLeafNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) (N
 // A continued node requires a non-nil readPage function.
 // A normal node owns data. A continued node owns a rebuilt logical image.
 // Its entry bytes remain valid until that owned storage changes.
-// Each page checksum and the complete leaf body are checked.
-func DecodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
-	return decodeLeafNode(data, id, pageSize, readPage, false)
+// The complete leaf body is checked. checksums selects nonzero checksum checks.
+func DecodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), checksums bool) (*Node, error) {
+	return decodeLeafNode(data, id, pageSize, readPage, false, checksums)
 }
 
 // decodeLeafNode shares the body layout for main-file pages and WAL payloads.
-// forWAL requires zero page checksums. Otherwise it verifies page checksums.
-func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool) (*Node, error) {
+// forWAL requires zero page checksums. checksums selects main-file checksum checks.
+func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (*Node, error) {
 	if mappedNodeType(data) == NodeTypeLeaf|overflowNodeFlag {
 		if readPage == nil {
 			return nil, fmt.Errorf("node %d requires continuation pages: %w", id, ErrInvalid)
 		}
-		h, _, _, err := readLeafNodeHeader(data, id, pageSize, forWAL)
+		h, _, _, err := readLeafNodeHeader(data, id, pageSize, forWAL, checksums)
 		if err != nil {
 			return nil, err
 		}
@@ -133,7 +134,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 		image := make([]byte, NodeHeaderSize+int(h.BodyLength))
 		copy(image[:14], data[:14])
 		binary.LittleEndian.PutUint16(image[:2], uint16(NodeTypeLeaf))
-		ids, err := copyContinuationBody(data, leafContinuationHeaderSize, image[NodeHeaderSize:], readPage, forWAL)
+		ids, err := copyContinuationBody(data, leafContinuationHeaderSize, image[NodeHeaderSize:], readPage, forWAL, checksums)
 		if err != nil {
 			return nil, err
 		}
@@ -156,7 +157,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 		if stored != 0 {
 			return nil, fmt.Errorf("read WAL node checksum %x: %w", stored, ErrInvalid)
 		}
-	} else if stored != 0 && stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if checksums && stored != 0 && stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
 	node, _, _, _, err := readEncodedLeaf(data, id, stored, nil, true, !forWAL, nil, nil, true)
@@ -169,11 +170,11 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 // continuation payloads. Pass nil for a normal node. A normal node owns data;
 // a continued node owns a rebuilt logical image. Do not change its owned bytes.
 func DecodeWALLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
-	return decodeLeafNode(data, id, pageSize, readPage, true)
+	return decodeLeafNode(data, id, pageSize, readPage, true, false)
 }
 
 // LookupMappedLeafNode searches a leaf's encoded directory without creating a Node.
-// Normal pages return borrowed entry bytes. Nonzero page checksums are checked.
+// Normal pages return borrowed entry bytes. checksums selects nonzero checksum checks.
 // Continued pages check each visited page. A found leaf value owns its bytes.
 // A continued key borrows the first page if it fits there; otherwise it owns a copy.
 // Set includeKey to false to omit the returned key and its copy.
@@ -181,13 +182,13 @@ func DecodeWALLeafNode(data []byte, id page.ID, pageSize int64, readPage func(pa
 // Keep data unchanged while a result uses its borrowed bytes.
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage must keep continuation bytes unchanged until the lookup returns.
-func LookupMappedLeafNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
-	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey)
+func LookupMappedLeafNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (Entry, bool, page.ID, error) {
+	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums)
 }
 
 // lookupLeafNode searches the same encoded directory in mapped pages and WAL images.
 // forWAL uses verified compact payloads. It checks zero page checksums.
-func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool, includeKey bool) (Entry, bool, page.ID, error) {
+func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool, includeKey, checksums bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
@@ -195,7 +196,7 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 		if readPage == nil {
 			return Entry{}, false, 0, ErrInvalid
 		}
-		h, _, _, err := readLeafNodeHeader(data, id, pageSize, forWAL)
+		h, _, _, err := readLeafNodeHeader(data, id, pageSize, forWAL, checksums)
 		if err != nil {
 			return Entry{}, false, 0, err
 		}
@@ -204,7 +205,7 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 		}
 		group, groupOffset, cached := data, 0, data
 		fragment := func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL)
+			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
 			return part, err
 		}
 		_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, true, nil, fragment, includeKey)
@@ -217,7 +218,7 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 		if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
-	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset); err != nil {
+	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset, checksums); err != nil {
 		return Entry{}, false, 0, err
 	}
 	_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, !forWAL, nil, nil, includeKey)
@@ -225,7 +226,7 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 }
 
 func lookupWALLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
-	return lookupLeafNode(data, id, key, pageSize, readPage, true, includeKey)
+	return lookupLeafNode(data, id, key, pageSize, readPage, true, includeKey, false)
 }
 
 func validateWALLeafNode(data []byte, id page.ID) error {
@@ -242,8 +243,8 @@ func validateWALLeafNode(data []byte, id page.ID) error {
 // visitLeafNodeReferences validates the encoded leaf body and its owned pages.
 // Continued bodies use the same descriptor reader as point lookup. Only keys
 // need a temporary buffer for order checks. Large values remain in their pages.
-func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, forWAL bool) error {
-	h, _, _, err := readLeafNodeHeader(data, id, pageSize, forWAL)
+func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, forWAL, checksums bool) error {
+	h, _, _, err := readLeafNodeHeader(data, id, pageSize, forWAL, checksums)
 	if err != nil {
 		return err
 	}
@@ -254,7 +255,7 @@ func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage f
 		}
 		group, groupOffset, cached := data, 0, data
 		fragment = func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL)
+			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
 			return part, err
 		}
 	}
@@ -267,7 +268,7 @@ func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage f
 			return visitContinuation(pageID)
 		}
 		return nil
-	})
+	}, checksums)
 }
 
 func leafPageCount(node *Node, pageSize int64) int {
@@ -543,9 +544,9 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 }
 
 // VisitMappedLeafRange visits entries in the half-open range [start, end).
-// It checks descriptor offsets, byte bounds, and a nonzero page checksum.
+// It checks descriptor offsets and byte bounds. checksums selects nonzero checksum checks.
 // The key and value passed to visit refer to data.
-func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
+func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error, checksums bool) error {
 	if len(data) < NodeHeaderSize {
 		return fmt.Errorf("read leaf page: %w", ErrInvalid)
 	}
@@ -559,7 +560,7 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 		return fmt.Errorf("read leaf page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
 	}
 
-	if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset); err != nil {
+	if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, checksums); err != nil {
 		return err
 	}
 	entryCount := int(binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset]))
@@ -594,8 +595,8 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 }
 
 // VisitMappedLeafReverse visits one mapped leaf from its largest key to its smallest key.
-// The key and value slices refer to data.
-func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint32, []byte, []byte) error) error {
+// The key and value slices refer to data. checksums selects nonzero checksum checks.
+func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint32, []byte, []byte) error, checksums bool) error {
 	if len(data) < NodeHeaderSize {
 		return fmt.Errorf("read leaf page: %w", ErrInvalid)
 	}
@@ -609,7 +610,7 @@ func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint
 		return fmt.Errorf("read leaf page ID %d, want %d: %w", pageID, expectedPageID, ErrInvalid)
 	}
 
-	if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset); err != nil {
+	if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, checksums); err != nil {
 		return err
 	}
 	entryCount := int(binary.LittleEndian.Uint32(data[nodeEntryCountOffset:nodeChecksumOffset]))

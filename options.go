@@ -37,7 +37,7 @@ type Options struct {
 	// DataPageChecksums enables checksum calculation and checks for leaf, branch, and continuation pages in a new file.
 	// The default is false. The DB file stores this choice.
 	// Open uses the stored choice for an existing file and ignores this option.
-	// Rebuild the file to change its mode.
+	// Use [DB.SetDataPageChecksums] to change an existing file.
 	// Without these checks, damaged key and value bytes can pass unnoticed. Metadata, allocation pages, and WAL records always retain their checksums.
 	DataPageChecksums bool
 

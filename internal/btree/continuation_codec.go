@@ -10,13 +10,14 @@ import (
 // ReadMappedContinuationNode verifies one continuation page without allocating.
 // It returns header values, encoded next IDs, and body bytes. The slices borrow
 // data and cannot grow into other fields. Keep data unchanged while using them.
-// It checks the checksum and array bounds, but does not follow page IDs.
-func ReadMappedContinuationNode(data []byte, id page.ID, pageSize int64) (ContinuationHeader, []byte, []byte, error) {
-	return readContinuationNodeHeader(data, id, pageSize, false)
+// It checks array bounds but does not follow page IDs.
+// checksums selects verification of the nonzero checksum field.
+func ReadMappedContinuationNode(data []byte, id page.ID, pageSize int64, checksums bool) (ContinuationHeader, []byte, []byte, error) {
+	return readContinuationNodeHeader(data, id, pageSize, false, checksums)
 }
 
 // readContinuationNodeHeader shares header checks between mapped pages and verified WAL payloads.
-func readContinuationNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) (ContinuationHeader, []byte, []byte, error) {
+func readContinuationNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksums bool) (ContinuationHeader, []byte, []byte, error) {
 	if int64(len(data)) != pageSize || pageSize <= ContinuationHeaderSize {
 		return ContinuationHeader{}, nil, nil, ErrInvalid
 	}
@@ -33,7 +34,7 @@ func readContinuationNodeHeader(data []byte, id page.ID, pageSize int64, forWAL 
 		if h.Checksum != 0 {
 			return ContinuationHeader{}, nil, nil, ErrInvalid
 		}
-	} else if h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, continuationChecksumOffset) {
+	} else if checksums && h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, continuationChecksumOffset) {
 		return ContinuationHeader{}, nil, nil, fmt.Errorf("continuation page %d: %w", id, page.ErrChecksum)
 	}
 	// Each eight-byte ID must leave at least one byte for body data.
@@ -47,8 +48,9 @@ func readContinuationNodeHeader(data []byte, id page.ID, pageSize int64, forWAL 
 // DecodeContinuationNode copies the header and decodes this page's ID array.
 // On success, the node owns data. Its body refers to data. Do not change or reuse
 // data after this call. This does not rebuild the owning leaf or branch node.
-func DecodeContinuationNode(data []byte, id page.ID, pageSize int64) (*ContinuationNode, error) {
-	h, encodedIDs, body, err := ReadMappedContinuationNode(data, id, pageSize)
+// checksums selects verification of nonzero checksum fields.
+func DecodeContinuationNode(data []byte, id page.ID, pageSize int64, checksums bool) (*ContinuationNode, error) {
+	h, encodedIDs, body, err := ReadMappedContinuationNode(data, id, pageSize, checksums)
 	if err != nil {
 		return nil, err
 	}
@@ -121,8 +123,8 @@ func sealContinuationPage(data []byte) {
 // A later group starts at the last ID of the current group. Other IDs point
 // directly to data pages with no ID array. No node entries are decoded here.
 // forWAL selects compact payloads with zero page checksums. Their WAL records
-// must already be verified. Main-file reads check each full page checksum.
-func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(page.ID) ([]byte, error), group *[]byte, groupOffset *int, cached *[]byte, forWAL bool) ([]byte, page.ID, error) {
+// must already be verified. checksums selects main-file checksum checks.
+func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(page.ID) ([]byte, error), group *[]byte, groupOffset *int, cached *[]byte, forWAL, checksums bool) ([]byte, page.ID, error) {
 	size := int(binary.LittleEndian.Uint32(first[18:22]))
 	offset -= NodeHeaderSize
 	if offset < 0 || offset >= size {
@@ -170,7 +172,7 @@ func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(
 			if forWAL {
 				pageSize = int64(len(next))
 			}
-			h, _, _, err := readContinuationNodeHeader(next, id, pageSize, forWAL)
+			h, _, _, err := readContinuationNodeHeader(next, id, pageSize, forWAL, checksums)
 			if err != nil {
 				return nil, 0, err
 			}
@@ -208,7 +210,7 @@ func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(
 // It returns the continuation IDs for retirement. It rejects repeated IDs
 // and nonzero final padding. forWAL selects verified compact WAL payloads.
 // Mapped point lookups do not copy the full body.
-func copyContinuationBody(first []byte, firstHeaderSize int, dst []byte, read func(page.ID) ([]byte, error), forWAL bool) ([]page.ID, error) {
+func copyContinuationBody(first []byte, firstHeaderSize int, dst []byte, read func(page.ID) ([]byte, error), forWAL, checksums bool) ([]page.ID, error) {
 	if len(dst) != int(binary.LittleEndian.Uint32(first[18:22])) {
 		return nil, ErrInvalid
 	}
@@ -225,7 +227,7 @@ func copyContinuationBody(first []byte, firstHeaderSize int, dst []byte, read fu
 		}
 		at += copy(dst[at:], part)
 		return nil
-	})
+	}, checksums)
 	return ids, err
 }
 
@@ -233,7 +235,7 @@ func copyContinuationBody(first []byte, firstHeaderSize int, dst []byte, read fu
 // It rejects repeated IDs and nonzero final padding.
 // visit receives borrowed body bytes. The owning leaf or branch codec must verify the first page.
 // Full decode copies these bytes. Ownership checks read them without a body copy.
-func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID) ([]byte, error), forWAL bool, visit func(page.ID, []byte) error) error {
+func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID) ([]byte, error), forWAL bool, visit func(page.ID, []byte) error, checksums bool) error {
 	size := int(binary.LittleEndian.Uint32(first[18:22]))
 	pages := continuationPageCount(size, int64(len(first)), firstHeaderSize)
 	if pages < 2 {
@@ -243,7 +245,7 @@ func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID)
 	group, groupOffset, cached := first, 0, first
 	firstID := page.ID(binary.LittleEndian.Uint64(first[2:10]))
 	for at := 0; at < size; {
-		part, id, err := continuationBodyBytes(first, firstHeaderSize, NodeHeaderSize+at, read, &group, &groupOffset, &cached, forWAL)
+		part, id, err := continuationBodyBytes(first, firstHeaderSize, NodeHeaderSize+at, read, &group, &groupOffset, &cached, forWAL, checksums)
 		if err != nil {
 			return err
 		}

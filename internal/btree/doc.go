@@ -13,8 +13,11 @@
 // The body codecs support both decoded nodes and direct reads from encoded bytes.
 // Direct point reads use binary search and return slices of the input bytes.
 //
-// A main-file page with a nonzero checksum is checked before its bytes are used.
+// Main-file readers accept an explicit checksum-check option.
+// When true, they verify nonzero fields before using page bytes.
+// When false, they ignore the checksum field and retain structural checks.
 // Zero marks an unchecked page. A calculated CRC32C of zero is stored as one.
-// The database checks that each page matches its stored checksum mode.
+// The database requires nonzero fields in enabled files.
+// Disabled files can contain zero or residual nonzero fields.
 // Compact WAL pages also have zero page checksums. WAL records protect their bytes.
 package btree

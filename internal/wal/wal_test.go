@@ -756,7 +756,7 @@ func TestWALCheckpoint_WritesCommittedPagesToMainFile(t *testing.T) {
 		if _, err := mainFile.ReadAt(pageContent, int64(pageID)*64); err != nil {
 			t.Fatal(err)
 		}
-		node, err := btree.DecodeNode(pageContent, pageID, 64, nil)
+		node, err := btree.DecodeNode(pageContent, pageID, 64, nil, true)
 		if err != nil {
 			t.Fatalf("decode checkpoint page %d: %v", pageID, err)
 		}

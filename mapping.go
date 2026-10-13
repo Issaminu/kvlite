@@ -87,7 +87,7 @@ func (db *DB) readMainPage(pageID page.ID) ([]byte, error) {
 }
 
 // readMainNodePage reads one data page and checks its stored checksum mode.
-// The codec checks a nonzero checksum before it uses protected page contents.
+// The codec checks nonzero fields only when the stored mode is enabled.
 func (db *DB) readMainNodePage(pageID page.ID) ([]byte, error) {
 	data, err := db.readMainPage(pageID)
 	if err != nil {

@@ -41,7 +41,8 @@ type DB struct {
 	options           *Options
 	wal               *wal.WAL
 	operationMu       sync.RWMutex
-	activeBackups     int // Protected by operationMu. A backup keeps the main file unchanged.
+	activeBackups     int           // Protected by operationMu. A backup keeps the main file unchanged.
+	backupsDone       chan struct{} // Closed under operationMu when the last active backup finishes.
 	lifecycleMu       sync.RWMutex
 	activeOperations  sync.WaitGroup
 	writeRequests     chan *writeRequest
@@ -473,7 +474,7 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize(), db.readMainNodePage)
+	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize(), db.readMainNodePage, db.meta.DataPageChecksums())
 	if err != nil {
 		return nil, err
 	}
@@ -522,7 +523,7 @@ func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuat
 	if err != nil {
 		return err
 	}
-	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), db.readMainNodePage, visit, visitContinuation)
+	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), db.readMainNodePage, visit, visitContinuation, db.meta.DataPageChecksums())
 }
 
 // cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
@@ -584,7 +585,7 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte, includeKey bool) (
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey)
+	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey, db.meta.DataPageChecksums())
 }
 
 // findCommittedEntry searches one committed tree for Get.

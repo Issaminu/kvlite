@@ -68,12 +68,13 @@ func encodeBranchWALNode(data []byte, node *Node) {
 // The byte slices borrow data and cannot grow into other fields.
 // A continued first page has its own body-length and next-ID fields.
 // The continuation codec checks each later page separately.
-func ReadMappedBranchNode(data []byte, id page.ID, pageSize int64) (NodeHeader, []byte, []byte, error) {
-	return readBranchNodeHeader(data, id, pageSize, false)
+// checksums selects verification of nonzero checksum fields.
+func ReadMappedBranchNode(data []byte, id page.ID, pageSize int64, checksums bool) (NodeHeader, []byte, []byte, error) {
+	return readBranchNodeHeader(data, id, pageSize, false, checksums)
 }
 
 // readBranchNodeHeader shares header checks between mapped pages and verified WAL payloads.
-func readBranchNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) (NodeHeader, []byte, []byte, error) {
+func readBranchNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksums bool) (NodeHeader, []byte, []byte, error) {
 	if len(data) < NodeHeaderSize || int64(len(data)) > pageSize {
 		return NodeHeader{}, nil, nil, ErrInvalid
 	}
@@ -98,7 +99,7 @@ func readBranchNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) 
 		if h.Checksum != 0 {
 			return NodeHeader{}, nil, nil, ErrInvalid
 		}
-	} else if h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if checksums && h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return NodeHeader{}, nil, nil, fmt.Errorf("node page %d: %w", id, page.ErrChecksum)
 	}
 	start := fixed + int(h.NextPageCount)*page.IDSize
@@ -110,19 +111,19 @@ func readBranchNodeHeader(data []byte, id page.ID, pageSize int64, forWAL bool) 
 // A continued node requires a non-nil readPage function.
 // A normal node owns data. A continued node owns a rebuilt logical image.
 // Its entry bytes remain valid until that owned storage changes.
-// Each page checksum and the complete branch body are checked.
-func DecodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
-	return decodeBranchNode(data, id, pageSize, readPage, false)
+// The complete branch body is checked. checksums selects nonzero checksum checks.
+func DecodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), checksums bool) (*Node, error) {
+	return decodeBranchNode(data, id, pageSize, readPage, false, checksums)
 }
 
 // decodeBranchNode shares the body layout for main-file pages and WAL payloads.
-// forWAL requires zero page checksums. Otherwise it verifies page checksums.
-func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool) (*Node, error) {
+// forWAL requires zero page checksums. checksums selects main-file checksum checks.
+func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (*Node, error) {
 	if mappedNodeType(data) == NodeTypeBranch|overflowNodeFlag {
 		if readPage == nil {
 			return nil, fmt.Errorf("node %d requires continuation pages: %w", id, ErrInvalid)
 		}
-		h, _, _, err := readBranchNodeHeader(data, id, pageSize, forWAL)
+		h, _, _, err := readBranchNodeHeader(data, id, pageSize, forWAL, checksums)
 		if err != nil {
 			return nil, err
 		}
@@ -132,7 +133,7 @@ func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(pag
 		image := make([]byte, NodeHeaderSize+int(h.BodyLength))
 		copy(image[:14], data[:14])
 		binary.LittleEndian.PutUint16(image[:2], uint16(NodeTypeBranch))
-		ids, err := copyContinuationBody(data, branchContinuationHeaderSize, image[NodeHeaderSize:], readPage, forWAL)
+		ids, err := copyContinuationBody(data, branchContinuationHeaderSize, image[NodeHeaderSize:], readPage, forWAL, checksums)
 		if err != nil {
 			return nil, err
 		}
@@ -155,7 +156,7 @@ func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(pag
 		if stored != 0 {
 			return nil, fmt.Errorf("read WAL node checksum %x: %w", stored, ErrInvalid)
 		}
-	} else if stored != 0 && stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
+	} else if checksums && stored != 0 && stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
 	node, _, _, _, err := readEncodedBranch(data, id, stored, nil, true, !forWAL, nil, nil)
@@ -168,21 +169,21 @@ func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(pag
 // continuation payloads. Pass nil for a normal node. A normal node owns data;
 // a continued node owns a rebuilt logical image. Do not change its owned bytes.
 func DecodeWALBranchNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
-	return decodeBranchNode(data, id, pageSize, readPage, true)
+	return decodeBranchNode(data, id, pageSize, readPage, true, false)
 }
 
 // LookupMappedBranchNode searches a branch's encoded directory without creating a Node.
-// Each search returns the selected child page ID. Nonzero page checksums are checked.
+// Each search returns the selected child page ID. checksums selects nonzero checksum checks.
 // Continued pages check each visited page and do not copy the complete body.
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage must keep continuation bytes unchanged until the lookup returns.
-func LookupMappedBranchNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
-	return lookupBranchNode(data, id, key, int64(len(data)), readPage, false)
+func LookupMappedBranchNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), checksums bool) (Entry, bool, page.ID, error) {
+	return lookupBranchNode(data, id, key, int64(len(data)), readPage, false, checksums)
 }
 
 // lookupBranchNode searches the same encoded directory in mapped pages and WAL images.
 // forWAL uses verified compact payloads. It checks zero page checksums.
-func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool) (Entry, bool, page.ID, error) {
+func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
@@ -190,7 +191,7 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 		if readPage == nil {
 			return Entry{}, false, 0, ErrInvalid
 		}
-		h, _, _, err := readBranchNodeHeader(data, id, pageSize, forWAL)
+		h, _, _, err := readBranchNodeHeader(data, id, pageSize, forWAL, checksums)
 		if err != nil {
 			return Entry{}, false, 0, err
 		}
@@ -199,7 +200,7 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 		}
 		group, groupOffset, cached := data, 0, data
 		fragment := func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, branchContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL)
+			part, _, err := continuationBodyBytes(data, branchContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
 			return part, err
 		}
 		_, entry, found, child, err := readEncodedBranch(data, id, 0, key, false, true, nil, fragment)
@@ -212,7 +213,7 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 		if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
-	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset); err != nil {
+	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset, checksums); err != nil {
 		return Entry{}, false, 0, err
 	}
 	_, entry, found, child, err := readEncodedBranch(data, id, 0, key, false, !forWAL, nil, nil)
@@ -220,7 +221,7 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 }
 
 func lookupWALBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
-	return lookupBranchNode(data, id, key, pageSize, readPage, true)
+	return lookupBranchNode(data, id, key, pageSize, readPage, true, false)
 }
 
 func validateWALBranchNode(data []byte, id page.ID) error {
@@ -237,8 +238,8 @@ func validateWALBranchNode(data []byte, id page.ID) error {
 // visitBranchNodeReferences validates the encoded branch body and its owned pages.
 // Continued bodies use the same descriptor reader as point lookup. Only keys
 // need a temporary buffer for order checks.
-func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, forWAL bool) error {
-	h, _, _, err := readBranchNodeHeader(data, id, pageSize, forWAL)
+func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, forWAL, checksums bool) error {
+	h, _, _, err := readBranchNodeHeader(data, id, pageSize, forWAL, checksums)
 	if err != nil {
 		return err
 	}
@@ -249,7 +250,7 @@ func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 		}
 		group, groupOffset, cached := data, 0, data
 		fragment = func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, branchContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL)
+			part, _, err := continuationBodyBytes(data, branchContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
 			return part, err
 		}
 	}
@@ -262,7 +263,7 @@ func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 			return visitContinuation(pageID)
 		}
 		return nil
-	})
+	}, checksums)
 }
 
 func branchPageCount(node *Node, pageSize int64) int {

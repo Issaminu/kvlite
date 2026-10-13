@@ -128,7 +128,7 @@ func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(
 	if err != nil {
 		return err
 	}
-	err = btree.VisitMappedLeafRange(data, pageID, start, end, visit)
+	err = btree.VisitMappedLeafRange(data, pageID, start, end, visit, db.meta.DataPageChecksums())
 	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
 		return err
 	}
@@ -165,7 +165,7 @@ func (db *DB) scanMappedTreeReverse(pageID page.ID, visit func(uint32, []byte, [
 	if err != nil {
 		return err
 	}
-	err = btree.VisitMappedLeafReverse(data, pageID, visit)
+	err = btree.VisitMappedLeafReverse(data, pageID, visit, db.meta.DataPageChecksums())
 	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
 		return err
 	}
