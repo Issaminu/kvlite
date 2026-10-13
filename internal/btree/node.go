@@ -153,9 +153,10 @@ const (
 )
 
 type Entry struct {
-	flags uint32
-	key   []byte
-	value []byte
+	flags      uint32
+	valueOwned bool
+	key        []byte
+	value      []byte
 }
 
 func NewEntry(flags uint32, key, value []byte) Entry {
@@ -172,6 +173,13 @@ func (e Entry) Key() []byte {
 
 func (e Entry) Value() []byte {
 	return e.value
+}
+
+// ValueIsOwned reports whether an encoded lookup made a private value buffer.
+// The caller can retain and change that value without a copy.
+// Values in decoded nodes and ordinary mapped pages return false.
+func (e Entry) ValueIsOwned() bool {
+	return e.valueOwned
 }
 
 // EncodedSize reports how many bytes this entry occupies inside an encoded node.

@@ -1918,6 +1918,60 @@ func TestGet_WALValueIsOwnedByCaller(t *testing.T) {
 	}
 }
 
+func TestGet_ValueUsesSingleBuffer(t *testing.T) {
+	for _, size := range []int{128, 64 << 10, 1 << 20} {
+		t.Run(strconv.Itoa(size), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{
+				Synchronous:              SyncNone,
+				CheckpointThresholdBytes: ^uint64(0),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { db.Close() })
+			createBucket(t, db, testBucketName)
+			key := []byte("key")
+			want := bytes.Repeat([]byte("v"), size)
+			if err := db.Put(testBucketName, key, want); err != nil {
+				t.Fatal(err)
+			}
+			for _, source := range []string{"WAL", "mapped"} {
+				if source == "mapped" {
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					reopened, err := Open(path, 0600, &Options{ReadOnly: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+					db = reopened
+				}
+				t.Run(source, func(t *testing.T) {
+					var value []byte
+					allocs := testing.AllocsPerRun(10, func() {
+						value, err = db.Get(testBucketName, key)
+						if err != nil {
+							t.Fatal(err)
+						}
+					})
+					if allocs != 1 {
+						t.Fatalf("Get allocations: got %g, want 1", allocs)
+					}
+					if !bytes.Equal(value, want) {
+						t.Fatal("Get returned different bytes")
+					}
+					value[0] = 'X'
+					again, err := db.Get(testBucketName, key)
+					if err != nil || !bytes.Equal(again, want) {
+						t.Fatalf("changing the Get result changed stored bytes: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
 // TestPutGet_MultipleKeys: several keys coexist and all survive a reopen.
 func TestPutGet_MultipleKeys(t *testing.T) {
 	path := tempfile()

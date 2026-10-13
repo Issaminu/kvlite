@@ -422,6 +422,9 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if entry.ValueIsOwned() {
+		return value, nil
+	}
 	return slices.Clone(value), nil
 }
 

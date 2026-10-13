@@ -516,6 +516,7 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 				if err := copyEncodedBody(keyEnd, entry.value, fragment); err != nil {
 					return nil, Entry{}, false, 0, err
 				}
+				entry.valueOwned = true
 			}
 			return nil, entry, true, 0, nil
 		}
