@@ -266,7 +266,7 @@ func TestSetDataPageChecksums_Errors(t *testing.T) {
 		t.Fatalf("closed: %v", err)
 	}
 	path := filepath.Join(t.TempDir(), "database")
-	db, err := Open(path, 0600, nil)
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -626,7 +626,7 @@ func TestSetDataPageChecksums_ConversionMainWriteFailure(t *testing.T) {
 
 func TestSetDataPageChecksums_WaitsForView(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncFull})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
 	if err != nil {
 		t.Fatal(err)
 	}
