@@ -1919,8 +1919,10 @@ func TestGet_WALValueIsOwnedByCaller(t *testing.T) {
 }
 
 func TestGet_ValueUsesSingleBuffer(t *testing.T) {
-	for _, size := range []int{128, 64 << 10, 1 << 20} {
-		t.Run(strconv.Itoa(size), func(t *testing.T) {
+	for _, testCase := range []struct{ keyBytes, valueBytes int }{
+		{3, 128}, {3, 64 << 10}, {3, 1 << 20}, {btree.MaxKeySize, 128},
+	} {
+		t.Run(fmt.Sprintf("key=%d/value=%d", testCase.keyBytes, testCase.valueBytes), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "database")
 			db, err := Open(path, 0600, &Options{
 				Synchronous:              SyncNone,
@@ -1931,8 +1933,8 @@ func TestGet_ValueUsesSingleBuffer(t *testing.T) {
 			}
 			t.Cleanup(func() { db.Close() })
 			createBucket(t, db, testBucketName)
-			key := []byte("key")
-			want := bytes.Repeat([]byte("v"), size)
+			key := bytes.Repeat([]byte("k"), testCase.keyBytes)
+			want := bytes.Repeat([]byte("v"), testCase.valueBytes)
 			if err := db.Put(testBucketName, key, want); err != nil {
 				t.Fatal(err)
 			}

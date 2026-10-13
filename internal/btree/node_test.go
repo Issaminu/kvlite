@@ -531,7 +531,7 @@ func TestLookupEncodedWALNode_UsesLeafDirectoryBinarySearch(t *testing.T) {
 	const firstLeafEntryOffsetField = NodeHeaderSize + encodedUint32Size
 	binary.LittleEndian.PutUint32(data[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
 
-	entry, found, child, err := LookupEncodedWALNode(data, node.PageID(), []byte("h"), 4096, nil)
+	entry, found, child, err := LookupEncodedWALNode(data, node.PageID(), []byte("h"), 4096, nil, true)
 	if err != nil || !found || child != 0 || !bytes.Equal(entry.Value(), []byte{7}) {
 		t.Fatalf("binary leaf lookup: found=%t child=%d value=%v err=%v", found, child, entry.Value(), err)
 	}
@@ -553,7 +553,7 @@ func TestLookupEncodedWALNode_UsesBranchDirectoryBinarySearch(t *testing.T) {
 	const firstBranchEntryOffsetField = NodeHeaderSize
 	binary.LittleEndian.PutUint32(data[firstBranchEntryOffsetField:firstBranchEntryOffsetField+4], ^uint32(0))
 
-	_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte("z"), 4096, nil)
+	_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte("z"), 4096, nil, true)
 	if err != nil || found || child != 18 {
 		t.Fatalf("binary branch lookup: found=%t child=%d err=%v", found, child, err)
 	}
@@ -664,7 +664,7 @@ func TestLookupEncodedWALNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 	var child page.ID
 	var lookupErr error
 	if got := testing.AllocsPerRun(100, func() {
-		entry, found, child, lookupErr = LookupEncodedWALNode(data, node.PageID(), []byte("beta"), 4096, nil)
+		entry, found, child, lookupErr = LookupEncodedWALNode(data, node.PageID(), []byte("beta"), 4096, nil, true)
 	}); got != 0 {
 		t.Fatalf("LookupEncodedWALNode allocations: got %v, want 0", got)
 	}
@@ -690,7 +690,7 @@ func TestLookupEncodedWALNode_SelectsBranchChild(t *testing.T) {
 		{key: "z", wantChild: 11},
 	} {
 		t.Run(testCase.key, func(t *testing.T) {
-			_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte(testCase.key), 4096, nil)
+			_, found, child, err := LookupEncodedWALNode(data, root.PageID(), []byte(testCase.key), 4096, nil, true)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -834,7 +834,7 @@ func TestNodePages_FileRoundTrip(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				got, gotFound, gotChild, err := LookupMappedNode(first, node.PageID(), key, read)
+				got, gotFound, gotChild, err := LookupMappedNode(first, node.PageID(), key, read, true)
 				if err != nil || gotFound != found || gotChild != child || (found && !bytes.Equal(got.Value(), want.Value())) {
 					t.Fatalf("mapped lookup %q differs: found=%v child=%d error=%v", key, gotFound, gotChild, err)
 				}
@@ -888,9 +888,9 @@ func TestNodePages_MappedLookupSkipsLargeValue(t *testing.T) {
 		query := []byte("z")
 		allocations := testing.AllocsPerRun(100, func() {
 			if forWAL {
-				_, found, child, err = LookupEncodedWALNode(pages[0], 8, query, size, read)
+				_, found, child, err = LookupEncodedWALNode(pages[0], 8, query, size, read, true)
 			} else {
-				_, found, child, err = LookupMappedNode(pages[0], 8, query, read)
+				_, found, child, err = LookupMappedNode(pages[0], 8, query, read, true)
 			}
 		})
 		if err != nil || found || (node.IsLeaf() && child != 0) || (!node.IsLeaf() && child != 21) {
@@ -939,7 +939,7 @@ func TestNodePages_RejectsDamageAndCycles(t *testing.T) {
 	if _, err := DecodeNode(pages[0], 8, 64, read); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("full decode missed damaged tail: %v", err)
 	}
-	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read); !errors.Is(err, page.ErrChecksum) {
+	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read, true); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("mapped lookup missed damaged tail: %v", err)
 	}
 	pages[1][63] ^= 1
@@ -955,7 +955,7 @@ func TestNodePages_RejectsDamageAndCycles(t *testing.T) {
 	if _, err := DecodeNode(pages[0], 8, 64, read); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("full decode missed self link: %v", err)
 	}
-	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read); !errors.Is(err, ErrInvalid) {
+	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read, true); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("mapped lookup missed self link: %v", err)
 	}
 }
@@ -1079,9 +1079,9 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 					var gotFound bool
 					var gotChild page.ID
 					if forWAL {
-						got, gotFound, gotChild, err = LookupEncodedWALNode(pages[0], node.PageID(), query, pageSize, read)
+						got, gotFound, gotChild, err = LookupEncodedWALNode(pages[0], node.PageID(), query, pageSize, read, true)
 					} else {
-						got, gotFound, gotChild, err = LookupMappedNode(pages[0], node.PageID(), query, read)
+						got, gotFound, gotChild, err = LookupMappedNode(pages[0], node.PageID(), query, read, true)
 					}
 					if err != nil || gotFound != found || gotChild != child || (found && (got.flags != want.flags || !bytes.Equal(got.key, want.key) || !bytes.Equal(got.value, want.value))) {
 						t.Fatalf("lookup %q: found=%v child=%d error=%v", query, gotFound, gotChild, err)
@@ -1112,7 +1112,7 @@ func TestNodePages_RejectsTooSmallContinuedPage(t *testing.T) {
 		if _, err := DecodeNode(data, 8, 27, read); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("decode small continued page: %v", err)
 		}
-		if _, _, _, err := LookupMappedNode(data, 8, []byte("key"), read); !errors.Is(err, ErrInvalid) {
+		if _, _, _, err := LookupMappedNode(data, 8, []byte("key"), read, true); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("lookup small continued page: %v", err)
 		}
 	}

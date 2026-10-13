@@ -1010,7 +1010,7 @@ func TestCommittedPageToNodeRejectsInvalidContinuationPayloads(t *testing.T) {
 			if _, err := log.CommittedPageToNode(&first); !errors.Is(err, want) {
 				t.Fatalf("%s: got %v, want %v", fault, err, want)
 			}
-			if _, _, _, err := log.LookupCommittedPage(&first, []byte("key")); !errors.Is(err, want) {
+			if _, _, _, err := log.LookupCommittedPage(&first, []byte("key"), true); !errors.Is(err, want) {
 				t.Fatalf("direct lookup %s: got %v, want %v", fault, err, want)
 			}
 		})

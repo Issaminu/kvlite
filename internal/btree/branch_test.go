@@ -49,7 +49,7 @@ func TestLookupMappedNode_SelectsBranchChild(t *testing.T) {
 	data := make([]byte, testNodePageSize)
 	copy(data, EncodeNode(root, testNodePageSize))
 
-	_, found, child, err := LookupMappedNode(data, root.PageID(), []byte("z"), nil)
+	_, found, child, err := LookupMappedNode(data, root.PageID(), []byte("z"), nil, true)
 	if err != nil {
 		t.Fatal(err)
 	}

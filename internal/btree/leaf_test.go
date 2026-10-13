@@ -195,7 +195,7 @@ func TestLookupMappedNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 	var child page.ID
 	var lookupErr error
 	if got := testing.AllocsPerRun(100, func() {
-		entry, found, child, lookupErr = LookupMappedNode(data, node.PageID(), []byte("beta"), nil)
+		entry, found, child, lookupErr = LookupMappedNode(data, node.PageID(), []byte("beta"), nil, true)
 	}); got != 0 {
 		t.Fatalf("LookupMappedNode allocations: got %v, want 0", got)
 	}
@@ -227,7 +227,7 @@ func TestLeafCodecRejectsBranch(t *testing.T) {
 		if _, _, _, err := ReadMappedLeafNode(pages[0], 8, 64); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("mapped header wrong type: %v", err)
 		}
-		if _, _, _, err := LookupMappedLeafNode(pages[0], 8, []byte("k"), read); !errors.Is(err, ErrInvalid) {
+		if _, _, _, err := LookupMappedLeafNode(pages[0], 8, []byte("k"), read, true); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("mapped lookup wrong type: %v", err)
 		}
 		if _, err := DecodeWALLeafNode(EncodeWALNode(node), 8, 4096, nil); !errors.Is(err, ErrInvalid) {

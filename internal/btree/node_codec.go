@@ -53,17 +53,18 @@ func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) 
 // A leaf returns an entry. A branch returns a child page ID.
 // Normal entry bytes borrow data. Continued leaf values own their bytes.
 // A continued key borrows the first page when it fits there; otherwise it owns a copy.
+// Set includeKey to false to omit the returned key and its copy.
 // Keep data unchanged while a result uses its borrowed bytes.
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage keeps visited continuation pages unchanged until this call returns.
-func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
+func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
 	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
 		return LookupMappedBranchNode(data, id, key, readPage)
 	}
-	return LookupMappedLeafNode(data, id, key, readPage)
+	return LookupMappedLeafNode(data, id, key, readPage, includeKey)
 }
 
 // EncodeNode selects the node's codec and updates its checksum.
@@ -126,11 +127,12 @@ func ValidateWALNode(data []byte, id page.ID) error {
 // Normal entries borrow data. A continued leaf owns its value. Its key borrows
 // the first page when it fits there; otherwise it owns a copy. A branch returns
 // a child page ID. Keep source bytes unchanged while using borrowed results.
-func LookupEncodedWALNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
+// Set includeKey to false to omit the returned key and its copy.
+func LookupEncodedWALNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
 	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
 		return lookupWALBranchNode(data, id, key, pageSize, readPage)
 	}
-	return lookupWALLeafNode(data, id, key, pageSize, readPage)
+	return lookupWALLeafNode(data, id, key, pageSize, readPage, includeKey)
 }
 
 // EncodeWALNode returns an owned compact node image without padding or a node checksum.

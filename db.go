@@ -567,7 +567,8 @@ func (db *DB) cacheWriteNode(node *btree.Node) {
 
 // lookupCommittedPage searches one committed page.
 // In a file database, a WAL page has priority over the main-file page with the same ID.
-func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
+// includeKey controls whether an encoded lookup returns the matched key.
+func (db *DB) lookupCommittedPage(pageID page.ID, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
 	if db.memoryNodes != nil {
 		node, err := db.readNode(pageID)
 		if err != nil {
@@ -576,21 +577,22 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte) (btree.Entry, bool
 		return btree.LookupDecodedNode(node, key)
 	}
 	if record, ok := db.wal.Lookup(pageID); ok {
-		return db.wal.LookupCommittedPage(&record, key)
+		return db.wal.LookupCommittedPage(&record, key, includeKey)
 	}
 	data, err := db.readMainPage(pageID)
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key, db.readMainPage)
+	return btree.LookupMappedNode(data, pageID, key, db.readMainPage, includeKey)
 }
 
-// findCommittedEntry searches one committed tree without decoding its pages.
-// A found entry refers to committed storage owned by the database.
-// A continued leaf returns an owned value and can return an owned key.
+// findCommittedEntry searches one committed tree for Get.
+// It omits encoded keys because Get needs only the value and flags.
+// Decoded and ordinary mapped values borrow database storage.
+// Continued encoded leaf values own their bytes.
 func (db *DB) findCommittedEntry(pageID page.ID, key []byte) (btree.Entry, bool, error) {
 	for {
-		entry, found, childPageID, err := db.lookupCommittedPage(pageID, key)
+		entry, found, childPageID, err := db.lookupCommittedPage(pageID, key, false)
 		if err != nil {
 			return btree.Entry{}, false, err
 		}

@@ -109,7 +109,7 @@ func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
 				if !ok {
 					t.Fatal("first WAL page is missing")
 				}
-				entry, found, child, err := log.LookupCommittedPage(&firstRecord, key)
+				entry, found, child, err := log.LookupCommittedPage(&firstRecord, key, true)
 				if err != nil || (branch && (found || child != node.Children[1])) || (!branch && (!found || child != 0 || !bytes.Equal(entry.Value(), value))) {
 					t.Fatalf("direct WAL lookup: found=%t child=%d error=%v", found, child, err)
 				}
@@ -143,7 +143,7 @@ func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
 					log.LoadCommittedRecord(record)
 				}
 				firstRecord, _ = log.Lookup(node.PageID())
-				entry, found, child, err = log.LookupCommittedPage(&firstRecord, key)
+				entry, found, child, err = log.LookupCommittedPage(&firstRecord, key, true)
 				if err != nil || (branch && (found || child != node.Children[1])) || (!branch && (!found || child != 0 || !bytes.Equal(entry.Value(), value))) {
 					t.Fatalf("direct WAL lookup: found=%t child=%d error=%v", found, child, err)
 				}

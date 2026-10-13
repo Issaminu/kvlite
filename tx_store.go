@@ -35,7 +35,7 @@ func (store *txTreeStore) PageSize() int64 {
 // A write transaction keeps each node that it reads.
 func (store *txTreeStore) LookupPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
 	if store.tx.readOnly {
-		return store.tx.db.lookupCommittedPage(pageID, key)
+		return store.tx.db.lookupCommittedPage(pageID, key, true)
 	}
 	node, err := store.ReadNode(pageID)
 	if err != nil {

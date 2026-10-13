@@ -137,7 +137,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 		if err != nil {
 			return nil, err
 		}
-		node, _, _, _, err := readEncodedLeaf(image, id, 0, nil, true, false, nil, nil)
+		node, _, _, _, err := readEncodedLeaf(image, id, 0, nil, true, false, nil, nil, true)
 		if err != nil {
 			return nil, err
 		}
@@ -159,7 +159,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 	} else if stored != pageChecksum(data, pageSize, nodeChecksumOffset) {
 		return nil, fmt.Errorf("verify node checksum: %w", page.ErrChecksum)
 	}
-	node, _, _, _, err := readEncodedLeaf(data, id, stored, nil, true, !forWAL, nil, nil)
+	node, _, _, _, err := readEncodedLeaf(data, id, stored, nil, true, !forWAL, nil, nil, true)
 	return node, err
 }
 
@@ -176,17 +176,18 @@ func DecodeWALLeafNode(data []byte, id page.ID, pageSize int64, readPage func(pa
 // Normal pages return borrowed entry bytes and require no checksum calculation.
 // Continued pages check each visited page. A found leaf value owns its bytes.
 // A continued key borrows the first page if it fits there; otherwise it owns a copy.
+// Set includeKey to false to omit the returned key and its copy.
 // A continued miss does not copy the complete body.
 // Keep data unchanged while a result uses its borrowed bytes.
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage must keep continuation bytes unchanged until the lookup returns.
-func LookupMappedLeafNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
-	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false)
+func LookupMappedLeafNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
+	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey)
 }
 
 // lookupLeafNode searches the same encoded directory in mapped pages and WAL images.
 // forWAL uses verified compact payloads. It checks zero page checksums.
-func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool) (Entry, bool, page.ID, error) {
+func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool, includeKey bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
@@ -206,7 +207,7 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL)
 			return part, err
 		}
-		_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, true, nil, fragment)
+		_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, true, nil, fragment, includeKey)
 		return entry, found, child, err
 	}
 	if forWAL {
@@ -217,12 +218,12 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
 	}
-	_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, !forWAL, nil, nil)
+	_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, !forWAL, nil, nil, includeKey)
 	return entry, found, child, err
 }
 
-func lookupWALLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
-	return lookupLeafNode(data, id, key, pageSize, readPage, true)
+func lookupWALLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
+	return lookupLeafNode(data, id, key, pageSize, readPage, true, includeKey)
 }
 
 func validateWALLeafNode(data []byte, id page.ID) error {
@@ -232,7 +233,7 @@ func validateWALLeafNode(data []byte, id page.ID) error {
 	if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 		return fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 	}
-	_, _, _, _, err := readEncodedLeaf(data, id, 0, nil, false, false, nil, nil)
+	_, _, _, _, err := readEncodedLeaf(data, id, 0, nil, false, false, nil, nil, true)
 	return err
 }
 
@@ -255,7 +256,7 @@ func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage f
 			return part, err
 		}
 	}
-	_, _, _, _, err = readEncodedLeaf(data, id, h.Checksum, nil, false, !forWAL && fragment == nil, visit, fragment)
+	_, _, _, _, err = readEncodedLeaf(data, id, h.Checksum, nil, false, !forWAL && fragment == nil, visit, fragment, true)
 	if err != nil || fragment == nil {
 		return err
 	}
@@ -350,7 +351,8 @@ func encodeLeafBody(data []byte, node *Node) {
 // supply mapped fragments at logical offsets, including the normal 18-byte header.
 // The owning entry point verifies the first page. WAL records must already
 // have passed their record checksum checks.
-func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool, visit func(page.ID) error, fragment func(int) ([]byte, error)) (*Node, Entry, bool, page.ID, error) {
+// includeKey applies only to directory lookup results.
+func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32, key []byte, createNode bool, allowPadding bool, visit func(page.ID) error, fragment func(int) ([]byte, error), includeKey bool) (*Node, Entry, bool, page.ID, error) {
 	if len(data) < NodeHeaderSize {
 		return nil, Entry{}, false, 0, fmt.Errorf("read node header: %w", ErrInvalid)
 	}
@@ -501,16 +503,19 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 		if comparison == 0 {
 			entry := Entry{flags: flags}
 			if fragment == nil {
-				entry.key = data[start:keyEnd:keyEnd]
+				if includeKey {
+					entry.key = data[start:keyEnd:keyEnd]
+				}
 				entry.value = data[keyEnd:end:end]
 			} else {
-				// Only the matching value needs owned storage. Keep a key in the first
-				// page borrowed. Other keys use a copy of the equal query bytes.
-				physical := leafContinuationHeaderSize + int(binary.LittleEndian.Uint32(data[22:26]))*page.IDSize + start - NodeHeaderSize
-				if physical+keyEnd-start <= len(data) {
-					entry.key = data[physical : physical+keyEnd-start : physical+keyEnd-start]
-				} else {
-					entry.key = bytes.Clone(key)
+				if includeKey {
+					// Keep a key in the first page borrowed. Other keys use a copy of the equal query bytes.
+					physical := leafContinuationHeaderSize + int(binary.LittleEndian.Uint32(data[22:26]))*page.IDSize + start - NodeHeaderSize
+					if physical+keyEnd-start <= len(data) {
+						entry.key = data[physical : physical+keyEnd-start : physical+keyEnd-start]
+					} else {
+						entry.key = bytes.Clone(key)
+					}
 				}
 				entry.value = make([]byte, end-keyEnd)
 				if err := copyEncodedBody(keyEnd, entry.value, fragment); err != nil {

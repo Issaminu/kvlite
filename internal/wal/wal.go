@@ -538,11 +538,13 @@ func (wal *WAL) CommittedPageToNode(record *CommittedPage) (*btree.Node, error) 
 // Normal entries borrow their source bytes. A continued leaf owns its value.
 // A continued key borrows the first image when it fits there; otherwise it owns
 // a copy. Keep source bytes unchanged while using borrowed results.
-func (wal *WAL) LookupCommittedPage(record *CommittedPage, key []byte) (btree.Entry, bool, page.ID, error) {
+// Set includeKey to false to omit the key from encoded lookup results.
+// Decoded entries still borrow their key and value from the Node.
+func (wal *WAL) LookupCommittedPage(record *CommittedPage, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
 	if record.Node != nil {
 		return btree.LookupDecodedNode(record.Node, key)
 	}
-	return btree.LookupEncodedWALNode(record.Payload, record.Header.PageID, key, wal.pageSize, wal.readNodePage)
+	return btree.LookupEncodedWALNode(record.Payload, record.Header.PageID, key, wal.pageSize, wal.readNodePage, includeKey)
 }
 
 // VisitCommittedPageReferences visits child nodes and continuation IDs separately.
