@@ -18,11 +18,19 @@ type Store interface {
 	// PageSize returns the fixed encoded size of one tree page.
 	PageSize() int64
 	// ReadNode returns the node visible to the current operation.
-	// A returned node is read-only until [Store.WritableNode] returns a private version.
+	// A returned node is read-only. WritableNode and DeleteLeafEntries return its private mutable version.
 	ReadNode(page.ID) (*Node, error)
 	// WritableNode returns a private mutable version of node with the same page ID.
 	// Repeated calls for that page must return the same private node.
 	WritableNode(*Node) *Node
+	// DeleteLeafEntries returns the private leaf after removing selected entries.
+	// It must preserve the committed node and earlier write-batch callback images.
+	// firstIndex and rest contain distinct, ascending indexes from the visible leaf.
+	// A separate first index avoids allocating a list for single-key deletes.
+	// Repeated writes to that page must reuse the same private node.
+	// minimumSize permits spare entry slots below the delete-repair threshold.
+	// Zero selects a leaf root, which needs no merge reservation.
+	DeleteLeafEntries(*Node, int, []int, int64) *Node
 	// AllocatePage returns a page ID that is not in use by another node.
 	// It returns an error when the store cannot allocate a page.
 	AllocatePage() (page.ID, error)
@@ -292,26 +300,37 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 		for last < len(ordered) && (upper == nil || bytes.Compare(ordered[last], upper) < 0) {
 			last++
 		}
-		indexes := make([]int, 0, last-first)
+		firstIndex, previousIndex := -1, -1
+		var rest []int
 		for _, key := range ordered[first:last] {
 			index, found, err := node.prepareDelete(key, false)
 			if err != nil {
 				return root, changed, err
 			}
-			if found && (len(indexes) == 0 || indexes[len(indexes)-1] != index) {
-				indexes = append(indexes, index)
+			if !found || index == previousIndex {
+				continue
 			}
+			if firstIndex < 0 {
+				firstIndex = index
+			} else {
+				if rest == nil {
+					rest = make([]int, 0, last-first-1)
+				}
+				rest = append(rest, index)
+			}
+			previousIndex = index
 		}
-		if len(indexes) > 0 {
-			leaf := tree.store.WritableNode(node)
-			for index := len(indexes) - 1; index >= 0; index-- {
-				leaf.applyDelete(indexes[index])
+		if firstIndex >= 0 {
+			var minimumSize int64
+			if len(path) > 0 {
+				minimumSize = tree.store.PageSize() / 4
 			}
+			leaf := tree.store.DeleteLeafEntries(node, firstIndex, rest, minimumSize)
 			if leaf.PageID() == root.PageID() {
 				root = leaf
 			}
 			var err error
-			root, err = tree.repairAfterDelete(root, leaf, path, indexes[0] == 0)
+			root, err = tree.repairAfterDelete(root, leaf, path, firstIndex == 0)
 			if err != nil {
 				return nil, changed, err
 			}
@@ -359,8 +378,11 @@ func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool,
 		return root, found, err
 	}
 
-	leaf := tree.store.WritableNode(node)
-	leaf.applyDelete(deleteIndex)
+	var minimumSize int64
+	if len(path) > 0 {
+		minimumSize = tree.store.PageSize() / 4
+	}
+	leaf := tree.store.DeleteLeafEntries(node, deleteIndex, nil, minimumSize)
 	if leaf.PageID() == root.PageID() {
 		root = leaf
 	}

@@ -127,11 +127,25 @@ func (store *txTreeStore) WritableNode(node *btree.Node) *btree.Node {
 	if dirty, ok := store.dirty[node.PageID()]; ok {
 		return dirty.final
 	}
+	return store.stageNodeClone(node, node.Clone())
+}
+
+// DeleteLeafEntries copies only retained entries on the first write to a leaf.
+// Later deletes compact the transaction's private entry list in place.
+func (store *txTreeStore) DeleteLeafEntries(node *btree.Node, firstIndex int, rest []int, minimumSize int64) *btree.Node {
+	if dirty, ok := store.dirty[node.PageID()]; ok {
+		dirty.final.DeleteLeafEntries(firstIndex, rest)
+		return dirty.final
+	}
+	return store.stageNodeClone(node, node.CloneWithoutLeafEntries(firstIndex, rest, minimumSize))
+}
+
+// stageNodeClone records the committed base and the new callback-owned image.
+func (store *txTreeStore) stageNodeClone(node, private *btree.Node) *btree.Node {
 	original := node
 	if batchDirty, ok := store.baseDirty[node.PageID()]; ok {
 		original = batchDirty.original
 	}
-	private := node.Clone()
 	store.nodes[node.PageID()] = private
 	store.dirty[node.PageID()] = dirtyNode{original: original, final: private}
 	return private

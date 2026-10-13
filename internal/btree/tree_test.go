@@ -60,6 +60,16 @@ func (store *memoryTreeStore) WritableNode(node *Node) *Node {
 	return private
 }
 
+func (store *memoryTreeStore) DeleteLeafEntries(node *Node, firstIndex int, rest []int, minimumSize int64) *Node {
+	if dirty, ok := store.dirty[node.PageID()]; ok {
+		dirty.DeleteLeafEntries(firstIndex, rest)
+		return dirty
+	}
+	private := node.CloneWithoutLeafEntries(firstIndex, rest, minimumSize)
+	store.StageNode(private)
+	return private
+}
+
 func (store *memoryTreeStore) StageNode(node *Node) {
 	if store.dirty == nil {
 		store.dirty = make(map[page.ID]*Node)

@@ -1424,3 +1424,119 @@ func TestVisitContinuedNodeReferences(t *testing.T) {
 		}
 	}
 }
+
+func TestLeafDeletionCopiesOnlyRetainedEntries(t *testing.T) {
+	for _, indexes := range [][]int{{0}, {2}, {4}, {0, 2, 4}, {0, 1, 2, 3, 4}} {
+		t.Run(fmt.Sprint(indexes), func(t *testing.T) {
+			base := NewLeafNode(3)
+			for i := range 5 {
+				if err := base.InsertEntry(NewEntry(uint32(i*2), []byte{byte('a' + i)}, []byte{byte(i)})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			base.SetOverflowPages([]page.ID{10, 11})
+			base.header.Checksum = 42
+			base.CacheEncodedSize()
+			before := EncodeWALNode(base)
+			want := base.Clone()
+			for i := len(indexes) - 1; i >= 0; i-- {
+				want.applyDelete(indexes[i])
+			}
+			private := base.CloneWithoutLeafEntries(indexes[0], indexes[1:], 0)
+			if !bytes.Equal(EncodeWALNode(private), EncodeWALNode(want)) || private.EncodedSize() != want.EncodedSize() {
+				t.Fatal("private copy changed retained leaf entries")
+			}
+			inPlace := base.Clone()
+			storage := inPlace.entries
+			inPlace.CacheEncodedSize()
+			inPlace.DeleteLeafEntries(indexes[0], indexes[1:])
+			if !bytes.Equal(EncodeWALNode(inPlace), EncodeWALNode(want)) || inPlace.EncodedSize() != want.EncodedSize() {
+				t.Fatal("private compaction changed retained leaf entries")
+			}
+			for _, entry := range storage[inPlace.EntryCount():] {
+				if entry.key != nil || entry.value != nil || entry.flags != 0 || entry.valueOwned {
+					t.Fatal("private compaction retained a removed entry")
+				}
+			}
+			private.continuationPageIDs[0] = 99
+			private.SetPageID(100)
+			if private.EntryCount() != 0 {
+				private.entries[0] = NewEntry(0, []byte("changed"), nil)
+			}
+			if !bytes.Equal(EncodeWALNode(base), before) || base.OverflowPages()[0] != 10 || base.header.Checksum != 42 {
+				t.Fatal("private deletion changed the committed node")
+			}
+		})
+	}
+}
+
+func TestLeafDeletionKeepsCapacityForMerge(t *testing.T) {
+	base := NewLeafNode(3)
+	for _, key := range []string{"a", "b", "c", "d", "e"} {
+		if err := base.InsertEntry(NewEntry(0, []byte(key), []byte(key))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	private := base.CloneWithoutLeafEntries(0, []int{1, 2}, 64)
+	if private.EntryCount() != 2 || cap(private.entries) < base.EntryCount() || private.EncodedSize() != 54 {
+		t.Fatal("underfull leaf did not keep merge capacity and its exact size")
+	}
+	right := NewLeafNode(5)
+	for _, key := range []string{"f", "g"} {
+		if err := right.InsertEntry(NewEntry(0, []byte(key), []byte(key))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parent := NewRootNode(4, private, right, []byte("f"))
+	storage := &private.entries[0]
+	mergeChildren(parent, 0, private, right)
+	if &private.entries[0] != storage || private.EntryCount() != 4 || private.EncodedSize() != 90 {
+		t.Fatal("leaf merge replaced reserved storage or kept a stale size")
+	}
+	if base.EntryCount() != 5 || string(base.EntryAt(0).Key()) != "a" {
+		t.Fatal("reserved merge changed the committed leaf")
+	}
+	empty := base.CloneWithoutLeafEntries(0, []int{1, 2, 3, 4}, 64)
+	if empty.EntryCount() != 0 || cap(empty.entries) < base.EntryCount() || empty.EncodedSize() != NodeHeaderSize {
+		t.Fatal("empty leaf lost capacity needed by successive merges")
+	}
+}
+
+// BenchmarkDeleteLeaf measures deletes from one committed leaf without file I/O.
+// Each iteration restores the store's page view before it deletes the same keys.
+func BenchmarkDeleteLeaf(b *testing.B) {
+	for _, c := range []struct {
+		count  int
+		single bool
+	}{{1, true}, {1, false}, {32, false}, {64, false}} {
+		b.Run(fmt.Sprintf("keys=%d/single=%t", c.count, c.single), func(b *testing.B) {
+			base := NewLeafNode(3)
+			keys := make([][]byte, 64)
+			for i := range keys {
+				keys[i] = fmt.Appendf(nil, "%08d", i)
+				if err := base.InsertEntry(NewEntry(0, keys[i], make([]byte, 32))); err != nil {
+					b.Fatal(err)
+				}
+			}
+			store := &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node), dirty: make(map[page.ID]*Node)}
+			tree := NewTree(store)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				store.nodes[3] = base
+				clear(store.dirty)
+				var root *Node
+				var changed bool
+				var err error
+				if c.single {
+					root, changed, err = tree.DeleteEntry(base, keys[0])
+				} else {
+					root, changed, err = tree.DeleteEntries(base, keys[:c.count])
+				}
+				if err != nil || !changed || root.EntryCount() != 64-c.count {
+					b.Fatalf("delete: changed=%t error=%v", changed, err)
+				}
+			}
+		})
+	}
+}

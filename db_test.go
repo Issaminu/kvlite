@@ -8411,3 +8411,112 @@ func TestPut_MaxValueSize(t *testing.T) {
 	}
 	check()
 }
+
+func TestDelete_CompactPrivateLeafRollback(t *testing.T) {
+	for _, memory := range []bool{false, true} {
+		name := "file"
+		if memory {
+			name = "memory"
+		}
+		t.Run(name, func(t *testing.T) {
+			var db *DB
+			if memory {
+				db = OpenMemory()
+			} else {
+				var err error
+				db, err = Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer db.Close()
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for _, key := range []string{"a", "b", "c", "d"} {
+					if err := bucket.Put([]byte(key), []byte("value-"+key)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			change := func(tx *Tx) error {
+				bucket := mustBucket(t, tx, testBucketName)
+				if err := bucket.Delete([]byte("b")); err != nil {
+					return err
+				}
+				if err := bucket.Put([]byte("e"), []byte("new")); err != nil {
+					return err
+				}
+				return bucket.DeleteBatch([][]byte{[]byte("d"), []byte("a"), []byte("a"), []byte("missing")})
+			}
+			if err := db.Update(func(tx *Tx) error {
+				if err := change(tx); err != nil {
+					return err
+				}
+				return errDiscardTx
+			}); !errors.Is(err, errDiscardTx) {
+				t.Fatalf("rollback: %v", err)
+			}
+			for _, key := range []string{"a", "b", "c", "d"} {
+				got, err := db.Get(testBucketName, []byte(key))
+				if err != nil || string(got) != "value-"+key {
+					t.Fatalf("rollback changed %s: %q, %v", key, got, err)
+				}
+			}
+			if _, err := db.Get(testBucketName, []byte("e")); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("rollback published e: %v", err)
+			}
+			if err := db.Update(change); err != nil {
+				t.Fatal(err)
+			}
+			for _, key := range []string{"a", "b", "d"} {
+				if _, err := db.Get(testBucketName, []byte(key)); !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("committed delete retained %s: %v", key, err)
+				}
+			}
+			for key, expected := range map[string]string{"c": "value-c", "e": "new"} {
+				if got, err := db.Get(testBucketName, []byte(key)); err != nil || string(got) != expected {
+					t.Fatalf("retained %s: %q, %v", key, got, err)
+				}
+			}
+		})
+	}
+}
+
+func TestDeleteLeafEntries_PreservesWriteBatchImages(t *testing.T) {
+	meta := page.NewMeta(4096)
+	root := btree.NewLeafNode(meta.Root())
+	db := &DB{meta: meta, rootNode: root}
+	base := btree.NewLeafNode(10)
+	for _, key := range []string{"a", "b", "c", "d", "e", "f"} {
+		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), []byte(key))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before := btree.EncodeWALNode(base)
+	first := newWriteTx(db, meta, root, nil, nil)
+	middle := first.store.DeleteLeafEntries(base, 1, []int{3}, 0)
+	if got := first.store.DeleteLeafEntries(middle, 2, nil, 0); got != middle {
+		t.Fatal("later delete replaced the private node")
+	}
+	retained := btree.EncodeWALNode(middle)
+	failed := newWriteTx(db, meta, root, first.store.dirty, nil)
+	failed.store.DeleteLeafEntries(middle, 0, nil, 0)
+	if !bytes.Equal(btree.EncodeWALNode(middle), retained) || !bytes.Equal(btree.EncodeWALNode(base), before) {
+		t.Fatal("later callback changed an earlier node image")
+	}
+	last := newWriteTx(db, meta, root, first.store.dirty, nil)
+	final := last.store.DeleteLeafEntries(middle, 1, nil, 0)
+	nodes, _ := makeWALCommitData(last.store.dirty, meta, false)
+	if len(nodes) != 1 || nodes[0].Original != base || nodes[0].Final != final || final.EntryCount() != 2 {
+		t.Fatal("delete did not preserve the original and final WAL images")
+	}
+	if string(final.EntryAt(0).Key()) != "a" || string(final.EntryAt(1).Key()) != "f" {
+		t.Fatal("delete kept the wrong callback entries")
+	}
+}

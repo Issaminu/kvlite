@@ -143,6 +143,40 @@ func (n *Node) Clone() *Node {
 	}
 }
 
+// CloneWithoutLeafEntries returns a private leaf with the selected entries removed.
+// firstIndex and rest must contain distinct, ascending entry indexes.
+// n must be a leaf. The clone owns its lists and shares immutable key and value
+// bytes with n, as Clone does. Only entries that remain are copied.
+// With minimumSize set, it keeps spare slots for an empty or small leaf.
+// Zero disables that reservation.
+func (n *Node) CloneWithoutLeafEntries(firstIndex int, rest []int, minimumSize int64) *Node {
+	remaining := len(n.entries) - 1 - len(rest)
+	capacity, size := remaining, 0
+	if minimumSize > 0 {
+		size = NodeHeaderSize
+		if remaining > 0 {
+			size = n.EncodedSize() - n.entries[firstIndex].EncodedSize(true)
+			for _, index := range rest {
+				size -= n.entries[index].EncodedSize(true)
+			}
+		}
+		if remaining == 0 || int64(size) < minimumSize {
+			capacity = len(n.entries)
+		}
+	}
+	entries := slices.Grow([]Entry(nil), capacity)[:remaining]
+	copyLeafEntriesExcept(entries, n.entries, firstIndex, rest)
+	header := *n.header
+	header.Checksum = 0
+	return &Node{
+		header:              &header,
+		entries:             entries,
+		Children:            slices.Clone(n.Children),
+		continuationPageIDs: slices.Clone(n.continuationPageIDs),
+		encodedSize:         size,
+	}
+}
+
 func (n *Node) firstKey() []byte {
 	if len(n.entries) == 0 {
 		return nil

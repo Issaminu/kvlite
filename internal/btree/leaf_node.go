@@ -129,6 +129,30 @@ func (n *Node) applyDelete(index int) {
 	n.header.Checksum = 0
 }
 
+// DeleteLeafEntries removes selected entries from a private leaf in one pass.
+// n must be a leaf owned by the caller. firstIndex and rest must contain
+// distinct, ascending entry indexes. It clears unused entry slots.
+func (n *Node) DeleteLeafEntries(firstIndex int, rest []int) {
+	remaining := len(n.entries) - 1 - len(rest)
+	copyLeafEntriesExcept(n.entries[:remaining], n.entries, firstIndex, rest)
+	clear(n.entries[remaining:])
+	n.entries = n.entries[:remaining]
+	n.encodedSize = 0
+	n.header.Checksum = 0
+}
+
+// copyLeafEntriesExcept copies the ranges between removed entries.
+// dst has room for the remaining entries. It can start at entries[0].
+func copyLeafEntriesExcept(dst, entries []Entry, firstIndex int, rest []int) {
+	write := copy(dst, entries[:firstIndex])
+	read := firstIndex + 1
+	for _, index := range rest {
+		write += copy(dst[write:], entries[read:index])
+		read = index + 1
+	}
+	copy(dst[write:], entries[read:])
+}
+
 // DeleteKeyIfPresent removes a leaf entry. A missing key makes no change.
 // WAL recovery can call it when a checkpoint already wrote the final leaf.
 func (n *Node) DeleteKeyIfPresent(key []byte) error {
