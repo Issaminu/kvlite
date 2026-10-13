@@ -510,7 +510,8 @@ if ((profile_enabled)); then
 		for view in cpu alloc; do
 			if [[ "${view}" == cpu ]]; then
 				profile_file="${container_case_dir}/cpu.pprof"
-				view_option=()
+				# Keep the array nonempty for Bash 3.2 with set -u.
+				view_option=(-sample_index=cpu)
 			else
 				profile_file="${container_case_dir}/memory.pprof"
 				view_option=(-alloc_space)
