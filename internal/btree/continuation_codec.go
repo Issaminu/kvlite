@@ -241,7 +241,7 @@ func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID)
 	if pages < 2 {
 		return ErrInvalid
 	}
-	seen := make(map[page.ID]struct{}, pages)
+	seen := pageIDSet{ids: make([]page.ID, 0, pages)}
 	group, groupOffset, cached := first, 0, first
 	firstID := page.ID(binary.LittleEndian.Uint64(first[2:10]))
 	for at := 0; at < size; {
@@ -249,10 +249,9 @@ func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID)
 		if err != nil {
 			return err
 		}
-		if _, exists := seen[id]; exists {
+		if !seen.add(id) {
 			return ErrInvalid
 		}
-		seen[id] = struct{}{}
 		if at+len(part) == size && id != firstID {
 			start := ContinuationHeaderSize + int(binary.LittleEndian.Uint32(cached[14:18]))*page.IDSize + len(part)
 			for _, b := range cached[start:] {
@@ -267,6 +266,52 @@ func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID)
 		at += len(part)
 	}
 	return nil
+}
+
+// pageIDSet finds a repeated page ID among the pages of one continued node.
+// New pages usually have ascending IDs, and ascending IDs need no map.
+// The first ID that is not larger than the one before it makes the set build a map from all earlier IDs.
+type pageIDSet struct {
+	ids  []page.ID            // Ascending IDs added before the map exists.
+	seen map[page.ID]struct{} // All added IDs after the first out-of-order ID.
+}
+
+// add records id. It returns false when the set already contains id.
+func (set *pageIDSet) add(id page.ID) bool {
+	if set.seen == nil {
+		if len(set.ids) == 0 || id > set.ids[len(set.ids)-1] {
+			set.ids = append(set.ids, id)
+			return true
+		}
+		set.seen = make(map[page.ID]struct{}, cap(set.ids))
+		for _, previous := range set.ids {
+			set.seen[previous] = struct{}{}
+		}
+	}
+	if _, exists := set.seen[id]; exists {
+		return false
+	}
+	set.seen[id] = struct{}{}
+	return true
+}
+
+// hasRepeatedPageID reports whether ids contains one ID more than once.
+// Ascending IDs need no map.
+func hasRepeatedPageID(ids []page.ID) bool {
+	for index := 1; index < len(ids); index++ {
+		if ids[index] > ids[index-1] {
+			continue
+		}
+		seen := make(map[page.ID]struct{}, len(ids))
+		for _, id := range ids {
+			if _, exists := seen[id]; exists {
+				return true
+			}
+			seen[id] = struct{}{}
+		}
+		return false
+	}
+	return false
 }
 
 // continuationPageCount counts pages needed for a body with grouped continuation IDs.
@@ -285,11 +330,13 @@ func continuationPageCount(bodySize int, pageSize int64, firstHeaderSize int) in
 // The owning codec writes the first page's type-specific fields and body.
 // Continuation pages get their own header here. Their checksums follow body encoding.
 func prepareContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int, pages [][]byte) ([][]byte, error) {
+	if hasRepeatedPageID(ids) {
+		return nil, ErrInvalid
+	}
 	allocate := pages == nil
 	if allocate {
 		pages = make([][]byte, len(ids))
 	}
-	seen := make(map[page.ID]struct{}, len(ids))
 	chunkSize := min(max(1<<20, int(pageSize)), len(ids)*int(pageSize))
 	var chunk []byte
 	arrayPageIndex := 0
@@ -297,10 +344,6 @@ func prepareContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int
 		if page.IsMetaID(id) {
 			return nil, ErrInvalid
 		}
-		if _, ok := seen[id]; ok {
-			return nil, ErrInvalid
-		}
-		seen[id] = struct{}{}
 		var data []byte
 		if allocate {
 			if len(chunk) < int(pageSize) {

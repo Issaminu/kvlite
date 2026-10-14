@@ -81,3 +81,33 @@ func TestContinuationNode_Codec(t *testing.T) {
 		}
 	}
 }
+
+func TestPageIDSet_FindsRepeatedIDs(t *testing.T) {
+	for _, test := range []struct {
+		ids      []page.ID
+		repeated bool
+	}{
+		{nil, false},
+		{[]page.ID{3, 4, 9}, false},
+		{[]page.ID{3, 4, 4}, true},
+		{[]page.ID{5, 5}, true},
+		{[]page.ID{9, 4, 3}, false},
+		{[]page.ID{3, 9, 4, 9}, true},
+		{[]page.ID{3, 9, 4, 3}, true},
+		{[]page.ID{3, 9, 4, 7}, false},
+	} {
+		set := pageIDSet{}
+		firstRepeat := -1
+		for index, id := range test.ids {
+			if !set.add(id) && firstRepeat < 0 {
+				firstRepeat = index
+			}
+		}
+		if (firstRepeat >= 0) != test.repeated || hasRepeatedPageID(test.ids) != test.repeated {
+			t.Fatalf("IDs %v: set found repeat at %d, function found %t; want repeated %t", test.ids, firstRepeat, hasRepeatedPageID(test.ids), test.repeated)
+		}
+		if test.repeated && firstRepeat != len(test.ids)-1 {
+			t.Fatalf("IDs %v: set found repeat at %d, want the last ID", test.ids, firstRepeat)
+		}
+	}
+}

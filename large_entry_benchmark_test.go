@@ -39,6 +39,20 @@ func openLargeEntryBenchmark(b *testing.B, options *Options, count, keySize, val
 	return path, db, keys
 }
 
+// reopenReadOnly closes db and opens path again in read-only mode, so reads use the mapped main file.
+func reopenReadOnly(b *testing.B, path string, db *DB) *DB {
+	b.Helper()
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	db, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
 // BenchmarkPut_LargeValueWAL measures repeated replacement of one 64 KiB value while the WAL keeps the last committed leaf.
 // Each Put reads that continued leaf before it changes it.
 func BenchmarkPut_LargeValueWAL(b *testing.B) {
@@ -51,6 +65,31 @@ func BenchmarkPut_LargeValueWAL(b *testing.B) {
 		value[0]++
 		if err := db.Put(largeEntryBucket, keys[0], value); err != nil {
 			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkScanRange_LargeValues measures a full scan of continued 64 KiB values in the mapped main file.
+func BenchmarkScanRange_LargeValues(b *testing.B) {
+	const count, size = 64, 64 << 10
+	path, db, _ := openLargeEntryBenchmark(b, nil, count, 16, size)
+	db = reopenReadOnly(b, path, db)
+	b.SetBytes(count * size)
+	b.ReportAllocs()
+	for b.Loop() {
+		visited := 0
+		err := db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket(largeEntryBucket)
+			if err != nil {
+				return err
+			}
+			return bucket.ScanRange(nil, nil, func(key, value []byte) error {
+				visited += len(value)
+				return nil
+			})
+		})
+		if err != nil || visited != count*size {
+			b.Fatalf("scan visited %d bytes, error %v", visited, err)
 		}
 	}
 }

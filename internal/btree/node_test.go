@@ -540,6 +540,46 @@ func BenchmarkWriteNode(b *testing.B) {
 	}
 }
 
+// BenchmarkDecodeContinuedLeaf measures a full decode of one continued leaf from in-memory pages.
+// Ascending IDs are the usual order for new pages. Descending IDs come from reused lower pages.
+func BenchmarkDecodeContinuedLeaf(b *testing.B) {
+	const pageSize int64 = 4096
+	for _, size := range []int{64 << 10, 1 << 20} {
+		for _, order := range []string{"ascending", "descending"} {
+			b.Run(fmt.Sprintf("bytes=%d/ids=%s", size, order), func(b *testing.B) {
+				node := NewLeafNode(7)
+				if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), size))); err != nil {
+					b.Fatal(err)
+				}
+				ids := make([]page.ID, NodePageCount(node, pageSize))
+				ids[0] = node.PageID()
+				for i := 1; i < len(ids); i++ {
+					ids[i] = page.ID(10 + i)
+					if order == "descending" {
+						ids[i] = page.ID(10 + len(ids) - i)
+					}
+				}
+				pages, err := EncodeNodePages(node, pageSize, ids)
+				if err != nil {
+					b.Fatal(err)
+				}
+				byID := make(map[page.ID][]byte, len(pages))
+				for i, data := range pages {
+					byID[ids[i]] = data
+				}
+				read := func(id page.ID) ([]byte, error) { return byID[id], nil }
+				b.SetBytes(int64(size))
+				b.ReportAllocs()
+				for b.Loop() {
+					if _, err := DecodeLeafNode(pages[0], node.PageID(), pageSize, read, false); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func fixedLeafImageForTest() []byte {
 	const (
 		entryCount      = 2
