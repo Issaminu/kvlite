@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 )
 
@@ -165,4 +166,56 @@ func benchmarkLargeUniformGets(b *testing.B, db *DB, keys [][]byte) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkCursorSeekParallel measures parallel read transactions that seek and read ten entries.
+// Read-only cursors get decoded nodes from the shared node cache, so each visited node takes its lock.
+func BenchmarkCursorSeekParallel(b *testing.B) {
+	path, db, keys := prepareLargeGetBenchmark(b)
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	db, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	seek := func(start int) error {
+		return db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket([]byte("bench"))
+			if err != nil {
+				return err
+			}
+			cursor, err := bucket.Cursor()
+			if err != nil {
+				return err
+			}
+			key, _, err := cursor.Seek(keys[start])
+			for range 9 {
+				if err != nil || key == nil {
+					return fmt.Errorf("cursor at %d: key %q, error %v", start, key, err)
+				}
+				key, _, err = cursor.Next()
+			}
+			return err
+		})
+	}
+	// Read every leaf once so the measured reads hit the node cache.
+	for start := 0; start < len(keys)-10; start += 64 {
+		if err := seek(start); err != nil {
+			b.Fatal(err)
+		}
+	}
+	var worker atomic.Uint64
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		random := rand.New(rand.NewSource(int64(worker.Add(1))))
+		for pb.Next() {
+			if err := seek(random.Intn(len(keys) - 10)); err != nil {
+				b.Error(err)
+				return
+			}
+		}
+	})
 }

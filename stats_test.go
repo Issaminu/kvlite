@@ -321,6 +321,8 @@ func TestStatsCheckpointSyncFailure(t *testing.T) {
 	}
 }
 
+// TestStatsConcurrentReadersKeepCacheUnchanged checks that concurrent readers keep the cache size and statistics unchanged.
+// Readers mark each cached node that they use, so CLOCK eviction keeps the nodes that only readers use.
 func TestStatsConcurrentReadersKeepCacheUnchanged(t *testing.T) {
 	db := openStatsDB(t, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1})
 	createBucket(t, db, []byte("data"))
@@ -346,7 +348,7 @@ func TestStatsConcurrentReadersKeepCacheUnchanged(t *testing.T) {
 	db.nextWriteNodeSlot = 0
 	for round := range 2 {
 		for _, entry := range db.writeNodes {
-			entry.referenced = false
+			entry.referenced.Store(false)
 		}
 		cacheSize := len(db.writeNodes)
 		results := make(chan error, 8)
@@ -396,9 +398,9 @@ func TestStatsConcurrentReadersKeepCacheUnchanged(t *testing.T) {
 		if len(db.writeNodes) != cacheSize {
 			t.Fatal("readers changed cache size")
 		}
-		for _, entry := range db.writeNodes {
-			if entry.referenced {
-				t.Fatal("readers changed a cache reference flag")
+		for pageID, entry := range db.writeNodes {
+			if !entry.referenced.Load() {
+				t.Fatalf("readers did not mark cached page %d as used", pageID)
 			}
 		}
 	}

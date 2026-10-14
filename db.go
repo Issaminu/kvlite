@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -22,8 +23,9 @@ const (
 )
 
 type writeNodeCacheEntry struct {
-	node       *btree.Node
-	referenced bool
+	node *btree.Node
+	// referenced is the CLOCK bit. Read-only lookups set it while they hold only the read lock of writeNodesMu, so it is atomic.
+	referenced atomic.Bool
 }
 
 // DB is an open handle to a KVLite database in a file or in memory. Create it with [Open] or [OpenMemory]. Its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
@@ -502,13 +504,33 @@ func (db *DB) readOnlyNode(pageID page.ID) (*btree.Node, error) {
 	db.writeNodesMu.RLock()
 	if entry, ok := db.writeNodes[pageID]; ok {
 		node := entry.node
+		// Mark the hit so eviction skips this node once. A load first keeps hits from writing a shared cache line again and again.
+		if !entry.referenced.Load() {
+			entry.referenced.Store(true)
+		}
 		db.writeNodesMu.RUnlock()
 		return node, nil
 	}
 	db.writeNodesMu.RUnlock()
+
+	// Decode without the cache lock, so concurrent misses do not wait for each other.
+	// Mapped pages stay unchanged while the caller holds the operation lock.
+	// Two readers can decode the same page. The first insert wins, and the other copy is dropped.
+	data, err := db.readMainNodePage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	node, err := btree.DecodeNode(slices.Clone(data), pageID, db.meta.PageSize(), db.readMainNodePage, db.meta.DataPageChecksums())
+	if err != nil {
+		return nil, err
+	}
 	db.writeNodesMu.Lock()
 	defer db.writeNodesMu.Unlock()
-	return db.readNode(pageID)
+	if cached, ok := db.cachedWriteNode(pageID); ok {
+		return cached, nil
+	}
+	db.cacheWriteNode(node)
+	return node, nil
 }
 
 // visitCommittedNodeReferences checks one node and visits its child and storage pages.
@@ -541,7 +563,7 @@ func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {
 	if !ok {
 		return nil, false
 	}
-	entry.referenced = true
+	entry.referenced.Store(true)
 	return entry.node, true
 }
 
@@ -551,7 +573,7 @@ func (db *DB) cacheWriteNode(node *btree.Node) {
 	pageID := node.PageID()
 	if entry, ok := db.writeNodes[pageID]; ok {
 		entry.node = node
-		entry.referenced = true
+		entry.referenced.Store(true)
 		return
 	}
 
@@ -562,17 +584,19 @@ func (db *DB) cacheWriteNode(node *btree.Node) {
 		for {
 			victimPageID := db.writeNodeSlots[db.nextWriteNodeSlot]
 			victim := db.writeNodes[victimPageID]
-			if !victim.referenced {
+			if !victim.referenced.Load() {
 				delete(db.writeNodes, victimPageID)
 				db.writeNodeSlots[db.nextWriteNodeSlot] = pageID
 				db.nextWriteNodeSlot = (db.nextWriteNodeSlot + 1) % maxCachedWriteNodePages
 				break
 			}
-			victim.referenced = false
+			victim.referenced.Store(false)
 			db.nextWriteNodeSlot = (db.nextWriteNodeSlot + 1) % maxCachedWriteNodePages
 		}
 	}
-	db.writeNodes[pageID] = &writeNodeCacheEntry{node: node, referenced: true}
+	entry := &writeNodeCacheEntry{node: node}
+	entry.referenced.Store(true)
+	db.writeNodes[pageID] = entry
 }
 
 // lookupCommittedPage searches one committed page.
