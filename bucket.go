@@ -200,7 +200,8 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 
 // loadBucket reads a bucket entry and opens the tree that it names. It returns (nil, nil) when no entry exists and [ErrIncompatibleValue] when the name belongs to a plain value.
 func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
-	entry, found, err := tx.tree.FindEntryRef(rootNode, bucketName)
+	// The bucket keeps the stored name, so the lookup must return the key.
+	entry, found, err := tx.tree.FindEntryRef(rootNode, bucketName, true)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +278,7 @@ func (bucket *Bucket) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if b, ok := bucket.children[string(bucketName)]; ok {
 		return b, nil
 	}
-	entry, found, err := bucket.findEntry(bucketName)
+	entry, found, err := bucket.findEntry(bucketName, true)
 	if err != nil || !found {
 		return nil, err
 	}
@@ -499,18 +500,20 @@ func (bucket *Bucket) Get(key []byte) ([]byte, error) {
 	if err := bucket.liveError(); err != nil {
 		return nil, err
 	}
-	entry, found, err := bucket.findEntry(key)
+	// Get uses only the value and flags. Skip the key so a continued key is not copied.
+	entry, found, err := bucket.findEntry(key, false)
 	if err != nil {
 		return nil, err
 	}
 	return valueFromEntry(entry, found)
 }
 
-func (bucket *Bucket) findEntry(key []byte) (btree.Entry, bool, error) {
+// findEntry finds key in bucket. includeKey has the same meaning as in [btree.Tree.FindEntryRef].
+func (bucket *Bucket) findEntry(key []byte, includeKey bool) (btree.Entry, bool, error) {
 	if bucket.rootNode != nil {
-		return bucket.tx.tree.FindEntryRef(bucket.rootNode, key)
+		return bucket.tx.tree.FindEntryRef(bucket.rootNode, key, includeKey)
 	}
-	return bucket.tx.tree.FindEntryRefFromPage(bucket.rootPageID, key)
+	return bucket.tx.tree.FindEntryRefFromPage(bucket.rootPageID, key, includeKey)
 }
 
 func (bucket *Bucket) loadRootNode() error {

@@ -23,7 +23,7 @@ func (store *memoryTreeStore) PageSize() int64 {
 	return store.pageSize
 }
 
-func (store *memoryTreeStore) LookupPage(pageID page.ID, key []byte) (Entry, bool, page.ID, error) {
+func (store *memoryTreeStore) LookupPage(pageID page.ID, key []byte, _ bool) (Entry, bool, page.ID, error) {
 	node := store.nodes[pageID]
 	if node == nil {
 		return Entry{}, false, 0, ErrKeyNotFound
@@ -86,7 +86,7 @@ func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entry, found, err := tree.FindEntryRef(root, []byte("key"))
+	entry, found, err := tree.FindEntryRef(root, []byte("key"), true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestTreePutEntry_AcceptsKeyBeyondOnePage(t *testing.T) {
 	}
 	for i := 0; i < 12; i++ {
 		key := bytes.Repeat([]byte{byte('a' + i)}, 256)
-		entry, found, err := tree.FindEntryRef(root, key)
+		entry, found, err := tree.FindEntryRef(root, key, true)
 		if err != nil || !found || !bytes.Equal(entry.Value(), []byte("value")) {
 			t.Fatalf("key %d: found=%t, error=%v", i, found, err)
 		}
@@ -178,7 +178,7 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 	for index := 0; index < entryCount; index++ {
 		key := fmt.Appendf(nil, "key-%03d", index)
 		want := fmt.Appendf(nil, "value-%03d", index)
-		entry, found, err := tree.FindEntryRef(root, key)
+		entry, found, err := tree.FindEntryRef(root, key, true)
 		if err != nil {
 			t.Fatalf("find %q: %v", key, err)
 		}
@@ -228,7 +228,7 @@ func TestTreePutEntry_RootSplitReturnsNewRoot(t *testing.T) {
 	}
 	for index := 0; index < inserted; index++ {
 		key := fmt.Appendf(nil, "key-%02d", index)
-		entry, found, err := tree.FindEntryRef(root, key)
+		entry, found, err := tree.FindEntryRef(root, key, true)
 		if err != nil {
 			t.Fatalf("find %q: %v", key, err)
 		}
@@ -326,7 +326,7 @@ func TestTreeDeleteEntryRemovesExistingKey(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("delete: found %t, error %v", found, err)
 	}
-	if _, found, err := tree.FindEntryRef(root, []byte("b")); err != nil || found {
+	if _, found, err := tree.FindEntryRef(root, []byte("b"), true); err != nil || found {
 		t.Fatalf("find deleted key: found %t, error %v", found, err)
 	}
 }
@@ -389,7 +389,7 @@ func TestTreeDeleteBucketEntryRejectsPlainValue(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("bucket delete: found %t, error %v", found, err)
 	}
-	if _, found, err := tree.FindEntryRef(root, []byte("nested")); err != nil || found {
+	if _, found, err := tree.FindEntryRef(root, []byte("nested"), true); err != nil || found {
 		t.Fatalf("deleted bucket entry: found %t, error %v", found, err)
 	}
 }
@@ -488,7 +488,7 @@ func TestTreeDeleteEntryRandomOrderKeepsExactSeparators(t *testing.T) {
 		deleted[index] = true
 		assertTreeSeparators(t, store, root)
 		for candidate := range keyCount {
-			_, found, err := tree.FindEntryRef(root, fmt.Appendf(nil, "key-%03d", candidate))
+			_, found, err := tree.FindEntryRef(root, fmt.Appendf(nil, "key-%03d", candidate), true)
 			if err != nil {
 				t.Fatal(err)
 			}

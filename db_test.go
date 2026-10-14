@@ -825,7 +825,7 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 		if got := bucket.rootNode.PageID(); got == rootPageID {
 			t.Fatalf("bucket root page ID after split: got old page %d, want a new page", got)
 		}
-		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, testBucketName)
+		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, testBucketName, true)
 		if err != nil {
 			return err
 		}
@@ -5108,7 +5108,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 		if got := p.rootNode.PageID(); got == rootPageID {
 			t.Fatalf("parent root page ID after split: got old page %d, want a new page", got)
 		}
-		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, []byte("p"))
+		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, []byte("p"), true)
 		if err != nil {
 			return err
 		}
@@ -5375,7 +5375,7 @@ func TestTreeFindEntryRef_DistinguishesEmptyValueFromMissing(t *testing.T) {
 			return err
 		}
 		root := bucket.rootNode
-		entry, found, err := tx.tree.FindEntryRef(root, []byte("present"))
+		entry, found, err := tx.tree.FindEntryRef(root, []byte("present"), true)
 		if err != nil {
 			return err
 		}
@@ -5386,7 +5386,7 @@ func TestTreeFindEntryRef_DistinguishesEmptyValueFromMissing(t *testing.T) {
 			t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
 		}
 
-		_, found, err = tx.tree.FindEntryRef(root, []byte("missing"))
+		_, found, err = tx.tree.FindEntryRef(root, []byte("missing"), true)
 		if err != nil {
 			return err
 		}
@@ -8025,6 +8025,50 @@ func TestReadNode_ContinuedWALRecordUsesCommittedNode(t *testing.T) {
 	}
 	if got := node.EntryAt(0).Value(); !bytes.Equal(got, bytes.Repeat([]byte{4}, size)) {
 		t.Fatalf("continued WAL leaf value: got %d bytes starting %v, want the last commit", len(got), got[:min(len(got), 1)])
+	}
+}
+
+// TestBucketGet_ReadTransactionSkipsContinuedKey checks that a read-only Get does not copy a key that does not fit in one page.
+// Get uses only the value, so the only allocation is the copy of the continued value.
+func TestBucketGet_ReadTransactionSkipsContinuedKey(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := bytes.Repeat([]byte("k"), MaxKeySize)
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(key, []byte("value"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A reopened read-only handle reads the mapped main file.
+	db, err = Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.View(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		allocations := testing.AllocsPerRun(10, func() {
+			value, err := bucket.Get(key)
+			if err != nil || string(value) != "value" {
+				panic(fmt.Sprintf("Get: value %q, error %v", value, err))
+			}
+		})
+		if allocations != 1 {
+			t.Fatalf("allocations for each Get: got %.0f, want 1 for the value copy", allocations)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 

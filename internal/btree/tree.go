@@ -14,7 +14,8 @@ type Store interface {
 	// The store selects the page representation.
 	// A leaf returns an entry and a zero child page ID.
 	// A branch returns the selected child page ID.
-	LookupPage(page.ID, []byte) (Entry, bool, page.ID, error)
+	// With includeKey false, an encoded leaf entry can omit its key and does not copy a continued key.
+	LookupPage(pageID page.ID, key []byte, includeKey bool) (Entry, bool, page.ID, error)
 	// PageSize returns the fixed encoded size of one tree page.
 	PageSize() int64
 	// ReadNode returns the node visible to the current operation.
@@ -62,8 +63,10 @@ func NewTree(store Store) *Tree {
 // FindEntryRef looks key up without copying the stored key or value.
 // It returns a zero entry with found false when the key is absent.
 // A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
+// Set includeKey to false when the caller does not use the entry key.
+// The store can then omit the key and does not copy a continued key.
 // An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
-func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
+func (tree *Tree) FindEntryRef(root *Node, key []byte, includeKey bool) (Entry, bool, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, err
 	}
@@ -75,21 +78,22 @@ func (tree *Tree) FindEntryRef(root *Node, key []byte) (Entry, bool, error) {
 	if err != nil {
 		return Entry{}, false, err
 	}
-	return tree.findEntryRefFromPage(childPageID, key)
+	return tree.findEntryRefFromPage(childPageID, key, includeKey)
 }
 
 // FindEntryRefFromPage starts at rootPageID without requiring a root Node.
 // A found entry refers to storage owned by the store.
-func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte) (Entry, bool, error) {
+// includeKey has the same meaning as in [Tree.FindEntryRef].
+func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte, includeKey bool) (Entry, bool, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, err
 	}
-	return tree.findEntryRefFromPage(rootPageID, key)
+	return tree.findEntryRefFromPage(rootPageID, key, includeKey)
 }
 
-func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte) (Entry, bool, error) {
+func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte, includeKey bool) (Entry, bool, error) {
 	for {
-		entry, found, childPageID, err := tree.store.LookupPage(pageID, key)
+		entry, found, childPageID, err := tree.store.LookupPage(pageID, key, includeKey)
 		if err != nil {
 			return Entry{}, false, err
 		}

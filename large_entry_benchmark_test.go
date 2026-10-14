@@ -69,6 +69,28 @@ func BenchmarkPut_LargeValueWAL(b *testing.B) {
 	}
 }
 
+// BenchmarkViewGet_LargeKey measures Bucket.Get in a read transaction with keys that do not fit in one page.
+func BenchmarkViewGet_LargeKey(b *testing.B) {
+	path, db, keys := openLargeEntryBenchmark(b, nil, 16, MaxKeySize, 128)
+	db = reopenReadOnly(b, path, db)
+	b.ReportAllocs()
+	index := 0
+	for b.Loop() {
+		err := db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket(largeEntryBucket)
+			if err != nil {
+				return err
+			}
+			_, err = bucket.Get(keys[index%len(keys)])
+			return err
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+		index++
+	}
+}
+
 // BenchmarkScanRange_LargeValues measures a full scan of continued 64 KiB values in the mapped main file.
 func BenchmarkScanRange_LargeValues(b *testing.B) {
 	const count, size = 64, 64 << 10

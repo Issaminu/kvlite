@@ -32,10 +32,10 @@ func (store *txTreeStore) PageSize() int64 {
 }
 
 // LookupPage uses committed storage for a read transaction.
-// A write transaction keeps each node that it reads.
-func (store *txTreeStore) LookupPage(pageID page.ID, key []byte) (btree.Entry, bool, page.ID, error) {
+// A write transaction keeps each node that it reads. Its decoded entries always include the key.
+func (store *txTreeStore) LookupPage(pageID page.ID, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
 	if store.tx.readOnly {
-		return store.tx.db.lookupCommittedPage(pageID, key, true)
+		return store.tx.db.lookupCommittedPage(pageID, key, includeKey)
 	}
 	node, err := store.ReadNode(pageID)
 	if err != nil {
