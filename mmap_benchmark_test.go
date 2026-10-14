@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -24,6 +25,33 @@ func BenchmarkGet_LargeUniform(b *testing.B) {
 	defer db.Close()
 
 	benchmarkLargeUniformGets(b, db, keys)
+}
+
+// BenchmarkGet_LargeUniformMiss measures point reads of absent keys in the mapped main file.
+// Each key sorts between two stored keys, so every lookup reaches a leaf and finds no match.
+// A miss does little work after the page lookups, so it shows a cost added to each visited page first.
+func BenchmarkGet_LargeUniformMiss(b *testing.B) {
+	path, db, keys := prepareLargeGetBenchmark(b)
+	if err := db.Close(); err != nil {
+		b.Fatal(err)
+	}
+	db, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer db.Close()
+	missing := make([][]byte, len(keys))
+	for index, key := range keys {
+		missing[index] = append(key[:len(key):len(key)], '!')
+	}
+	random := rand.New(rand.NewSource(1))
+	b.ReportAllocs()
+	for b.Loop() {
+		keyIndex := random.Intn(len(missing))
+		if _, err := db.Get([]byte("bench"), missing[keyIndex]); !errors.Is(err, ErrKeyNotFound) {
+			b.Fatalf("got %v, want %v", err, ErrKeyNotFound)
+		}
+	}
 }
 
 // BenchmarkGet_LargeUniformParallelWarm measures parallel point reads after every key has been read once.
