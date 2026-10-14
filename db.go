@@ -459,6 +459,14 @@ func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
 	record, ok := db.wal.Lookup(pgid)
 	if ok {
+		// An encoded record, such as the first page of a continued node, needs a full decode.
+		// Each successful commit caches its final nodes, and a failed commit changes neither the WAL nor the cache.
+		// So a cached node for this page is the committed version that the WAL record holds.
+		if record.Node == nil {
+			if node, ok := db.cachedWriteNode(pgid); ok {
+				return node, nil
+			}
+		}
 		node, err := db.wal.CommittedPageToNode(&record)
 		if err != nil {
 			return nil, err

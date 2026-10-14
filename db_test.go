@@ -7959,6 +7959,75 @@ func TestPut_ContinuedWriteBatch(t *testing.T) {
 	}
 }
 
+// TestReadNode_ContinuedWALRecordUsesCommittedNode checks that a write reads a continued WAL leaf without a new decode.
+// Failed updates between commits must not change the value that later writes read.
+func TestReadNode_ContinuedWALRecordUsesCommittedNode(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	size := 3 * int(db.meta.PageSize())
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("a"), bytes.Repeat([]byte{0}, size))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for round := 1; round <= 4; round++ {
+		err := db.Update(func(tx *Tx) error {
+			if err := mustBucket(t, tx, testBucketName).Put([]byte("a"), bytes.Repeat([]byte{0xff}, size)); err != nil {
+				return err
+			}
+			return errDiscardTx
+		})
+		if !errors.Is(err, errDiscardTx) {
+			t.Fatalf("round %d: failed update: %v", round, err)
+		}
+		if err := db.Update(func(tx *Tx) error {
+			bucket := mustBucket(t, tx, testBucketName)
+			got, err := bucket.Get([]byte("a"))
+			if want := bytes.Repeat([]byte{byte(round - 1)}, size); err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("round %d: write transaction read %d bytes starting %v, error %v; want the previous commit", round, len(got), got[:min(len(got), 1)], err)
+			}
+			return bucket.Put([]byte("a"), bytes.Repeat([]byte{byte(round)}, size))
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A changed continued leaf can move to new pages, so read its page ID after the last commit.
+	var leafPageID page.ID
+	if err := db.View(func(tx *Tx) error {
+		leafPageID = mustBucket(t, tx, testBucketName).rootPageID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	record, ok := db.wal.Lookup(leafPageID)
+	if !ok || record.Node != nil || record.Payload == nil {
+		t.Fatalf("leaf %d WAL record: found %t, decoded %t; want an encoded record", leafPageID, ok, record.Node != nil)
+	}
+	var node *btree.Node
+	allocations := testing.AllocsPerRun(10, func() {
+		node, err = db.readNode(leafPageID)
+		if err != nil {
+			panic(err)
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("allocations for each continued WAL leaf read: got %.0f, want 0", allocations)
+	}
+	if got := node.EntryAt(0).Value(); !bytes.Equal(got, bytes.Repeat([]byte{4}, size)) {
+		t.Fatalf("continued WAL leaf value: got %d bytes starting %v, want the last commit", len(got), got[:min(len(got), 1)])
+	}
+}
+
 // TestDelete_ContinuedTree releases removed leaves and branches and repairs the root.
 func TestDelete_ContinuedTree(t *testing.T) {
 	for _, batch := range []bool{false, true} {
