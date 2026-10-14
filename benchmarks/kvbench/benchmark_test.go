@@ -412,19 +412,24 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	}
 	b.SetBytes(int64(benchmarkCase.valueBytes * benchmarkCase.batchSize * benchmarkCase.operations))
 	iteration := 0
+	var counters writeCounters
 	for b.Loop() {
+		b.StopTimer()
 		if iteration > 0 {
-			b.StopTimer()
 			closeBenchmarkEngine(b, engine)
 			engine, err = prepareBenchmarkEngine(b, kind, mode, redisAddress, benchmarkCase.clients, setupPairs)
 			if err != nil {
 				b.Fatal(err)
 			}
-			b.StartTimer()
 		}
+		before := readWriteCounters(b, engine, kind)
+		b.StartTimer()
 		if err := runBenchmarkOperations(b, engine, operationPairs, benchmarkCase, schedule); err != nil {
 			b.Fatal(err)
 		}
+		b.StopTimer()
+		counters.add(before, readWriteCounters(b, engine, kind))
+		b.StartTimer()
 		iteration++
 	}
 	if err := engine.Validate(b.Context()); err != nil {
@@ -457,9 +462,57 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 		b.ReportMetric(float64(stats.walBytesWritten), "wal-written-B")
 		b.ReportMetric(float64(stats.checkpointCount), "checkpoints")
 	}
+	// Counts for each measured operation. They do not depend on timing.
+	measured := float64(b.N * benchmarkCase.operations)
+	if counters.hasWAL {
+		b.ReportMetric(float64(counters.walCommits)/measured, "wal-commits/op")
+		b.ReportMetric(float64(counters.walWrittenBytes)/measured, "wal-B/op")
+	}
+	if counters.hasProcessIO {
+		b.ReportMetric(float64(counters.writeCalls)/measured, "write-calls/op")
+		b.ReportMetric(float64(counters.storageWrittenBytes)/measured, "storage-written-B/op")
+	}
 	if stats.memoryBytes > 0 {
 		b.ReportMetric(float64(stats.memoryBytes), "dataset-memory-B")
 	}
+}
+
+// writeCounters are counts that do not depend on timing. They make small
+// changes in write work visible when durable timings are noisy.
+type writeCounters struct {
+	walCommits          uint64
+	walWrittenBytes     uint64
+	writeCalls          uint64
+	storageWrittenBytes uint64
+	hasWAL              bool
+	hasProcessIO        bool
+}
+
+// readWriteCounters reads the counters of engine and of this process.
+// Redis writes in another process, so process counters are not used for Redis.
+func readWriteCounters(b *testing.B, engine Engine, kind EngineKind) writeCounters {
+	b.Helper()
+	stats, err := engine.StorageStats(b.Context())
+	if err != nil {
+		b.Fatal(err)
+	}
+	counters := writeCounters{walCommits: stats.walCommitCount, walWrittenBytes: stats.walBytesWritten, hasWAL: stats.hasKVLiteWALStats}
+	if kind != EngineRedis {
+		var io processIO
+		io, counters.hasProcessIO = readProcessIO()
+		counters.writeCalls, counters.storageWrittenBytes = io.writeCalls, io.storageWrittenBytes
+	}
+	return counters
+}
+
+// add adds the change from before to after.
+func (counters *writeCounters) add(before, after writeCounters) {
+	counters.walCommits += after.walCommits - before.walCommits
+	counters.walWrittenBytes += after.walWrittenBytes - before.walWrittenBytes
+	counters.writeCalls += after.writeCalls - before.writeCalls
+	counters.storageWrittenBytes += after.storageWrittenBytes - before.storageWrittenBytes
+	counters.hasWAL = after.hasWAL
+	counters.hasProcessIO = after.hasProcessIO
 }
 
 func makeMissingKey(position string, index int) []byte {

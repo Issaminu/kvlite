@@ -54,6 +54,7 @@ type storageStats struct {
 	memoryBytes        int64
 	allocatedBytes     int64
 	walBytesWritten    uint64
+	walCommitCount     uint64
 	checkpointCount    uint64
 	hasKVLiteWALStats  bool
 	allocatedPages     uint64
@@ -65,6 +66,12 @@ type storageStats struct {
 	tailPagesReclaimed uint64
 	hasAllocationStats bool
 	hasAllocatedBytes  bool
+}
+
+// processIO holds write counters of the benchmark process.
+type processIO struct {
+	writeCalls          uint64
+	storageWrittenBytes uint64
 }
 
 type orderedEngine interface {

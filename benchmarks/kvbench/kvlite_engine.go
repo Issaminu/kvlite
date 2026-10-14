@@ -290,6 +290,7 @@ func (engine *kvliteEngine) StorageStats(_ context.Context) (storageStats, error
 		logBytes:           logBytes,
 		allocatedBytes:     primaryAllocated + logAllocated,
 		walBytesWritten:    runtimeStats.WALBytesWritten,
+		walCommitCount:     runtimeStats.WALCommitCount,
 		checkpointCount:    runtimeStats.CheckpointCount,
 		hasKVLiteWALStats:  true,
 		allocatedPages:     runtimeStats.AllocatedPageCount,

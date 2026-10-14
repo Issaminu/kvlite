@@ -329,12 +329,16 @@ KVLite stores tree pages in its main database file. Its write-ahead log (WAL) re
 | `close-ns`, `reopen-ns`                          | Time to close and reopen an embedded database in the named case.                                                             |
 | `wal-written-B`                                  | Successful KVLite WAL transaction bytes since the benchmark opened the database. A checkpoint does not decrease this value. |
 | `checkpoints`                                    | Completed KVLite checkpoints since the benchmark opened the database. The value excludes the final close.                   |
+| `wal-commits/op`, `wal-B/op`                     | KVLite WAL commits and WAL bytes for each measured operation. Setup is not included. These counts do not depend on timing. |
+| `write-calls/op`, `storage-written-B/op`         | Write system calls and bytes sent to storage by the Go process for each measured operation, from `/proc/self/io` on Linux. KVLite and bbolt only. |
 | `dataset-memory-B`                               | Redis `used_memory_dataset`. It is an extra Redis-only value.                                                               |
 | `checksum`                                       | A deterministic value that proves scan output was consumed.                                                                 |
 
 The suite does not report cross-engine Go allocation values. Redis server allocations do not appear in the Go client process.
 
-`wal-written-B` and `checkpoints` explain KVLite work. They are not cross-engine storage metrics. The suite does not yet report a fair combined CPU value, peak resident memory value, operating-system write-byte count, or sync-call count. A Go-process value would omit the Redis server. A Redis-server value would omit the Go client. Collect these values at the container boundary before you use them for a cross-engine claim.
+`wal-written-B` and `checkpoints` explain KVLite work. They are not cross-engine storage metrics. The counts for each operation come only from the acknowledged-operations cases. Use them to compare two KVLite versions when durable timings are noisy: a change in `wal-commits/op` or `wal-B/op` is a real change in work. `write-calls/op` also counts writes to sockets. `storage-written-B/op` is zero on `tmpfs`. Redis writes in its own server process, so the suite does not report process counters for Redis.
+
+The suite does not yet report a fair combined CPU value, peak resident memory value, or sync-call count. In durable mode, each KVLite WAL commit makes one WAL sync, so `wal-commits/op` gives the WAL sync count. A Go-process value would omit the Redis server. A Redis-server value would omit the Go client. Collect these values at the container boundary before you use them for a cross-engine claim.
 
 ## Matched API boundaries
 
