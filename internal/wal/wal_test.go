@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"runtime/debug"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -553,6 +554,45 @@ func TestWALCommit_DoesNotRetainLargeEncodingBuffer(t *testing.T) {
 	if capacity := cap(log.encodingBuffer); capacity > retentionLimit {
 		t.Fatalf("retained encoding capacity: got %d, want at most %d", capacity, retentionLimit)
 	}
+}
+
+func TestWALEncodeTransaction_ReusesLargeEncodingBuffer(t *testing.T) {
+	// A garbage collection can free the pooled buffer. Stop collections so the reuse is certain.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+	const pageSize = 4096
+	nodes := make([]NodeRecord, 2*maxRetainedEncodingBufferBytes/pageSize)
+	for index := range nodes {
+		node := btree.NewLeafNode(page.ID(3 + index))
+		if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 3900))); err != nil {
+			t.Fatal(err)
+		}
+		nodes[index] = NodeRecord{Final: node}
+	}
+	log := &WAL{pageSize: pageSize}
+	first, _, err := log.encodeTransaction(nodes, nil, nil, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first) <= maxRetainedEncodingBufferBytes {
+		t.Fatalf("transaction size: got %d, want more than %d", len(first), maxRetainedEncodingBufferBytes)
+	}
+	// The race detector makes sync.Pool drop some items, so try more than once.
+	previous := first
+	for attempt := range 20 {
+		log.releaseEncodingBuffer()
+		if capacity := cap(log.encodingBuffer); capacity > maxRetainedEncodingBufferBytes {
+			t.Fatalf("retained encoding capacity: got %d, want at most %d", capacity, maxRetainedEncodingBufferBytes)
+		}
+		next, _, err := log.encodeTransaction(nodes, nil, nil, TxID(attempt+2))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if &next[0] == &previous[0] {
+			return
+		}
+		previous = next
+	}
+	t.Fatal("later large transactions did not reuse the pooled encoding buffer")
 }
 
 func TestWALCommit_RetainsBenchmarkSizedEncodingBuffer(t *testing.T) {

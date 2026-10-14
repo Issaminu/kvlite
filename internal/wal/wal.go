@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -15,7 +16,9 @@ import (
 
 const (
 	// maxRetainedEncodingBufferBytes is the largest transaction encoding buffer kept across commits.
-	// Larger buffers are dropped after [WAL.Commit] returns so one large transaction does not retain memory.
+	// After [WAL.Commit] returns, a larger buffer moves to a [sync.Pool].
+	// The next large transaction can use it again, and the garbage collector can free it.
+	// So one large transaction does not retain memory.
 	maxRetainedEncodingBufferBytes = 2 << 20
 
 	walFileMagic      uint32 = 0x4c57564b // The little-endian bytes spell "KVWL".
@@ -43,6 +46,7 @@ type WAL struct {
 	hasUnsyncedWrites        bool                      // true when WAL bytes were appended after the last successful sync
 	appendOffset             int64                     // byte offset of the next WAL append; independent of the file read/write cursor
 	encodingBuffer           []byte                    // reusable transaction encoding buffer; capacity may be cleared after large commits
+	largeEncodingBuffers     sync.Pool                 // *[]byte encoding buffers larger than maxRetainedEncodingBufferBytes
 	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
 	pagePatch                PagePatch                 // reusable page patch; encoded into encodingBuffer before reuse
 	appendFailure            error                     // set when rollback truncate fails; blocks later commits until [WAL.Truncate] succeeds
@@ -125,14 +129,27 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 	return needsCheckpoint, nil
 }
 
-// releaseEncodingBuffer drops an oversized transaction encoding buffer after Commit returns.
+// releaseEncodingBuffer moves an oversized transaction encoding buffer to the pool after Commit returns.
 func (wal *WAL) releaseEncodingBuffer() {
 	if cap(wal.encodingBuffer) > maxRetainedEncodingBufferBytes {
+		buffer := wal.encodingBuffer[:0]
+		wal.largeEncodingBuffers.Put(&buffer)
 		wal.encodingBuffer = nil
 	}
 	if cap(wal.pagePatch.ranges) > maxRetainedEncodingBufferBytes {
 		wal.pagePatch.ranges = nil
 	}
+}
+
+// newEncodingBuffer returns an empty buffer with room for size bytes.
+// A size above maxRetainedEncodingBufferBytes can use a pooled buffer.
+func (wal *WAL) newEncodingBuffer(size int) []byte {
+	if size > maxRetainedEncodingBufferBytes {
+		if pooled, ok := wal.largeEncodingBuffers.Get().(*[]byte); ok && cap(*pooled) >= size {
+			return (*pooled)[:0]
+		}
+	}
+	return make([]byte, 0, size)
 }
 
 // encodeTransaction encodes changed nodes, allocation pages, optional metadata, and one commit marker.
@@ -177,8 +194,10 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	transaction := wal.encodingBuffer[:0]
 	// Continued payloads borrow this transaction after Commit succeeds.
 	// Never reuse their storage for another transaction.
-	if continuedPageCount != 0 || cap(transaction) < transactionSize {
+	if continuedPageCount != 0 {
 		transaction = make([]byte, 0, transactionSize)
+	} else if cap(transaction) < transactionSize {
+		transaction = wal.newEncodingBuffer(transactionSize)
 	}
 	// One temporary list holds all continued-page destinations. Ordinary nodes need no list.
 	var continuedPages [][]byte

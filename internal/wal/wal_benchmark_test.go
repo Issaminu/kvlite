@@ -44,3 +44,26 @@ func BenchmarkEncodeTransaction(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkEncodeTransaction_ManyPages measures repeated transactions that are larger than the retained encoding buffer.
+func BenchmarkEncodeTransaction_ManyPages(b *testing.B) {
+	const pageSize = 4096
+	const pageCount = 800 // About 3.1 MiB in each transaction.
+	nodes := make([]NodeRecord, pageCount)
+	for index := range nodes {
+		node := btree.NewLeafNode(page.ID(3 + index))
+		if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 3900))); err != nil {
+			b.Fatal(err)
+		}
+		nodes[index] = NodeRecord{Final: node}
+	}
+	log := &WAL{pageSize: pageSize}
+	b.ReportAllocs()
+	b.SetBytes(pageCount * pageSize)
+	for b.Loop() {
+		if _, _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
+			b.Fatal(err)
+		}
+		log.releaseEncodingBuffer()
+	}
+}
