@@ -178,11 +178,26 @@ func DecodeWALBranchNode(data []byte, id page.ID, pageSize int64, readPage func(
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage must keep continuation bytes unchanged until the lookup returns.
 func LookupMappedBranchNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), checksums bool) (Entry, bool, page.ID, error) {
-	return lookupBranchNode(data, id, key, int64(len(data)), readPage, false, checksums)
+	if checksums {
+		return lookupCheckedBranchNode(data, id, key, readPage)
+	}
+	return lookupBranchNode(data, id, key, int64(len(data)), readPage, false, false)
+}
+
+// lookupCheckedBranchNode verifies the checksum of a normal mapped branch page and then searches it.
+// The header read in lookupBranchNode verifies the first page of a continued branch.
+func lookupCheckedBranchNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error)) (Entry, bool, page.ID, error) {
+	if mappedNodeType(data) != NodeTypeBranch|overflowNodeFlag {
+		if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, true); err != nil {
+			return Entry{}, false, 0, err
+		}
+	}
+	return lookupBranchNode(data, id, key, int64(len(data)), readPage, false, true)
 }
 
 // lookupBranchNode searches the same encoded directory in mapped pages and WAL images.
 // forWAL uses verified compact payloads. It checks zero page checksums.
+// It does not verify the checksum of a normal mapped page. lookupCheckedBranchNode does that first.
 func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
@@ -213,8 +228,6 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 		if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
-	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset, checksums); err != nil {
-		return Entry{}, false, 0, err
 	}
 	_, entry, found, child, err := readEncodedBranch(data, id, 0, key, false, !forWAL, nil, nil)
 	return entry, found, child, err

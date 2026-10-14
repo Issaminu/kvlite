@@ -183,11 +183,26 @@ func DecodeWALLeafNode(data []byte, id page.ID, pageSize int64, readPage func(pa
 // Pass nil for a normal node. A continued node requires readPage.
 // readPage must keep continuation bytes unchanged until the lookup returns.
 func LookupMappedLeafNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (Entry, bool, page.ID, error) {
-	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums)
+	if checksums {
+		return lookupCheckedLeafNode(data, id, key, readPage, includeKey)
+	}
+	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey, false)
+}
+
+// lookupCheckedLeafNode verifies the checksum of a normal mapped leaf page and then searches it.
+// The header read in lookupLeafNode verifies the first page of a continued leaf.
+func lookupCheckedLeafNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
+	if mappedNodeType(data) != NodeTypeLeaf|overflowNodeFlag {
+		if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, true); err != nil {
+			return Entry{}, false, 0, err
+		}
+	}
+	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey, true)
 }
 
 // lookupLeafNode searches the same encoded directory in mapped pages and WAL images.
 // forWAL uses verified compact payloads. It checks zero page checksums.
+// It does not verify the checksum of a normal mapped page. lookupCheckedLeafNode does that first.
 func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL bool, includeKey, checksums bool) (Entry, bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
@@ -218,8 +233,6 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 		if crc := binary.LittleEndian.Uint32(data[14:18]); crc != 0 {
 			return Entry{}, false, 0, fmt.Errorf("read WAL node checksum %x: %w", crc, ErrInvalid)
 		}
-	} else if err := checkPageChecksum(data, pageSize, nodeChecksumOffset, checksums); err != nil {
-		return Entry{}, false, 0, err
 	}
 	_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, !forWAL, nil, nil, includeKey)
 	return entry, found, child, err
