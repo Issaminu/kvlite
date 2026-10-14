@@ -117,10 +117,18 @@ func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
-	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
-		return LookupMappedBranchNode(data, id, key, readPage, checksums)
+	kind := mappedNodeType(data)
+	branch := kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag
+	if checksums {
+		if branch {
+			return lookupCheckedBranchNode(data, id, key, readPage)
+		}
+		return lookupCheckedLeafNode(data, id, key, readPage, includeKey)
 	}
-	return LookupMappedLeafNode(data, id, key, readPage, includeKey, checksums)
+	if branch {
+		return lookupBranchNode(data, id, key, int64(len(data)), readPage, false, false)
+	}
+	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey, false)
 }
 
 // EncodeNode selects the node's codec and updates its checksum.

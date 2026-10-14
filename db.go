@@ -581,11 +581,26 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte, includeKey bool) (
 	if record, ok := db.wal.Lookup(pageID); ok {
 		return db.wal.LookupCommittedPage(&record, key, includeKey)
 	}
+	if db.meta.DataPageChecksums() {
+		return db.lookupCheckedMainPage(pageID, key, includeKey)
+	}
+	// Disabled mode accepts any checksum field, so the first page needs no mode check.
+	// The lookup checks the page type and page ID.
+	data, err := db.readMainPage(pageID)
+	if err != nil {
+		return btree.Entry{}, false, 0, err
+	}
+	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey, false)
+}
+
+// lookupCheckedMainPage searches one main-file page in a file with data-page checksums.
+// A separate function keeps the mode check and its error formatting out of lookupCommittedPage, which runs for each page of a point read.
+func (db *DB) lookupCheckedMainPage(pageID page.ID, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
 	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey, db.meta.DataPageChecksums())
+	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey, true)
 }
 
 // findCommittedEntry searches one committed tree for Get.
