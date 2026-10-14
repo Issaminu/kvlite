@@ -142,7 +142,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 		if err != nil {
 			return nil, err
 		}
-		*node.header = h
+		node.header = h
 		node.continuationPageIDs = ids
 		return node, nil
 	}
@@ -434,7 +434,7 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 	var node *Node
 	if createNode {
 		node = &Node{
-			header: &NodeHeader{
+			header: NodeHeader{
 				Type:       NodeTypeLeaf,
 				PageID:     expectedPageID,
 				EntryCount: entryCount,

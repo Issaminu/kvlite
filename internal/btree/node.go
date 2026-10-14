@@ -67,7 +67,7 @@ type NodeHeader struct {
 // The store records the complete list so changes can retire the old pages
 // without reading the arrays again. A node that fits in one page has no list.
 type Node struct {
-	header              *NodeHeader
+	header              NodeHeader
 	entries             []Entry
 	Children            []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
 	continuationPageIDs []page.ID // only for branch/leaf nodes with overflow, or continuation nodes
@@ -96,8 +96,8 @@ func (n *Node) SetOverflowPages(ids []page.ID) {
 	}
 }
 
-func newNodeHeader(nodeType NodeType, pgid page.ID) *NodeHeader {
-	return &NodeHeader{
+func newNodeHeader(nodeType NodeType, pgid page.ID) NodeHeader {
+	return NodeHeader{
 		Type:   nodeType,
 		PageID: pgid,
 	}
@@ -134,9 +134,8 @@ func (n *Node) EntryAt(index int) *Entry {
 // It shares the immutable key and value bytes with n.
 // Node changes must replace an entry or byte slice instead of changing shared bytes in place.
 func (n *Node) Clone() *Node {
-	header := *n.header
 	return &Node{
-		header:              &header,
+		header:              n.header,
 		entries:             slices.Clone(n.entries),
 		Children:            slices.Clone(n.Children),
 		continuationPageIDs: slices.Clone(n.continuationPageIDs),
@@ -166,10 +165,10 @@ func (n *Node) CloneWithoutLeafEntries(firstIndex int, rest []int, minimumSize i
 	}
 	entries := slices.Grow([]Entry(nil), capacity)[:remaining]
 	copyLeafEntriesExcept(entries, n.entries, firstIndex, rest)
-	header := *n.header
+	header := n.header
 	header.Checksum = 0
 	return &Node{
-		header:              &header,
+		header:              header,
 		entries:             entries,
 		Children:            slices.Clone(n.Children),
 		continuationPageIDs: slices.Clone(n.continuationPageIDs),

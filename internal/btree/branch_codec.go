@@ -141,7 +141,7 @@ func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(pag
 		if err != nil {
 			return nil, err
 		}
-		*node.header = h
+		node.header = h
 		node.continuationPageIDs = ids
 		return node, nil
 	}
@@ -450,7 +450,7 @@ func readEncodedBranch(data []byte, expectedPageID page.ID, storedChecksum uint3
 	var node *Node
 	if createNode {
 		node = &Node{
-			header: &NodeHeader{
+			header: NodeHeader{
 				Type:       NodeTypeBranch,
 				PageID:     expectedPageID,
 				EntryCount: entryCount,

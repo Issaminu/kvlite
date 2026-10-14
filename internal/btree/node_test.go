@@ -10,6 +10,7 @@ import (
 	"os"
 	"slices"
 	"testing"
+	"unsafe"
 
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -43,10 +44,11 @@ func TestNodeClone_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	}
 
 	var clone *Node
+	// The Node holds its header, so one allocation covers both. The second one holds the entry list.
 	if got := testing.AllocsPerRun(100, func() {
 		clone = original.Clone()
-	}); got != 3 {
-		t.Fatalf("Node.Clone allocations: got %v, want 3", got)
+	}); got != 2 {
+		t.Fatalf("Node.Clone allocations: got %v, want 2", got)
 	}
 	if clone == nil || len(clone.entries) != 2 {
 		t.Fatalf("cloned entries: got %+v", clone)
@@ -293,8 +295,8 @@ func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	var decodeErr error
 	if got := testing.AllocsPerRun(100, func() {
 		decoded, decodeErr = DecodeNode(encoded, node.PageID(), testNodePageSize, nil, true)
-	}); got != 3 {
-		t.Fatalf("DecodeNode allocations: got %v, want 3", got)
+	}); got != 2 {
+		t.Fatalf("DecodeNode allocations: got %v, want 2 for the node with its header and the entry list", got)
 	}
 	if decodeErr != nil {
 		t.Fatal(decodeErr)
@@ -508,6 +510,14 @@ func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	}
 	if writer.Len() != int(pageSize) {
 		t.Fatalf("encoded node size: got %d bytes, want one %d-byte page", writer.Len(), pageSize)
+	}
+}
+
+// TestNodeLayout_StaysInSizeClass guards the Node size. Each clone allocates one Node, which holds its header.
+// A new field can move Node into a larger allocation size class and make every clone larger.
+func TestNodeLayout_StaysInSizeClass(t *testing.T) {
+	if size := unsafe.Sizeof(Node{}); size > 112 {
+		t.Fatalf("Node size: got %d bytes, want at most 112", size)
 	}
 }
 
