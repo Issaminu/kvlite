@@ -15,13 +15,14 @@ readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile]"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile] [--profile-engines=kvlite,bbolt,redis]"
 benchmark_scale="light"
 engine_option="--engines=kvlite,bbolt,redis"
 workload_option=""
 storage_option=""
 case_option=""
 profile_enabled=0
+profile_engine_csv=""
 scale_set=0
 engine_set=0
 workload_set=0
@@ -75,6 +76,15 @@ for argument in "$@"; do
 			exit 1
 		fi
 		profile_enabled=1
+		;;
+	--profile-engines=*)
+		# Profile only these engines. This option selects profiling.
+		if ((profile_enabled)); then
+			echo "select profiling once" >&2
+			exit 1
+		fi
+		profile_enabled=1
+		profile_engine_csv="${argument#--profile-engines=}"
 		;;
 	*)
 		echo "${usage}" >&2
@@ -172,6 +182,21 @@ if [[ -z "${selected_engines}" ]]; then
 fi
 readonly selected_engines
 readonly uses_redis
+profile_engines="${selected_engines}"
+if [[ -n "${profile_engine_csv}" ]]; then
+	profile_engines=""
+	IFS=',' read -r -a requested_profile_engines <<<"${profile_engine_csv}"
+	for engine in "${requested_profile_engines[@]}"; do
+		if [[ " ${selected_engines} " != *" ${engine} "* ]]; then
+			echo "profile engines must be selected engines: ${selected_engines}" >&2
+			exit 1
+		fi
+		if [[ " ${profile_engines} " != *" ${engine} "* ]]; then
+			profile_engines+="${profile_engines:+ }${engine}"
+		fi
+	done
+fi
+readonly profile_engines
 
 selected_case_mode=""
 selected_case_name=""
@@ -233,6 +258,21 @@ else
 	default_cpu_set="0-${cpu_last}"
 fi
 readonly cpu_set="${KVBENCH_CPUSET:-${default_cpu_set}}"
+# Limit the Go container to three quarters of the Docker VM memory by default.
+# Then an out-of-memory error stops one process in the container, not the whole VM.
+# Trace conversion of a very large trace was such a process.
+docker_memory_bytes="$(docker info --format '{{.MemTotal}}')"
+if [[ ! "${docker_memory_bytes}" =~ ^[1-9][0-9]*$ ]]; then
+	echo "Docker reported an invalid memory size: ${docker_memory_bytes}" >&2
+	exit 1
+fi
+readonly go_memory="${KVBENCH_GO_MEMORY:-$((docker_memory_bytes / 4 * 3))}"
+# Skip the trace wait views when trace.out is larger than this many MiB. Conversion can need many times the trace size in memory.
+readonly trace_view_max_mib="${KVBENCH_TRACE_VIEW_MAX_MIB:-256}"
+if [[ ! "${trace_view_max_mib}" =~ ^[0-9]+$ ]]; then
+	echo "KVBENCH_TRACE_VIEW_MAX_MIB must be a whole number of MiB" >&2
+	exit 1
+fi
 declare -a benchmark_data_mount
 if [[ "${benchmark_storage}" == "tmpfs" ]]; then
 	benchmark_data_mount=(--tmpfs "/benchmark-data:rw,exec,size=512m")
@@ -251,6 +291,7 @@ start_go() {
 	docker rm --force "${go_name}" >/dev/null 2>&1 || true
 	docker run --detach --name "${go_name}" \
 		--cpuset-cpus "${cpu_set}" \
+		--memory "${go_memory}" \
 		--env GOFLAGS=-buildvcs=false \
 		--network "${network_name}" \
 		"${benchmark_data_mount[@]}" \
@@ -353,13 +394,39 @@ engine_order() {
 	done
 }
 
+# Life-cycle cases measure open and close work. Earlier cases in the same process change the heap,
+# the garbage collector state, and caches, so each life-cycle case runs in its own process.
+readonly lifecycle_cases=(create-load-close open-clean close-after-writes recover-after-process-kill)
+
+# run_benchmarks runs the selected benchmarks for one engine and prints their output.
+# A selected single case already runs alone. BenchmarkLifecycle runs only with all workloads,
+# with durable writes, and without Redis, so other runs do not start its processes.
+run_benchmarks() {
+	local mode="$1"
+	local engine="$2"
+	local count="$3"
+	if [[ -n "${selected_case_name}" || "${benchmark_workload}" != "all" ]]; then
+		run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count="${count}"
+		return
+	fi
+	# Return each failure. A command substitution in Bash 3.2 does not keep set -e.
+	run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -skip '^BenchmarkLifecycle$' -benchtime=1x -count="${count}" || return
+	if [[ "${mode}" != "durable" || "${engine}" == "redis" ]]; then
+		return
+	fi
+	local lifecycle_case
+	for lifecycle_case in "${lifecycle_cases[@]}"; do
+		run_go "${mode}" "${engine}" -run '^$' -bench "^BenchmarkLifecycle\$/^scale=${benchmark_scale}\$/^${lifecycle_case}\$" -benchtime=1x -count="${count}" || return
+	done
+}
+
 run_round() {
 	local mode="$1"
 	local round="$2"
 	local output_file="${results_dir}/${mode}.txt"
 	local engine
 	for engine in $(engine_order "${round}"); do
-		run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count="${samples_per_round}" | tee -a "${output_file}"
+		run_benchmarks "${mode}" "${engine}" "${samples_per_round}" | tee -a "${output_file}"
 	done
 }
 
@@ -369,7 +436,7 @@ run_warmup_round() {
 	local engine
 	local output
 	for engine in $(engine_order "${round}"); do
-		if ! output="$(run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count=1)"; then
+		if ! output="$(run_benchmarks "${mode}" "${engine}" 1)"; then
 			echo "${output}" >&2
 			return 1
 		fi
@@ -431,8 +498,11 @@ verify_redis_reopen_after_kill() {
 	echo "Samples per round: ${samples_per_round}"
 	echo "Measured samples: $((measured_count * samples_per_round))"
 	echo "Profile every selected case: ${profile_enabled}"
+	echo "Profiled engines: ${profile_engines}"
 	echo "Benchmark filter: ${benchmark_filter}"
 	echo "CPU set: ${cpu_set}"
+	echo "Go container memory limit: ${go_memory}"
+	echo "Largest trace for wait views: ${trace_view_max_mib} MiB"
 	echo "Benchmark data storage: ${benchmark_storage}"
 	echo "Working tree:"
 	git -C "${repository_dir}" status --short
@@ -492,19 +562,22 @@ echo "Raw results: ${results_dir}"
 if ((profile_enabled)); then
 	profile_dir="${results_dir}/profiles"
 	mkdir -p "${profile_dir}"
-	docker exec "${go_name}" /benchmark-data/kvbench-report cases /benchmark-results >"${profile_dir}/index.tsv"
+	docker exec "${go_name}" /benchmark-data/kvbench-report cases /benchmark-results "${profile_engines// /,}" >"${profile_dir}/index.tsv"
 	while IFS=$'\t' read -r case_id case_mode case_name case_engine case_filter case_rounds; do
 		case_dir="${profile_dir}/${case_id}"
 		container_case_dir="/benchmark-results/profiles/${case_id}"
 		mkdir -p "${case_dir}"
-		rm -f "${case_dir}"/{cpu.pprof,memory.pprof,trace.out,run.txt,cpu-top.txt,cpu-cum.txt,alloc-top.txt,alloc-cum.txt,net.pprof,net-top.txt,sync.pprof,sync-top.txt,syscall.pprof,syscall-top.txt,sched.pprof,sched-top.txt}
+		rm -f "${case_dir}"/{cpu.pprof,memory.pprof,trace.out,run.txt,cpu-top.txt,cpu-cum.txt,alloc-top.txt,alloc-cum.txt,net.pprof,net-top.txt,sync.pprof,sync-top.txt,syscall.pprof,syscall-top.txt,sched.pprof,sched-top.txt,wait-views-skipped.txt}
 		echo "Profile ${case_id}: ${case_mode} ${case_name} (${case_rounds} repeats)"
 		run_go "${case_mode}" "${case_engine}" \
 			-run '^$' -bench "${case_filter}" -benchtime=1x -count="${case_rounds}" -timeout=0 \
 			-o /benchmark-data/kvbench.test \
 			-cpuprofile="${container_case_dir}/cpu.pprof" \
 			-memprofile="${container_case_dir}/memory.pprof" \
-			-trace="${container_case_dir}/trace.out" | tee "${case_dir}/run.txt"
+			-trace="${container_case_dir}/trace.out" |
+			# The container writes run.txt, so the check below reads a complete file.
+			# A file that the host writes through the bind mount can look empty in the container for a short time.
+			docker exec --interactive "${go_name}" tee "${container_case_dir}/run.txt"
 		docker exec "${go_name}" /benchmark-data/kvbench-report check-profile \
 			"${container_case_dir}/run.txt" "${case_name}" "${case_rounds}"
 		for view in cpu alloc; do
@@ -523,6 +596,11 @@ if ((profile_enabled)); then
 			/benchmark-data/kvbench.test "${container_case_dir}/cpu.pprof" >"${case_dir}/cpu-cum.txt"
 		docker exec "${go_name}" go tool pprof -top -cum -alloc_space -nodecount=0 -divide_by="${case_rounds}" \
 			/benchmark-data/kvbench.test "${container_case_dir}/memory.pprof" >"${case_dir}/alloc-cum.txt"
+		trace_bytes="$(docker exec "${go_name}" stat -c %s "${container_case_dir}/trace.out")"
+		if ((trace_bytes > trace_view_max_mib * 1024 * 1024)); then
+			echo "Skip trace wait views: trace.out has ${trace_bytes} bytes, limit ${trace_view_max_mib} MiB." | tee "${case_dir}/wait-views-skipped.txt"
+			continue
+		fi
 		for wait_kind in net sync syscall sched; do
 			if docker exec "${go_name}" sh -c 'go tool trace -pprof="$1" "$2" > "$3"' sh \
 				"${wait_kind}" "${container_case_dir}/trace.out" "${container_case_dir}/${wait_kind}.pprof"; then

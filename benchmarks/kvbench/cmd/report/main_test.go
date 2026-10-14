@@ -123,3 +123,52 @@ func TestProfileLeadsStayShort(t *testing.T) {
 		t.Fatalf("profile leads = %q", text)
 	}
 }
+
+func TestProfiledEngines(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"environment.txt":    "Measured rounds: 2\nMeasured samples: 2\nProfiled engines: kvlite\n",
+		"durable.txt":        "BenchmarkRead/scale=light/kvlite 1 100 ns/op\nBenchmarkRead/scale=light/bbolt 1 50 ns/op\nBenchmarkRead/scale=light/kvlite 1 110 ns/op\nBenchmarkRead/scale=light/bbolt 1 60 ns/op\n",
+		"no-commit-sync.txt": "",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := collect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases bytes.Buffer
+	if err := listCases(dir, &cases, "kvlite"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cases.String(); got != "0001\tdurable\tBenchmarkRead/scale=light/kvlite\tkvlite\t^BenchmarkRead$/^scale=light$/^kvlite$\t2\n" {
+		t.Fatalf("kvlite cases = %q", got)
+	}
+	caseDir := filepath.Join(dir, "profiles", "0001")
+	if err := os.MkdirAll(caseDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "profiles", "index.tsv"), cases.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	top := "Total samples = 500ms (100%)\nflat flat% sum% cum cum% name\n2ms 50.00% 50.00% 3ms 75.00% github.com/Issaminu/kvlite.Get\n"
+	for _, file := range []string{"cpu-top.txt", "cpu-cum.txt", "alloc-top.txt", "alloc-cum.txt"} {
+		if err := os.WriteFile(filepath.Join(caseDir, file), []byte(top), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	profiles, err := readProfiles(dir, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 1 || len(profiles[0].PeerGaps) != 1 || profiles[0].PeerGaps[0].Peer != "bbolt" {
+		t.Fatalf("profiles = %+v", profiles)
+	}
+	r.Environment = strings.Replace(r.Environment, "Profiled engines: kvlite\n", "", 1)
+	if _, err := readProfiles(dir, r); err == nil {
+		t.Fatal("accepted missing profiles when every engine was profiled")
+	}
+}

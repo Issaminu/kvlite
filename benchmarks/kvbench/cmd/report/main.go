@@ -92,7 +92,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: report report DIR | cases DIR | check-profile FILE NAME COUNT")
+		return errors.New("usage: report report DIR | cases DIR [ENGINE,...] | check-profile FILE NAME COUNT")
 	}
 	switch args[0] {
 	case "report":
@@ -101,10 +101,14 @@ func run(args []string) error {
 		}
 		return writeReport(args[1])
 	case "cases":
-		if len(args) != 2 {
-			return errors.New("cases needs a result directory")
+		if len(args) != 2 && len(args) != 3 {
+			return errors.New("cases needs a result directory and an optional engine list")
 		}
-		return listCases(args[1], os.Stdout)
+		var engines []string
+		if len(args) == 3 {
+			engines = strings.Split(args[2], ",")
+		}
+		return listCases(args[1], os.Stdout, engines...)
 	case "check-profile":
 		if len(args) != 4 {
 			return errors.New("check-profile needs a file, name, and count")
@@ -478,7 +482,8 @@ func markdown(r report) string {
 	return b.String()
 }
 
-func listCases(dir string, output io.Writer) error {
+// listCases prints one profile index row for each timed case. Nonempty engines limits the rows to those engines.
+func listCases(dir string, output io.Writer, engines ...string) error {
 	r, err := collect(dir)
 	if err != nil {
 		return err
@@ -489,7 +494,7 @@ func listCases(dir string, output io.Writer) error {
 	}
 	count := 0
 	for _, row := range r.Results {
-		if row.Metric != "ns/op" {
+		if row.Metric != "ns/op" || (len(engines) > 0 && !slices.Contains(engines, row.Engine)) {
 			continue
 		}
 		parts := strings.Split(row.Benchmark, "/")
@@ -660,8 +665,26 @@ func readProfiles(dir string, r report) ([]caseProfile, error) {
 		}
 		profiles = append(profiles, p)
 	}
-	if len(profiles) != len(known) {
-		return nil, fmt.Errorf("found %d profiles for %d timed cases", len(profiles), len(known))
+	profiled := profiledEngines(r.Environment)
+	expected := 0
+	for _, row := range known {
+		if profiled == nil || slices.Contains(profiled, row.Engine) {
+			expected++
+		}
+	}
+	if len(profiles) != expected {
+		return nil, fmt.Errorf("found %d profiles for %d timed cases of the profiled engines", len(profiles), expected)
 	}
 	return profiles, nil
+}
+
+// profiledEngines reads the "Profiled engines" line of environment.txt.
+// It returns nil when the line is absent, which means that every engine was profiled.
+func profiledEngines(environment string) []string {
+	for _, line := range strings.Split(environment, "\n") {
+		if value, ok := strings.CutPrefix(line, "Profiled engines: "); ok {
+			return strings.Fields(value)
+		}
+	}
+	return nil
 }

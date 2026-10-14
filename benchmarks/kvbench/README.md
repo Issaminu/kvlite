@@ -129,6 +129,8 @@ The full warm-up pass prepares the executable, container, and shared operating-s
 
 The Docker scales use up to four CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. All scales can set `KVBENCH_RESULTS_DIR` to select the output directory.
 
+The Go container gets a memory limit of three quarters of the Docker VM memory. Set `KVBENCH_GO_MEMORY` to a Docker memory value, such as `8g`, to change it. With the limit, an out-of-memory error stops one process in the container, not the whole VM.
+
 ## Read results and profile cases
 
 The Docker runner builds the Go report tool in its pinned Go container. After the measured rounds, it writes `report.md`, `report.json`, `summary.csv`, `metrics.csv`, and `comparisons.csv` beside the raw result files. The short report lists up to five clear gains and losses for each matched engine and durability mode. It puts cases with overlapping observed ranges in a separate count. The JSON file keeps every sample. The CSV files show the mean, median, minimum, and maximum for each case and metric.
@@ -146,7 +148,11 @@ To profile every case selected by the scale, workload, durability modes, and eng
 ./run-docker.sh medium --engines=kvlite,bbolt --case=durable:BenchmarkLifecycle/scale=medium/close-after-writes --profile
 ```
 
+To profile only some engines, use `--profile-engines` in place of `--profile`. The measured rounds still run every selected engine, so the report keeps its engine comparisons. For example, `--engines=kvlite,bbolt,redis --profile-engines=kvlite` profiles only the KVLite cases.
+
 The runner finishes its normal unprofiled rounds first. It then runs each selected case again with CPU profiling, allocation profiling, and an execution trace. It repeats each profiled case once per measured round. The profiles cover the repeats together. The report divides sampled CPU time and allocated bytes by the number of repeats. Its short table shows the leading engine function for CPU self time, CPU inclusive time, and inclusive allocation. It hides CPU rankings below 200 ms of sampled CPU time across all repeats. It marks rankings below 1 second as limited. `report.json` lists up to three functions for each measure. Raw profiles, traces, wait files, and full function lists are under `profiles/`. Use them to inspect the complete call path. The report also includes the normal timing values and matched-engine comparisons. Without an explicit workload, a direct `--case` run uses `all`.
+
+The trace wait views (`net`, `sync`, `syscall`, and `sched`) are skipped for a trace larger than 256 MiB, because their conversion can need many times the trace size in memory. The case then has a `wait-views-skipped.txt` file. Set `KVBENCH_TRACE_VIEW_MAX_MIB` to change the limit.
 
 Profiles include fixture setup, final checks, and profiling overhead. CPU samples estimate time spent on the CPU; trace wait profiles estimate blocked time. Neither gives exact time for each function call. The short report omits wait rankings because test and profiler activity can dominate them. Use the unprofiled rounds to measure speed changes. A Redis profile covers its Go client process, not the Redis server process.
 
