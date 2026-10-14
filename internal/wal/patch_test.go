@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"math/rand/v2"
 	"os"
 	"testing"
 
@@ -233,5 +234,110 @@ func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
 	}
 	if records, err := log.ReadRecords(); err != nil || len(records) != 0 {
 		t.Fatalf("WAL after checkpoint: got %d records, error %v", len(records), err)
+	}
+}
+
+// referencePagePatchRanges is the original byte-by-byte range builder.
+// The word-based builder must produce the same ranges.
+func referencePagePatchRanges(patch []byte, baseOffset int, base, target []byte) []byte {
+	for index := 0; index < len(target); {
+		for index < len(target) && index < len(base) && base[index] == target[index] {
+			index++
+		}
+		if index == len(target) {
+			break
+		}
+		start := index
+		for index < len(target) {
+			if index >= len(base) || base[index] != target[index] {
+				index++
+				continue
+			}
+			equalStart := index
+			for index < len(target) && index < len(base) && base[index] == target[index] {
+				index++
+			}
+			if index-equalStart > pagePatchRangeHeaderSize {
+				index = equalStart
+				break
+			}
+		}
+		patch = binary.LittleEndian.AppendUint32(patch, uint32(baseOffset+start))
+		patch = binary.LittleEndian.AppendUint32(patch, uint32(index-start))
+		patch = append(patch, target[start:index]...)
+	}
+	return patch
+}
+
+func TestAppendChangedPagePatchRanges_MatchesByteScan(t *testing.T) {
+	random := rand.New(rand.NewPCG(1, 2))
+	for trial := range 20000 {
+		size := random.IntN(80)
+		if trial%10 == 0 {
+			size = random.IntN(4096)
+		}
+		base := make([]byte, size)
+		for index := range base {
+			base[index] = byte(random.IntN(4))
+		}
+		target := bytes.Clone(base)
+		// Change runs of random length so that equal sections of every length near the header size occur.
+		for index := 0; index < size; {
+			index += random.IntN(20)
+			length := 1 + random.IntN(12)
+			for at := index; at < min(size, index+length); at++ {
+				target[at] ^= byte(1 + random.IntN(255))
+			}
+			index += length
+		}
+		shortBase := base
+		if trial%7 == 0 && size > 0 {
+			shortBase = base[:random.IntN(size)]
+		}
+		offset := random.IntN(1000)
+		want := referencePagePatchRanges(nil, offset, shortBase, target)
+		got := appendChangedPagePatchRanges(nil, offset, shortBase, target)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("trial %d: size %d, base size %d: got %x, want %x", trial, size, len(shortBase), got, want)
+		}
+	}
+}
+
+// BenchmarkAppendChangedPagePatchRanges measures range building for one changed value field.
+func BenchmarkAppendChangedPagePatchRanges(b *testing.B) {
+	cases := []struct {
+		name   string
+		size   int
+		change func([]byte)
+	}{
+		{"all-changed/bytes=128", 128, func(value []byte) {
+			for index := range value {
+				value[index] ^= 0x5a
+			}
+		}},
+		{"all-changed/bytes=4000", 4000, func(value []byte) {
+			for index := range value {
+				value[index] ^= 0x5a
+			}
+		}},
+		{"one-word-changed/bytes=4000", 4000, func(value []byte) { value[2000] ^= 1 }},
+		{"every-16th-byte/bytes=4000", 4000, func(value []byte) {
+			for index := 0; index < len(value); index += 16 {
+				value[index] ^= 1
+			}
+		}},
+	}
+	for _, test := range cases {
+		b.Run(test.name, func(b *testing.B) {
+			base := bytes.Repeat([]byte{7}, test.size)
+			target := bytes.Clone(base)
+			test.change(target)
+			patch := make([]byte, 0, 2*test.size+64)
+			b.SetBytes(int64(test.size))
+			b.ReportAllocs()
+			for b.Loop() {
+				patch = appendChangedPagePatchRanges(patch[:0], 64, base, target)
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math/bits"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -66,53 +67,28 @@ func (patch *PagePatch) appendEncoded(data []byte) []byte {
 // 3. Continue until a sufficiently long equal section appears.
 // 4. Store one replacement range.
 // 5. Repeat until the target ends.
+//
+// Both scans compare eight bytes in each step. A range ends before the first
+// equal section that is longer than one range header, or at the end of target.
+// Shorter equal sections stay in the range, because a new range header costs more.
 func appendChangedPagePatchRanges(patch []byte, baseOffset int, base, target []byte) []byte {
+	// Bytes after the end of base count as different. Current callers pass same-length fields.
+	compared := min(len(base), len(target))
+	base, comparedTarget := base[:compared], target[:compared]
 
 	// Each outer-loop pass emits one replacement range.
 	for index := 0; index < len(target); {
 		// Skip bytes that already match.
-		// When this loop stops, index is at either:
-		//   1. the next different byte, or
-		//   2. the end of target.
-		for index < len(target) && index < len(base) && base[index] == target[index] {
-			index++
-		}
+		index = nextDifferentByte(base, comparedTarget, index)
 		if index == len(target) {
 			break
 		}
 
-		// The current byte differs.
-		// Save its position as the start of the next replacement range.
+		// The current byte differs. It is the start of the next replacement range.
+		// The range ends before the next equal section that is longer than a range header.
+		// The next outer-loop pass skips that equal section.
 		start := index
-
-		// Now find where this replacement range should end.
-		for index < len(target) {
-			// A different byte belongs to this replacement range.
-			// index >= len(base) is defensive. Current callers pass same-length base and target fields.
-			if index >= len(base) || base[index] != target[index] {
-				index++
-				continue
-			}
-
-			// We found equal bytes after at least one different byte.
-			// Save the start and scan the complete equal run.
-			equalStart := index
-			for index < len(target) && index < len(base) && base[index] == target[index] {
-				index++
-			}
-
-			// Every new range needs an eight-byte header.
-			//
-			// If this equal run is longer than eight bytes, excluding it is smaller than keeping it in the current range.
-			// Rewind to the start of the equal run and finish the current range.
-			//
-			// The next outer-loop pass will skip this equal run.
-
-			if index-equalStart > pagePatchRangeHeaderSize {
-				index = equalStart
-				break
-			}
-		}
+		index = nextLongEqualRun(base, comparedTarget, start, len(target))
 
 		// Store an absolute node offset, the replacement size, and the final bytes.
 		patch = binary.LittleEndian.AppendUint32(patch, uint32(baseOffset+start))
@@ -120,6 +96,68 @@ func appendChangedPagePatchRanges(patch []byte, baseOffset int, base, target []b
 		patch = append(patch, target[start:index]...)
 	}
 	return patch
+}
+
+// nextDifferentByte returns the first index at or after index where base and target differ.
+// base and target must have the same length. It returns len(base) when the rest is equal.
+func nextDifferentByte(base, target []byte, index int) int {
+	for ; index+8 <= len(base) && index+8 <= len(target); index += 8 {
+		if difference := binary.LittleEndian.Uint64(base[index:]) ^ binary.LittleEndian.Uint64(target[index:]); difference != 0 {
+			return index + bits.TrailingZeros64(difference)/8
+		}
+	}
+	for index < len(base) && index < len(target) && base[index] == target[index] {
+		index++
+	}
+	return index
+}
+
+// nextLongEqualRun returns the start of the first equal section at or after index
+// that is longer than [pagePatchRangeHeaderSize] bytes. base and target must have
+// the same length. Bytes from len(base) to end count as different.
+// It returns end when no such section exists.
+func nextLongEqualRun(base, target []byte, index, end int) int {
+	const (
+		lowBits  = 0x0101010101010101
+		highBits = 0x8080808080808080
+	)
+	run := 0 // The number of equal bytes just before index.
+	for ; index+8 <= len(base) && index+8 <= len(target); index += 8 {
+		difference := binary.LittleEndian.Uint64(base[index:]) ^ binary.LittleEndian.Uint64(target[index:])
+		if difference == 0 {
+			run += 8
+			if run > pagePatchRangeHeaderSize {
+				return index + 8 - run
+			}
+			continue
+		}
+		// This expression is nonzero exactly when difference has a zero byte, which is an equal byte.
+		if (difference-lowBits)&^difference&highBits == 0 {
+			run = 0
+			continue
+		}
+		for at := range 8 {
+			if byte(difference>>(8*at)) != 0 {
+				run = 0
+				continue
+			}
+			run++
+			if run > pagePatchRangeHeaderSize {
+				return index + at + 1 - run
+			}
+		}
+	}
+	for ; index < len(base) && index < len(target); index++ {
+		if base[index] != target[index] {
+			run = 0
+			continue
+		}
+		run++
+		if run > pagePatchRangeHeaderSize {
+			return index + 1 - run
+		}
+	}
+	return end
 }
 
 // ApplyPagePatch applies an encoded patch to a new same-size copy of base.
