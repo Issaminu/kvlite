@@ -287,6 +287,15 @@ func (n *Node) EncodedSize() int {
 	if n.encodedSize != 0 {
 		return n.encodedSize
 	}
+	return n.computeEncodedSize()
+}
+
+// computeEncodedSize adds the encoded size of every entry.
+// It is not inlined, so EncodedSize stays small enough to inline at its callers.
+// Most calls find the saved size and do not need this loop.
+//
+//go:noinline
+func (n *Node) computeEncodedSize() int {
 	return NodeHeaderSize + nodePayloadSize(n)
 }
 

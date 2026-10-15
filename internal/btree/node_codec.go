@@ -207,12 +207,9 @@ func EncodeWALNode(node *Node) []byte {
 	return data
 }
 
-// WALNodeEncodedSize reports the selected codec's compact image size.
+// WALNodeEncodedSize reports the compact image size. Leaves and branches use the same saved size.
 func WALNodeEncodedSize(node *Node) int {
-	if node.IsLeaf() {
-		return leafEncodedSize(node)
-	}
-	return branchEncodedSize(node)
+	return node.EncodedSize()
 }
 
 // AppendEncodedWALNode appends an owned compact image to data using the selected codec.
