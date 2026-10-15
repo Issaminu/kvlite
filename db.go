@@ -102,13 +102,17 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 	if err != nil {
 		return nil, err
 	}
+	filePath, err := filepath.Abs(path)
+	if err != nil {
+		return nil, fmt.Errorf("resolve database path: %w", err)
+	}
 
 	var dbFile *os.File
 
 	if resolvedOptions.ReadOnly {
-		dbFile, err = os.OpenFile(path, os.O_RDONLY, mode)
+		dbFile, err = os.OpenFile(filePath, os.O_RDONLY, mode)
 	} else {
-		dbFile, err = os.OpenFile(path, os.O_RDWR|os.O_CREATE, mode)
+		dbFile, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, mode)
 	}
 
 	if err != nil {
@@ -205,7 +209,7 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 	if !db.options.ReadOnly && db.options.Synchronous != SyncNone {
 		// File sync does not persist a new file name.
 		// Both names must reach storage before a later commit can return success.
-		parent, err := os.Open(filepath.Dir(path))
+		parent, err := os.Open(filepath.Dir(filePath))
 		if err != nil {
 			return db.failOpen(fmt.Errorf("open database directory: %w", err))
 		}

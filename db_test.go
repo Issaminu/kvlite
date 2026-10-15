@@ -2425,6 +2425,68 @@ func TestDB_Path(t *testing.T) {
 	}
 }
 
+func TestDB_CloseAfterWorkingDirectoryChange(t *testing.T) {
+	firstDir, secondDir := t.TempDir(), t.TempDir()
+	const name = "database"
+	t.Chdir(firstDir)
+	first, err := Open(name, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if !first.closed {
+			_ = first.Close()
+		}
+	})
+
+	t.Chdir(secondDir)
+	second, err := Open(name, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if !second.closed {
+			_ = second.Close()
+		}
+	})
+	createBucket(t, second, testBucketName)
+	if err := second.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	secondLog := filepath.Join(secondDir, name+"-wal")
+	wantLog, err := os.ReadFile(secondLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(firstDir, name+"-wal")); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("first database log remains after Close: %v", err)
+	}
+	gotLog, err := os.ReadFile(secondLog)
+	if err != nil {
+		t.Fatalf("closing the first database removed the second database log: %v", err)
+	}
+	if !bytes.Equal(gotLog, wantLog) {
+		t.Fatal("closing the first database changed the second database log")
+	}
+	if first.Path() != name || second.Path() != name {
+		t.Fatal("Path did not preserve the caller's relative path")
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(filepath.Join(secondDir, name), 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopened.Close()
+	if got, err := reopened.Get(testBucketName, []byte("key")); err != nil || string(got) != "value" {
+		t.Fatalf("committed value after reopen: got %q, error %v", got, err)
+	}
+}
+
 // -----------------------------------------------------------------------------
 // Open and metadata robustness.
 // -----------------------------------------------------------------------------

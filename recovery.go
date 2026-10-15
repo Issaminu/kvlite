@@ -42,7 +42,8 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 }
 
 func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.WALRecord, error) {
-	walPath := db.path + "-wal"
+	// Use the file's absolute name so a directory change cannot redirect log deletion.
+	walPath := db.file.Name() + "-wal"
 	var walFile *os.File
 	var err error
 
