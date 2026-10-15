@@ -14,6 +14,33 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+func TestRecovery_ZeroFilledWALHeaderOpens(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// A crash during the first commit after a clean open can keep the WAL size but not its bytes.
+	if err := os.WriteFile(path+"-wal", make([]byte, 4096), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatalf("open with zero-filled WAL: %v", err)
+	}
+	defer reopened.Close()
+	if got, err := reopened.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("value")) {
+		t.Fatalf("checkpointed value after zero-filled WAL: got %q, error %v", got, err)
+	}
+}
+
 func TestRecovery_PartialCheckpoint(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -172,6 +199,10 @@ func TestRecovery_IncompleteWALTail(t *testing.T) {
 		t.Fatal(err)
 	}
 	tail := complete[len(committed):]
+	checksumSeed, err := wal.RecordChecksumSeed(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
 	markerSize := wal.HeaderSize + wal.ChecksumSize
 	kept := 1024 - len(committed)%512
 	if len(tail)-markerSize <= kept {
@@ -228,7 +259,7 @@ func TestRecovery_IncompleteWALTail(t *testing.T) {
 					case "marker-id":
 						marker.Header.TxID++
 					}
-					candidate = wal.AppendEncodedWALRecord(candidate[:len(candidate)-markerSize], &marker)
+					candidate = wal.AppendEncodedWALRecord(candidate[:len(candidate)-markerSize], &marker, checksumSeed)
 				}
 				if damage != "none" {
 					candidate = append(candidate, following[len(complete):]...)

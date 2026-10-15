@@ -257,7 +257,7 @@ func TestWALCommit_MixedContinuedImagesKeepOwnedBytes(t *testing.T) {
 	allocation := []AllocationRecord{{PageID: 400, Payload: make([]byte, pageSize)}}
 	meta := []byte("meta")
 	want := make(map[page.ID][]byte)
-	var expected []byte
+	var expectedRecords []WALRecord
 	for _, record := range nodes {
 		ids := make([]page.ID, btree.NodePageCount(record.Final, pageSize))
 		for i := range ids {
@@ -270,16 +270,21 @@ func TestWALCommit_MixedContinuedImagesKeepOwnedBytes(t *testing.T) {
 		}
 		for i, data := range images {
 			want[ids[i]] = data
-			expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: 1}, data)
+			expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: 1}, Payload: data})
 		}
 	}
-	expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeAllocation, PageID: 400, TxID: 1}, allocation[0].Payload)
+	expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeAllocation, PageID: 400, TxID: 1}, Payload: allocation[0].Payload})
 	for _, id := range []page.ID{page.Meta0ID, page.Meta1ID} {
-		expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeMeta, PageID: id, TxID: 1}, meta)
+		expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeMeta, PageID: id, TxID: 1}, Payload: meta})
 	}
-	expected = appendEncodedPayloadRecord(expected, RecordHeader{Type: RecordTypeCommit, TxID: 1}, nil)
+	expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeCommit, TxID: 1}})
 	if _, err := log.Commit(nodes, allocation, meta, nil); err != nil {
 		t.Fatal(err)
+	}
+	// Record checksums use the salt that the commit selected.
+	var expected []byte
+	for index := range expectedRecords {
+		expected = AppendEncodedWALRecord(expected, &expectedRecords[index], log.checksumSeed)
 	}
 	got, err := os.ReadFile(file.Name())
 	if err != nil || !bytes.Equal(got[walFileHeaderSize:], expected) {
@@ -525,12 +530,12 @@ func TestCompactContinuationRecordRejectsDamagedWALBytes(t *testing.T) {
 	binary.LittleEndian.PutUint64(data[2:10], 7)
 	data[btree.ContinuationHeaderSize] = 'b'
 	record := WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: 7, TxID: 1}, Payload: data}
-	encoded, err := EncodeWALRecord(&record, 64)
+	encoded, err := EncodeWALRecord(&record, 64, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	encoded[HeaderSize+len(data)-1] ^= 1
-	if _, err := DecodeWALRecord(bytes.NewReader(encoded), 64); !errors.Is(err, page.ErrChecksum) {
+	if _, err := DecodeWALRecord(bytes.NewReader(encoded), 64, 0); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("damaged WAL body: got %v, want checksum error", err)
 	}
 }

@@ -6,10 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"sync"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/checksum"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -22,13 +24,21 @@ const (
 	maxRetainedEncodingBufferBytes = 2 << 20
 
 	walFileMagic      uint32 = 0x4c57564b // The little-endian bytes spell "KVWL".
-	walFileHeaderSize        = 8
+	walFileHeaderSize        = 20
 )
 
 // A non-empty WAL file starts with this header:
 //
-//	[0:4] magic number
-//	[4:8] database format version
+//	[0:4]   magic number
+//	[4:8]   database format version
+//	[8:16]  salt of this WAL generation
+//	[16:20] CRC32C checksum of bytes [0:16]
+//
+// A generation starts when a commit writes at offset zero, after the WAL is created or cleared.
+// Each generation selects a new random salt, and its checksum seed differs from the previous generation.
+// Every record checksum covers that salt.
+// A crash can keep new records but lose the truncate that cleared the WAL.
+// Then the earlier records after them fail their checksums, and recovery stops before them.
 
 type WAL struct {
 	path                     string
@@ -50,6 +60,8 @@ type WAL struct {
 	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
 	pagePatch                PagePatch                 // reusable page patch; encoded into encodingBuffer before reuse
 	appendFailure            error                     // set when an append fails after it starts to write; blocks every later commit on this WAL
+	salt                     uint64                    // salt of the current generation; written in the file header
+	checksumSeed             uint32                    // CRC32C checksum of salt; every record checksum starts from it
 	syncFile                 func() error              // syncFile is a test hook for sync failures and call counts.
 }
 
@@ -86,6 +98,10 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 		return false, nil
 	}
 
+	if wal.appendOffset == 0 {
+		// Record checksums depend on the salt, so select it before encoding.
+		wal.startGeneration()
+	}
 	transaction, continuedPages, err := wal.encodeTransaction(nodes, allocationPages, encodedMeta, wal.nextTxid)
 	if err != nil {
 		return false, err
@@ -225,16 +241,16 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	}
 	for _, record := range allocationPages {
 		header := RecordHeader{Type: RecordTypeAllocation, PageID: record.PageID, TxID: txid}
-		transaction = appendEncodedPayloadRecord(transaction, header, record.Payload)
+		transaction = appendEncodedPayloadRecord(transaction, header, record.Payload, wal.checksumSeed)
 	}
 	if len(encodedMeta) > 0 {
 		header := RecordHeader{Type: RecordTypeMeta, TxID: txid}
 		for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
 			header.PageID = pageID
-			transaction = appendEncodedPayloadRecord(transaction, header, encodedMeta)
+			transaction = appendEncodedPayloadRecord(transaction, header, encodedMeta, wal.checksumSeed)
 		}
 	}
-	transaction = appendEncodedPayloadRecord(transaction, RecordHeader{Type: RecordTypeCommit, TxID: txid}, nil)
+	transaction = appendEncodedPayloadRecord(transaction, RecordHeader{Type: RecordTypeCommit, TxID: txid}, nil, wal.checksumSeed)
 	if continuedPageCount == 0 {
 		wal.encodingBuffer = transaction[:0]
 	}
@@ -260,19 +276,19 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	// Recovery must not depend on a main page that a partial checkpoint can damage.
 	_, hasWALImage := wal.overlay[header.PageID]
 	if record.Original == nil || !hasWALImage {
-		return appendEncodedNodeRecord(transaction, header, record.Final), nil
+		return appendEncodedNodeRecord(transaction, header, record.Final, wal.checksumSeed), nil
 	}
 	// Continuation pages use different offsets from a single-page node.
 	// A complete image lets recovery replace the old format without a patch.
 	if len(record.Original.OverflowPages()) != 0 {
-		return appendEncodedNodeRecord(transaction, header, record.Final), nil
+		return appendEncodedNodeRecord(transaction, header, record.Final, wal.checksumSeed), nil
 	}
 	if record.Final.IsLeaf() && record.Final.EntryCount() < record.Original.EntryCount() {
 		keys, ok := appendLeafDeleteKeys(wal.pagePatch.ranges[:0], record.Original, record.Final, targetSize)
 		if ok && len(keys) < targetSize {
 			wal.pagePatch.ranges = keys
 			header.Type = RecordTypeLeafDelete
-			return appendEncodedPayloadRecord(transaction, header, keys), nil
+			return appendEncodedPayloadRecord(transaction, header, keys, wal.checksumSeed), nil
 		}
 	}
 
@@ -286,12 +302,12 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	}
 	if compatible && encodedSize == targetSize && wal.pagePatch.encodedSize() < targetSize {
 		header.Type = RecordTypePatch
-		return appendEncodedPagePatchRecord(transaction, header, &wal.pagePatch), nil
+		return appendEncodedPagePatchRecord(transaction, header, &wal.pagePatch, wal.checksumSeed), nil
 	}
 	// A different entry count or field length moves later bytes to new offsets.
 	// Use the complete image when the direct scan cannot report fixed-offset changes,
 	// or when the patch is not smaller than the complete image.
-	return appendEncodedNodeRecord(transaction, header, record.Final), nil
+	return appendEncodedNodeRecord(transaction, header, record.Final, wal.checksumSeed), nil
 }
 
 // appendContinuedNodeRecords leaves record headers and checksums between the
@@ -317,7 +333,7 @@ func (wal *WAL) appendContinuedNodeRecords(transaction []byte, record *NodeRecor
 		header := RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: txid}
 		appendRecordHeader(transaction[:headerStart], header, len(data))
 		payloadStart := headerStart + HeaderSize
-		end = len(appendRecordChecksum(transaction[:payloadStart+len(data)], headerStart, payloadStart))
+		end = len(appendRecordChecksum(transaction[:payloadStart+len(data)], headerStart, payloadStart, wal.checksumSeed))
 	}
 	return transaction[:end], nil
 }
@@ -433,8 +449,9 @@ func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUns
 }
 
 // ReadRecords validates the WAL header and reads the valid record prefix.
-// It returns nil, nil when no WAL file is configured or the file is empty.
-// It stops at the first invalid record.
+// It returns nil, nil when no WAL file is configured, the file is empty, or a crash left the header incomplete or zero-filled.
+// Such a header holds no finished commit, because a generation writes its header with its first commit.
+// It stops at the first invalid record, including a record from an earlier generation.
 // File I/O failures still return an error.
 // After header validation it sets [WAL.appendOffset] to the file size.
 // The caller must clear an incomplete tail before a later [WAL.Commit].
@@ -449,18 +466,20 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 	if info.Size() == 0 {
 		return nil, nil
 	}
-	if info.Size() < walFileHeaderSize {
-		// A partial header cannot contain a complete transaction.
-		return nil, nil
-	}
 
-	var header [walFileHeaderSize]byte
-	if _, err := wal.file.ReadAt(header[:], 0); err != nil {
+	var data [walFileHeaderSize]byte
+	headerData := data[:min(info.Size(), walFileHeaderSize)]
+	if _, err := wal.file.ReadAt(headerData, 0); err != nil {
 		return nil, fmt.Errorf("read WAL header: %w", err)
 	}
-	if err := validateWALFileHeader(header[:]); err != nil {
+	salt, complete, err := parseFileHeader(headerData)
+	if err != nil {
 		return nil, err
 	}
+	if !complete {
+		return nil, nil
+	}
+	wal.salt, wal.checksumSeed = salt, saltChecksumSeed(salt)
 	wal.appendOffset = info.Size()
 	// Recovered bytes can still be in the operating system cache.
 	wal.hasUnsyncedWrites = true
@@ -468,7 +487,7 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 	reader := io.NewSectionReader(wal.file, walFileHeaderSize, info.Size()-walFileHeaderSize)
 	var records []WALRecord
 	for {
-		record, err := DecodeWALRecord(reader, wal.pageSize)
+		record, err := DecodeWALRecord(reader, wal.pageSize, wal.checksumSeed)
 		if err != nil {
 			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, page.ErrChecksum) {
 				return nil, err
@@ -544,7 +563,7 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	writeOffset := wal.appendOffset
 	bytesWritten := len(transaction)
 	if writeOffset == 0 {
-		header := encodeWALFileHeader()
+		header := encodeWALFileHeader(wal.salt)
 		if err := fileio.WriteFullAt(wal.file, header[:], 0); err != nil {
 			return false, fmt.Errorf("persist WAL header: %w", err)
 		}
@@ -568,21 +587,76 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	return needsCheckpoint, nil
 }
 
-func encodeWALFileHeader() [walFileHeaderSize]byte {
+// startGeneration selects the salt for a WAL that starts again at offset zero.
+// Its checksum seed differs from the previous generation, so no record of that generation passes validation.
+func (wal *WAL) startGeneration() {
+	previous := wal.checksumSeed
+	for {
+		salt := rand.Uint64()
+		seed := saltChecksumSeed(salt)
+		if seed != previous {
+			wal.salt, wal.checksumSeed = salt, seed
+			return
+		}
+	}
+}
+
+// saltChecksumSeed returns the CRC32C checksum of the file encoding of salt.
+func saltChecksumSeed(salt uint64) uint32 {
+	var data [8]byte
+	binary.LittleEndian.PutUint64(data[:], salt)
+	return checksum.Sum32(data[:])
+}
+
+func encodeWALFileHeader(salt uint64) [walFileHeaderSize]byte {
 	var header [walFileHeaderSize]byte
 	binary.LittleEndian.PutUint32(header[0:4], walFileMagic)
 	binary.LittleEndian.PutUint32(header[4:8], page.FormatVersion)
+	binary.LittleEndian.PutUint64(header[8:16], salt)
+	binary.LittleEndian.PutUint32(header[16:20], checksum.Sum32(header[:16]))
 	return header
 }
 
-func validateWALFileHeader(header []byte) error {
-	if binary.LittleEndian.Uint32(header[0:4]) != walFileMagic {
-		return fmt.Errorf("read WAL magic: %w", page.ErrInvalid)
+// parseFileHeader returns the salt from the header at the start of WAL file data.
+// It reports false when data is shorter than a header or zero-filled.
+// A generation writes its header with its first commit, so such a WAL holds no finished commit.
+func parseFileHeader(data []byte) (salt uint64, complete bool, err error) {
+	if len(data) < walFileHeaderSize || allZero(data) {
+		return 0, false, nil
 	}
-	if version := binary.LittleEndian.Uint32(header[4:8]); version != page.FormatVersion {
-		return fmt.Errorf("read WAL format version %d: %w", version, page.ErrVersionMismatch)
+	if binary.LittleEndian.Uint32(data[0:4]) != walFileMagic {
+		return 0, false, fmt.Errorf("read WAL magic: %w", page.ErrInvalid)
 	}
-	return nil
+	if version := binary.LittleEndian.Uint32(data[4:8]); version != page.FormatVersion {
+		return 0, false, fmt.Errorf("read WAL format version %d: %w", version, page.ErrVersionMismatch)
+	}
+	// A header holds the salt for every record after it. Report damage instead of ignoring the generation.
+	if checksum.Sum32(data[:16]) != binary.LittleEndian.Uint32(data[16:20]) {
+		return 0, false, fmt.Errorf("read WAL header checksum: %w", page.ErrChecksum)
+	}
+	return binary.LittleEndian.Uint64(data[8:16]), true, nil
+}
+
+func allZero(data []byte) bool {
+	for _, value := range data {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// RecordChecksumSeed returns the record checksum seed of the WAL file that starts with data.
+// Use it with [EncodeWALRecord] and [DecodeWALRecord].
+func RecordChecksumSeed(data []byte) (uint32, error) {
+	salt, complete, err := parseFileHeader(data[:min(len(data), walFileHeaderSize)])
+	if err != nil {
+		return 0, err
+	}
+	if !complete {
+		return 0, fmt.Errorf("WAL header is incomplete: %w", page.ErrInvalid)
+	}
+	return saltChecksumSeed(salt), nil
 }
 
 func (wal *WAL) reachedCheckpointThreshold() bool {

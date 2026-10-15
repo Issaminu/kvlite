@@ -75,6 +75,14 @@ func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
 			},
 			wantErr: page.ErrVersionMismatch,
 		},
+		{
+			// Every record depends on the salt, so damage must not silently drop the generation.
+			name: "salt",
+			change: func(header []byte) {
+				header[8] ^= 1
+			},
+			wantErr: page.ErrChecksum,
+		},
 	}
 
 	for _, testCase := range testCases {
@@ -85,7 +93,7 @@ func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
 			}
 			defer walFile.Close()
 
-			header := encodeWALFileHeader()
+			header := encodeWALFileHeader(1)
 			testCase.change(header[:])
 			if _, err := walFile.Write(header[:]); err != nil {
 				t.Fatal(err)
@@ -96,6 +104,144 @@ func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
 				t.Fatalf("ReadRecords error: got %v, want %v", err, testCase.wantErr)
 			}
 		})
+	}
+}
+
+func TestWALReadRecords_IgnoresRecordsFromEarlierGeneration(t *testing.T) {
+	path := t.TempDir() + "/wal"
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: 64, SyncOnCommit: true, CheckpointThresholdBytes: 1 << 20})
+	// The first generation has three transactions of equal size.
+	for _, value := range []string{"old-1", "old-2", "old-3"} {
+		if _, err := log.Commit(nil, nil, []byte(value), nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	earlier, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A checkpoint clears the WAL. The second generation has one transaction of the same size.
+	if err := log.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Commit(nil, nil, []byte("new-1"), nil); err != nil {
+		t.Fatal(err)
+	}
+	current, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(current) >= len(earlier) {
+		t.Fatalf("second generation size %d, want less than %d", len(current), len(earlier))
+	}
+
+	// A crash kept the new bytes but lost the truncate, so the earlier tail follows the new transaction.
+	crashed := append(bytes.Clone(current), earlier[len(current):]...)
+	crashPath := t.TempDir() + "/crashed-wal"
+	if err := os.WriteFile(crashPath, crashed, 0600); err != nil {
+		t.Fatal(err)
+	}
+	crashFile, err := os.Open(crashPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer crashFile.Close()
+	records, err := New(Config{File: crashFile, PageSize: 64}).ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 {
+		t.Fatalf("recovered %d records, want the 3 records of the second generation", len(records))
+	}
+	newTxID := records[0].Header.TxID
+	for _, record := range records {
+		if record.Header.TxID != newTxID {
+			t.Fatalf("recovered transaction %d from an earlier generation after transaction %d", record.Header.TxID, newTxID)
+		}
+	}
+	if !bytes.Equal(records[0].Payload, []byte("new-1")) {
+		t.Fatalf("recovered payload %q, want %q", records[0].Payload, "new-1")
+	}
+}
+
+func TestWALReadRecords_ZeroFilledHeaderIsEmpty(t *testing.T) {
+	header := encodeWALFileHeader(1)
+	for _, test := range []struct {
+		name string
+		data []byte
+	}{
+		// A crash during the first commit of a generation can keep the file size without the written bytes.
+		{name: "zero-filled", data: make([]byte, 256)},
+		// A crash can also keep only part of the header.
+		{name: "short", data: header[:12]},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := t.TempDir() + "/wal"
+			if err := os.WriteFile(path, test.data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			file, err := os.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			records, err := New(Config{File: file, PageSize: 64}).ReadRecords()
+			if err != nil || len(records) != 0 {
+				t.Fatalf("incomplete WAL header: got %d records and error %v, want an empty WAL", len(records), err)
+			}
+		})
+	}
+}
+
+func TestWALCommit_NewGenerationChangesSalt(t *testing.T) {
+	path := t.TempDir() + "/wal"
+	file, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: 64, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit(nil, nil, []byte("first"), nil); err != nil {
+		t.Fatal(err)
+	}
+	first := log.checksumSeed
+	// A commit after a checkpoint starts a new generation in the same WAL.
+	if err := log.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Commit(nil, nil, []byte("second"), nil); err != nil {
+		t.Fatal(err)
+	}
+	second := log.checksumSeed
+	if second == first {
+		t.Fatalf("generation after truncate: seed %d, previous %d", second, first)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed, err := RecordChecksumSeed(data); err != nil || seed != second {
+		t.Fatalf("file header seed: got %d and error %v, want %d", seed, err, second)
+	}
+
+	// A reopened database reads the old salt before it clears the WAL, so its next generation differs too.
+	reopened := New(Config{File: file, PageSize: 64, CheckpointThresholdBytes: 1 << 20})
+	if _, err := reopened.ReadRecords(); err != nil {
+		t.Fatal(err)
+	}
+	if err := reopened.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Commit(nil, nil, []byte("third"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if third := reopened.checksumSeed; third == second {
+		t.Fatalf("generation after reopen: seed %d, previous %d", third, second)
 	}
 }
 
@@ -945,7 +1091,7 @@ func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		Payload: []byte("xy"),
 	}
 	// Layout: record type, page ID, transaction ID, content length, content,
-	// and the CRC32C checksum of all preceding bytes.
+	// and the CRC32C checksum of the little-endian generation salt and all preceding bytes.
 	want := []byte{
 		2,
 		1, 0, 0, 0, 0, 0, 0, 0,
@@ -953,10 +1099,13 @@ func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		2, 0, 0, 0,
 		'x', 'y',
 	}
-	wantChecksum := crc32.Checksum(want, crc32.MakeTable(crc32.Castagnoli))
+	const salt uint64 = 0x0807060504030201
+	salted := append([]byte{1, 2, 3, 4, 5, 6, 7, 8}, want...)
+	wantChecksum := crc32.Checksum(salted, crc32.MakeTable(crc32.Castagnoli))
 	want = binary.LittleEndian.AppendUint32(want, wantChecksum)
 
-	encoded, err := EncodeWALRecord(record, int64(len(record.Payload)))
+	seed := saltChecksumSeed(salt)
+	encoded, err := EncodeWALRecord(record, int64(len(record.Payload)), seed)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -964,12 +1113,16 @@ func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 		t.Fatalf("encode WAL record: got %x, want %x", encoded, want)
 	}
 
-	decoded, err := DecodeWALRecord(bytes.NewReader(encoded), int64(len(record.Payload)))
+	decoded, err := DecodeWALRecord(bytes.NewReader(encoded), int64(len(record.Payload)), seed)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if decoded.Header != record.Header || !bytes.Equal(decoded.Payload, record.Payload) {
 		t.Fatalf("decode WAL record: got %+v, want %+v", decoded, record)
+	}
+	// The seed of another generation must reject the record.
+	if _, err := DecodeWALRecord(bytes.NewReader(encoded), int64(len(record.Payload)), seed+1); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("decode with another generation: got %v, want checksum error", err)
 	}
 }
 
@@ -1016,15 +1169,15 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := bytes.NewReader(transaction)
-	firstMeta, err := DecodeWALRecord(reader, pageSize)
+	firstMeta, err := DecodeWALRecord(reader, pageSize, log.checksumSeed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	secondMeta, err := DecodeWALRecord(reader, pageSize)
+	secondMeta, err := DecodeWALRecord(reader, pageSize, log.checksumSeed)
 	if err != nil {
 		t.Fatal(err)
 	}
-	commitMarker, err := DecodeWALRecord(reader, pageSize)
+	commitMarker, err := DecodeWALRecord(reader, pageSize, log.checksumSeed)
 	if err != nil {
 		t.Fatal(err)
 	}

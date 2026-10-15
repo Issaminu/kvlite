@@ -78,14 +78,15 @@ type WALRecord struct {
 }
 
 // EncodeWALRecord returns one encoded WAL record.
+// checksumSeed selects the WAL generation. Use [RecordChecksumSeed] to get it from WAL file bytes.
 // It returns an error when Payload is larger than pageSize.
-func EncodeWALRecord(record *WALRecord, pageSize int64) ([]byte, error) {
+func EncodeWALRecord(record *WALRecord, pageSize int64, checksumSeed uint32) ([]byte, error) {
 	size, err := EncodedWALRecordSize(record, pageSize)
 	if err != nil {
 		return nil, err
 	}
 
-	return AppendEncodedWALRecord(make([]byte, 0, size), record), nil
+	return AppendEncodedWALRecord(make([]byte, 0, size), record, checksumSeed), nil
 }
 
 // EncodedWALRecordSize returns the encoded size of record.
@@ -99,33 +100,34 @@ func EncodedWALRecordSize(record *WALRecord, pageSize int64) (int, error) {
 }
 
 // AppendEncodedWALRecord appends one encoded WAL record to data.
+// checksumSeed selects the WAL generation, as in [EncodeWALRecord].
 // It does not validate the payload size.
-func AppendEncodedWALRecord(data []byte, record *WALRecord) []byte {
-	return appendEncodedPayloadRecord(data, record.Header, record.Payload)
+func AppendEncodedWALRecord(data []byte, record *WALRecord, checksumSeed uint32) []byte {
+	return appendEncodedPayloadRecord(data, record.Header, record.Payload, checksumSeed)
 }
 
-func appendEncodedPayloadRecord(data []byte, header RecordHeader, payload []byte) []byte {
+func appendEncodedPayloadRecord(data []byte, header RecordHeader, payload []byte, checksumSeed uint32) []byte {
 	headerStart := len(data)
 	data = appendRecordHeader(data, header, len(payload))
 	payloadStart := len(data)
 	data = append(data, payload...)
-	return appendRecordChecksum(data, headerStart, payloadStart)
+	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
 }
 
-func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.Node) []byte {
+func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.Node, checksumSeed uint32) []byte {
 	headerStart := len(data)
 	data = appendRecordHeader(data, header, btree.WALNodeEncodedSize(node))
 	payloadStart := len(data)
 	data = btree.AppendEncodedWALNode(data, node)
-	return appendRecordChecksum(data, headerStart, payloadStart)
+	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
 }
 
-func appendEncodedPagePatchRecord(data []byte, header RecordHeader, patch *PagePatch) []byte {
+func appendEncodedPagePatchRecord(data []byte, header RecordHeader, patch *PagePatch, checksumSeed uint32) []byte {
 	headerStart := len(data)
 	data = appendRecordHeader(data, header, patch.encodedSize())
 	payloadStart := len(data)
 	data = patch.appendEncoded(data)
-	return appendRecordChecksum(data, headerStart, payloadStart)
+	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
 }
 
 func appendRecordHeader(data []byte, header RecordHeader, payloadSize int) []byte {
@@ -135,14 +137,16 @@ func appendRecordHeader(data []byte, header RecordHeader, payloadSize int) []byt
 	return binary.LittleEndian.AppendUint32(data, uint32(payloadSize))
 }
 
-func appendRecordChecksum(data []byte, headerStart, payloadStart int) []byte {
-	checksum := computeRecordChecksum(data[headerStart:payloadStart], data[payloadStart:])
+func appendRecordChecksum(data []byte, headerStart, payloadStart int, checksumSeed uint32) []byte {
+	checksum := computeRecordChecksum(checksumSeed, data[headerStart:payloadStart], data[payloadStart:])
 	data = binary.LittleEndian.AppendUint32(data, checksum)
 	return data
 }
 
 // DecodeWALRecord reads and validates one WAL record from r.
-func DecodeWALRecord(r io.Reader, pageSize int64) (*WALRecord, error) {
+// checksumSeed selects the WAL generation, as in [EncodeWALRecord].
+// A record from another generation fails with [page.ErrChecksum].
+func DecodeWALRecord(r io.Reader, pageSize int64, checksumSeed uint32) (*WALRecord, error) {
 	headerData := make([]byte, HeaderSize)
 	if err := fileio.ReadFull(r, headerData); err != nil {
 		return nil, err // io.EOF at a clean boundary; io.ErrUnexpectedEOF on a torn tail
@@ -173,7 +177,7 @@ func DecodeWALRecord(r io.Reader, pageSize int64) (*WALRecord, error) {
 		return nil, err
 	}
 	checksum := binary.LittleEndian.Uint32(checksumData[:])
-	if computeRecordChecksum(headerData, record.Payload) != checksum {
+	if computeRecordChecksum(checksumSeed, headerData, record.Payload) != checksum {
 		return nil, page.ErrChecksum
 	}
 
@@ -185,6 +189,8 @@ func IsCommitMarker(record *WALRecord) bool {
 	return record.Header.Type == RecordTypeCommit
 }
 
-func computeRecordChecksum(header, payload []byte) uint32 {
-	return checksum.Sum32(header, payload)
+// computeRecordChecksum returns the CRC32C checksum of the generation salt, header, and payload.
+// checksumSeed is the checksum of the salt alone, so a record checksum binds the record to its generation.
+func computeRecordChecksum(checksumSeed uint32, header, payload []byte) uint32 {
+	return checksum.Update32(checksumSeed, header, payload)
 }

@@ -267,7 +267,11 @@ func TestDataPageChecksums_ControlPagesStayProtected(t *testing.T) {
 					data[2*pageSize+allocationHeaderSize] ^= 1
 				case "WAL":
 					log[len(log)-1] ^= 1
-					if _, err := wal.DecodeWALRecord(bytes.NewReader(log[len(log)-wal.HeaderSize-wal.ChecksumSize:]), int64(pageSize)); !errors.Is(err, ErrChecksum) {
+					checksumSeed, err := wal.RecordChecksumSeed(log)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := wal.DecodeWALRecord(bytes.NewReader(log[len(log)-wal.HeaderSize-wal.ChecksumSize:]), int64(pageSize), checksumSeed); !errors.Is(err, ErrChecksum) {
 						t.Fatalf("damaged commit marker: got %v, want checksum error", err)
 					}
 					if err := os.WriteFile(path+"-wal", log, 0600); err != nil {
@@ -342,12 +346,16 @@ func TestDataPageChecksums_RecoveryUsesWALMetadata(t *testing.T) {
 					headerSize -= wal.HeaderSize + len(record.Payload) + wal.ChecksumSize
 				}
 				log = log[:headerSize]
+				checksumSeed, err := wal.RecordChecksumSeed(log)
+				if err != nil {
+					t.Fatal(err)
+				}
 				patched := false
 				for _, record := range records {
 					if record.Header.TxID == records[0].Header.TxID {
 						continue
 					}
-					log = wal.AppendEncodedWALRecord(log, &record)
+					log = wal.AppendEncodedWALRecord(log, &record, checksumSeed)
 					patched = patched || record.Header.Type == wal.RecordTypePatch
 				}
 				if !patched {
