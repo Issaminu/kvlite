@@ -342,4 +342,9 @@ func createKilledDatabase(tb testing.TB, kind EngineKind, dataDir string, delete
 	if err := command.Wait(); err == nil {
 		tb.Fatal("crash helper exited without a kill error")
 	}
+	// Linux can release the file locks of a killed process some milliseconds after Wait returns.
+	// Wait for them here, so a timed open measures recovery and not one lock retry of the engine.
+	if err := waitForReleasedFileLocks(dataDir, 5*time.Second); err != nil {
+		tb.Fatal(err)
+	}
 }
