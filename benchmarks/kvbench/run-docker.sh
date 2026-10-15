@@ -85,6 +85,10 @@ for argument in "$@"; do
 		fi
 		profile_enabled=1
 		profile_engine_csv="${argument#--profile-engines=}"
+		if [[ -z "${profile_engine_csv}" ]]; then
+			echo "select at least one profile engine" >&2
+			exit 1
+		fi
 		;;
 	*)
 		echo "${usage}" >&2
@@ -409,14 +413,26 @@ run_benchmarks() {
 		run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -benchtime=1x -count="${count}"
 		return
 	fi
-	# Return each failure. A command substitution in Bash 3.2 does not keep set -e.
+	# Return each failure. The warm-up round calls this function inside `if !`, where set -e is off.
 	run_go "${mode}" "${engine}" -run '^$' -bench "${benchmark_filter}" -skip '^BenchmarkLifecycle$' -benchtime=1x -count="${count}" || return
 	if [[ "${mode}" != "durable" || "${engine}" == "redis" ]]; then
 		return
 	fi
-	local lifecycle_case
+	local lifecycle_case sample output
 	for lifecycle_case in "${lifecycle_cases[@]}"; do
-		run_go "${mode}" "${engine}" -run '^$' -bench "^BenchmarkLifecycle\$/^scale=${benchmark_scale}\$/^${lifecycle_case}\$" -benchtime=1x -count="${count}" || return
+		# Each sample gets a new process, so no sample sees the heap of an earlier one.
+		for ((sample = 0; sample < count; sample++)); do
+			output="$(run_go "${mode}" "${engine}" -run '^$' -bench "^BenchmarkLifecycle\$/^scale=${benchmark_scale}\$/^${lifecycle_case}\$" -benchtime=1x -count=1)" || {
+				printf '%s\n' "${output}"
+				return 1
+			}
+			printf '%s\n' "${output}"
+			# A renamed case matches no benchmark, and go test still succeeds. Stop instead of losing the case.
+			if [[ "${output}" != *"BenchmarkLifecycle/scale=${benchmark_scale}/${lifecycle_case}/${engine}"* ]]; then
+				echo "life-cycle case ${lifecycle_case} produced no result for ${engine}; update lifecycle_cases" >&2
+				return 1
+			fi
+		done
 	done
 }
 

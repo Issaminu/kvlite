@@ -412,7 +412,8 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 	}
 	b.SetBytes(int64(benchmarkCase.valueBytes * benchmarkCase.batchSize * benchmarkCase.operations))
 	iteration := 0
-	var counters writeCounters
+	// A counter is reported only if every read of it succeeded.
+	counters := writeCounters{hasWAL: true, hasProcessIO: true}
 	for b.Loop() {
 		b.StopTimer()
 		if iteration > 0 {
@@ -506,13 +507,14 @@ func readWriteCounters(b *testing.B, engine Engine, kind EngineKind) writeCounte
 }
 
 // add adds the change from before to after.
+// A counter stays available only if both reads, and every earlier read, had it.
 func (counters *writeCounters) add(before, after writeCounters) {
 	counters.walCommits += after.walCommits - before.walCommits
 	counters.walWrittenBytes += after.walWrittenBytes - before.walWrittenBytes
 	counters.writeCalls += after.writeCalls - before.writeCalls
 	counters.storageWrittenBytes += after.storageWrittenBytes - before.storageWrittenBytes
-	counters.hasWAL = after.hasWAL
-	counters.hasProcessIO = after.hasProcessIO
+	counters.hasWAL = counters.hasWAL && before.hasWAL && after.hasWAL
+	counters.hasProcessIO = counters.hasProcessIO && before.hasProcessIO && after.hasProcessIO
 }
 
 func makeMissingKey(position string, index int) []byte {
