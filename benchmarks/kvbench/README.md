@@ -20,7 +20,7 @@ The suite has three result groups:
 - KVLite and bbolt also run ordered reads and bucket tests. A bucket contains named key/value entries. The Redis API does not provide these operations.
 - KVLite and bbolt run open, close, and recovery tests. These tests cannot measure the separate Redis server through a Go client call.
 
-See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-03 report uses `large --workloads=all --storage=volume`. It contains the complete case matrix and the median of 15 measured rounds.
+See the repository [benchmark report](../../BENCHMARKS.md) for the latest full run. The 2026-10-15 report uses `large --workloads=all --storage=volume --profile-engines=kvlite` at commit `ca4fdae`. It contains the complete case matrix, including the large-entry cases, and the median of 15 measured rounds.
 
 ## Run benchmarks on GitHub Actions
 
