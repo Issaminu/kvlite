@@ -41,9 +41,9 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 	return db.ingestWalRecords(committed)
 }
 
-func (db *DB) readOrCreateWal(pageSize int64) (*wal.WAL, []wal.WALRecord, error) {
-	// Use the file's absolute name so a directory change cannot redirect log deletion.
-	walPath := db.file.Name() + "-wal"
+func (db *DB) readOrCreateWal(path string, pageSize int64) (*wal.WAL, []wal.WALRecord, error) {
+	// Open supplies the resolved absolute path so symbolic links share one log.
+	walPath := path + "-wal"
 	var walFile *os.File
 	var err error
 

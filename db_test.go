@@ -2261,6 +2261,10 @@ func TestOpen_SyncsParentDirectory(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "database")
+			parentInfo, err := os.Stat(filepath.Dir(path))
+			if err != nil {
+				t.Fatal(err)
+			}
 			if test.options != nil && test.options.ReadOnly {
 				db, err := Open(path, 0600, nil)
 				if err != nil {
@@ -2279,7 +2283,7 @@ func TestOpen_SyncsParentDirectory(t *testing.T) {
 					}
 					parent = dir
 					info, err := dir.Stat()
-					if err != nil || !info.IsDir() || dir.Name() != filepath.Dir(path) {
+					if err != nil || !info.IsDir() || !os.SameFile(info, parentInfo) {
 						t.Fatalf("sync target is not the database directory: %v", err)
 					}
 					for _, name := range []string{path, path + "-wal"} {
@@ -2422,6 +2426,89 @@ func TestDB_Path(t *testing.T) {
 
 	if s := db.Path(); s != path {
 		t.Fatalf("unexpected path: %s", s)
+	}
+}
+
+func TestOpen_RecoversWALThroughSymlink(t *testing.T) {
+	for _, writeThroughLink := range []bool{false, true} {
+		for _, readOnly := range []bool{false, true} {
+			t.Run(fmt.Sprintf("write-link=%t/read-only=%t", writeThroughLink, readOnly), func(t *testing.T) {
+				dir := t.TempDir()
+				if err := os.Mkdir(filepath.Join(dir, "data"), 0700); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "data", "database")
+				link := filepath.Join(dir, "link")
+				if err := os.Symlink(filepath.Join("data", "database"), link); err != nil {
+					if errors.Is(err, os.ErrPermission) {
+						t.Skipf("symbolic links are not permitted: %v", err)
+					}
+					t.Fatal(err)
+				}
+				writePath, readPath := path, link
+				if writeThroughLink {
+					writePath, readPath = link, path
+				}
+				db, err := Open(writePath, 0600, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				createBucket(t, db, testBucketName)
+				if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				main, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(writePath, 0600, &Options{CheckpointThresholdBytes: 1 << 30})
+				if err != nil {
+					t.Fatal(err)
+				}
+				t.Cleanup(func() {
+					if !db.closed {
+						_ = db.Close()
+					}
+				})
+				if err := db.Put(testBucketName, []byte("key"), []byte("new")); err != nil {
+					t.Fatal(err)
+				}
+				log, err := os.ReadFile(path + "-wal")
+				if err != nil {
+					t.Fatalf("committed log is not beside the database target: %v", err)
+				}
+				if db.Path() != writePath {
+					t.Fatal("Path did not preserve the caller's path")
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				// Restore the pre-checkpoint main file with the committed log.
+				if err := os.WriteFile(path, main, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path+"-wal", log, 0600); err != nil {
+					t.Fatal(err)
+				}
+				recovered, err := Open(readPath, 0600, &Options{ReadOnly: readOnly})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer recovered.Close()
+				if got, err := recovered.Get(testBucketName, []byte("key")); err != nil || string(got) != "new" {
+					t.Fatalf("committed value after recovery: got %q, error %v", got, err)
+				}
+				if recovered.Path() != readPath {
+					t.Fatal("Path did not preserve the caller's recovery path")
+				}
+				if _, err := os.Lstat(link + "-wal"); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("a separate log exists for the symbolic link: %v", err)
+				}
+			})
+		}
 	}
 }
 

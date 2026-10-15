@@ -82,6 +82,7 @@ func (db *DB) endOperation() {
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
 // With [SyncFull] or [SyncNormal], a writable Open syncs the parent directory before it returns success. The file system must support directory sync.
+// Open follows symbolic links and keeps the write-ahead log beside the target file.
 //
 // A new database uses the operating system page size. Open uses the stored page size when it reopens that database.
 //
@@ -129,6 +130,10 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 	if err := lockDatabaseFile(db.file, db.options.ReadOnly, db.options.LockTimeout); err != nil {
 		return db.failOpen(err)
 	}
+	filePath, err = filepath.EvalSymlinks(filePath)
+	if err != nil {
+		return db.failOpen(fmt.Errorf("resolve database links: %w", err))
+	}
 	isNew := !db.hasMeta()
 	var mainMetaErr error
 	var walPageSize int64
@@ -150,7 +155,7 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 		}
 	}
 
-	wal, records, err := db.readOrCreateWal(walPageSize)
+	wal, records, err := db.readOrCreateWal(filePath, walPageSize)
 	if err != nil {
 		return db.failOpen(err)
 	}
