@@ -121,13 +121,14 @@ func nextLongEqualRun(base, target []byte, index, end int) int {
 		lowBits  = 0x0101010101010101
 		highBits = 0x8080808080808080
 	)
-	run := 0 // The number of equal bytes just before index.
-	for ; index+8 <= len(base) && index+8 <= len(target); index += 8 {
-		difference := binary.LittleEndian.Uint64(base[index:]) ^ binary.LittleEndian.Uint64(target[index:])
+	b, t := base[index:], target[index:]
+	run := 0 // The number of equal bytes just before the start of b.
+	for ; len(b) >= 8 && len(t) >= 8; b, t = b[8:], t[8:] {
+		difference := binary.LittleEndian.Uint64(b) ^ binary.LittleEndian.Uint64(t)
 		if difference == 0 {
 			run += 8
 			if run > pagePatchRangeHeaderSize {
-				return index + 8 - run
+				return len(base) - len(b) + 8 - run
 			}
 			continue
 		}
@@ -143,18 +144,18 @@ func nextLongEqualRun(base, target []byte, index, end int) int {
 			}
 			run++
 			if run > pagePatchRangeHeaderSize {
-				return index + at + 1 - run
+				return len(base) - len(b) + at + 1 - run
 			}
 		}
 	}
-	for ; index < len(base) && index < len(target); index++ {
-		if base[index] != target[index] {
+	for ; len(b) > 0 && len(t) > 0; b, t = b[1:], t[1:] {
+		if b[0] != t[0] {
 			run = 0
 			continue
 		}
 		run++
 		if run > pagePatchRangeHeaderSize {
-			return index + 1 - run
+			return len(base) - len(b) + 1 - run
 		}
 	}
 	return end
