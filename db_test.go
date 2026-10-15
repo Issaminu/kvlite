@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
@@ -2291,7 +2292,7 @@ func TestOpen_SyncsParentDirectory(t *testing.T) {
 							t.Errorf("file missing before directory sync: %v", err)
 						}
 					}
-					return dir.Sync()
+					return fileio.Sync(dir)
 				})
 				if err != nil {
 					t.Fatal(err)

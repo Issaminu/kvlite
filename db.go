@@ -82,6 +82,7 @@ func (db *DB) endOperation() {
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
 // With [SyncFull] or [SyncNormal], a writable Open syncs the parent directory before it returns success. The file system must support directory sync.
+// Windows skips directory sync.
 // Open follows symbolic links and keeps the write-ahead log beside the target file.
 //
 // WAL recovery stops at the first invalid record or transaction.
@@ -96,7 +97,7 @@ func (db *DB) endOperation() {
 // The caller must call [DB.Close] when the database is no longer needed and must check its error.
 // Use [OpenMemory] to create a database with no file operations.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
-	return open(path, mode, options, (*os.File).Sync)
+	return open(path, mode, options, fileio.Sync)
 }
 
 func open(path string, mode os.FileMode, options *Options, syncDirectory func(*os.File) error) (*DB, error) {

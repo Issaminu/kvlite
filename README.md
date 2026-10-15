@@ -463,11 +463,11 @@ The backup contains the committed state selected before the copy starts. The bac
 
 To restore, copy `backup.db` to a new path, such as `restored.db`, and open that copy with `Open`. Keep the backup if you need to restore it again. A writable handle can change the file that it opens.
 
-The source handle's `Synchronous` option also controls the backup. With `SyncFull` or `SyncNormal`, Backup syncs the backup file and its parent directory before it returns success. With `SyncNone`, it skips both sync calls. A system failure can then lose or damage the backup.
+The source handle's `Synchronous` option also controls the backup. With `SyncFull` or `SyncNormal`, Backup syncs the backup file and, except on Windows, its parent directory before it returns success. With `SyncNone`, it skips both sync calls. A system failure can then lose or damage the backup.
 
 A checkpoint moves committed WAL data into the main database file. Backup pauses checkpoints until all active backups finish. The WAL can grow during that time. Saved WAL page data also remains in memory until the backup finishes. `Close` waits for active backups. Do not call `Backup` inside a transaction callback.
 
-The destination and its `-wal` path must not exist. The parent directory must exist. Keep both paths unused by other processes until `Backup` returns. The file system must support hard links. `SyncFull` and `SyncNormal` also require directory sync.
+The destination and its `-wal` path must not exist. The parent directory must exist. Keep both paths unused by other processes until `Backup` returns. The file system must support hard links. Except on Windows, `SyncFull` and `SyncNormal` also require directory sync.
 
 If the application stops during the copy, a temporary `.kvlite-backup-*` file can remain. Remove that incomplete file. The source uses normal WAL recovery on its next open. A failure after the destination becomes visible leaves a complete file at that path, but `Backup` still returns an error.
 

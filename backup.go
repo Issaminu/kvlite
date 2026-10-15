@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
@@ -26,12 +27,13 @@ import (
 //
 // With [SyncFull] or [SyncNormal], Backup syncs the new file before it makes path visible.
 // It then removes the temporary name and syncs the parent directory.
+// Windows skips directory sync.
 // With [SyncNone], Backup skips both sync calls. A system failure can lose or damage the backup.
 // An error after path becomes visible leaves a complete backup at path.
-// The file system must support hard links. SyncFull and SyncNormal also require directory sync.
+// The file system must support hard links. Except on Windows, SyncFull and SyncNormal also require directory sync.
 // The caller must keep path and path+"-wal" unused by other processes during Backup.
 func (db *DB) Backup(path string) error {
-	return db.backup(path, io.Copy, (*os.File).Sync)
+	return db.backup(path, io.Copy, fileio.Sync)
 }
 
 func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, error), syncFile func(*os.File) error) error {

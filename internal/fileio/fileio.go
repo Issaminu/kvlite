@@ -1,6 +1,10 @@
 package fileio
 
-import "io"
+import (
+	"io"
+	"os"
+	"runtime"
+)
 
 func ReadFull(reader io.Reader, data []byte) error {
 	_, err := io.ReadFull(reader, data)
@@ -36,4 +40,19 @@ func WriteFullAt(w io.WriterAt, data []byte, offset int64) error {
 		offset += int64(n)
 	}
 	return nil
+}
+
+// Sync flushes file data and metadata to storage.
+// It skips directory sync on Windows.
+func Sync(file *os.File) error {
+	if runtime.GOOS == "windows" {
+		info, err := file.Stat()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+	}
+	return file.Sync()
 }

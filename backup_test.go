@@ -12,6 +12,8 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/Issaminu/kvlite/internal/fileio"
 )
 
 func TestBackupLiveSnapshot(t *testing.T) {
@@ -96,7 +98,7 @@ func TestBackupLiveSnapshot(t *testing.T) {
 					t.Fatal("WAL did not grow")
 				}
 				return io.Copy(dst, src)
-			}, (*os.File).Sync)
+			}, fileio.Sync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -216,7 +218,7 @@ func TestBackupContinuedTree(t *testing.T) {
 					return 0, err
 				}
 				return io.Copy(dst, src)
-			}, (*os.File).Sync)
+			}, fileio.Sync)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -261,7 +263,7 @@ func TestBackupFailureAndPaths(t *testing.T) {
 		t.Fatal(err)
 	}
 	wantErr := errors.New("copy failed")
-	if err := db.backup(path, func(io.Writer, io.Reader) (int64, error) { return 0, wantErr }, (*os.File).Sync); !errors.Is(err, wantErr) {
+	if err := db.backup(path, func(io.Writer, io.Reader) (int64, error) { return 0, wantErr }, fileio.Sync); !errors.Is(err, wantErr) {
 		t.Fatalf("copy failure: %v", err)
 	}
 	if db.activeBackups != 0 {
@@ -299,7 +301,7 @@ func TestBackupCloseWaits(t *testing.T) {
 			close(started)
 			<-release
 			return io.Copy(dst, src)
-		}, (*os.File).Sync)
+		}, fileio.Sync)
 	}()
 	<-started
 	closeDone := make(chan error, 1)
@@ -349,7 +351,7 @@ func TestBackupProcessExit(t *testing.T) {
 				os.Exit(86)
 			}
 			return io.Copy(dst, src)
-		}, (*os.File).Sync)
+		}, fileio.Sync)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -443,7 +445,7 @@ func TestBackupSyncMode(t *testing.T) {
 					} else {
 						calls = append(calls, "file")
 					}
-					return file.Sync()
+					return fileio.Sync(file)
 				})
 				if err != nil {
 					t.Fatal(err)
@@ -479,7 +481,7 @@ func TestBackupSyncFailure(t *testing.T) {
 				if info.IsDir() == failDirectory {
 					return wantErr
 				}
-				return file.Sync()
+				return fileio.Sync(file)
 			})
 			if !errors.Is(err, wantErr) {
 				t.Fatalf("sync error: got %v, want %v", err, wantErr)

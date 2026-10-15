@@ -2,7 +2,10 @@ package fileio
 
 import (
 	"bytes"
+	"errors"
 	"io"
+	"os"
+	"runtime"
 	"testing"
 	"testing/iotest"
 )
@@ -74,5 +77,43 @@ func TestReadFull_CompletesPartialReads(t *testing.T) {
 	}
 	if !bytes.Equal(data, want) {
 		t.Fatalf("read %q, want %q", data, want)
+	}
+}
+
+func TestSync_FileAndDirectory(t *testing.T) {
+	dir := t.TempDir()
+	file, err := os.CreateTemp(dir, "file")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if _, err := file.Write([]byte("data")); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		readOnly, err := os.Open(file.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer readOnly.Close()
+		if err := Sync(readOnly); err == nil {
+			t.Fatal("sync ignored the Windows write-access requirement for a regular file")
+		}
+	}
+	parent, err := os.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+	for _, target := range []*os.File{file, parent} {
+		if err := Sync(target); err != nil {
+			t.Fatalf("sync %s: %v", target.Name(), err)
+		}
+		if err := target.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := Sync(target); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("sync closed %s: got %v, want closed-file error", target.Name(), err)
+		}
 	}
 }
