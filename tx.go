@@ -55,11 +55,11 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 
 // Update runs fn in one read-write transaction. The callback can read and write buckets. A read in fn can see a write made earlier in the same fn.
 //
-// If fn returns nil, Update commits all changes together. Other database operations can then read them. If fn returns an error, Update discards all changes and returns that error.
+// If fn returns nil, Update commits all changes together. Other database operations can then read them. If fn returns an error, Update discards all changes. It returns that error unless a shared WAL commit fails, as described below.
 //
 // Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
 //
-// For a file database in [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch. If the WAL commit fails, each callback that depends on that commit receives the same error. A memory database commits each callback without a log or file operations.
+// For a file database in [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch before those changes are durable. If the WAL commit fails, Update returns the commit error for each callback that changed data or ran after an earlier change in the batch. That error replaces an error that fn returned, because fn could read changes that the failed commit discards. Act outside the database only after Update returns nil. A memory database commits each callback without a log or file operations.
 //
 // Do not start another transaction from fn. Use the Tx passed to fn. If fn panics, Update discards its changes before the panic continues.
 func (db *DB) Update(transaction func(tx *Tx) error) error {

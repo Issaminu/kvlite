@@ -6898,6 +6898,119 @@ func TestWriteBatch_WALFailurePublishesNoCallback(t *testing.T) {
 	}
 }
 
+func TestWriteBatch_WALFailureReplacesErrorAfterPendingWrite(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		db.wal.SetSyncFileForTesting(nil)
+		_ = db.Close()
+	}()
+	createBucket(t, db, testBucketName)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("batch sync failed")
+	errKeyExists := errors.New("key exists")
+	db.wal.SetSyncFileForTesting(func() error { return wantErr })
+	requests := []*writeRequest{
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("first"), []byte("one"))
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			// This callback sees the pending write from the first callback and fails because of it.
+			transaction: func(tx *Tx) error {
+				if _, err := mustBucket(t, tx, testBucketName).Get([]byte("first")); err == nil {
+					return errKeyExists
+				}
+				return nil
+			},
+			result: make(chan writeResult, 1),
+		},
+	}
+
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	if result := <-requests[0].result; !errors.Is(result.err, wantErr) {
+		t.Fatalf("write error: got %v, want %v", result.err, wantErr)
+	}
+	result := <-requests[1].result
+	db.wal.SetSyncFileForTesting(nil)
+	if _, err := db.Get(testBucketName, []byte("first")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("value after failed batch: got %v, want ErrKeyNotFound", err)
+	}
+	if !errors.Is(result.err, wantErr) || errors.Is(result.err, errKeyExists) {
+		t.Fatalf("callback error after failed batch: got %v, want only %v", result.err, wantErr)
+	}
+}
+
+func TestWriteBatch_WALFailureKeepsResultsWithoutPendingDependency(t *testing.T) {
+	path := tempfile()
+	defer os.RemoveAll(path)
+	defer os.RemoveAll(path + "-wal")
+
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		db.wal.SetSyncFileForTesting(nil)
+		_ = db.Close()
+	}()
+	createBucket(t, db, testBucketName)
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantErr := errors.New("batch sync failed")
+	errOwn := errors.New("callback failed before pending writes")
+	db.wal.SetSyncFileForTesting(func() error { return wantErr })
+	requests := []*writeRequest{
+		{
+			// This callback runs before any pending write, so it sees only committed state.
+			transaction: func(tx *Tx) error {
+				return errOwn
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			transaction: func(tx *Tx) error {
+				return mustBucket(t, tx, testBucketName).Put([]byte("first"), []byte("one"))
+			},
+			result: make(chan writeResult, 1),
+		},
+		{
+			transaction: func(tx *Tx) error {
+				panic("callback panic")
+			},
+			result: make(chan writeResult, 1),
+		},
+	}
+
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	if result := <-requests[0].result; !errors.Is(result.err, errOwn) || errors.Is(result.err, wantErr) {
+		t.Fatalf("callback before pending writes: got %v, want only %v", result.err, errOwn)
+	}
+	if result := <-requests[1].result; !errors.Is(result.err, wantErr) {
+		t.Fatalf("write error: got %v, want %v", result.err, wantErr)
+	}
+	if result := <-requests[2].result; !result.panicked || result.panicValue != "callback panic" || result.err != nil {
+		t.Fatalf("panic after pending write: got %+v, want the unchanged panic", result)
+	}
+}
+
 func TestClose_WaitsForActiveUpdate(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)

@@ -37,7 +37,7 @@ type writeResult struct {
 	panicValue any
 	panicked   bool
 	goexited   bool
-	// dependsOnCommit is true when the callback changed the batch or ran after a pending change that it could observe. A failed batch commit must fail that callback because its result can depend on that change.
+	// dependsOnCommit is true when the callback changed the batch or ran after a pending change that it could observe. A failed batch commit replaces the result of that callback, including an error that it returned, because the result can depend on that change.
 	dependsOnCommit bool
 }
 
@@ -148,6 +148,8 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		tx := newWriteTx(db, state.meta, state.rootNode, state.dirty, state.allocation)
 		result := executeWriteCallback(request.transaction, tx)
 		if result.err != nil || result.panicked || result.goexited {
+			// A failed callback discards its own changes. Its error can still depend on pending changes from earlier callbacks.
+			result.dependsOnCommit = hasPendingWrites
 			results = append(results, result)
 		} else {
 			transactionChangedState := len(tx.store.dirty) > 0 || tx.metaDirty || (tx.allocationOwned && tx.allocation.changed())
@@ -216,7 +218,8 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 
 	for index, request := range requests {
 		result := results[index]
-		if result.err == nil && !result.panicked && !result.goexited && result.dependsOnCommit {
+		// A panic or Goexit continues unchanged. It is a failure, not a result that a caller can trust.
+		if commitErr != nil && result.dependsOnCommit && !result.panicked && !result.goexited {
 			result.err = commitErr
 		}
 		request.result <- result
