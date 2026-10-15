@@ -97,17 +97,17 @@ func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
 	return db.wal.Checkpoint(db.file, targetSize, db.meta.DataPageChecksums())
 }
 
-func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
+func committedWALRecords(records []wal.WALRecord) []wal.WALRecord {
 	committed := make([]wal.WALRecord, 0, len(records))
 	pending := make([]wal.WALRecord, 0)
 
-	for index, record := range records {
+	for _, record := range records {
 		if !wal.IsCommitMarker(&record) {
 			pending = append(pending, record)
 			continue
 		}
 
-		matches := len(pending) > 0
+		matches := len(pending) > 0 && record.Header.TxID != 0 && record.Header.PageID == 0 && len(record.Payload) == 0
 		for _, candidate := range pending {
 			if candidate.Header.TxID != record.Header.TxID {
 				matches = false
@@ -115,17 +115,14 @@ func committedWALRecords(records []wal.WALRecord) ([]wal.WALRecord, error) {
 			}
 		}
 		if !matches {
-			if index == len(records)-1 {
-				return committed, nil
-			}
-			return nil, page.ErrInvalid
+			break
 		}
 
 		committed = append(committed, pending...)
 		pending = pending[:0]
 	}
 
-	return committed, nil
+	return committed
 }
 
 // metaFromCommittedRecords returns the newest valid metadata from committed WAL records. It returns nil when the records do not contain metadata.

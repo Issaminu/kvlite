@@ -267,12 +267,25 @@ func TestDataPageChecksums_ControlPagesStayProtected(t *testing.T) {
 					data[2*pageSize+allocationHeaderSize] ^= 1
 				case "WAL":
 					log[len(log)-1] ^= 1
+					if _, err := wal.DecodeWALRecord(bytes.NewReader(log[len(log)-wal.HeaderSize-wal.ChecksumSize:]), int64(pageSize)); !errors.Is(err, ErrChecksum) {
+						t.Fatalf("damaged commit marker: got %v, want checksum error", err)
+					}
 					if err := os.WriteFile(path+"-wal", log, 0600); err != nil {
 						t.Fatal(err)
 					}
 				}
 				if err := os.WriteFile(path, data, 0600); err != nil {
 					t.Fatal(err)
+				}
+				if target == "WAL" {
+					recovered, err := Open(path, 0600, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := recovered.Close(); err != nil {
+						t.Fatal(err)
+					}
+					return
 				}
 				if db, err := Open(path, 0600, nil); !errors.Is(err, ErrChecksum) {
 					if db != nil {

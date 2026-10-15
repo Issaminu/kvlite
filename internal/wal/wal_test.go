@@ -352,6 +352,39 @@ func TestWALReadRecords_InitializesAppendOffsetForRecovery(t *testing.T) {
 	}
 }
 
+func TestWALReadRecords_StopsAtDamagedRecord(t *testing.T) {
+	for _, name := range []string{"incomplete", "committed"} {
+		t.Run(name, func(t *testing.T) {
+			file, err := os.CreateTemp(t.TempDir(), "wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer file.Close()
+			log := New(Config{File: file, PageSize: 4096})
+			if _, err := log.Commit(nil, nil, []byte("stable"), nil); err != nil {
+				t.Fatal(err)
+			}
+			start := log.appendOffset
+			// Later records must stay discarded even when a complete marker follows.
+			if _, err := log.Commit(nil, nil, bytes.Repeat([]byte("p"), 2020), nil); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := file.WriteAt([]byte("x"), start+HeaderSize); err != nil {
+				t.Fatal(err)
+			}
+			if name == "incomplete" {
+				if err := file.Truncate(log.appendOffset - HeaderSize - ChecksumSize); err != nil {
+					t.Fatal(err)
+				}
+			}
+			records, err := log.ReadRecords()
+			if err != nil || len(records) != 3 || !bytes.Equal(records[0].Payload, []byte("stable")) {
+				t.Fatalf("earlier committed transaction: got %+v, %v", records, err)
+			}
+		})
+	}
+}
+
 func TestWALReadRecords_ReturnsStatError(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {

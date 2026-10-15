@@ -6144,7 +6144,7 @@ func TestAudit_GoexitRollsBackUpdate(t *testing.T) {
 	}
 }
 
-func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
+func TestAudit_MidWALChecksumFailureStopsRecovery(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -6173,8 +6173,9 @@ func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
 	if len(walBytes) < wal.HeaderSize {
 		t.Fatalf("WAL is too small: %d bytes", len(walBytes))
 	}
-	contentSize := int(binary.LittleEndian.Uint32(walBytes[17:21]))
-	checksumOffset := wal.HeaderSize + contentSize
+	const fileHeaderSize = 8
+	contentSize := int(binary.LittleEndian.Uint32(walBytes[fileHeaderSize+17 : fileHeaderSize+21]))
+	checksumOffset := fileHeaderSize + wal.HeaderSize + contentSize
 	if checksumOffset >= len(walBytes)-1 {
 		t.Fatalf("first record has no later WAL data: checksum offset %d, WAL size %d", checksumOffset, len(walBytes))
 	}
@@ -6191,16 +6192,18 @@ func TestAudit_MidWALChecksumFailureIsNotTreatedAsTornTail(t *testing.T) {
 	}
 
 	recovered, err := openDB(crashPath)
-	if err == nil {
-		_ = recovered.Close()
-		t.Fatal("Open accepted a checksum failure before later WAL records")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, ErrChecksum) {
-		t.Fatalf("expected ErrChecksum, got %v", err)
+	defer recovered.Close()
+	for _, key := range []string{"first", "second"} {
+		if _, err := recovered.Get(testBucketName, []byte(key)); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("replayed key %q after damaged WAL record: %v", key, err)
+		}
 	}
 }
 
-func TestAudit_FinalWALChecksumFailureReturnsChecksumError(t *testing.T) {
+func TestAudit_FinalWALChecksumFailureDiscardsTransaction(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -6240,12 +6243,12 @@ func TestAudit_FinalWALChecksumFailureReturnsChecksumError(t *testing.T) {
 	}
 
 	recovered, err := openDB(crashPath)
-	if err == nil {
-		_ = recovered.Close()
-		t.Fatal("Open accepted a checksum failure on the final WAL record")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !errors.Is(err, ErrChecksum) {
-		t.Fatalf("expected ErrChecksum, got %v", err)
+	defer recovered.Close()
+	if _, err := recovered.Get(testBucketName, []byte("key")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("replayed transaction with damaged commit marker: %v", err)
 	}
 }
 
@@ -7615,10 +7618,7 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 	if records == nil {
 		t.Fatal("committed WAL has no records")
 	}
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		t.Fatal(err)
-	}
+	committed := committedWALRecords(records)
 
 	db.wal.ClearCommittedRecordsForTesting()
 	if err := db.file.Close(); err != nil {
@@ -7895,10 +7895,7 @@ func TestPut_ContinuedTree(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			committed, err := committedWALRecords(records)
-			if err != nil {
-				t.Fatal(err)
-			}
+			committed := committedWALRecords(records)
 			db.wal.ClearCommittedRecordsForTesting()
 			if err := db.loadCommittedIntoOverlay(committed); err != nil {
 				t.Fatal(err)

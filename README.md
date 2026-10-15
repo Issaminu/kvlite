@@ -281,7 +281,9 @@ For a database at `app.db`, KVLite can use two files:
 
 A writable open creates the log. A clean writable close removes it. An application or system failure can leave the log beside the main file.
 
-`Open` validates metadata and checksums. It replays complete committed log transactions. It ignores an incomplete final transaction. A checksum error in committed data stops recovery and returns an error.
+`Open` checks WAL records in order. It stops at the first invalid record or transaction and recovers only earlier complete transactions. Unsupported file formats, invalid main-file data, and file I/O errors still return an error.
+
+Writable recovery follows the configured synchronization mode. With `SyncFull` or `SyncNormal`, it synchronizes the WAL, writes the recovered pages to the main file, synchronizes the main file, and then clears the WAL. With `SyncNone`, it writes the recovered pages and clears the WAL without synchronization. A write or required synchronization failure keeps the WAL for another attempt. Read-only recovery keeps the recovered pages in memory and does not change either file.
 
 Data-page checksum calculation and checks are disabled by default. Enable them when you create a file:
 
@@ -312,10 +314,10 @@ KVLite records which database pages are in use. A later transaction can reuse a 
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SyncFull`   | Default. A non-empty update returns after KVLite synchronizes its log data to storage. Concurrent updates can share this work.                            |
 | `SyncNormal` | Synchronizes at a checkpoint or clean close. A system failure can lose recent committed updates from the operating-system cache.                          |
-| `SyncNone`   | Writes files without synchronizing them at open, commit, checkpoint, close, or backup. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
+| `SyncNone`   | Writes files without synchronization, including during recovery. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
 
 
-These modes do not change transaction atomicity. They change when committed log data reaches storage.
+These modes select when operations synchronize committed data to storage.
 
 Select the durability mode in the open options:
 

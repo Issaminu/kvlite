@@ -84,6 +84,11 @@ func (db *DB) endOperation() {
 // With [SyncFull] or [SyncNormal], a writable Open syncs the parent directory before it returns success. The file system must support directory sync.
 // Open follows symbolic links and keeps the write-ahead log beside the target file.
 //
+// WAL recovery stops at the first invalid record or transaction.
+// It uses only complete transactions before that point.
+// With [SyncFull] or [SyncNormal], writable recovery syncs the WAL and main file before it clears the WAL.
+// With [SyncNone], recovery does not issue storage sync calls.
+//
 // A new database uses the operating system page size. Open uses the stored page size when it reopens that database.
 //
 // A read-only Open takes a shared database-file lock, so several read-only handles can open the database together. A writable Open takes an exclusive lock. Open waits for a conflicting handle to close unless a positive [Options.LockTimeout] expires.
@@ -161,10 +166,7 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 	}
 
 	db.wal = wal
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		return db.failOpen(err)
-	}
+	committed := committedWALRecords(records)
 	committedMeta, committedMetaErr := metaFromCommittedRecords(committed)
 	if mainMetaErr != nil && (len(records) == 0 || committedMetaErr != nil || committedMeta == nil) {
 		// Only validated metadata from a complete WAL transaction can replace invalid main-file metadata.
@@ -206,7 +208,7 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 		return db.failOpen(err)
 	}
 
-	if len(records) > 0 && !db.options.ReadOnly {
+	if !db.options.ReadOnly {
 		if err := db.wal.Truncate(); err != nil {
 			return db.failOpen(err)
 		}

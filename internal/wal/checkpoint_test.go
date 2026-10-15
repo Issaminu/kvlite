@@ -87,6 +87,44 @@ func TestWALCommit_KeepsFullImageUntilCheckpoint(t *testing.T) {
 	}
 }
 
+func TestWALCheckpoint_MainSyncFailureKeepsWAL(t *testing.T) {
+	main, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer main.Close()
+	if err := main.Sync(); err == nil {
+		t.Skip("the null device does not report sync failures on this platform")
+	}
+	if _, err := main.WriteAt(make([]byte, 128), 0); err != nil {
+		t.Skip("the null device does not support writes at an offset")
+	}
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: 128, SyncOnCheckpoint: true})
+	node := btree.NewLeafNode(2)
+	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Commit([]NodeRecord{{Final: node}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(file.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := log.Checkpoint(main, 0, false); err == nil {
+		t.Fatal("checkpoint skipped the main-file sync failure")
+	}
+	after, err := os.ReadFile(file.Name())
+	if err != nil || !bytes.Equal(after, before) || len(log.overlay) != 1 {
+		t.Fatalf("main-file sync failure discarded recovery data: %v", err)
+	}
+}
+
 func TestWALCheckpoint_ReusesBuffersAfterWriteFailure(t *testing.T) {
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {

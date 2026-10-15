@@ -43,7 +43,7 @@ type WAL struct {
 	checkpointCount          uint64
 	overlay                  map[page.ID]CommittedPage // Committed pages that are not yet checkpointed.
 	nextTxid                 TxID                      // sequence number stamped on the next committed transaction
-	hasUnsyncedWrites        bool                      // true when WAL bytes were appended after the last successful sync
+	hasUnsyncedWrites        bool                      // true when WAL bytes need a storage sync
 	appendOffset             int64                     // byte offset of the next WAL append; independent of the file read/write cursor
 	encodingBuffer           []byte                    // reusable transaction encoding buffer; capacity may be cleared after large commits
 	largeEncodingBuffers     sync.Pool                 // *[]byte encoding buffers larger than maxRetainedEncodingBufferBytes
@@ -429,9 +429,12 @@ func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUns
 	return nil
 }
 
-// ReadRecords validates the WAL header and decodes every stored record.
+// ReadRecords validates the WAL header and reads the valid record prefix.
 // It returns nil, nil when no WAL file is configured or the file is empty.
-// On success it sets [WAL.appendOffset] to the file size so a later [WAL.Commit] appends after the recovered prefix.
+// It stops at the first invalid record.
+// File I/O failures still return an error.
+// After header validation it sets [WAL.appendOffset] to the file size.
+// The caller must clear an incomplete tail before a later [WAL.Commit].
 func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 	if wal.file == nil {
 		return nil, nil
@@ -456,22 +459,24 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 		return nil, err
 	}
 	wal.appendOffset = info.Size()
+	// Recovered bytes can still be in the operating system cache.
+	wal.hasUnsyncedWrites = true
 
 	reader := io.NewSectionReader(wal.file, walFileHeaderSize, info.Size()-walFileHeaderSize)
 	var records []WALRecord
 	for {
 		record, err := DecodeWALRecord(reader, wal.pageSize)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				break
+			if !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, page.ErrChecksum) {
+				return nil, err
 			}
-			// if we ever encouner an ErrChecksum, it is returned as an err
-			return nil, err
+			break
+		}
+		if record.Header.Type > RecordTypeLeafDelete || record.Header.TxID == 0 ||
+			(IsCommitMarker(record) && (record.Header.PageID != 0 || len(record.Payload) != 0)) {
+			break
 		}
 		records = append(records, *record)
-		if record.Header.Type > RecordTypeLeafDelete {
-			return nil, fmt.Errorf("WAL record type %d: %w", record.Header.Type, page.ErrInvalid)
-		}
 		if record.Header.TxID >= wal.nextTxid {
 			wal.nextTxid = record.Header.TxID + 1
 		}

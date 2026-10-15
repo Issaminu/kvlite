@@ -135,6 +135,252 @@ func TestRecovery_PartialCheckpoint(t *testing.T) {
 	}
 }
 
+func TestRecovery_IncompleteWALTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	if err := db.Put(testBucketName, []byte("stable"), []byte("committed")); err != nil {
+		t.Fatal(err)
+	}
+	main, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pendingValue := bytes.Repeat([]byte("pending"), 200)
+	if err := db.Put(testBucketName, []byte("pending"), pendingValue); err != nil {
+		t.Fatal(err)
+	}
+	complete, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("later"), []byte("must be discarded")); err != nil {
+		t.Fatal(err)
+	}
+	following, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	tail := complete[len(committed):]
+	markerSize := wal.HeaderSize + wal.ChecksumSize
+	kept := 1024 - len(committed)%512
+	if len(tail)-markerSize <= kept {
+		t.Fatal("test needs a record that spans several sectors")
+	}
+	for _, damage := range []string{"short", "no-marker", "partial-sector", "partial-header", "bad-length", "marker-like-data", "embedded-marker", "committed-data", "committed-length", "committed-short-read", "commit-checksum", "record-type", "record-id", "marker-page", "marker-payload", "marker-id", "none"} {
+		for _, mode := range []struct {
+			readOnly bool
+			sync     Sync
+		}{{sync: SyncFull}, {sync: SyncNone}, {readOnly: true, sync: SyncNone}} {
+			t.Run(fmt.Sprintf("%s/read-only=%t/sync=%d", damage, mode.readOnly, mode.sync), func(t *testing.T) {
+				candidate := bytes.Clone(tail)
+				switch damage {
+				case "short":
+					candidate = candidate[:40]
+				case "no-marker":
+					candidate = candidate[:len(candidate)-markerSize]
+				case "partial-sector":
+					clear(candidate[kept:])
+				case "partial-header":
+					clear(candidate[10:])
+				case "bad-length":
+					clear(candidate[kept:])
+					binary.LittleEndian.PutUint32(candidate[wal.HeaderSize-4:wal.HeaderSize], ^uint32(0))
+				case "marker-like-data", "embedded-marker":
+					marker := bytes.Clone(candidate[len(candidate)-markerSize:])
+					clear(candidate[kept:])
+					if damage == "marker-like-data" {
+						marker[len(marker)-1] ^= 1
+					}
+					copy(candidate[100:], marker)
+				case "committed-data":
+					candidate[wal.HeaderSize+100] ^= 1
+				case "committed-length":
+					binary.LittleEndian.PutUint32(candidate[wal.HeaderSize-4:wal.HeaderSize], ^uint32(0))
+				case "committed-short-read":
+					binary.LittleEndian.PutUint32(candidate[wal.HeaderSize-4:wal.HeaderSize], uint32(os.Getpagesize()))
+				case "commit-checksum":
+					candidate[len(candidate)-1] ^= 1
+				case "record-type", "record-id", "marker-page", "marker-payload", "marker-id":
+					marker := wal.WALRecord{Header: wal.RecordHeader{
+						Type: wal.RecordTypeCommit,
+						TxID: wal.TxID(binary.LittleEndian.Uint64(tail[len(tail)-markerSize+9 : len(tail)-markerSize+17])),
+					}}
+					switch damage {
+					case "record-type":
+						marker.Header.Type = 255
+					case "record-id":
+						marker.Header.TxID = 0
+					case "marker-page":
+						marker.Header.PageID = 3
+					case "marker-payload":
+						marker.Payload = []byte("invalid")
+					case "marker-id":
+						marker.Header.TxID++
+					}
+					candidate = wal.AppendEncodedWALRecord(candidate[:len(candidate)-markerSize], &marker)
+				}
+				if damage != "none" {
+					candidate = append(candidate, following[len(complete):]...)
+				}
+				log := append(bytes.Clone(committed), candidate...)
+				crashPath := filepath.Join(t.TempDir(), "database")
+				if err := os.WriteFile(crashPath, main, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(crashPath+"-wal", log, 0600); err != nil {
+					t.Fatal(err)
+				}
+				recovered, err := Open(crashPath, 0600, &Options{ReadOnly: mode.readOnly, Synchronous: mode.sync})
+				if err != nil {
+					t.Fatalf("recover earlier committed data: %v", err)
+				}
+				defer recovered.Close()
+				got, err := recovered.Get(testBucketName, []byte("stable"))
+				if err != nil || string(got) != "committed" {
+					t.Fatalf("earlier committed value: got %q, %v", got, err)
+				}
+				got, err = recovered.Get(testBucketName, []byte("pending"))
+				if damage == "none" {
+					if err != nil || !bytes.Equal(got, pendingValue) {
+						t.Fatalf("complete transaction: got %q, %v", got, err)
+					}
+				} else if !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("incomplete transaction became visible: %v", err)
+				}
+				if _, err := recovered.Get(testBucketName, []byte("later")); !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("transaction after damaged data became visible: %v", err)
+				}
+				stored, err := os.ReadFile(crashPath + "-wal")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode.readOnly {
+					if !bytes.Equal(stored, log) {
+						t.Fatal("read-only recovery changed the WAL")
+					}
+				} else if len(stored) != 0 {
+					t.Fatal("writable recovery did not clear the WAL")
+				}
+				if !mode.readOnly {
+					if err := recovered.Put(testBucketName, []byte("after"), []byte("recovery")); err != nil {
+						t.Fatal(err)
+					}
+					if err := recovered.Close(); err != nil {
+						t.Fatal(err)
+					}
+					reopened, err := Open(crashPath, 0600, nil)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer reopened.Close()
+					got, err := reopened.Get(testBucketName, []byte("after"))
+					if err != nil || string(got) != "recovery" {
+						t.Fatalf("write after recovery: got %q, %v", got, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestRecovery_UsesSyncMode(t *testing.T) {
+	for _, mode := range []Sync{SyncFull, SyncNormal, SyncNone} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{Synchronous: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.closeFiles()
+			createBucket(t, db, testBucketName)
+			if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			records, err := db.wal.ReadRecords()
+			if err != nil {
+				t.Fatal(err)
+			}
+			committed := committedWALRecords(records)
+			main, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log, err := os.ReadFile(path + "-wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			db.wal.ClearCommittedRecordsForTesting()
+			syncErr := errors.New("recovery WAL sync failed")
+			db.wal.SetSyncFileForTesting(func() error { return syncErr })
+			err = db.ingestWalRecords(committed)
+			if mode == SyncNone {
+				if err != nil {
+					t.Fatalf("SyncNone recovery called sync: %v", err)
+				}
+			} else {
+				if !errors.Is(err, syncErr) {
+					t.Fatalf("recovery: got %v, want WAL sync failure", err)
+				}
+				for name, want := range map[string][]byte{path: main, path + "-wal": log} {
+					got, err := os.ReadFile(name)
+					if err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("failed WAL sync changed %s: %v", name, err)
+					}
+				}
+				db.wal.SetSyncFileForTesting(nil)
+				if err := db.ingestWalRecords(committed); err != nil {
+					t.Fatalf("retry recovery: %v", err)
+				}
+			}
+			if info, err := os.Stat(path + "-wal"); err != nil || info.Size() != 0 {
+				t.Fatalf("successful recovery did not clear the WAL: %v", err)
+			}
+		})
+	}
+}
+
+func TestCommittedWALRecords_StopsAtInvalidTransaction(t *testing.T) {
+	stable := wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 3, TxID: 1}}
+	marker := wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: 2}}
+	for _, fault := range []string{"empty", "mismatch", "mixed-records", "page-id", "payload"} {
+		t.Run(fault, func(t *testing.T) {
+			records := []wal.WALRecord{stable, {Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: 1}}}
+			if fault != "empty" {
+				records = append(records, wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 3, TxID: 2}})
+			}
+			invalid := marker
+			switch fault {
+			case "mismatch":
+				invalid.Header.TxID = 9
+			case "mixed-records":
+				records = append(records, wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 4, TxID: 9}})
+			case "page-id":
+				invalid.Header.PageID = 3
+			case "payload":
+				invalid.Payload = []byte("invalid")
+			}
+			records = append(records, invalid,
+				wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 3, TxID: 3}},
+				wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: 3}})
+			got := committedWALRecords(records)
+			if len(got) != 1 || got[0].Header != stable.Header {
+				t.Fatalf("valid transaction before invalid marker: got %+v", got)
+			}
+		})
+	}
+}
+
 func TestOpenIgnoresDroppedAllocationSegmentInWAL(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -521,10 +767,7 @@ func TestMetaFromCommittedRecords_RejectsInvalidPageSize(t *testing.T) {
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
 
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		t.Fatal(err)
-	}
+	committed := committedWALRecords(records)
 	if _, err := metaFromCommittedRecords(committed); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("metadata error: got %v, want ErrInvalid", err)
 	}
@@ -554,10 +797,7 @@ func TestLoadCommittedIntoOverlay_RejectsInvalidNodeDirectory(t *testing.T) {
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
 	db := &DB{wal: wal.New(wal.Config{})}
-	committed, err := committedWALRecords(records)
-	if err != nil {
-		t.Fatal(err)
-	}
+	committed := committedWALRecords(records)
 
 	if err := db.loadCommittedIntoOverlay(committed); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("read-only recovery error: got %v, want ErrInvalid", err)
