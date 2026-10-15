@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -80,6 +81,7 @@ func (db *DB) endOperation() {
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
+// With [SyncFull] or [SyncNormal], a writable Open syncs the parent directory before it returns success. The file system must support directory sync.
 //
 // A new database uses the operating system page size. Open uses the stored page size when it reopens that database.
 //
@@ -88,6 +90,10 @@ func (db *DB) endOperation() {
 // The caller must call [DB.Close] when the database is no longer needed and must check its error.
 // Use [OpenMemory] to create a database with no file operations.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
+	return open(path, mode, options, (*os.File).Sync)
+}
+
+func open(path string, mode os.FileMode, options *Options, syncDirectory func(*os.File) error) (*DB, error) {
 	if path == "" {
 		return nil, ErrPathRequired
 	}
@@ -194,6 +200,17 @@ func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
 	if len(records) > 0 && !db.options.ReadOnly {
 		if err := db.wal.Truncate(); err != nil {
 			return db.failOpen(err)
+		}
+	}
+	if !db.options.ReadOnly && db.options.Synchronous != SyncNone {
+		// File sync does not persist a new file name.
+		// Both names must reach storage before a later commit can return success.
+		parent, err := os.Open(filepath.Dir(path))
+		if err != nil {
+			return db.failOpen(fmt.Errorf("open database directory: %w", err))
+		}
+		if err := errors.Join(syncDirectory(parent), parent.Close()); err != nil {
+			return db.failOpen(fmt.Errorf("sync database directory: %w", err))
 		}
 	}
 	db.startWriteBatcher()

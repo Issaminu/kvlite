@@ -2247,6 +2247,95 @@ func TestOpen_NilOptionsCreatesWritableDatabase(t *testing.T) {
 	}
 }
 
+func TestOpen_SyncsParentDirectory(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		options  *Options
+		wantSync bool
+	}{
+		{name: "default", wantSync: true},
+		{name: "full", options: &Options{Synchronous: SyncFull}, wantSync: true},
+		{name: "normal", options: &Options{Synchronous: SyncNormal}, wantSync: true},
+		{name: "none", options: &Options{Synchronous: SyncNone}},
+		{name: "read-only", options: &Options{ReadOnly: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			if test.options != nil && test.options.ReadOnly {
+				db, err := Open(path, 0600, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Reopen after Close removes the WAL. Its new name also needs a sync.
+			for attempt := range 2 {
+				var parent *os.File
+				db, err := open(path, 0600, test.options, func(dir *os.File) error {
+					if parent != nil {
+						t.Error("directory synced more than once")
+					}
+					parent = dir
+					info, err := dir.Stat()
+					if err != nil || !info.IsDir() || dir.Name() != filepath.Dir(path) {
+						t.Fatalf("sync target is not the database directory: %v", err)
+					}
+					for _, name := range []string{path, path + "-wal"} {
+						if _, err := os.Stat(name); err != nil {
+							t.Errorf("file missing before directory sync: %v", err)
+						}
+					}
+					return dir.Sync()
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if (parent != nil) != test.wantSync {
+					t.Fatalf("open %d: directory sync = %t, want %t", attempt, parent != nil, test.wantSync)
+				}
+				if parent != nil {
+					if _, err := parent.Stat(); !errors.Is(err, os.ErrClosed) {
+						t.Fatalf("directory was not closed: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestOpen_DirectorySyncFailure(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	syncErr := errors.New("directory sync failed")
+	var parent *os.File
+	db, err := open(path, 0600, nil, func(dir *os.File) error {
+		parent = dir
+		return syncErr
+	})
+	if db != nil {
+		_ = db.Close()
+		t.Fatal("Open returned a database after directory sync failed")
+	}
+	if !errors.Is(err, syncErr) {
+		t.Fatalf("Open error: got %v, want %v", err, syncErr)
+	}
+	if _, err := parent.Stat(); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("directory was not closed after sync failure: %v", err)
+	}
+	// A failed Open must release its file lock so a retry can succeed.
+	db, err = Open(path, 0600, &Options{LockTimeout: time.Millisecond})
+	if err != nil {
+		t.Fatalf("retry Open: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestOpen_RelaxedSyncModesDoNotSyncEachCommit(t *testing.T) {
 	tests := []struct {
 		name string
