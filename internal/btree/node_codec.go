@@ -17,6 +17,16 @@ const checksumZeroBlockSize = 4096
 
 var checksumZeroBlock [checksumZeroBlockSize]byte
 
+// continuedNodeHeaderSize adds the body length and next-ID count to the normal header of the first page of a continued leaf or branch.
+//
+//	[18:22] total logical body length, uint32
+//	[22:26] next page count N, uint32
+//	[26:26+8*N] continuation IDs
+//	[26+8*N:P] first body bytes
+//
+// Offsets in entry descriptors still include the normal 18-byte logical header.
+const continuedNodeHeaderSize = NodeHeaderSize + 2*encodedUint32Size
+
 // mappedNodeType reads only the type tag common to every page type.
 func mappedNodeType(data []byte) NodeType {
 	if len(data) < 2 {
@@ -296,11 +306,7 @@ func WALNodePagesEncodedSize(node *Node, pageSize int64) int {
 	if count == 1 {
 		return size
 	}
-	firstHeader := leafContinuationHeaderSize
-	if !node.IsLeaf() {
-		firstHeader = branchContinuationHeaderSize
-	}
-	return size - NodeHeaderSize + firstHeader + (count-1)*(ContinuationHeaderSize+page.IDSize)
+	return size - NodeHeaderSize + continuedNodeHeaderSize + (count-1)*(ContinuationHeaderSize+page.IDSize)
 }
 
 // EncodeWALNodePagesInto writes compact WAL images into caller-owned pages.

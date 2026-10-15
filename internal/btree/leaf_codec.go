@@ -20,16 +20,6 @@ import (
 // The key begins at the data offset. The value follows the key.
 const leafEntryDescriptorSize = 4 * encodedUint32Size
 
-// leafContinuationHeaderSize adds the body length and next-ID count to the normal header.
-//
-//	[18:22] total logical body length, uint32
-//	[22:26] next page count N, uint32
-//	[26:26+8*N] continuation IDs
-//	[26+8*N:P] first body bytes
-//
-// Offsets in entry descriptors still include the normal 18-byte logical header.
-const leafContinuationHeaderSize = NodeHeaderSize + 2*encodedUint32Size
-
 func leafPayloadSize(node *Node) int {
 	size := 0
 	for _, entry := range node.entries {
@@ -86,10 +76,10 @@ func readLeafNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksu
 	}
 	fixed := NodeHeaderSize
 	if h.Type&overflowNodeFlag != 0 {
-		if int64(len(data)) != pageSize || pageSize <= leafContinuationHeaderSize+page.IDSize {
+		if int64(len(data)) != pageSize || pageSize <= continuedNodeHeaderSize+page.IDSize {
 			return NodeHeader{}, nil, nil, ErrInvalid
 		}
-		fixed = leafContinuationHeaderSize
+		fixed = continuedNodeHeaderSize
 		h.BodyLength = binary.LittleEndian.Uint32(data[18:22])
 		h.NextPageCount = binary.LittleEndian.Uint32(data[22:26])
 		if uint64(h.NextPageCount) > uint64((pageSize-int64(fixed)-1)/page.IDSize) {
@@ -134,7 +124,7 @@ func decodeLeafNode(data []byte, id page.ID, pageSize int64, readPage func(page.
 		image := make([]byte, NodeHeaderSize+int(h.BodyLength))
 		copy(image[:14], data[:14])
 		binary.LittleEndian.PutUint16(image[:2], uint16(NodeTypeLeaf))
-		ids, err := copyContinuationBody(data, leafContinuationHeaderSize, image[NodeHeaderSize:], readPage, forWAL, checksums)
+		ids, err := copyContinuationBody(data, image[NodeHeaderSize:], readPage, forWAL, checksums)
 		if err != nil {
 			return nil, err
 		}
@@ -218,9 +208,9 @@ func lookupLeafNode(data []byte, id page.ID, key []byte, pageSize int64, readPag
 		if uint64(h.BodyLength)+NodeHeaderSize <= uint64(pageSize) || uint64(h.BodyLength) > uint64(MaxValueSize+MaxKeySize+leafEntryDescriptorSize) {
 			return Entry{}, false, 0, ErrInvalid
 		}
-		group, groupOffset, cached := data, 0, data
+		var cursor continuationCursor
 		fragment := func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
+			part, _, err := continuationBodyBytes(data, offset, readPage, &cursor, forWAL, checksums)
 			return part, err
 		}
 		_, entry, found, child, err := readEncodedLeaf(data, id, 0, key, false, true, nil, fragment, includeKey)
@@ -266,9 +256,9 @@ func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage f
 		if readPage == nil || uint64(h.BodyLength)+NodeHeaderSize <= uint64(pageSize) || uint64(h.BodyLength) > uint64(MaxValueSize+MaxKeySize+leafEntryDescriptorSize) {
 			return ErrInvalid
 		}
-		group, groupOffset, cached := data, 0, data
+		var cursor continuationCursor
 		fragment = func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, leafContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
+			part, _, err := continuationBodyBytes(data, offset, readPage, &cursor, forWAL, checksums)
 			return part, err
 		}
 	}
@@ -276,7 +266,7 @@ func visitLeafNodeReferences(data []byte, id page.ID, pageSize int64, readPage f
 	if err != nil || fragment == nil {
 		return err
 	}
-	return walkContinuationPages(data, leafContinuationHeaderSize, readPage, forWAL, func(pageID page.ID, _ []byte) error {
+	return walkContinuationPages(data, readPage, forWAL, func(pageID page.ID, _ []byte) error {
 		if pageID != id && visitContinuation != nil {
 			return visitContinuation(pageID)
 		}
@@ -289,7 +279,7 @@ func leafPageCount(node *Node, pageSize int64) int {
 	if pageSize >= NodeHeaderSize && int64(size) <= pageSize {
 		return 1
 	}
-	return continuationPageCount(size-NodeHeaderSize, pageSize, leafContinuationHeaderSize)
+	return continuationPageCount(size-NodeHeaderSize, pageSize, continuedNodeHeaderSize)
 }
 
 // EncodeLeafNodePages writes this leaf and its continuation pages into owned buffers.
@@ -326,7 +316,7 @@ func encodeLeafNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool,
 		pages[0] = data
 		return pages, nil
 	}
-	pages, err := prepareContinuationPages(ids, pageSize, leafContinuationHeaderSize, pages)
+	pages, err := prepareContinuationPages(ids, pageSize, pages)
 	if err != nil {
 		return nil, err
 	}
@@ -344,12 +334,12 @@ func encodeLeafNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool,
 		binary.LittleEndian.PutUint32(fields[4:8], uint32(offset))
 		binary.LittleEndian.PutUint32(fields[8:12], uint32(len(entry.key)))
 		binary.LittleEndian.PutUint32(fields[12:16], uint32(len(entry.value)))
-		copyContinuationBytes(pages, leafContinuationHeaderSize, &index, &at, fields[:])
+		copyContinuationBytes(pages, &index, &at, fields[:])
 		offset += len(entry.key) + len(entry.value)
 	}
 	for _, entry := range node.entries {
-		copyContinuationBytes(pages, leafContinuationHeaderSize, &index, &at, entry.key)
-		copyContinuationBytes(pages, leafContinuationHeaderSize, &index, &at, entry.value)
+		copyContinuationBytes(pages, &index, &at, entry.key)
+		copyContinuationBytes(pages, &index, &at, entry.value)
 	}
 
 	finishContinuationPages(pages, index, at, forWAL)
@@ -536,7 +526,7 @@ func readEncodedLeaf(data []byte, expectedPageID page.ID, storedChecksum uint32,
 			} else {
 				if includeKey {
 					// Keep a key in the first page borrowed. Other keys use a copy of the equal query bytes.
-					physical := leafContinuationHeaderSize + int(binary.LittleEndian.Uint32(data[22:26]))*page.IDSize + start - NodeHeaderSize
+					physical := continuedNodeHeaderSize + int(binary.LittleEndian.Uint32(data[22:26]))*page.IDSize + start - NodeHeaderSize
 					if physical+keyEnd-start <= len(data) {
 						entry.key = data[physical : physical+keyEnd-start : physical+keyEnd-start]
 					} else {

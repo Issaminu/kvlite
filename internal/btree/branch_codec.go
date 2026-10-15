@@ -19,16 +19,6 @@ import (
 // Each child ID uses eight bytes. A key starts at its descriptor's data offset.
 const branchEntryDescriptorSize = 2 * encodedUint32Size
 
-// branchContinuationHeaderSize adds the body length and next-ID count to the normal header.
-//
-//	[18:22] total logical body length, uint32
-//	[22:26] next page count N, uint32
-//	[26:26+8*N] continuation IDs
-//	[26+8*N:P] first body bytes
-//
-// Offsets in entry descriptors still include the normal 18-byte logical header.
-const branchContinuationHeaderSize = NodeHeaderSize + 2*encodedUint32Size
-
 func branchPayloadSize(node *Node) int {
 	size := page.IDSize
 	for _, entry := range node.entries {
@@ -85,10 +75,10 @@ func readBranchNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, check
 	}
 	fixed := NodeHeaderSize
 	if h.Type&overflowNodeFlag != 0 {
-		if int64(len(data)) != pageSize || pageSize <= branchContinuationHeaderSize+page.IDSize {
+		if int64(len(data)) != pageSize || pageSize <= continuedNodeHeaderSize+page.IDSize {
 			return NodeHeader{}, nil, nil, ErrInvalid
 		}
-		fixed = branchContinuationHeaderSize
+		fixed = continuedNodeHeaderSize
 		h.BodyLength = binary.LittleEndian.Uint32(data[18:22])
 		h.NextPageCount = binary.LittleEndian.Uint32(data[22:26])
 		if uint64(h.NextPageCount) > uint64((pageSize-int64(fixed)-1)/page.IDSize) {
@@ -133,7 +123,7 @@ func decodeBranchNode(data []byte, id page.ID, pageSize int64, readPage func(pag
 		image := make([]byte, NodeHeaderSize+int(h.BodyLength))
 		copy(image[:14], data[:14])
 		binary.LittleEndian.PutUint16(image[:2], uint16(NodeTypeBranch))
-		ids, err := copyContinuationBody(data, branchContinuationHeaderSize, image[NodeHeaderSize:], readPage, forWAL, checksums)
+		ids, err := copyContinuationBody(data, image[NodeHeaderSize:], readPage, forWAL, checksums)
 		if err != nil {
 			return nil, err
 		}
@@ -213,9 +203,9 @@ func lookupBranchNode(data []byte, id page.ID, key []byte, pageSize int64, readP
 		if uint64(h.BodyLength)+NodeHeaderSize <= uint64(pageSize) || uint64(h.BodyLength) > uint64(MaxValueSize+MaxKeySize+branchEntryDescriptorSize+page.IDSize) {
 			return Entry{}, false, 0, ErrInvalid
 		}
-		group, groupOffset, cached := data, 0, data
+		var cursor continuationCursor
 		fragment := func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, branchContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
+			part, _, err := continuationBodyBytes(data, offset, readPage, &cursor, forWAL, checksums)
 			return part, err
 		}
 		_, entry, found, child, err := readEncodedBranch(data, id, 0, key, false, true, nil, fragment)
@@ -261,9 +251,9 @@ func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 		if readPage == nil || uint64(h.BodyLength)+NodeHeaderSize <= uint64(pageSize) || uint64(h.BodyLength) > uint64(MaxValueSize+MaxKeySize+branchEntryDescriptorSize+page.IDSize) {
 			return ErrInvalid
 		}
-		group, groupOffset, cached := data, 0, data
+		var cursor continuationCursor
 		fragment = func(offset int) ([]byte, error) {
-			part, _, err := continuationBodyBytes(data, branchContinuationHeaderSize, offset, readPage, &group, &groupOffset, &cached, forWAL, checksums)
+			part, _, err := continuationBodyBytes(data, offset, readPage, &cursor, forWAL, checksums)
 			return part, err
 		}
 	}
@@ -271,7 +261,7 @@ func visitBranchNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 	if err != nil || fragment == nil {
 		return err
 	}
-	return walkContinuationPages(data, branchContinuationHeaderSize, readPage, forWAL, func(pageID page.ID, _ []byte) error {
+	return walkContinuationPages(data, readPage, forWAL, func(pageID page.ID, _ []byte) error {
 		if pageID != id && visitContinuation != nil {
 			return visitContinuation(pageID)
 		}
@@ -284,7 +274,7 @@ func branchPageCount(node *Node, pageSize int64) int {
 	if pageSize >= NodeHeaderSize && int64(size) <= pageSize {
 		return 1
 	}
-	return continuationPageCount(size-NodeHeaderSize, pageSize, branchContinuationHeaderSize)
+	return continuationPageCount(size-NodeHeaderSize, pageSize, continuedNodeHeaderSize)
 }
 
 // EncodeBranchNodePages writes this branch and its continuation pages into owned buffers.
@@ -321,7 +311,7 @@ func encodeBranchNodePages(node *Node, pageSize int64, ids []page.ID, forWAL boo
 		pages[0] = data
 		return pages, nil
 	}
-	pages, err := prepareContinuationPages(ids, pageSize, branchContinuationHeaderSize, pages)
+	pages, err := prepareContinuationPages(ids, pageSize, pages)
 	if err != nil {
 		return nil, err
 	}
@@ -337,16 +327,16 @@ func encodeBranchNodePages(node *Node, pageSize int64, ids []page.ID, forWAL boo
 		var fields [branchEntryDescriptorSize]byte
 		binary.LittleEndian.PutUint32(fields[:4], uint32(offset))
 		binary.LittleEndian.PutUint32(fields[4:8], uint32(len(entry.key)))
-		copyContinuationBytes(pages, branchContinuationHeaderSize, &index, &at, fields[:])
+		copyContinuationBytes(pages, &index, &at, fields[:])
 		offset += len(entry.key)
 	}
 	var field [page.IDSize]byte
 	for _, id := range node.Children {
 		binary.LittleEndian.PutUint64(field[:], uint64(id))
-		copyContinuationBytes(pages, branchContinuationHeaderSize, &index, &at, field[:])
+		copyContinuationBytes(pages, &index, &at, field[:])
 	}
 	for _, entry := range node.entries {
-		copyContinuationBytes(pages, branchContinuationHeaderSize, &index, &at, entry.key)
+		copyContinuationBytes(pages, &index, &at, entry.key)
 	}
 
 	finishContinuationPages(pages, index, at, forWAL)

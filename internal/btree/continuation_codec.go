@@ -112,32 +112,40 @@ func sealContinuationPage(data []byte) {
 	binary.LittleEndian.PutUint32(data[crc:crc+4], pageChecksum(data, int64(len(data)), crc))
 }
 
+// continuationCursor remembers the pages that continuationBodyBytes reached in one continued body.
+// The zero value starts at the first page. A cursor belongs to one caller and one body.
+// It never stores the first page, so the caller can keep it and the body in local variables.
+type continuationCursor struct {
+	group       []byte // last page with an ID array after the first page; nil means the first page
+	groupOffset int    // body offset of group
+	cached      []byte // last checked continuation page; nil before the first read
+}
+
 // continuationBodyBytes returns the mapped fragment at a logical node offset.
 // offset includes the normal 18-byte node header. The returned ID identifies
 // the physical page that holds the fragment. The bytes borrow that page.
 // The owning codec checks the first page. This function checks each later page.
-// group and groupOffset remember the last ID-array page reached by this lookup.
-// cached remembers one verified page. These variables belong to the caller.
-// groupOffset is the body offset of group. It increases when a group is
-// skipped, so a repeated link cannot make this loop run without a bound.
+// cursor remembers the last ID-array page reached and one verified page.
+// Its group offset increases when a group is skipped, so a repeated link
+// cannot make this loop run without a bound.
 // A later group starts at the last ID of the current group. Other IDs point
 // directly to data pages with no ID array. No node entries are decoded here.
 // forWAL selects compact payloads with zero page checksums. Their WAL records
 // must already be verified. checksums selects main-file checksum checks.
-func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(page.ID) ([]byte, error), group *[]byte, groupOffset *int, cached *[]byte, forWAL, checksums bool) ([]byte, page.ID, error) {
+func continuationBodyBytes(first []byte, offset int, read func(page.ID) ([]byte, error), cursor *continuationCursor, forWAL, checksums bool) ([]byte, page.ID, error) {
 	size := int(binary.LittleEndian.Uint32(first[18:22]))
 	offset -= NodeHeaderSize
 	if offset < 0 || offset >= size {
 		return nil, 0, ErrInvalid
 	}
-	data, base := *group, *groupOffset
-	if offset < base {
-		data, base = first, 0
+	group, base := cursor.group, cursor.groupOffset
+	if group == nil || offset < base {
+		group, base = nil, 0
 	}
 	for {
-		fixed := ContinuationHeaderSize
-		if base == 0 {
-			fixed = firstHeaderSize
+		data, fixed := first, continuedNodeHeaderSize
+		if group != nil {
+			data, fixed = group, ContinuationHeaderSize
 		}
 		count := int(binary.LittleEndian.Uint32(data[fixed-4 : fixed]))
 		want := min(continuationPageCount(size-base, int64(len(first)), fixed)-1, (len(first)-fixed-1)/page.IDSize)
@@ -161,8 +169,8 @@ func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(
 		if page.IsMetaID(id) || id == page.ID(binary.LittleEndian.Uint64(first[2:10])) {
 			return nil, 0, ErrInvalid
 		}
-		next := *cached
-		if id != page.ID(binary.LittleEndian.Uint64(next[2:10])) {
+		next := cursor.cached
+		if next == nil || id != page.ID(binary.LittleEndian.Uint64(next[2:10])) {
 			var err error
 			next, err = read(id)
 			if err != nil {
@@ -185,13 +193,13 @@ func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(
 					return nil, 0, ErrInvalid
 				}
 			}
-			*cached = next
+			cursor.cached = next
 		}
 		if index == count-1 {
 			base += bodySize + (count-1)*pageBodySize
-			data = next
-			if base > *groupOffset {
-				*group, *groupOffset = data, base
+			group = next
+			if base > cursor.groupOffset {
+				cursor.group, cursor.groupOffset = group, base
 			}
 			continue
 		}
@@ -210,18 +218,18 @@ func continuationBodyBytes(first []byte, firstHeaderSize, offset int, read func(
 // It returns the continuation IDs for retirement. It rejects repeated IDs
 // and nonzero final padding. forWAL selects verified compact WAL payloads.
 // Mapped point lookups do not copy the full body.
-func copyContinuationBody(first []byte, firstHeaderSize int, dst []byte, read func(page.ID) ([]byte, error), forWAL, checksums bool) ([]page.ID, error) {
+func copyContinuationBody(first []byte, dst []byte, read func(page.ID) ([]byte, error), forWAL, checksums bool) ([]page.ID, error) {
 	if len(dst) != int(binary.LittleEndian.Uint32(first[18:22])) {
 		return nil, ErrInvalid
 	}
-	pages := continuationPageCount(len(dst), int64(len(first)), firstHeaderSize)
+	pages := continuationPageCount(len(dst), int64(len(first)), continuedNodeHeaderSize)
 	if pages < 2 {
 		return nil, ErrInvalid
 	}
 	ids := make([]page.ID, 0, pages-1)
 	firstID := page.ID(binary.LittleEndian.Uint64(first[2:10]))
 	at := 0
-	err := walkContinuationPages(first, firstHeaderSize, read, forWAL, func(id page.ID, part []byte) error {
+	err := walkContinuationPages(first, read, forWAL, func(id page.ID, part []byte) error {
 		if id != firstID {
 			ids = append(ids, id)
 		}
@@ -235,17 +243,17 @@ func copyContinuationBody(first []byte, firstHeaderSize int, dst []byte, read fu
 // It rejects repeated IDs and nonzero final padding.
 // visit receives borrowed body bytes. The owning leaf or branch codec must verify the first page.
 // Full decode copies these bytes. Ownership checks read them without a body copy.
-func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID) ([]byte, error), forWAL bool, visit func(page.ID, []byte) error, checksums bool) error {
+func walkContinuationPages(first []byte, read func(page.ID) ([]byte, error), forWAL bool, visit func(page.ID, []byte) error, checksums bool) error {
 	size := int(binary.LittleEndian.Uint32(first[18:22]))
-	pages := continuationPageCount(size, int64(len(first)), firstHeaderSize)
+	pages := continuationPageCount(size, int64(len(first)), continuedNodeHeaderSize)
 	if pages < 2 {
 		return ErrInvalid
 	}
 	seen := pageIDSet{ids: make([]page.ID, 0, pages)}
-	group, groupOffset, cached := first, 0, first
+	var cursor continuationCursor
 	firstID := page.ID(binary.LittleEndian.Uint64(first[2:10]))
 	for at := 0; at < size; {
-		part, id, err := continuationBodyBytes(first, firstHeaderSize, NodeHeaderSize+at, read, &group, &groupOffset, &cached, forWAL, checksums)
+		part, id, err := continuationBodyBytes(first, NodeHeaderSize+at, read, &cursor, forWAL, checksums)
 		if err != nil {
 			return err
 		}
@@ -253,8 +261,9 @@ func walkContinuationPages(first []byte, firstHeaderSize int, read func(page.ID)
 			return ErrInvalid
 		}
 		if at+len(part) == size && id != firstID {
-			start := ContinuationHeaderSize + int(binary.LittleEndian.Uint32(cached[14:18]))*page.IDSize + len(part)
-			for _, b := range cached[start:] {
+			last := cursor.cached
+			start := ContinuationHeaderSize + int(binary.LittleEndian.Uint32(last[14:18]))*page.IDSize + len(part)
+			for _, b := range last[start:] {
 				if b != 0 {
 					return ErrInvalid
 				}
@@ -329,7 +338,7 @@ func continuationPageCount(bodySize int, pageSize int64, firstHeaderSize int) in
 // It uses supplied destinations or allocates page buffers when pages is nil.
 // The owning codec writes the first page's type-specific fields and body.
 // Continuation pages get their own header here. Their checksums follow body encoding.
-func prepareContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int, pages [][]byte) ([][]byte, error) {
+func prepareContinuationPages(ids []page.ID, pageSize int64, pages [][]byte) ([][]byte, error) {
 	if hasRepeatedPageID(ids) {
 		return nil, ErrInvalid
 	}
@@ -356,7 +365,7 @@ func prepareContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int
 		}
 		fixed := ContinuationHeaderSize
 		if i == 0 {
-			fixed = firstHeaderSize
+			fixed = continuedNodeHeaderSize
 		}
 		// Supplied buffers can contain old header fields, including checksums.
 		clear(data[:fixed])
@@ -382,11 +391,11 @@ func prepareContinuationPages(ids []page.ID, pageSize int64, firstHeaderSize int
 // copyContinuationBytes appends body bytes across the prepared page buffers.
 // index and at keep the write position between descriptors and payload slices.
 // The owning codec supplies those bytes. This function does not interpret them.
-func copyContinuationBytes(pages [][]byte, firstHeaderSize int, index, at *int, source []byte) {
+func copyContinuationBytes(pages [][]byte, index, at *int, source []byte) {
 	for len(source) > 0 {
 		fixed := ContinuationHeaderSize
 		if *index == 0 {
-			fixed = firstHeaderSize
+			fixed = continuedNodeHeaderSize
 		}
 		data := pages[*index]
 		start := fixed + int(binary.LittleEndian.Uint32(data[fixed-4:fixed]))*page.IDSize
