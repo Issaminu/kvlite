@@ -305,6 +305,10 @@ func TestDataPageChecksums_RecoveryUsesWALMetadata(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// Write an unchanged base image before the compact record.
+				if err := db.Put([]byte("bucket"), []byte("key"), value); err != nil {
+					t.Fatal(err)
+				}
 				value[0] = 'b'
 				if err := db.Put([]byte("bucket"), []byte("key"), value); err != nil {
 					t.Fatal(err)
@@ -315,18 +319,28 @@ func TestDataPageChecksums_RecoveryUsesWALMetadata(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// Remove the base transaction to model a WAL from the older writer.
+				log, err := os.ReadFile(path + "-wal")
+				if err != nil {
+					t.Fatal(err)
+				}
+				headerSize := len(log)
+				for _, record := range records {
+					headerSize -= wal.HeaderSize + len(record.Payload) + wal.ChecksumSize
+				}
+				log = log[:headerSize]
 				patched := false
 				for _, record := range records {
+					if record.Header.TxID == records[0].Header.TxID {
+						continue
+					}
+					log = wal.AppendEncodedWALRecord(log, &record)
 					patched = patched || record.Header.Type == wal.RecordTypePatch
 				}
 				if !patched {
 					t.Fatal("fixture did not write a patch that needs a main-page base")
 				}
 				main, err := os.ReadFile(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				log, err := os.ReadFile(path + "-wal")
 				if err != nil {
 					t.Fatal(err)
 				}

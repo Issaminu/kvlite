@@ -104,6 +104,9 @@ func TestWALCommit_EncodesLeafDeletes(t *testing.T) {
 		}
 	}
 	log := New(Config{File: file, PageSize: 256, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -111,20 +114,20 @@ func TestWALCommit_EncodesLeafDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 2 || records[0].Header.Type != RecordTypeLeafDelete {
-		t.Fatalf("WAL records: got %+v, want leaf delete and commit", records)
+	if len(records) != 4 || records[0].Header.Type != RecordTypeNode || records[2].Header.Type != RecordTypeLeafDelete {
+		t.Fatalf("WAL records: got %+v, want a complete image followed by a leaf delete", records)
 	}
-	if got := records[0].Payload; !bytes.Equal(got, []byte{5, 0, 0, 0, 3, 0, 0, 0, 1, 0, 'b', 1, 0, 'd'}) {
+	if got := records[2].Payload; !bytes.Equal(got, []byte{5, 0, 0, 0, 3, 0, 0, 0, 1, 0, 'b', 1, 0, 'd'}) {
 		t.Fatalf("deleted keys: got %v, want b and d", got)
 	}
-	image, err := ApplyLeafDeletes(btree.EncodeWALNode(base), records[0].Payload, base.PageID())
+	image, err := ApplyLeafDeletes(btree.EncodeWALNode(base), records[2].Payload, base.PageID())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(image, btree.EncodeWALNode(target)) {
 		t.Fatal("leaf delete did not rebuild the final node")
 	}
-	image, err = ApplyLeafDeletes(btree.EncodeWALNode(target), records[0].Payload, base.PageID())
+	image, err = ApplyLeafDeletes(btree.EncodeWALNode(target), records[2].Payload, base.PageID())
 	if err != nil || !bytes.Equal(image, btree.EncodeWALNode(target)) {
 		t.Fatalf("repeated leaf delete changed final node: error %v", err)
 	}

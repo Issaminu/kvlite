@@ -14,6 +14,127 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+func TestRecovery_PartialCheckpoint(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		checksums bool
+		deleting  bool
+	}{
+		{name: "overwrite", checksums: true},
+		{name: "delete", deleting: true},
+		{name: "delete-checksums", checksums: true, deleting: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			options := &Options{DataPageChecksums: test.checksums, CheckpointThresholdBytes: 1 << 30}
+			db, err := Open(path, 0600, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for index := range 35 {
+					if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), bytes.Repeat([]byte{byte(index + 1)}, 80)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			main, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			db, err = Open(path, 0600, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			var rootID page.ID
+			if err := db.View(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err == nil {
+					rootID = bucket.rootPageID
+				}
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if test.deleting {
+				for _, key := range []string{"key-015", "key-020"} {
+					if err := db.Delete(testBucketName, []byte(key)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else {
+				for index := 25; index <= 26; index++ {
+					if err := db.Put(testBucketName, []byte(fmt.Sprintf("key-%03d", index)), bytes.Repeat([]byte{byte(index + 100)}, 80)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			}
+			log, err := os.ReadFile(path + "-wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			offset := int(rootID) * int(db.meta.PageSize())
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			complete, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Model a checkpoint that wrote the first sector but left later sectors old.
+			torn := bytes.Clone(main)
+			copy(torn[offset:offset+512], complete[offset:offset+512])
+			if bytes.Equal(torn, main) || bytes.Equal(torn, complete) {
+				t.Fatal("test needs a mix of old and new page sectors")
+			}
+			for _, readOnly := range []bool{false, true} {
+				t.Run(fmt.Sprintf("read-only=%t", readOnly), func(t *testing.T) {
+					crashPath := filepath.Join(t.TempDir(), "database")
+					if err := os.WriteFile(crashPath, torn, 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(crashPath+"-wal", log, 0600); err != nil {
+						t.Fatal(err)
+					}
+					recovered, err := Open(crashPath, 0600, &Options{ReadOnly: readOnly})
+					if err != nil {
+						t.Fatalf("recover committed log over a partial checkpoint: %v", err)
+					}
+					defer recovered.Close()
+					for index := range 35 {
+						key := []byte(fmt.Sprintf("key-%03d", index))
+						got, err := recovered.Get(testBucketName, key)
+						if test.deleting && (index == 15 || index == 20) {
+							if !errors.Is(err, ErrKeyNotFound) {
+								t.Fatalf("deleted key %q: %v", key, err)
+							}
+							continue
+						}
+						value := byte(index + 1)
+						if !test.deleting && (index == 25 || index == 26) {
+							value = byte(index + 100)
+						}
+						if err != nil || !bytes.Equal(got, bytes.Repeat([]byte{value}, 80)) {
+							t.Fatalf("committed value for %q was not recovered: %v", key, err)
+						}
+					}
+				})
+			}
+		})
+	}
+}
+
 func TestOpenIgnoresDroppedAllocationSegmentInWAL(t *testing.T) {
 	for _, test := range []struct {
 		name     string

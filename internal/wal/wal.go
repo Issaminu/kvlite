@@ -57,6 +57,8 @@ type WAL struct {
 // It returns whether the committed WAL size reached the checkpoint threshold.
 //
 // nodes contains original and final data-page images.
+// Each page's first change after a checkpoint uses a complete image.
+// Later changes can use compact records while that image remains in the WAL.
 // The caller sets allocated continuation IDs with [btree.Node.SetOverflowPages].
 // Commit writes one RecordTypeNode per page of a continued node. It publishes
 // compact payloads for those pages after the append succeeds.
@@ -250,7 +252,10 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	if len(record.Final.OverflowPages()) != 0 {
 		return wal.appendContinuedNodeRecords(transaction, record, txid, pages)
 	}
-	if record.Original == nil {
+	// The first change after a checkpoint needs a complete image.
+	// Recovery must not depend on a main page that a partial checkpoint can damage.
+	_, hasWALImage := wal.overlay[header.PageID]
+	if record.Original == nil || !hasWALImage {
 		return appendEncodedNodeRecord(transaction, header, record.Final), nil
 	}
 	// Continuation pages use different offsets from a single-page node.

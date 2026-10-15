@@ -23,6 +23,70 @@ type checkpointWriter struct {
 	writes []checkpointWrite
 }
 
+func TestWALCommit_KeepsFullImageUntilCheckpoint(t *testing.T) {
+	const pageSize = 128
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	main, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer main.Close()
+	log := New(Config{File: file, PageSize: pageSize, SyncOnCommit: true, SyncOnCheckpoint: true})
+	base := btree.NewLeafNode(2)
+	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("start"))); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		value            string
+		wantType         RecordType
+		checkpoint       bool
+		failedCheckpoint bool
+	}{
+		{value: "first", wantType: RecordTypeNode},
+		{value: "later", wantType: RecordTypePatch, failedCheckpoint: true},
+		{value: "reset", wantType: RecordTypeNode, checkpoint: true},
+		{value: "after", wantType: RecordTypePatch},
+	} {
+		if step.failedCheckpoint {
+			readOnly, err := os.Open(main.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpointErr := log.Checkpoint(readOnly, 3*pageSize, false)
+			if err := readOnly.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if checkpointErr == nil {
+				t.Fatal("checkpoint to a read-only file succeeded")
+			}
+		}
+		if step.checkpoint {
+			if err := log.Checkpoint(main, 3*pageSize, false); err != nil {
+				t.Fatal(err)
+			}
+		}
+		target := base.Clone()
+		if err := target.InsertEntry(btree.NewEntry(0, []byte("key"), []byte(step.value))); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		records, err := log.ReadRecords()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(records) < 2 || records[len(records)-2].Header.Type != step.wantType {
+			t.Fatalf("record for %q: want type %d, got %+v", step.value, step.wantType, records)
+		}
+		base = target
+	}
+}
+
 func TestWALCheckpoint_ReusesBuffersAfterWriteFailure(t *testing.T) {
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {

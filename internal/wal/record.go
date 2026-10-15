@@ -46,7 +46,8 @@ type RecordHeader struct {
 }
 
 // NodeRecord carries one changed data node from a write transaction to [WAL.Commit].
-// WAL.Commit compares Original and Final and writes a page patch or leaf-delete record when it is smaller than the complete final image.
+// Commit writes a complete image for the first change to each page after a checkpoint.
+// Later changes can use a page patch or leaf-delete record when it is smaller than the complete final image.
 // Commit uses full records if Original or Final has continuation pages.
 // Final must have allocated continuation IDs, set with [btree.Node.SetOverflowPages].
 // A single-page image has different offsets from a page with continuation IDs.

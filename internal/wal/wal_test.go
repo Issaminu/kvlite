@@ -408,7 +408,8 @@ func TestWALEncodeTransaction_ReusesNodePatchBuffers(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	log := &WAL{pageSize: 128, nextTxid: 1}
+	log := New(Config{PageSize: 128})
+	log.LoadCommittedRecord(WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: base.PageID()}, Payload: btree.EncodeWALNode(base)})
 	nodes := []NodeRecord{{Original: base, Final: target}}
 	if _, _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 		t.Fatal(err)
@@ -440,6 +441,9 @@ func TestWALCommit_EncodesSmallerPagePatchAndPublishesFinalNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := New(Config{File: walFile, PageSize: 128, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	nodes := []NodeRecord{{
 		Original: base,
 		Final:    target,
@@ -452,10 +456,10 @@ func TestWALCommit_EncodesSmallerPagePatchAndPublishesFinalNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 2 || decoded[0].Header.Type != RecordTypePatch {
-		t.Fatalf("decoded WAL records: got %+v, want one page patch and one commit marker", decoded)
+	if len(decoded) != 4 || decoded[0].Header.Type != RecordTypeNode || decoded[2].Header.Type != RecordTypePatch {
+		t.Fatalf("decoded WAL records: got %+v, want a complete image followed by a page patch", decoded)
 	}
-	patched, err := ApplyPagePatch(btree.EncodeWALNode(base), decoded[0].Payload, 128)
+	patched, err := ApplyPagePatch(btree.EncodeWALNode(base), decoded[2].Payload, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -484,6 +488,9 @@ func TestWALCommit_UsesFullImageWhenEntryCountChanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	log := New(Config{File: walFile, PageSize: 128, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := log.Commit([]NodeRecord{{
 		Original: base,
 		Final:    target,
@@ -495,10 +502,10 @@ func TestWALCommit_UsesFullImageWhenEntryCountChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 2 || decoded[0].Header.Type != RecordTypeNode {
-		t.Fatalf("decoded WAL records: got %+v, want one full image and one commit marker", decoded)
+	if len(decoded) != 4 || decoded[2].Header.Type != RecordTypeNode {
+		t.Fatalf("decoded WAL records: got %+v, want a complete image after the entry count changes", decoded)
 	}
-	if err := btree.ValidateWALNode(decoded[0].Payload, target.PageID()); err != nil {
+	if err := btree.ValidateWALNode(decoded[2].Payload, target.PageID()); err != nil {
 		t.Fatalf("validate complete node image: %v", err)
 	}
 }
@@ -514,6 +521,9 @@ func TestWALCommit_EncodesPatchForBranchNode(t *testing.T) {
 	target := base.Clone()
 	target.Children[1] = 5
 	log := New(Config{File: walFile, PageSize: 128, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -522,10 +532,10 @@ func TestWALCommit_EncodesPatchForBranchNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 2 || decoded[0].Header.Type != RecordTypePatch {
-		t.Fatalf("decoded WAL records: got %+v, want one page patch and one commit marker", decoded)
+	if len(decoded) != 4 || decoded[0].Header.Type != RecordTypeNode || decoded[2].Header.Type != RecordTypePatch {
+		t.Fatalf("decoded WAL records: got %+v, want a complete image followed by a page patch", decoded)
 	}
-	patched, err := ApplyPagePatch(btree.EncodeWALNode(base), decoded[0].Payload, 128)
+	patched, err := ApplyPagePatch(btree.EncodeWALNode(base), decoded[2].Payload, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
