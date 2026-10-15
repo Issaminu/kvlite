@@ -9,6 +9,10 @@ import (
 // fileLockRetryInterval limits how often a waiting Open asks the operating system for the same lock.
 const fileLockRetryInterval = 50 * time.Millisecond
 
+// firstFileLockRetryInterval is the first delay of a waiting Open. Each later delay is two times longer, up to fileLockRetryInterval.
+// A process that exits or crashes can release its lock some milliseconds after it ends. Short first delays let a restarted process open the file sooner.
+const firstFileLockRetryInterval = time.Millisecond
+
 // lockDatabaseFile waits for a shared read-only lock or an exclusive writable lock on file. A zero timeout waits without a limit, while a positive timeout returns an error that matches [ErrDatabaseLocked] when the lock remains unavailable.
 func lockDatabaseFile(file *os.File, readOnly bool, timeout time.Duration) error {
 	// The zero time value represents the configured unlimited wait without a separate flag.
@@ -16,6 +20,7 @@ func lockDatabaseFile(file *os.File, readOnly bool, timeout time.Duration) error
 	if timeout > 0 {
 		deadline = time.Now().Add(timeout)
 	}
+	retry := firstFileLockRetryInterval
 	for {
 		// tryFileLock makes one non-blocking operating-system call. A read-only handle requests a shared lock; a writable handle requests an exclusive lock.
 		locked, err := tryFileLock(file, !readOnly)
@@ -29,7 +34,8 @@ func lockDatabaseFile(file *os.File, readOnly bool, timeout time.Duration) error
 		}
 
 		// Sleep between attempts so a waiting Open does not continuously use CPU time.
-		delay := fileLockRetryInterval
+		delay := retry
+		retry = min(2*retry, fileLockRetryInterval)
 		// If deadline == 0, this means that we should keep trying to aquire the lock indefinetly.
 		if !deadline.IsZero() {
 			remaining := time.Until(deadline)
