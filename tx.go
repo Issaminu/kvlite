@@ -57,6 +57,8 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 //
 // If fn returns nil, Update commits all changes together. Other database operations can then read them. If fn returns an error, Update discards all changes. It returns that error unless a shared WAL commit fails, as described below.
 //
+// If a write or sync of the write-ahead log fails during the commit, Update returns an error that matches [ErrWALWriteFailed]. The changes can be saved or lost, because the failed write can still reach storage. The DB then stops. Later transactions, reads, writes, and backups return the same error without calling fn. Close the DB and open it again. Then check the data before you repeat a change that is not safe to apply twice.
+//
 // Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
 //
 // For a file database in [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch before those changes are durable. If the WAL commit fails, Update returns the commit error for each callback that changed data or ran after an earlier change in the batch. That error replaces an error that fn returned, because fn could read changes that the failed commit discards. Act outside the database only after Update returns nil. A memory database commits each callback without a log or file operations.
@@ -79,6 +81,9 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 }
 
 func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
+	if err := db.walWriteFailure(); err != nil {
+		return err
+	}
 	tx := newTx(db, false)
 	defer func() { tx.closed = true }()
 
@@ -179,7 +184,7 @@ func makeWALCommitData(dirty map[page.ID]dirtyNode, meta *page.Meta, metaDirty b
 //
 // Several View callbacks can run at the same time. A View callback waits while [DB.Update] runs. Update waits for all active View callbacks to return.
 //
-// Do not start another transaction from fn. Use the Tx passed to fn. View returns the error from fn. If fn panics, View closes the transaction before the panic continues.
+// Do not start another transaction from fn. Use the Tx passed to fn. View returns the error from fn. If fn panics, View closes the transaction before the panic continues. After [ErrWALWriteFailed], View returns that error without calling fn.
 func (db *DB) View(transaction func(tx *Tx) error) error {
 	if err := db.beginOperation(); err != nil {
 		return err
@@ -189,6 +194,9 @@ func (db *DB) View(transaction func(tx *Tx) error) error {
 	db.operationMu.RLock()
 	defer db.operationMu.RUnlock()
 
+	if err := db.walWriteFailure(); err != nil {
+		return err
+	}
 	tx := newTx(db, true)
 	defer func() { tx.closed = true }()
 	return transaction(tx)

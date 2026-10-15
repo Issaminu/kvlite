@@ -25,7 +25,8 @@ import (
 // It calculates missing checksums before it commits the enabled mode.
 // This cannot detect past damage to bytes that had no checksum.
 // A failed conversion leaves the mode disabled. Converted pages can retain checksums.
-// A later call can retry the conversion. Storage synchronization follows [Options.Synchronous].
+// A later call can retry the conversion. After [ErrWALWriteFailed], reopen the database before the retry.
+// Storage synchronization follows [Options.Synchronous].
 //
 // Do not call SetDataPageChecksums inside a transaction callback.
 func (db *DB) SetDataPageChecksums(enabled bool) error {
@@ -47,6 +48,10 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 		db.operationMu.Unlock()
 		<-done
 		db.operationMu.Lock()
+	}
+	// A conversion checkpoints before it commits, so it must stop before that work too.
+	if err := db.walWriteFailure(); err != nil {
+		return err
 	}
 	if db.meta.DataPageChecksums() == enabled {
 		return nil

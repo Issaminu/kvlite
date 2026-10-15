@@ -477,7 +477,7 @@ func TestSetDataPageChecksums_DisableCommitFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	injected := errors.New("mode commit failed")
 	db.wal.SetSyncFileForTesting(func() error { return injected })
 	if err := db.SetDataPageChecksums(false); !errors.Is(err, injected) {
@@ -487,7 +487,10 @@ func TestSetDataPageChecksums_DisableCommitFailure(t *testing.T) {
 		t.Fatal("failed commit changed mode")
 	}
 	checkDataPageFields(t, db, true)
-	db.wal.SetSyncFileForTesting(nil)
+	if err := db.SetDataPageChecksums(false); !errors.Is(err, ErrWALWriteFailed) {
+		t.Fatalf("disable retry on the stopped handle: got %v, want ErrWALWriteFailed", err)
+	}
+	db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncFull})
 	if err := db.SetDataPageChecksums(false); err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +502,7 @@ func TestSetDataPageChecksums_FinalCommitFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	injected := errors.New("final mode commit failed")
 	syncs := 0
 	db.wal.SetSyncFileForTesting(func() error {
@@ -516,7 +519,10 @@ func TestSetDataPageChecksums_FinalCommitFailure(t *testing.T) {
 		t.Fatal("failed final commit changed mode")
 	}
 	checkDataPageFields(t, db, true)
-	db.wal.SetSyncFileForTesting(nil)
+	db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+	if db.meta.DataPageChecksums() {
+		t.Fatal("reopen after failed final commit changed mode")
+	}
 	if err := db.SetDataPageChecksums(true); err != nil {
 		t.Fatal(err)
 	}

@@ -285,6 +285,8 @@ A writable open creates the log. A clean writable close removes it. An applicati
 
 Writable recovery follows the configured synchronization mode. With `SyncFull` or `SyncNormal`, it synchronizes the WAL, writes the recovered pages to the main file, synchronizes the main file, and then clears the WAL. With `SyncNone`, it writes the recovered pages and clears the WAL without synchronization. A write or required synchronization failure keeps the WAL for another attempt. Read-only recovery keeps the recovered pages in memory and does not change either file.
 
+If a WAL write or sync fails during a commit, the commit returns an error that matches `ErrWALWriteFailed`. The failed transaction can still reach storage, so the commit can be saved or lost. The handle then stops: transactions, reads, writes, and backups return the same error. `Stats`, `Path`, and `Close` still work. Close the handle and open the database again. Recovery then uses the files to decide the result. Check the data before you repeat a change that is not safe to apply twice. A failed checkpoint does not stop the handle, because a later checkpoint writes every page again from memory.
+
 Data-page checksum calculation and checks are disabled by default. Enable them when you create a file:
 
 ```go

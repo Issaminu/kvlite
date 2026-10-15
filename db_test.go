@@ -4571,7 +4571,8 @@ func TestDeleteBucketRepairsCatalogRoot(t *testing.T) {
 }
 
 func TestDeleteBucketWALFailureKeepsTreeAndAllocation(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull})
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncFull})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -4612,6 +4613,7 @@ func TestDeleteBucketWALFailureKeepsTreeAndAllocation(t *testing.T) {
 	if after.AllocatedPageCount != before.AllocatedPageCount || after.PagesRetired != before.PagesRetired {
 		t.Fatalf("failed commit changed allocation: before %+v, after %+v", before, after)
 	}
+	db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncFull})
 	if value, err := db.Get([]byte("data"), []byte("key-099")); err != nil || len(value) != 300 {
 		t.Fatalf("value after failed delete: length %d, error %v", len(value), err)
 	}
@@ -6890,7 +6892,7 @@ func TestWriteBatch_WALFailurePublishesNoCallback(t *testing.T) {
 			t.Fatalf("write error: got %v, want %v", result.err, wantErr)
 		}
 	}
-	db.wal.SetSyncFileForTesting(nil)
+	db = reopenAfterWALWriteFailure(t, db, path, nil)
 	for _, key := range [][]byte{[]byte("first"), []byte("second")} {
 		if _, err := db.Get(testBucketName, key); !errors.Is(err, ErrKeyNotFound) {
 			t.Fatalf("value %q after failed batch: got %v, want ErrKeyNotFound", key, err)
@@ -6945,7 +6947,7 @@ func TestWriteBatch_WALFailureReplacesErrorAfterPendingWrite(t *testing.T) {
 		t.Fatalf("write error: got %v, want %v", result.err, wantErr)
 	}
 	result := <-requests[1].result
-	db.wal.SetSyncFileForTesting(nil)
+	db = reopenAfterWALWriteFailure(t, db, path, nil)
 	if _, err := db.Get(testBucketName, []byte("first")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("value after failed batch: got %v, want ErrKeyNotFound", err)
 	}
@@ -7415,7 +7417,7 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	createBucket(t, db, testBucketName)
 
 	if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
@@ -7466,9 +7468,118 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	if walAfter.Size() != walBefore.Size() {
 		t.Fatalf("failed transaction WAL size: got %d, want %d", walAfter.Size(), walBefore.Size())
 	}
+	db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncNormal})
 	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("old")) {
 		t.Fatalf("value after WAL sync failure: got %q, err %v", got, err)
 	}
+}
+
+func TestUpdate_WALWriteFailureStopsDatabaseUntilReopen(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		synchronous Sync
+	}{
+		// SyncFull commits through the write batch and fails in the WAL sync.
+		{name: "sync failure", synchronous: SyncFull},
+		// SyncNormal commits directly and fails in the WAL write.
+		{name: "write failure", synchronous: SyncNormal},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{Synchronous: test.synchronous})
+			if err != nil {
+				t.Fatal(err)
+			}
+			createBucket(t, db, testBucketName)
+			if err := db.Put(testBucketName, []byte("saved"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+
+			injected := errors.New("injected WAL sync failure")
+			var restore func()
+			if test.synchronous == SyncFull {
+				db.wal.SetSyncFileForTesting(func() error { return injected })
+				restore = func() { db.wal.SetSyncFileForTesting(nil) }
+			} else {
+				writable := db.wal.FileForTesting()
+				readOnly, err := os.Open(path + "-wal")
+				if err != nil {
+					t.Fatal(err)
+				}
+				db.wal.ReplaceFileForTesting(readOnly)
+				restore = func() {
+					db.wal.ReplaceFileForTesting(writable)
+					_ = readOnly.Close()
+				}
+			}
+
+			err = db.Put(testBucketName, []byte("failed"), []byte("value"))
+			// The storage works again. The handle must still stop, because the failed commit can be on disk.
+			restore()
+			if !errors.Is(err, ErrWALWriteFailed) {
+				t.Fatalf("failed commit: got %v, want ErrWALWriteFailed", err)
+			}
+			if test.synchronous == SyncFull && !errors.Is(err, injected) {
+				t.Fatalf("failed commit: got %v, want the sync error %v", err, injected)
+			}
+
+			callbackRan := false
+			err = db.Update(func(tx *Tx) error {
+				callbackRan = true
+				return nil
+			})
+			if !errors.Is(err, ErrWALWriteFailed) || callbackRan {
+				t.Fatalf("Update after WAL failure: callback ran=%v, error=%v, want ErrWALWriteFailed without the callback", callbackRan, err)
+			}
+			if err := db.View(func(tx *Tx) error { return nil }); !errors.Is(err, ErrWALWriteFailed) {
+				t.Fatalf("View after WAL failure: got %v, want ErrWALWriteFailed", err)
+			}
+			if _, err := db.Get(testBucketName, []byte("saved")); !errors.Is(err, ErrWALWriteFailed) {
+				t.Fatalf("Get after WAL failure: got %v, want ErrWALWriteFailed", err)
+			}
+			if err := db.Backup(filepath.Join(t.TempDir(), "backup")); !errors.Is(err, ErrWALWriteFailed) {
+				t.Fatalf("Backup after WAL failure: got %v, want ErrWALWriteFailed", err)
+			}
+			if _, err := db.Stats(); err != nil {
+				t.Fatalf("Stats after WAL failure: %v", err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close after WAL failure: %v", err)
+			}
+
+			reopened, err := Open(path, 0600, &Options{Synchronous: test.synchronous})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			if got, err := reopened.Get(testBucketName, []byte("saved")); err != nil || !bytes.Equal(got, []byte("value")) {
+				t.Fatalf("saved value after reopen: got %q, error %v", got, err)
+			}
+			if _, err := reopened.Get(testBucketName, []byte("failed")); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("failed value after reopen: got %v, want ErrKeyNotFound", err)
+			}
+			if err := reopened.Put(testBucketName, []byte("after"), []byte("value")); err != nil {
+				t.Fatalf("Put after reopen: %v", err)
+			}
+		})
+	}
+}
+
+// reopenAfterWALWriteFailure checks that db stopped after a failed WAL append. It closes db and opens path again with options.
+func reopenAfterWALWriteFailure(t *testing.T, db *DB, path string, options *Options) *DB {
+	t.Helper()
+	if err := db.View(func(*Tx) error { return nil }); !errors.Is(err, ErrWALWriteFailed) {
+		t.Fatalf("View after WAL write failure: got %v, want ErrWALWriteFailed", err)
+	}
+	db.wal.SetSyncFileForTesting(nil)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close after WAL write failure: %v", err)
+	}
+	reopened, err := Open(path, 0600, options)
+	if err != nil {
+		t.Fatalf("reopen after WAL write failure: %v", err)
+	}
+	return reopened
 }
 
 func TestAudit_CheckpointFailureRetriesOnNextCommit(t *testing.T) {
@@ -8177,11 +8288,13 @@ func TestPut_ContinuationPageOwnership(t *testing.T) {
 
 // TestPut_ContinuedCommitFailure keeps the old data and allocation state on failure.
 func TestPut_ContinuedCommitFailure(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+	path := filepath.Join(t.TempDir(), "database")
+	options := &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30}
+	db, err := Open(path, 0600, options)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer db.Close()
+	defer func() { _ = db.Close() }()
 	if err := db.Update(func(tx *Tx) error {
 		bucket, err := tx.CreateBucket(testBucketName)
 		if err != nil {
@@ -8216,10 +8329,6 @@ func TestPut_ContinuedCommitFailure(t *testing.T) {
 		if !errors.Is(err, errDiscardTx) {
 			t.Fatalf("commit error: %v", err)
 		}
-		got, err := db.Get(testBucketName, []byte("key"))
-		if err != nil || !bytes.Equal(got, transition.before) {
-			t.Fatalf("failed commit changed readable bytes: %v", err)
-		}
 		current, err := db.readNode(root.PageID())
 		if err != nil {
 			t.Fatal(err)
@@ -8231,6 +8340,11 @@ func TestPut_ContinuedCommitFailure(t *testing.T) {
 			if !db.allocation.allocated(id) {
 				t.Fatalf("failed commit freed continuation %d", id)
 			}
+		}
+		db = reopenAfterWALWriteFailure(t, db, path, options)
+		got, err := db.Get(testBucketName, []byte("key"))
+		if err != nil || !bytes.Equal(got, transition.before) {
+			t.Fatalf("failed commit changed readable bytes: %v", err)
 		}
 	}
 }
@@ -8579,6 +8693,10 @@ func TestDeleteBucket_ContinuedPages(t *testing.T) {
 			}
 			if err := db.validatePageOwnership(); err != nil {
 				t.Fatal(err)
+			}
+			db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+			if db.allocation.allocatedPageCount() != before {
+				t.Fatal("reopen after failed sync changed allocation")
 			}
 			if err := db.Update(func(tx *Tx) error {
 				parent := mustBucket(t, tx, testBucketName)

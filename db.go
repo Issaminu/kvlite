@@ -78,6 +78,16 @@ func (db *DB) endOperation() {
 	db.activeOperations.Done()
 }
 
+// walWriteFailure returns the [ErrWALWriteFailed] error that stopped this handle, or nil.
+// After that failure, memory no longer matches what the files can recover, so data operations must not continue.
+// The caller must hold operationMu.
+func (db *DB) walWriteFailure() error {
+	if db.wal == nil {
+		return nil
+	}
+	return db.wal.AppendFailure()
+}
+
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
@@ -432,6 +442,9 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 	db.operationMu.RLock()
 	defer db.operationMu.RUnlock()
 
+	if err := db.walWriteFailure(); err != nil {
+		return nil, err
+	}
 	if len(bucketName) == 0 {
 		return nil, ErrBucketNameRequired
 	}

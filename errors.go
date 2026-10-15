@@ -5,6 +5,7 @@ import (
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
+	"github.com/Issaminu/kvlite/internal/wal"
 )
 
 var (
@@ -27,4 +28,5 @@ var (
 	ErrIncompatibleValue    = btree.ErrIncompatibleValue
 	ErrCursorInvalidated    = errors.New("cursor invalidated by bucket change") // ErrCursorInvalidated is returned when a bucket changes while one of its cursors is in use. Create a new cursor before traversal continues.
 	ErrScanCallbackRequired = errors.New("scan callback required")              // ErrScanCallbackRequired is returned when [Bucket.ScanPrefix] or [Bucket.ScanRange] receives a nil callback.
+	ErrWALWriteFailed       = wal.ErrWriteFailed                                // ErrWALWriteFailed means a write or sync of the write-ahead log failed during a commit. That commit can be saved or lost. The DB then returns this error from every later transaction, read, write, and backup. [DB.Stats], [DB.Path], and [DB.Close] still work. Close the DB, open it again, and check the data.
 )

@@ -172,17 +172,31 @@ func TestWALCommit_SyncFailureRestoresAppendOffset(t *testing.T) {
 	}
 
 	log.syncFile = nil
-	if _, err := log.Commit(nil, nil, encodedMeta, nil); err != nil {
+	if _, err := log.Commit(nil, nil, encodedMeta, nil); !errors.Is(err, ErrWriteFailed) {
+		t.Fatalf("commit after failed append: got %v, want ErrWriteFailed", err)
+	}
+
+	// A reopened database gets a new WAL. It appends at the restored offset.
+	reopened := New(Config{
+		File:                     walFile,
+		PageSize:                 64,
+		SyncOnCommit:             true,
+		CheckpointThresholdBytes: 1 << 20,
+	})
+	if _, err := reopened.ReadRecords(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reopened.Commit(nil, nil, encodedMeta, nil); err != nil {
 		t.Fatal(err)
 	}
 	info, err := walFile.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != log.appendOffset {
-		t.Fatalf("WAL size after retry: got %d, append offset %d", info.Size(), log.appendOffset)
+	if info.Size() != reopened.appendOffset {
+		t.Fatalf("WAL size after retry: got %d, append offset %d", info.Size(), reopened.appendOffset)
 	}
-	if got := log.Stats().TotalBytesWritten; got != uint64(info.Size()) {
+	if got := reopened.Stats().TotalBytesWritten; got != uint64(info.Size()) {
 		t.Fatalf("total WAL bytes after retry: got %d, want %d", got, info.Size())
 	}
 }
@@ -276,22 +290,66 @@ func TestWALTruncate_FailureKeepsAppendOffset(t *testing.T) {
 	}
 }
 
-func TestWALFailedRollbackBlocksLaterCommits(t *testing.T) {
+func TestWALFailedAppendBlocksLaterCommits(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		closedFile bool
+	}{
+		{name: "sync failure"},
+		// A closed file fails the write and the rollback truncate.
+		{name: "write and rollback failure", closedFile: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			walFile, err := os.CreateTemp(t.TempDir(), "wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer walFile.Close()
+			log := New(Config{File: walFile, PageSize: 64, SyncOnCommit: true, CheckpointThresholdBytes: 1 << 20})
+			syncErr := errors.New("injected sync failure")
+			log.syncFile = func() error { return syncErr }
+			if test.closedFile {
+				if err := walFile.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			_, failure := log.Commit(nil, nil, []byte("value"), nil)
+			if !errors.Is(failure, ErrWriteFailed) || log.AppendFailure() != failure {
+				t.Fatalf("failed append: got %v, stored %v, want ErrWriteFailed", failure, log.AppendFailure())
+			}
+			if !test.closedFile && !errors.Is(failure, syncErr) {
+				t.Fatalf("failed append: got %v, want the sync error %v", failure, syncErr)
+			}
+			log.syncFile = nil
+			if !test.closedFile {
+				if err := log.Truncate(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := log.Commit(nil, nil, []byte("value"), nil); err != failure {
+				t.Fatalf("commit after failed append: got %v, want the first failure %v", err, failure)
+			}
+		})
+	}
+}
+
+func TestWALCommitErrorBeforeAppendDoesNotBlockLaterCommits(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
 	}
-	log := New(Config{File: walFile, PageSize: 64})
-	if err := walFile.Close(); err != nil {
-		t.Fatal(err)
-	}
-	rollbackErr := log.rollbackAppend(0, 0, false)
-	if rollbackErr == nil {
-		t.Fatal("rollback on closed WAL succeeded")
-	}
+	defer walFile.Close()
+	log := New(Config{File: walFile, PageSize: 64, SyncOnCommit: true, CheckpointThresholdBytes: 1 << 20})
 
-	if _, err := log.Commit(nil, nil, []byte("value"), nil); !errors.Is(err, rollbackErr) {
-		t.Fatalf("commit after failed rollback: got %v, want rollback error %v", err, rollbackErr)
+	if _, err := log.Commit(nil, nil, make([]byte, 65), nil); !errors.Is(err, ErrRecordPayloadTooLarge) || errors.Is(err, ErrWriteFailed) {
+		t.Fatalf("oversized metadata: got %v, want only ErrRecordPayloadTooLarge", err)
+	}
+	if log.AppendFailure() != nil {
+		t.Fatalf("encoding error stopped the WAL: %v", log.AppendFailure())
+	}
+	if _, err := log.Commit(nil, nil, []byte("value"), nil); err != nil {
+		t.Fatalf("commit after encoding error: %v", err)
 	}
 }
 
@@ -1024,11 +1082,20 @@ func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
 		t.Fatal("failed commit changed the overlay")
 	}
 	log.SetSyncFileForTesting(nil)
-	if _, err := log.Commit(changes, nil, nil, nil); err != nil {
+	if _, err := log.Commit(changes, nil, nil, nil); !errors.Is(err, ErrWriteFailed) {
+		t.Fatalf("commit after failed append: got %v, want ErrWriteFailed", err)
+	}
+
+	// A reopened database gets a new WAL. Its retry reuses the transaction ID that the failed commit did not use.
+	reopened := New(Config{File: file, PageSize: pageSize, SyncOnCommit: true})
+	if _, err := reopened.ReadRecords(); err != nil {
 		t.Fatal(err)
 	}
-	records, err := log.ReadRecords()
-	if err != nil || len(records) != len(ids)+3 || log.nextTxid != 3 || len(log.overlay) != len(ids) {
+	if _, err := reopened.Commit(changes, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := reopened.ReadRecords()
+	if err != nil || len(records) != len(ids)+3 || reopened.nextTxid != 3 || len(reopened.overlay) != len(ids) {
 		t.Fatalf("retry: %d records, %v", len(records), err)
 	}
 	for _, record := range records[2 : len(records)-1] {

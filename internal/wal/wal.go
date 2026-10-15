@@ -49,7 +49,7 @@ type WAL struct {
 	largeEncodingBuffers     sync.Pool                 // *[]byte encoding buffers larger than maxRetainedEncodingBufferBytes
 	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
 	pagePatch                PagePatch                 // reusable page patch; encoded into encodingBuffer before reuse
-	appendFailure            error                     // set when rollback truncate fails; blocks later commits until [WAL.Truncate] succeeds
+	appendFailure            error                     // set when an append fails after it starts to write; blocks every later commit on this WAL
 	syncFile                 func() error              // syncFile is a test hook for sync failures and call counts.
 }
 
@@ -70,11 +70,14 @@ type WAL struct {
 //
 // Appends use [WAL.appendOffset], not the WAL file read/write cursor, so unrelated seeks on the file cannot corrupt the log.
 //
-// On failure, Commit truncates the failed append and restores the pre-append byte and synchronization state without updating the overlay.
-// If that rollback truncate fails, Commit stores the truncate error and later Commit calls return it until [WAL.Truncate] succeeds.
+// An error before the append starts, such as an oversized payload, changes nothing.
+// A write or sync failure returns an error that matches [ErrWriteFailed].
+// Commit then truncates the failed append and restores the pre-append byte and synchronization state without updating the overlay.
+// The truncate is not synchronized, so the failed transaction can still reach storage.
+// Every later Commit on this WAL returns the same error, because a new transaction must not build on that unknown file state.
 func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, retired map[page.ID]struct{}) (bool, error) {
 	if wal.appendFailure != nil {
-		return false, fmt.Errorf("WAL append is disabled after failed rollback: %w", wal.appendFailure)
+		return false, wal.appendFailure
 	}
 	if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
 		if len(retired) != 0 {
@@ -95,7 +98,8 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 	needsCheckpoint, err := wal.appendTransaction(transaction)
 	if err != nil {
 		rollbackErr := wal.rollbackAppend(startOffset, bytesBefore, unsyncedBefore)
-		return false, errors.Join(err, rollbackErr)
+		wal.appendFailure = fmt.Errorf("%w: %w", ErrWriteFailed, errors.Join(err, rollbackErr))
+		return false, wal.appendFailure
 	}
 	wal.totalBytesWritten += uint64(wal.appendOffset - startOffset)
 
@@ -417,11 +421,10 @@ func appendBranchNodePatch(patch *PagePatch, base, target *btree.Node) (encodedS
 }
 
 // rollbackAppend removes bytes from a failed commit and restores the counters that describe the retained WAL prefix.
-// A truncate failure leaves [WAL.appendFailure] set and blocks later appends until [WAL.Truncate] succeeds.
+// Without a crash, a later open of this WAL then does not recover the failed transaction.
 func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUnsyncedWrites bool) error {
 	if err := wal.file.Truncate(offset); err != nil {
-		wal.appendFailure = fmt.Errorf("truncate failed WAL transaction: %w", err)
-		return wal.appendFailure
+		return fmt.Errorf("truncate failed WAL transaction: %w", err)
 	}
 	wal.bytesSinceCheckpoint = bytesSinceCheckpoint
 	wal.hasUnsyncedWrites = hasUnsyncedWrites
@@ -504,8 +507,8 @@ func (wal *WAL) Sync() error {
 	return nil
 }
 
-// Truncate clears the WAL file.
-// It resets [WAL.appendOffset] and clears [WAL.appendFailure] so appends can resume after a failed rollback truncate.
+// Truncate clears the WAL file and resets [WAL.appendOffset].
+// It does not clear an append failure. Only a new WAL for a reopened database accepts commits again.
 //
 // Only truncate after the WAL contents have been ingested into the database.
 func (wal *WAL) Truncate() error {
@@ -513,8 +516,13 @@ func (wal *WAL) Truncate() error {
 		return err
 	}
 	wal.appendOffset = 0
-	wal.appendFailure = nil
 	return nil
+}
+
+// AppendFailure returns the error that stopped commits after a failed append, or nil.
+// The caller must hold the same lock that it holds for [WAL.Commit].
+func (wal *WAL) AppendFailure() error {
+	return wal.appendFailure
 }
 
 // Delete the WAL file

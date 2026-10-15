@@ -52,6 +52,10 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	}
 
 	db.operationMu.Lock()
+	if err := db.walWriteFailure(); err != nil {
+		db.operationMu.Unlock()
+		return err
+	}
 	size, err := db.logicalFileSize()
 	if err != nil {
 		db.operationMu.Unlock()

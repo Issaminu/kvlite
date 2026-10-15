@@ -168,7 +168,8 @@ func TestStatsWriteBatchCountsOneCommit(t *testing.T) {
 }
 
 func TestStatsFailedCommit(t *testing.T) {
-	db := openStatsDB(t, &Options{Synchronous: SyncFull, MaxWriteBatchSize: 1})
+	options := &Options{Synchronous: SyncFull, MaxWriteBatchSize: 1}
+	db := openStatsDB(t, options)
 	createBucket(t, db, []byte("data"))
 	before := readStats(t, db)
 	syncError := errors.New("sync failed")
@@ -181,13 +182,27 @@ func TestStatsFailedCommit(t *testing.T) {
 	if got := readStats(t, db); got != before {
 		t.Fatalf("failed commit changed statistics: %+v", got)
 	}
-	if _, err := db.Get([]byte("data"), []byte("failed")); !errors.Is(err, ErrKeyNotFound) {
+	if err := db.Put([]byte("data"), []byte("failed"), []byte("value")); !errors.Is(err, ErrWALWriteFailed) {
+		t.Fatalf("Put on the stopped handle: got %v, want ErrWALWriteFailed", err)
+	}
+	if got := readStats(t, db); got != before {
+		t.Fatalf("rejected Put changed statistics: %+v", got)
+	}
+
+	reopened := reopenAfterWALWriteFailure(t, db, db.Path(), options)
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := reopened.Get([]byte("data"), []byte("failed")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("failed commit published data: %v", err)
 	}
-	if err := db.Put([]byte("data"), []byte("failed"), []byte("value")); err != nil {
+	reopenedBefore := readStats(t, reopened)
+	if err := reopened.Put([]byte("data"), []byte("failed"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	retried := readStats(t, db).Sub(&before)
+	retried := readStats(t, reopened).Sub(&reopenedBefore)
 	if retried.WALCommitCount != 1 || retried.WALBytesWritten == 0 || retried.AllocatedPageCount != before.AllocatedPageCount {
 		t.Fatalf("retry counters: %+v", retried)
 	}

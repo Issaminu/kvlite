@@ -979,7 +979,8 @@ func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
 }
 
 func TestDeleteWALFailureKeepsTreeAndAllocationState(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: SyncFull})
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncFull})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1026,6 +1027,7 @@ func TestDeleteWALFailureKeepsTreeAndAllocationState(t *testing.T) {
 	if db.meta.LastPage() != lastPageBefore {
 		t.Fatalf("last page after failed delete: got %d, want %d", db.meta.LastPage(), lastPageBefore)
 	}
+	db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncFull})
 	for index := range entryCount {
 		if _, err := db.Get(testBucketName, fmt.Appendf(nil, "key-%04d", index)); err != nil {
 			t.Fatalf("read key %d after failed delete: %v", index, err)
