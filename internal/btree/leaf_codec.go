@@ -165,12 +165,12 @@ func checkLeafBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) e
 // lookupLeafBody finds key in a contiguous leaf image with a binary search.
 // It reads only the descriptors and keys on the search path.
 // The returned key and value borrow image. Set includeKey to false to omit the key.
-func lookupLeafBody(image []byte, h NodeHeader, key []byte, includeKey bool) (Entry, bool, error) {
-	dataStart, err := leafDataStart(uint64(len(image)), h.EntryCount)
+func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool) (Entry, bool, error) {
+	dataStart, err := leafDataStart(uint64(len(image)), entryCount)
 	if err != nil {
 		return Entry{}, false, err
 	}
-	count, imageSize := int(h.EntryCount), uint64(len(image))
+	count, imageSize := int(entryCount), uint64(len(image))
 	low, high := 0, count
 	for low < high {
 		middle := (low + high) / 2
@@ -218,6 +218,9 @@ func mappedLeafImage(data []byte, id page.ID, checksums bool, readPage func(page
 			return nil, err
 		}
 		return image, nil
+	}
+	if _, _, ok := plainNodeHeader(data, id, int64(len(data)), false, checksums); ok {
+		return data, nil
 	}
 	if _, err := readNodeHeader(data, id, int64(len(data)), false, checksums); err != nil {
 		return nil, err

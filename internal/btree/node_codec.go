@@ -405,6 +405,24 @@ func readNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksums b
 	return h, nil
 }
 
+// plainNodeHeader reads the type and entry count of a one-page leaf or branch that needs no checksum check.
+// It returns ok=false for every other page. readNodeHeader then checks that page and reports the error.
+// It returns only small values, so a lookup does not copy a NodeHeader for each page.
+func plainNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksums bool) (kind NodeType, count uint32, ok bool) {
+	if len(data) < NodeHeaderSize || int64(len(data)) > pageSize {
+		return 0, 0, false
+	}
+	kind = NodeType(binary.LittleEndian.Uint16(data[:2]))
+	if kind != NodeTypeLeaf && kind != NodeTypeBranch || page.ID(binary.LittleEndian.Uint64(data[2:10])) != id {
+		return 0, 0, false
+	}
+	// A WAL payload needs a zero checksum, and a mapped page with checksums on needs a verified one.
+	if checksum := binary.LittleEndian.Uint32(data[14:18]); checksum != 0 && (forWAL || checksums) {
+		return 0, 0, false
+	}
+	return kind, binary.LittleEndian.Uint32(data[10:14]), true
+}
+
 // kind returns NodeTypeLeaf or NodeTypeBranch without the continuation flag.
 func (h NodeHeader) kind() NodeType {
 	return h.Type &^ overflowNodeFlag
@@ -519,6 +537,15 @@ func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage fu
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, 0, err
 	}
+	// Most lookups read a one-page node with no checksum to check.
+	if kind, count, ok := plainNodeHeader(data, id, pageSize, forWAL, checksums); ok {
+		if kind == NodeTypeBranch {
+			child, err := lookupBranchBody(data, count, key)
+			return Entry{}, false, child, err
+		}
+		entry, found, err := lookupLeafBody(data, count, key, includeKey)
+		return entry, found, 0, err
+	}
 	h, err := readNodeHeader(data, id, pageSize, forWAL, checksums)
 	if err != nil {
 		return Entry{}, false, 0, err
@@ -537,10 +564,10 @@ func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage fu
 		return entry, found, 0, err
 	}
 	if h.kind() == NodeTypeBranch {
-		child, err := lookupBranchBody(data, h, key)
+		child, err := lookupBranchBody(data, h.EntryCount, key)
 		return Entry{}, false, child, err
 	}
-	entry, found, err := lookupLeafBody(data, h, key, includeKey)
+	entry, found, err := lookupLeafBody(data, h.EntryCount, key, includeKey)
 	return entry, found, 0, err
 }
 

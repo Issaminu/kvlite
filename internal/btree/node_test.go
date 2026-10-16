@@ -15,6 +15,57 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+// The lookup fast path must never accept a page that readNodeHeader rejects, and it must return the same kind and entry count.
+func TestPlainNodeHeader_AcceptsOnlyPagesThatReadNodeHeaderAccepts(t *testing.T) {
+	const id, pageSize = page.ID(8), 64
+	header := func(kind NodeType, pageID page.ID, checksum uint32, size int) []byte {
+		data := make([]byte, size)
+		binary.LittleEndian.PutUint16(data[0:2], uint16(kind))
+		binary.LittleEndian.PutUint64(data[2:10], uint64(pageID))
+		binary.LittleEndian.PutUint32(data[10:14], 3)
+		binary.LittleEndian.PutUint32(data[14:18], checksum)
+		return data
+	}
+	checked := header(NodeTypeLeaf, id, 0, 32)
+	binary.LittleEndian.PutUint32(checked[14:18], pageChecksum(checked, pageSize, nodeChecksumOffset))
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "leaf", data: header(NodeTypeLeaf, id, 0, 32)},
+		{name: "branch", data: header(NodeTypeBranch, id, 0, 32)},
+		{name: "continued leaf", data: header(NodeTypeLeaf|overflowNodeFlag, id, 0, pageSize)},
+		{name: "continued branch", data: header(NodeTypeBranch|overflowNodeFlag, id, 0, pageSize)},
+		{name: "other page", data: header(NodeTypeLeaf, id+1, 0, 32)},
+		{name: "continuation page", data: header(NodeTypeContinuation, id, 0, 32)},
+		{name: "wrong checksum", data: header(NodeTypeLeaf, id, 1, 32)},
+		{name: "correct checksum", data: checked},
+		{name: "short", data: header(NodeTypeLeaf, id, 0, 32)[:NodeHeaderSize-1]},
+		{name: "longer than page", data: header(NodeTypeLeaf, id, 0, pageSize+1)},
+	}
+	accepted := 0
+	for _, test := range tests {
+		for _, forWAL := range []bool{false, true} {
+			for _, checksums := range []bool{false, true} {
+				kind, count, ok := plainNodeHeader(test.data, id, pageSize, forWAL, checksums)
+				if !ok {
+					continue
+				}
+				accepted++
+				h, err := readNodeHeader(test.data, id, pageSize, forWAL, checksums)
+				if err != nil || h.isContinued() || kind != h.kind() || count != h.EntryCount {
+					t.Errorf("%s (forWAL=%t, checksums=%t): fast path accepted kind %d count %d; readNodeHeader returned %+v, %v", test.name, forWAL, checksums, kind, count, h, err)
+				}
+			}
+		}
+	}
+	// Leaves and branches with a zero checksum pass in all four modes.
+	// A nonzero checksum, correct or not, passes only in the mode that checks no checksum.
+	if accepted != 10 {
+		t.Fatalf("fast path accepted %d header and mode pairs, want 10", accepted)
+	}
+}
+
 func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 	original := &Node{
 		header:   newNodeHeader(NodeTypeBranch, 1),

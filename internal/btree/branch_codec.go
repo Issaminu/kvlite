@@ -176,12 +176,12 @@ func checkBranchBody(image []byte, h NodeHeader, exact bool, visit func(page.ID)
 // lookupBranchBody returns the child that routes key in a contiguous branch image.
 // That child is on the right side of the last separator that is not larger than key, so a key equal to a separator goes right.
 // It reads only the separators on the search path.
-func lookupBranchBody(image []byte, h NodeHeader, key []byte) (page.ID, error) {
-	dataStart, err := branchDataStart(uint64(len(image)), h.EntryCount)
+func lookupBranchBody(image []byte, entryCount uint32, key []byte) (page.ID, error) {
+	dataStart, err := branchDataStart(uint64(len(image)), entryCount)
 	if err != nil {
 		return 0, err
 	}
-	count, imageSize := int(h.EntryCount), uint64(len(image))
+	count, imageSize := int(entryCount), uint64(len(image))
 	// Find the first separator that is larger than key. Its index is also the index of the child.
 	low, high := 0, count
 	for low < high {
