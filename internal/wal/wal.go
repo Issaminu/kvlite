@@ -63,6 +63,7 @@ type WAL struct {
 	salt                     uint64                    // salt of the current generation; written in the file header
 	checksumSeed             uint32                    // CRC32C checksum of salt; every record checksum starts from it
 	syncFile                 func() error              // syncFile is a test hook for sync failures and call counts.
+	syncDirectory            func() error              // set until the first successful Sync syncs the database directory
 }
 
 // Commit appends one transaction and publishes each changed page to the committed overlay.
@@ -521,6 +522,13 @@ func (wal *WAL) Sync() error {
 	}
 	if err != nil {
 		return err
+	}
+	if wal.syncDirectory != nil {
+		// A file sync does not persist a new file name. The first sync of this WAL also syncs its directory.
+		if err := wal.syncDirectory(); err != nil {
+			return err
+		}
+		wal.syncDirectory = nil
 	}
 	wal.hasUnsyncedWrites = false
 	return nil

@@ -41,7 +41,8 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 	return db.ingestWalRecords(committed)
 }
 
-func (db *DB) readOrCreateWal(path string, pageSize int64) (*wal.WAL, []wal.WALRecord, error) {
+// syncDirectory is nil when the handle must not sync the database directory.
+func (db *DB) readOrCreateWal(path string, pageSize int64, syncDirectory func() error) (*wal.WAL, []wal.WALRecord, error) {
 	// Open supplies the resolved absolute path so symbolic links share one log.
 	walPath := path + "-wal"
 	var walFile *os.File
@@ -72,6 +73,7 @@ func (db *DB) readOrCreateWal(path string, pageSize int64) (*wal.WAL, []wal.WALR
 		SyncOnCommit:             db.options.Synchronous == SyncFull,
 		SyncOnCheckpoint:         db.options.Synchronous != SyncNone,
 		CheckpointThresholdBytes: db.options.CheckpointThresholdBytes,
+		SyncDirectory:            syncDirectory,
 	})
 
 	records, err := log.ReadRecords()

@@ -32,6 +32,7 @@ type Config struct {
 	SyncOnCommit             bool
 	SyncOnCheckpoint         bool
 	CheckpointThresholdBytes uint64
+	SyncDirectory            func() error // SyncDirectory makes the names of the database and WAL files durable. The first successful [WAL.Sync] calls it once. Nil means that the WAL does not sync the directory.
 }
 
 // CommittedPage is the latest committed state of one page that is not yet checkpointed.
@@ -52,6 +53,7 @@ func New(config Config) *WAL {
 		syncOnCommit:             config.SyncOnCommit,
 		syncOnCheckpoint:         config.SyncOnCheckpoint,
 		checkpointThresholdBytes: config.CheckpointThresholdBytes,
+		syncDirectory:            config.SyncDirectory,
 		overlay:                  make(map[page.ID]CommittedPage),
 		nextTxid:                 1,
 	}

@@ -2248,7 +2248,7 @@ func TestOpen_NilOptionsCreatesWritableDatabase(t *testing.T) {
 	}
 }
 
-func TestOpen_SyncsParentDirectory(t *testing.T) {
+func TestOpen_SyncsParentDirectoryAtFirstWALSync(t *testing.T) {
 	for _, test := range []struct {
 		name     string
 		options  *Options
@@ -2297,6 +2297,23 @@ func TestOpen_SyncsParentDirectory(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// A handle that does not write does not sync the directory.
+				if parent != nil {
+					t.Fatalf("open %d: Open synced the directory before a write", attempt)
+				}
+				if !db.options.ReadOnly {
+					if err := db.Update(func(tx *Tx) error {
+						_, err := tx.CreateBucket([]byte{'b', byte('0' + attempt)})
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+					// SyncFull must sync the directory before the first commit returns success.
+					if test.wantSync && db.options.Synchronous == SyncFull && parent == nil {
+						t.Fatalf("open %d: the first SyncFull commit returned before the directory sync", attempt)
+					}
+				}
+				// SyncNormal syncs the WAL, and so the directory, at the checkpoint in Close.
 				if err := db.Close(); err != nil {
 					t.Fatal(err)
 				}
@@ -2321,17 +2338,23 @@ func TestOpen_DirectorySyncFailure(t *testing.T) {
 		parent = dir
 		return syncErr
 	})
-	if db != nil {
-		_ = db.Close()
-		t.Fatal("Open returned a database after directory sync failed")
+	if err != nil {
+		t.Fatalf("Open synced the directory before a write: %v", err)
 	}
+	// The first commit syncs the WAL and then the directory. A failed sync must fail that commit.
+	err = db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket(testBucketName)
+		return err
+	})
 	if !errors.Is(err, syncErr) {
-		t.Fatalf("Open error: got %v, want %v", err, syncErr)
+		t.Fatalf("first commit error: got %v, want %v", err, syncErr)
 	}
 	if _, err := parent.Stat(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("directory was not closed after sync failure: %v", err)
 	}
-	// A failed Open must release its file lock so a retry can succeed.
+	// A failed WAL sync stops the handle, like any failed WAL write.
+	_ = db.Close()
+	// Close must release the file lock so a new Open can succeed.
 	db, err = Open(path, 0600, &Options{LockTimeout: time.Millisecond})
 	if err != nil {
 		t.Fatalf("retry Open: %v", err)

@@ -91,7 +91,9 @@ func (db *DB) walWriteFailure() error {
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
-// With [SyncFull] or [SyncNormal], a writable Open syncs the parent directory before it returns success. The file system must support directory sync.
+// With [SyncFull] or [SyncNormal], the first write-ahead log sync of a writable handle also syncs the parent directory.
+// That sync runs before a commit or a checkpoint depends on the file names, so a handle that does not write does not sync the directory.
+// The file system must support directory sync.
 // Windows skips directory sync.
 // Open follows symbolic links and keeps the write-ahead log beside the target file.
 //
@@ -171,7 +173,22 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 		}
 	}
 
-	wal, records, err := db.readOrCreateWal(filePath, walPageSize)
+	var syncWALDirectory func() error
+	if !db.options.ReadOnly && db.options.Synchronous != SyncNone {
+		// Close removes the WAL, so a writable Open can create its name again. A file sync does not persist a new file name.
+		// The first WAL sync calls this function, so both names reach storage before a commit or a checkpoint depends on them.
+		syncWALDirectory = func() error {
+			parent, err := os.Open(filepath.Dir(filePath))
+			if err != nil {
+				return fmt.Errorf("open database directory: %w", err)
+			}
+			if err := errors.Join(syncDirectory(parent), parent.Close()); err != nil {
+				return fmt.Errorf("sync database directory: %w", err)
+			}
+			return nil
+		}
+	}
+	wal, records, err := db.readOrCreateWal(filePath, walPageSize, syncWALDirectory)
 	if err != nil {
 		return db.failOpen(err)
 	}
@@ -222,17 +239,6 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 	if !db.options.ReadOnly {
 		if err := db.wal.Truncate(); err != nil {
 			return db.failOpen(err)
-		}
-	}
-	if !db.options.ReadOnly && db.options.Synchronous != SyncNone {
-		// File sync does not persist a new file name.
-		// Both names must reach storage before a later commit can return success.
-		parent, err := os.Open(filepath.Dir(filePath))
-		if err != nil {
-			return db.failOpen(fmt.Errorf("open database directory: %w", err))
-		}
-		if err := errors.Join(syncDirectory(parent), parent.Close()); err != nil {
-			return db.failOpen(fmt.Errorf("sync database directory: %w", err))
 		}
 	}
 	db.startWriteBatcher()
