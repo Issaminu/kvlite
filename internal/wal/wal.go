@@ -64,6 +64,7 @@ type WAL struct {
 	checksumSeed             uint32                    // CRC32C checksum of salt; every record checksum starts from it
 	syncFile                 func() error              // syncFile is a test hook for sync failures and call counts.
 	syncDirectory            func() error              // set until the first successful Sync syncs the database directory
+	fileKnownEmpty           bool                      // true while the file is known to hold no bytes, so Truncate makes no system call
 }
 
 // Commit appends one transaction and publishes each changed page to the committed overlay.
@@ -465,6 +466,7 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 		return nil, err
 	}
 	if info.Size() == 0 {
+		wal.fileKnownEmpty = true
 		return nil, nil
 	}
 
@@ -538,11 +540,17 @@ func (wal *WAL) Sync() error {
 // It does not clear an append failure. Only a new WAL for a reopened database accepts commits again.
 //
 // Only truncate after the WAL contents have been ingested into the database.
+// Truncate makes no system call when the file is known to be empty, for example after Open finds an empty WAL.
 func (wal *WAL) Truncate() error {
+	if wal.fileKnownEmpty {
+		wal.appendOffset = 0
+		return nil
+	}
 	if err := wal.file.Truncate(0); err != nil {
 		return err
 	}
 	wal.appendOffset = 0
+	wal.fileKnownEmpty = true
 	return nil
 }
 
@@ -570,6 +578,8 @@ func (wal *WAL) Delete() error {
 func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 	writeOffset := wal.appendOffset
 	bytesWritten := len(transaction)
+	// A write that fails can still leave bytes in the file.
+	wal.fileKnownEmpty = false
 	if writeOffset == 0 {
 		header := encodeWALFileHeader(wal.salt)
 		if err := fileio.WriteFullAt(wal.file, header[:], 0); err != nil {

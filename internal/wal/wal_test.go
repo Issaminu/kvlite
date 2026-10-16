@@ -436,6 +436,43 @@ func TestWALTruncate_FailureKeepsAppendOffset(t *testing.T) {
 	}
 }
 
+// Open truncates the WAL of every writable handle.
+// A WAL that was empty at open needs no system call, but a WAL with any bytes, even a torn header, does.
+func TestWALTruncate_SkipsOnlyAFileKnownToBeEmpty(t *testing.T) {
+	header := encodeWALFileHeader(1)
+	for _, test := range []struct {
+		name     string
+		content  []byte
+		wantCall bool
+	}{
+		{name: "empty"},
+		{name: "torn header", content: header[:3], wantCall: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			walFile, err := os.CreateTemp(t.TempDir(), "wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := walFile.Write(test.content); err != nil {
+				t.Fatal(err)
+			}
+			log := New(Config{Path: walFile.Name(), File: walFile, PageSize: 4096})
+			records, err := log.ReadRecords()
+			if err != nil || len(records) != 0 {
+				t.Fatalf("read records: got %d records and error %v, want none", len(records), err)
+			}
+			// A closed file fails every system call, so Truncate returns nil only when it makes none.
+			if err := walFile.Close(); err != nil {
+				t.Fatal(err)
+			}
+			err = log.Truncate()
+			if called := err != nil; called != test.wantCall {
+				t.Fatalf("Truncate made a system call: %t (error %v), want %t", called, err, test.wantCall)
+			}
+		})
+	}
+}
+
 func TestWALFailedAppendBlocksLaterCommits(t *testing.T) {
 	for _, test := range []struct {
 		name       string
