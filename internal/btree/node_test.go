@@ -581,7 +581,7 @@ func BenchmarkDecodeContinuedLeaf(b *testing.B) {
 				b.SetBytes(int64(size))
 				b.ReportAllocs()
 				for b.Loop() {
-					if _, err := DecodeLeafNode(pages[0], node.PageID(), pageSize, read, false); err != nil {
+					if _, err := DecodeNode(pages[0], node.PageID(), pageSize, read, false); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -1170,11 +1170,17 @@ func TestNodePages_RejectsDamageAndCycles(t *testing.T) {
 	invalid := bytes.Clone(pages[0])
 	binary.LittleEndian.PutUint32(invalid[22:26], ^uint32(0))
 	binary.LittleEndian.PutUint32(invalid[14:18], pageChecksum(invalid, 64, nodeChecksumOffset))
-	if _, _, _, err := ReadMappedLeafNode(invalid, 8, 64, true); !errors.Is(err, ErrInvalid) {
+	if _, err := readNodeHeader(invalid, 8, 64, false, true); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("invalid node ID array with valid CRC: %v", err)
 	}
 	if _, err := DecodeNode(invalid, 8, 64, read, true); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("decode invalid node ID array: %v", err)
+	}
+	// Without a new checksum, the checksum check finds the damage before the continued fields are used.
+	damaged := bytes.Clone(pages[0])
+	binary.LittleEndian.PutUint32(damaged[22:26], ^uint32(0))
+	if _, err := DecodeNode(damaged, 8, 64, read, true); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("decode damaged continued header with checksums: %v", err)
 	}
 	if _, err := DecodeNode(pages[0], 8, 64, nil, true); !errors.Is(err, ErrInvalid) {
 		t.Fatal("continued node accepted no reader")
@@ -1585,6 +1591,60 @@ func BenchmarkDeleteLeaf(b *testing.B) {
 				}
 				if err != nil || !changed || root.EntryCount() != 64-c.count {
 					b.Fatalf("delete: changed=%t error=%v", changed, err)
+				}
+			}
+		})
+	}
+}
+
+// TestNodeCodecRejectsWrongTypeBeforeContinuationPages checks that the page type selects the body layout.
+// An unknown type, or a body read with the layout of the other node type, fails before any continuation page is read.
+func TestNodeCodecRejectsWrongTypeBeforeContinuationPages(t *testing.T) {
+	read := func(id page.ID) ([]byte, error) {
+		t.Fatal("wrong type followed continuation IDs")
+		return nil, ErrInvalid
+	}
+	leaf := NewLeafNode(8)
+	if err := leaf.InsertEntry(NewEntry(0, []byte("k"), []byte("v"))); err != nil {
+		t.Fatal(err)
+	}
+	branch := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), []byte("k"))
+	for name, test := range map[string]struct {
+		node *Node
+		tag  NodeType
+	}{
+		"unknown type":           {leaf, 7},
+		"unknown continued type": {leaf, 7 | overflowNodeFlag},
+		"continuation page":      {leaf, NodeTypeContinuation},
+		"leaf read as branch":    {leaf, NodeTypeBranch},
+		"branch read as leaf":    {branch, NodeTypeLeaf},
+	} {
+		t.Run(name, func(t *testing.T) {
+			data := EncodeWALNode(test.node)
+			binary.LittleEndian.PutUint16(data[:2], uint16(test.tag))
+			if _, err := DecodeNode(data, 8, 64, read, false); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("decode: %v", err)
+			}
+			if _, err := DecodeWALNode(data, 8, 64, read); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL decode: %v", err)
+			}
+			if _, _, _, err := LookupMappedNode(data, 8, []byte("k"), read, true, false); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("mapped lookup: %v", err)
+			}
+			if _, _, _, err := LookupEncodedWALNode(data, 8, []byte("k"), 64, read, true); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL lookup: %v", err)
+			}
+			visit := func(page.ID) error { return nil }
+			if err := VisitMappedNodeReferences(data, 8, 64, read, visit, visit, false); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("mapped reference check: %v", err)
+			}
+			if err := VisitWALNodeReferences(data, 8, 64, read, visit, visit); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL reference check: %v", err)
+			}
+			// A continuation page is a valid WAL payload, so only the other types apply.
+			if test.tag != NodeTypeContinuation {
+				if err := ValidateWALNode(data, 8); !errors.Is(err, ErrInvalid) {
+					t.Fatalf("WAL validation: %v", err)
 				}
 			}
 		})

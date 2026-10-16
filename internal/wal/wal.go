@@ -684,11 +684,10 @@ func (wal *WAL) CommittedPageToNode(record *CommittedPage) (*btree.Node, error) 
 }
 
 // LookupCommittedPage searches one committed leaf or routes through one branch.
-// A decoded record uses its Node. An encoded record uses binary search over
-// its page images. It reads continuation images from the committed WAL overlay.
-// Normal entries borrow their source bytes. A continued leaf owns its value.
-// A continued key borrows the first image when it fits there; otherwise it owns
-// a copy. Keep source bytes unchanged while using borrowed results.
+// A decoded record uses its Node. An encoded record is searched in its page images.
+// It reads continuation images from the committed WAL overlay.
+// Normal entries borrow their source bytes. Keep source bytes unchanged while using borrowed results.
+// A continued leaf owns a copy of its value, and its key is a copy of key.
 // Set includeKey to false to omit the key from encoded lookup results.
 // Decoded entries still borrow their key and value from the Node.
 func (wal *WAL) LookupCommittedPage(record *CommittedPage, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {

@@ -27,6 +27,10 @@ var checksumZeroBlock [checksumZeroBlockSize]byte
 // Offsets in entry descriptors still include the normal 18-byte logical header.
 const continuedNodeHeaderSize = NodeHeaderSize + 2*encodedUint32Size
 
+// maxContinuedBodyLength limits the declared body length of a continued node before decode allocates it.
+// One leaf entry, or one branch entry with its child ID, uses 16 bytes in addition to its key and value.
+const maxContinuedBodyLength = MaxValueSize + MaxKeySize + leafEntryDescriptorSize
+
 // mappedNodeType reads only the type tag common to every page type.
 func mappedNodeType(data []byte) NodeType {
 	if len(data) < 2 {
@@ -102,53 +106,37 @@ func checkPageChecksum(data []byte, pageSize int64, offset int, checksums bool) 
 	return nil
 }
 
-// DecodeNode selects the leaf or branch codec and verifies the complete node.
+// DecodeNode verifies and decodes a leaf or branch, including all of its continuation pages.
 // readPage supplies continuation pages. Pass nil for a normal node.
 // A continued node requires a non-nil readPage function.
 // The returned node owns data or a rebuilt logical body. Do not change its owned bytes.
 // checksums selects verification of nonzero checksum fields.
 func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), checksums bool) (*Node, error) {
-	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
-		return DecodeBranchNode(data, id, pageSize, readPage, checksums)
-	}
-	return DecodeLeafNode(data, id, pageSize, readPage, checksums)
+	return decodeNode(data, id, pageSize, readPage, false, checksums)
 }
 
-// LookupMappedNode selects the leaf or branch mapped lookup.
+// LookupMappedNode finds key in a mapped leaf, or the child page that routes key in a mapped branch.
 // A leaf returns an entry. A branch returns a child page ID.
-// Normal entry bytes borrow data. Continued leaf values own their bytes.
-// A continued key borrows the first page when it fits there; otherwise it owns a copy.
-// Set includeKey to false to omit the returned key and its copy.
-// Keep data unchanged while a result uses its borrowed bytes.
-// Pass nil for a normal node. A continued node requires readPage.
+// The entry of a node in one page borrows data. Keep data unchanged while the result uses it.
+// A continued node is read in place, and the lookup reads only the pages that it needs.
+// The entry of a continued leaf owns a copy of its value (see [Entry.ValueIsOwned]), and its key is a copy of key.
+// Set includeKey to false to omit the returned key.
+// Pass nil readPage for a normal node. A continued node requires readPage.
 // readPage keeps visited continuation pages unchanged until this call returns.
 // checksums selects verification of nonzero checksum fields.
 func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (Entry, bool, page.ID, error) {
-	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, 0, err
-	}
-	kind := mappedNodeType(data)
-	branch := kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag
-	if checksums {
-		if branch {
-			return lookupCheckedBranchNode(data, id, key, readPage)
-		}
-		return lookupCheckedLeafNode(data, id, key, readPage, includeKey)
-	}
-	if branch {
-		return lookupBranchNode(data, id, key, int64(len(data)), readPage, false, false)
-	}
-	return lookupLeafNode(data, id, key, int64(len(data)), readPage, false, includeKey, false)
+	return lookupNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums)
 }
 
-// EncodeNode selects the node's codec and updates its checksum.
+// EncodeNode writes a compact page image and updates the node's checksum.
 // The returned compact image belongs to the caller and excludes page padding.
+// The checksum includes zero padding up to pageSize.
 // pageSize must not be smaller than the encoded node. WriteNode checks this before writing.
 func EncodeNode(node *Node, pageSize int64) []byte {
-	if node.IsLeaf() {
-		return EncodeLeafNode(node, pageSize)
-	}
-	return EncodeBranchNode(node, pageSize)
+	data := EncodeWALNode(node)
+	node.header.Checksum = pageChecksum(data, pageSize, nodeChecksumOffset)
+	binary.LittleEndian.PutUint32(data[nodeChecksumOffset:NodeHeaderSize], node.header.Checksum)
+	return data
 }
 
 func nodePayloadSize(node *Node) int {
@@ -158,15 +146,12 @@ func nodePayloadSize(node *Node) int {
 	return branchPayloadSize(node)
 }
 
-// DecodeWALNode selects the codec for a compact node from a verified WAL record.
+// DecodeWALNode decodes a compact leaf or branch from a verified WAL record.
 // Each page checksum must be zero. pageSize is the physical database page size.
 // readPage supplies verified continuation payloads. Pass nil for a normal node.
 // The returned node owns data or a rebuilt logical image. Do not change its owned bytes.
 func DecodeWALNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
-	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
-		return DecodeWALBranchNode(data, id, pageSize, readPage)
-	}
-	return DecodeWALLeafNode(data, id, pageSize, readPage)
+	return decodeNode(data, id, pageSize, readPage, true, false)
 }
 
 // ValidateWALNode checks one WAL node payload without constructing a Node.
@@ -175,38 +160,27 @@ func DecodeWALNode(data []byte, id page.ID, pageSize int64, readPage func(page.I
 // Header and ID-array checks use the compact payload length. Checkpoint adds padding.
 // This does not follow continuation IDs or validate the complete continued body.
 func ValidateWALNode(data []byte, id page.ID) error {
-	switch mappedNodeType(data) {
-	case NodeTypeLeaf:
-		return validateWALLeafNode(data, id)
-	case NodeTypeBranch:
-		return validateWALBranchNode(data, id)
-	case NodeTypeLeaf | overflowNodeFlag:
-		_, _, _, err := readLeafNodeHeader(data, id, int64(len(data)), true, false)
-		return err
-	case NodeTypeBranch | overflowNodeFlag:
-		_, _, _, err := readBranchNodeHeader(data, id, int64(len(data)), true, false)
-		return err
-	case NodeTypeContinuation:
+	if mappedNodeType(data) == NodeTypeContinuation {
 		_, _, _, err := readContinuationNodeHeader(data, id, int64(len(data)), true, false)
 		return err
-	default:
-		return ErrInvalid
 	}
+	h, err := readNodeHeader(data, id, int64(len(data)), true, false)
+	if err != nil || h.isContinued() {
+		return err
+	}
+	return checkBody(data, h, true, nil)
 }
 
-// LookupEncodedWALNode selects the codec for a point lookup in a verified WAL record.
-// It searches encoded bytes without creating a Node or copying the full body.
-// pageSize is the physical database page size. readPage supplies verified
-// continuation payloads. Pass nil for a normal node. Every page checksum is zero.
-// Normal entries borrow data. A continued leaf owns its value. Its key borrows
-// the first page when it fits there; otherwise it owns a copy. A branch returns
-// a child page ID. Keep source bytes unchanged while using borrowed results.
-// Set includeKey to false to omit the returned key and its copy.
+// LookupEncodedWALNode finds key in a leaf from a verified WAL record, or the child page that routes key in a branch.
+// It searches the encoded bytes without creating a Node.
+// pageSize is the physical database page size. Every page checksum is zero.
+// readPage supplies verified continuation payloads. Pass nil for a normal node.
+// The entry of a node in one page borrows data. Keep data unchanged while the result uses it.
+// A continued node is read in place, and the lookup reads only the pages that it needs.
+// The entry of a continued leaf owns a copy of its value, and its key is a copy of key.
+// Set includeKey to false to omit the returned key.
 func LookupEncodedWALNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
-	if kind := mappedNodeType(data); kind == NodeTypeBranch || kind == NodeTypeBranch|overflowNodeFlag {
-		return lookupWALBranchNode(data, id, key, pageSize, readPage)
-	}
-	return lookupWALLeafNode(data, id, key, pageSize, readPage, includeKey)
+	return lookupNode(data, id, key, pageSize, readPage, true, includeKey, false)
 }
 
 // EncodeWALNode returns an owned compact node image without padding or a node checksum.
@@ -222,7 +196,7 @@ func WALNodeEncodedSize(node *Node) int {
 	return node.EncodedSize()
 }
 
-// AppendEncodedWALNode appends an owned compact image to data using the selected codec.
+// AppendEncodedWALNode appends an owned compact image to data.
 func AppendEncodedWALNode(data []byte, node *Node) []byte {
 	start := len(data)
 	size := WALNodeEncodedSize(node)
@@ -232,11 +206,15 @@ func AppendEncodedWALNode(data []byte, node *Node) []byte {
 	return data
 }
 
+// encodeWALNode writes a compact image with no page padding or node checksum.
+// data must have WALNodeEncodedSize bytes. A verified WAL record protects these bytes.
 func encodeWALNode(data []byte, node *Node) {
+	clear(data)
+	putNodeHeader(data, node.kind(), node)
 	if node.IsLeaf() {
-		encodeLeafWALNode(data, node)
+		putLeafBody(data, node)
 	} else {
-		encodeBranchWALNode(data, node)
+		putBranchBody(data, node)
 	}
 }
 
@@ -248,10 +226,7 @@ func encodeWALNode(data []byte, node *Node) {
 // No Node or complete body copy is created. Callbacks can run before an error;
 // the caller must finish all checks before it changes ownership.
 func VisitMappedNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, checksums bool) error {
-	if mappedNodeType(data) & ^overflowNodeFlag == NodeTypeBranch {
-		return visitBranchNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false, checksums)
-	}
-	return visitLeafNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false, checksums)
+	return visitNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, false, checksums)
 }
 
 // VisitWALNodeReferences checks a node from verified compact WAL records.
@@ -259,39 +234,34 @@ func VisitMappedNodeReferences(data []byte, id page.ID, pageSize int64, readPage
 // Each payload must have passed its WAL checksum check. Page checksums must be
 // zero. This checks the complete body without creating a Node or copying values.
 func VisitWALNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error) error {
-	if mappedNodeType(data) & ^overflowNodeFlag == NodeTypeBranch {
-		return visitBranchNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true, false)
-	}
-	return visitLeafNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true, false)
+	return visitNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true, false)
 }
 
-// NodePageCount selects the codec's count, including its first page.
+// NodePageCount returns the number of pages that the encoded node uses, including its first page.
 // It returns zero when a required continued header and ID cannot fit.
 func NodePageCount(node *Node, pageSize int64) int {
-	if node.IsLeaf() {
-		return leafPageCount(node, pageSize)
+	size := node.EncodedSize()
+	if pageSize >= NodeHeaderSize && int64(size) <= pageSize {
+		return 1
 	}
-	return branchPageCount(node, pageSize)
+	return continuationPageCount(size-NodeHeaderSize, pageSize, continuedNodeHeaderSize)
 }
 
-// EncodeNodePages selects the leaf or branch page encoder.
-// The returned pages belong to the caller. Encoding does not change node or ids.
+// EncodeNodePages writes this node and its continuation pages into owned buffers.
+// ids must start with node.PageID and contain exactly NodePageCount distinct non-metadata IDs.
+// The caller must own the allocated IDs. Encoding does not change node or ids.
 func EncodeNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
-	if node.IsLeaf() {
-		return EncodeLeafNodePages(node, pageSize, ids)
-	}
-	return EncodeBranchNodePages(node, pageSize, ids)
+	return encodeNodePages(node, pageSize, ids, false, nil)
 }
 
-// EncodeWALNodePages selects the leaf or branch encoder for compact WAL page images.
-// ids has the same requirements as EncodeNodePages. Each image omits page padding
-// and has a zero page checksum. The WAL record protects its bytes. Stored key and
-// value bytes, including trailing zeros, stay intact. The caller owns the images.
+// EncodeWALNodePages writes compact WAL page images.
+// ids has the same requirements as EncodeNodePages.
+// Each image omits page padding and has a zero page checksum.
+// The WAL record protects its bytes.
+// Stored key and value bytes, including trailing zeros, stay intact.
+// The caller owns the images.
 func EncodeWALNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
-	if node.IsLeaf() {
-		return encodeLeafNodePages(node, pageSize, ids, true, nil)
-	}
-	return encodeBranchNodePages(node, pageSize, ids, true, nil)
+	return encodeNodePages(node, pageSize, ids, true, nil)
 }
 
 // WALNodePagesEncodedSize returns the total bytes in compact WAL page images.
@@ -332,12 +302,7 @@ func EncodeWALNodePagesInto(node *Node, pageSize int64, ids []page.ID, pages [][
 			return ErrInvalid
 		}
 	}
-	var err error
-	if node.IsLeaf() {
-		_, err = encodeLeafNodePages(node, pageSize, ids, true, pages)
-	} else {
-		_, err = encodeBranchNodePages(node, pageSize, ids, true, pages)
-	}
+	_, err := encodeNodePages(node, pageSize, ids, true, pages)
 	return err
 }
 
@@ -403,45 +368,300 @@ func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad, dataPageCheck
 	return nil
 }
 
-// copyEncodedBody copies only the requested bytes from mapped body fragments.
-// A descriptor or child ID uses a small caller-owned buffer. A point lookup
-// supplies storage only for the matching value. It never copies the full body.
-func copyEncodedBody(offset int, dst []byte, fragment func(int) ([]byte, error)) error {
-	for len(dst) > 0 {
-		part, err := fragment(offset)
-		if err != nil {
-			return err
-		}
-		n := copy(dst, part)
-		offset += n
-		dst = dst[n:]
+// readNodeHeader checks the first page of a leaf or branch and returns its header.
+// Mapped pages and verified WAL payloads use the same checks.
+// forWAL requires a zero checksum. Otherwise checksums verifies a nonzero checksum.
+// The check verifies the checksum before it uses the continued-header fields.
+// The first page of a continued node also has a body length and a next-ID count.
+// The body must need more than one page and must not be larger than the largest body that one entry can create.
+// The continuation codec checks each later page separately.
+func readNodeHeader(data []byte, id page.ID, pageSize int64, forWAL, checksums bool) (NodeHeader, error) {
+	if len(data) < NodeHeaderSize || int64(len(data)) > pageSize {
+		return NodeHeader{}, ErrInvalid
 	}
-	return nil
+	h := NodeHeader{Type: NodeType(binary.LittleEndian.Uint16(data[:2])), PageID: page.ID(binary.LittleEndian.Uint64(data[2:10])),
+		EntryCount: binary.LittleEndian.Uint32(data[10:14]), Checksum: binary.LittleEndian.Uint32(data[14:18])}
+	if kind := h.kind(); kind != NodeTypeLeaf && kind != NodeTypeBranch || h.PageID != id {
+		return NodeHeader{}, ErrInvalid
+	}
+	if h.isContinued() && (int64(len(data)) != pageSize || pageSize <= continuedNodeHeaderSize+page.IDSize) {
+		return NodeHeader{}, ErrInvalid
+	}
+	if forWAL {
+		if h.Checksum != 0 {
+			return NodeHeader{}, fmt.Errorf("read WAL node checksum %x: %w", h.Checksum, ErrInvalid)
+		}
+	} else if checksums && h.Checksum != 0 && h.Checksum != pageChecksum(data, pageSize, nodeChecksumOffset) {
+		return NodeHeader{}, fmt.Errorf("node page %d: %w", id, page.ErrChecksum)
+	}
+	if h.isContinued() {
+		h.BodyLength = binary.LittleEndian.Uint32(data[18:22])
+		h.NextPageCount = binary.LittleEndian.Uint32(data[22:26])
+		if uint64(h.BodyLength)+NodeHeaderSize <= uint64(pageSize) || uint64(h.BodyLength) > maxContinuedBodyLength ||
+			uint64(h.NextPageCount) > uint64((pageSize-continuedNodeHeaderSize-1)/page.IDSize) {
+			return NodeHeader{}, ErrInvalid
+		}
+	}
+	return h, nil
 }
 
-// compareEncodedKey compares mapped key bytes without assembling a continued key.
-// Each page fragment is compared with the matching part of key.
-// It stops at the first difference. Normal keys use [bytes.Compare] directly.
-func compareEncodedKey(offset, size int, key []byte, fragment func(int) ([]byte, error)) (int, error) {
-	keySize := len(key)
-	for remaining := min(size, keySize); remaining > 0; {
-		part, err := fragment(offset)
-		if err != nil {
-			return 0, err
+// kind returns NodeTypeLeaf or NodeTypeBranch without the continuation flag.
+func (h NodeHeader) kind() NodeType {
+	return h.Type &^ overflowNodeFlag
+}
+
+// isContinued reports whether h names the first page of a continued node.
+func (h NodeHeader) isContinued() bool {
+	return h.Type&overflowNodeFlag != 0
+}
+
+// continuedDirectoryScratchSize is the size of the caller-owned copy of a directory that a continued body stores across pages.
+// A continued leaf has one entry and a continued branch has at most two separators (see Node.NeedsSplit), so their descriptors and child IDs fit.
+// A larger directory uses new storage.
+const continuedDirectoryScratchSize = 64
+
+// validKey reports whether a key at image[start:end] has a valid size and lies in the data area of the image.
+// The data area starts at dataStart, after the descriptors, and ends at imageSize.
+// Leaves and branches use the same rule.
+func validKey(start, end, dataStart, imageSize uint64) bool {
+	// end-start-1 < MaxKeySize also rejects an empty key, because the subtraction wraps.
+	return end-start-1 < MaxKeySize && start >= dataStart && end <= imageSize
+}
+
+// inOrder reports whether an entry follows the previous entry: its key starts at next, where the previous entry ends, and is larger than the previous key.
+// A key is never empty, so an empty previous key accepts the first entry.
+func inOrder(start, next uint64, previous, key []byte) bool {
+	return start == next && bytes.Compare(previous, key) < 0
+}
+
+// errEntryCount reports an entry count whose descriptors do not fit in the image.
+var errEntryCount = fmt.Errorf("read node entry count: %w", ErrInvalid)
+
+// entryError reports an invalid descriptor, an entry out of order, or a key out of order.
+func entryError(index int) error {
+	return fmt.Errorf("read node entry %d: %w", index, ErrInvalid)
+}
+
+// errBodySize reports a body that has bytes after its last entry.
+var errBodySize = fmt.Errorf("read node body size: %w", ErrInvalid)
+
+// decodeNode verifies and decodes a leaf or branch, including all of its continuation pages.
+// forWAL requires zero page checksums. checksums selects main-file checksum checks.
+// A normal node owns data. A continued node owns a rebuilt logical image.
+func decodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (*Node, error) {
+	image, h, ids, err := nodeImage(data, id, pageSize, readPage, forWAL, checksums)
+	if err != nil {
+		return nil, err
+	}
+	// A main-file page has zero padding after its body. A WAL image and a rebuilt image end at their last entry.
+	node, err := decodeBody(image, h, forWAL || h.isContinued())
+	if err != nil {
+		return nil, err
+	}
+	node.continuationPageIDs = ids
+	return node, nil
+}
+
+// nodeImage checks the header of a leaf or branch and returns one contiguous image of it.
+// A node that fits in one page returns data.
+// A continued node returns a new image that has a normal header and the complete body, and the IDs of its continuation pages.
+// Every read of a node works on one contiguous image, so the body code never sees a page boundary.
+// h is the header of the first page.
+func nodeImage(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (image []byte, h NodeHeader, ids []page.ID, err error) {
+	h, err = readNodeHeader(data, id, pageSize, forWAL, checksums)
+	if err != nil {
+		return nil, NodeHeader{}, nil, err
+	}
+	if !h.isContinued() {
+		return data, h, nil, nil
+	}
+	if readPage == nil {
+		return nil, NodeHeader{}, nil, continuationPagesError(id)
+	}
+	image = make([]byte, NodeHeaderSize+int(h.BodyLength))
+	copy(image[:nodeChecksumOffset], data[:nodeChecksumOffset])
+	binary.LittleEndian.PutUint16(image[:2], uint16(h.kind()))
+	ids, err = copyContinuationBody(data, image[NodeHeaderSize:], readPage, forWAL, checksums)
+	if err != nil {
+		return nil, NodeHeader{}, nil, err
+	}
+	return image, h, ids, nil
+}
+
+// decodeBody decodes the entries of one contiguous image.
+// h becomes the node header. exact requires the last entry to end at the end of image.
+func decodeBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
+	if h.kind() == NodeTypeLeaf {
+		return decodeLeafBody(image, h, exact)
+	}
+	return decodeBranchBody(image, h, exact)
+}
+
+// checkBody checks one contiguous leaf or branch image in the same way as decodeBody, without a Node.
+// visit receives the child page IDs of a branch or the nested bucket roots of a leaf. visit can be nil.
+func checkBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) error) error {
+	if h.kind() == NodeTypeLeaf {
+		return checkLeafBody(image, h, exact, visit)
+	}
+	return checkBranchBody(image, h, exact, visit)
+}
+
+// continuationPagesError reports a continued node that the caller gave no readPage function.
+func continuationPagesError(id page.ID) error {
+	return fmt.Errorf("node %d requires continuation pages: %w", id, ErrInvalid)
+}
+
+// lookupNode finds key in a leaf, or the child that routes key in a branch.
+// A node in one page is searched in place, so the result borrows data.
+// A continued node is read page by page with a continuedBody, so a lookup reads only the pages that it needs.
+// forWAL uses verified compact payloads and requires zero page checksums.
+func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, includeKey, checksums bool) (Entry, bool, page.ID, error) {
+	if err := validateLookupKey(key); err != nil {
+		return Entry{}, false, 0, err
+	}
+	h, err := readNodeHeader(data, id, pageSize, forWAL, checksums)
+	if err != nil {
+		return Entry{}, false, 0, err
+	}
+	if h.isContinued() {
+		if readPage == nil {
+			return Entry{}, false, 0, continuationPagesError(id)
 		}
-		n := min(remaining, len(part))
-		if cmp := bytes.Compare(part[:n], key[:n]); cmp != 0 {
-			return cmp, nil
+		var cursor continuationCursor
+		body := continuedBody{first: data, readPage: readPage, forWAL: forWAL, checksums: checksums, cursor: &cursor}
+		if h.kind() == NodeTypeBranch {
+			child, err := lookupContinuedBranch(&body, h, key)
+			return Entry{}, false, child, err
 		}
-		offset += n
-		key = key[n:]
-		remaining -= n
+		entry, found, err := lookupContinuedLeaf(&body, h, key, includeKey)
+		return entry, found, 0, err
 	}
-	if size < keySize {
-		return -1, nil
+	if h.kind() == NodeTypeBranch {
+		child, err := lookupBranchBody(data, h, key)
+		return Entry{}, false, child, err
 	}
-	if size > keySize {
-		return 1, nil
+	entry, found, err := lookupLeafBody(data, h, key, includeKey)
+	return entry, found, 0, err
+}
+
+// visitNodeReferences checks the complete body and every owned page of a leaf or branch.
+// A node in one page is checked in place. A one-page main-file node can have zero padding after its body.
+// A continued node is read page by page with a continuedBody, so the check does not copy values.
+// Then walkContinuationPages checks every continuation page and passes its ID to visitContinuation.
+func visitNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, forWAL, checksums bool) error {
+	h, err := readNodeHeader(data, id, pageSize, forWAL, checksums)
+	if err != nil {
+		return err
 	}
-	return 0, nil
+	if !h.isContinued() {
+		return checkBody(data, h, forWAL, visit)
+	}
+	if readPage == nil {
+		return continuationPagesError(id)
+	}
+	var cursor continuationCursor
+	body := continuedBody{first: data, readPage: readPage, forWAL: forWAL, checksums: checksums, cursor: &cursor}
+	if h.kind() == NodeTypeBranch {
+		err = checkContinuedBranch(&body, h, visit)
+	} else {
+		err = checkContinuedLeaf(&body, h, visit)
+	}
+	if err != nil {
+		return err
+	}
+	return walkContinuationPages(data, readPage, forWAL, func(pageID page.ID, _ []byte) error {
+		if pageID != id && visitContinuation != nil {
+			return visitContinuation(pageID)
+		}
+		return nil
+	}, checksums)
+}
+
+// A body is a fixed-size directory followed by the keys in entry order.
+// A leaf stores each value after its key. A branch stores only keys.
+// The node type selects the directory layout. See leaf_codec.go and branch_codec.go.
+// A node in one page writes its body with putLeafBody or putBranchBody.
+// A continued node writes its directory with putDirectory and streams the keys and values after it.
+
+// directorySize returns the size of the directory: the descriptors, and the child IDs of a branch.
+func directorySize(node *Node) int {
+	if node.IsLeaf() {
+		return leafDirectorySize(node)
+	}
+	return branchDirectorySize(node)
+}
+
+// putDirectory writes the directory of node into dst, which has directorySize bytes.
+func putDirectory(dst []byte, node *Node) {
+	if node.IsLeaf() {
+		putLeafDirectory(dst, node)
+	} else {
+		putBranchDirectory(dst, node)
+	}
+}
+
+// putNodeHeader writes the type, page ID, and entry count. It does not change the checksum field.
+func putNodeHeader(data []byte, nodeType NodeType, node *Node) {
+	binary.LittleEndian.PutUint16(data[:2], uint16(nodeType))
+	binary.LittleEndian.PutUint64(data[2:10], uint64(node.PageID()))
+	binary.LittleEndian.PutUint32(data[10:14], uint32(len(node.entries)))
+}
+
+// encodeNodePages writes main-file pages or compact WAL images of one leaf or branch.
+// pages supplies destinations. Pass nil to allocate them.
+func encodeNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool, pages [][]byte) ([][]byte, error) {
+	encodedSize := node.EncodedSize()
+	if uint64(encodedSize) > uint64(^uint32(0)) || len(ids) == 0 || len(ids) != NodePageCount(node, pageSize) ||
+		ids[0] != node.PageID() || page.IsMetaID(ids[0]) {
+		return nil, ErrInvalid
+	}
+	if len(ids) == 1 {
+		size := int(pageSize)
+		if forWAL {
+			size = encodedSize
+		}
+		var data []byte
+		if pages == nil {
+			data = make([]byte, size)
+		} else {
+			data = pages[0][:size:size]
+		}
+		encodeWALNode(data[:encodedSize], node)
+		if !forWAL {
+			binary.LittleEndian.PutUint32(data[nodeChecksumOffset:NodeHeaderSize], pageChecksum(data, pageSize, nodeChecksumOffset))
+		}
+		if pages == nil {
+			pages = make([][]byte, 1)
+		}
+		pages[0] = data
+		return pages, nil
+	}
+	pages, err := prepareContinuationPages(ids, pageSize, pages)
+	if err != nil {
+		return nil, err
+	}
+	first := pages[0]
+	putNodeHeader(first, node.kind()|overflowNodeFlag, node)
+	binary.LittleEndian.PutUint32(first[18:22], uint32(encodedSize-NodeHeaderSize))
+	// A continued node has few entries, so its directory uses a small temporary buffer.
+	// The keys and values stream into the pages without a copy of the full body.
+	var scratch [continuedDirectoryScratchSize]byte
+	directory := scratch[:]
+	if size := directorySize(node); size > len(directory) {
+		directory = make([]byte, size)
+	} else {
+		directory = directory[:size]
+	}
+	putDirectory(directory, node)
+	index, at := 0, 0
+	copyContinuationBytes(pages, &index, &at, directory)
+	leaf := node.IsLeaf()
+	for _, entry := range node.entries {
+		copyContinuationBytes(pages, &index, &at, entry.key)
+		if leaf {
+			copyContinuationBytes(pages, &index, &at, entry.value)
+		}
+	}
+	finishContinuationPages(pages, index, at, forWAL)
+	return pages, nil
 }

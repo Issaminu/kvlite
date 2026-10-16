@@ -105,7 +105,12 @@ func newNodeHeader(nodeType NodeType, pgid page.ID) NodeHeader {
 
 // IsLeaf reports whether n stores key and value entries.
 func (n *Node) IsLeaf() bool {
-	return n.header.Type & ^overflowNodeFlag == NodeTypeLeaf
+	return n.kind() == NodeTypeLeaf
+}
+
+// kind returns NodeTypeLeaf or NodeTypeBranch without the continuation flag.
+func (n *Node) kind() NodeType {
+	return n.header.kind()
 }
 
 func (n *Node) PageID() page.ID {

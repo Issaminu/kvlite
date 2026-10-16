@@ -121,9 +121,9 @@ func (bucket *Bucket) ScanPrefix(prefix []byte, fn func(key, value []byte) error
 }
 
 // scanMappedTreeRange visits entries in the half-open range [start, end) from the main database file.
-// It reads ordinary leaf entries from page bytes. It decodes branches and continued leaves.
+// It reads ordinary leaf entries from page bytes. It decodes branches, and it rebuilds each continued leaf into one image.
 // The caller must first prove that committed WAL pages cannot replace pages in the main file.
-// Results borrow page bytes or a decoded continuation body. They remain valid while the current database operation holds its read lock.
+// Results borrow page bytes or the rebuilt image of a continued leaf. They remain valid while the current database operation holds its read lock.
 func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
 	data, err := db.readMainNodePage(pageID)
 	if err != nil {

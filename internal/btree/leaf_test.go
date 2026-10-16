@@ -204,38 +204,3 @@ func TestLookupMappedNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 		t.Fatalf("LookupMappedNode: entry=%q found=%t child=%d err=%v", entry.Value(), found, child, lookupErr)
 	}
 }
-
-// TestLeafCodecRejectsBranch checks type ownership through the direct codec entry points.
-func TestLeafCodecRejectsBranch(t *testing.T) {
-	for _, size := range []int{1, 80} {
-		node := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), bytes.Repeat([]byte("k"), size))
-		ids := make([]page.ID, NodePageCount(node, 64))
-		ids[0] = 8
-		for i := 1; i < len(ids); i++ {
-			ids[i] = page.ID(42 + i*3)
-		}
-		pages, err := EncodeBranchNodePages(node, 64, ids)
-		if err != nil {
-			t.Fatal(err)
-		}
-		read := func(id page.ID) ([]byte, error) {
-			t.Fatal("wrong type followed continuation IDs")
-			return nil, ErrInvalid
-		}
-		if _, err := DecodeLeafNode(pages[0], 8, 64, read, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("decode wrong type: %v", err)
-		}
-		if _, _, _, err := ReadMappedLeafNode(pages[0], 8, 64, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("mapped header wrong type: %v", err)
-		}
-		if _, _, _, err := LookupMappedLeafNode(pages[0], 8, []byte("k"), read, true, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("mapped lookup wrong type: %v", err)
-		}
-		if _, err := DecodeWALLeafNode(EncodeWALNode(node), 8, 4096, nil); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("WAL decode wrong type: %v", err)
-		}
-		if _, err := EncodeLeafNodePages(node, 64, ids); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("encode wrong type: %v", err)
-		}
-	}
-}

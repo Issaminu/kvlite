@@ -4,14 +4,15 @@
 // Branch code is in branch_node.go and branch_codec.go.
 // Continuation pages use continuation_node.go and continuation_codec.go.
 // Shared node data, decoded reads, and balance rules are in node.go.
-// Each type owns its page encoding, decoding, and mapped reads.
-// Leaf and branch codecs also own their compact WAL images.
-// node_codec.go selects a codec and provides shared byte and checksum operations.
+// node_codec.go contains what leaves and branches share: the node header, checksums, page encoding, the entry rules, and the entry points for decode, lookup, and reference checks.
+// leaf_codec.go and branch_codec.go contain the descriptor layout of their type, the code that writes it, and one entry loop for each read operation.
+// continuation_codec.go reads and writes the pages of a continued node, and it reads a continued body in place.
 // Tree reads, inserts, deletes, and repair are in tree.go.
 // Ordered reads are in cursor.go.
 //
 // The body codecs support both decoded nodes and direct reads from encoded bytes.
-// Direct point reads use binary search and return slices of the input bytes.
+// Direct point reads of a node in one page use binary search and return slices of the input bytes.
+// Direct point reads of a continued node read only the pages that they need and return copies.
 //
 // Main-file readers accept an explicit checksum-check option.
 // When true, they verify nonzero fields before using page bytes.

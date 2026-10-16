@@ -1,8 +1,11 @@
 package btree
 
 import (
+	"bytes"
+	"cmp"
 	"encoding/binary"
 	"fmt"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -211,6 +214,260 @@ func continuationBodyBytes(first []byte, offset int, read func(page.ID) ([]byte,
 		end := min(len(next), ContinuationHeaderSize+size-pageBase)
 		return next[ContinuationHeaderSize+at : end], id, nil
 	}
+}
+
+// continuedBody reads the body of a continued leaf or branch in place, one page at a time.
+// Offsets are logical body offsets: they count from the start of the normal 18-byte header, as descriptor offsets do.
+// A reader that needs only some bytes, such as a point lookup, reads only the pages that hold them.
+// It never copies the complete body.
+type continuedBody struct {
+	first     []byte                        // the first page, with a checked header
+	readPage  func(page.ID) ([]byte, error) // supplies each continuation page
+	forWAL    bool                          // pages are verified compact WAL payloads
+	checksums bool                          // main-file pages verify nonzero checksums
+	// cursor remembers the pages reached so far. It points to a separate variable of the caller.
+	// Escape analysis treats a struct as one value, and it treats the pages in a cursor as escaping, so a cursor field would make readPage escape and allocate in every caller.
+	cursor *continuationCursor
+}
+
+// read copies len(dst) body bytes at offset into dst.
+func (body *continuedBody) read(offset int, dst []byte) error {
+	for len(dst) > 0 {
+		part, _, err := continuationBodyBytes(body.first, offset, body.readPage, body.cursor, body.forWAL, body.checksums)
+		if err != nil {
+			return err
+		}
+		n := copy(dst, part)
+		offset += n
+		dst = dst[n:]
+	}
+	return nil
+}
+
+// compare compares size body bytes at offset with key, as bytes.Compare does.
+// It compares one page part at a time and stops at the first difference.
+func (body *continuedBody) compare(offset, size int, key []byte) (int, error) {
+	length := min(size, len(key))
+	for compared := 0; compared < length; {
+		part, _, err := continuationBodyBytes(body.first, offset+compared, body.readPage, body.cursor, body.forWAL, body.checksums)
+		if err != nil {
+			return 0, err
+		}
+		part = part[:min(len(part), length-compared)]
+		if comparison := bytes.Compare(part, key[compared:compared+len(part)]); comparison != 0 {
+			return comparison, nil
+		}
+		compared += len(part)
+	}
+	// All compared bytes are equal, so the shorter one sorts first.
+	return cmp.Compare(size, len(key)), nil
+}
+
+// directory reads the directory of size bytes into a buffer that starts like a node image: the directory starts at NodeHeaderSize.
+// So leafSpan, branchKey, and branchChild read it as they read an image.
+// scratch holds a small directory without an allocation. A larger directory uses new storage.
+func (body *continuedBody) directory(size int, scratch []byte) ([]byte, error) {
+	buffer := scratch
+	if NodeHeaderSize+size > len(buffer) {
+		buffer = make([]byte, NodeHeaderSize+size)
+	}
+	buffer = buffer[:NodeHeaderSize+size]
+	return buffer, body.read(NodeHeaderSize, buffer[NodeHeaderSize:])
+}
+
+// lookupContinuedLeaf finds key in a continued leaf without copying its body.
+// It compares keys page by page and copies only the value of the matching entry.
+// A continued leaf has one entry (see Node.NeedsSplit), so it checks the entries in order and does no binary search.
+// The value is a private copy, and the key is a copy of key.
+// Set includeKey to false to omit the key.
+func lookupContinuedLeaf(body *continuedBody, h NodeHeader, key []byte, includeKey bool) (Entry, bool, error) {
+	imageSize := NodeHeaderSize + uint64(h.BodyLength)
+	dataStart, err := leafDataStart(imageSize, h.EntryCount)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	var scratch [NodeHeaderSize + continuedDirectoryScratchSize]byte
+	directory, err := body.directory(int(dataStart)-NodeHeaderSize, scratch[:])
+	if err != nil {
+		return Entry{}, false, err
+	}
+	for index := range int(h.EntryCount) {
+		flags, start, keyEnd, end := leafSpan(directory, index)
+		if !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) {
+			return Entry{}, false, entryError(index)
+		}
+		comparison, err := body.compare(int(start), int(keyEnd-start), key)
+		if err != nil || comparison > 0 {
+			// Keys are in order, so a larger key ends the search.
+			return Entry{}, false, err
+		}
+		if comparison < 0 {
+			continue
+		}
+		entry := Entry{flags: flags, value: make([]byte, end-keyEnd), valueOwned: true}
+		if err := body.read(int(keyEnd), entry.value); err != nil {
+			return Entry{}, false, err
+		}
+		if includeKey {
+			// The stored key equals key, so a copy of key needs no more page reads.
+			// The result never borrows from body: escape analysis treats body as one value, so readPage would escape and allocate in every caller.
+			entry.key = bytes.Clone(key)
+		}
+		return entry, true, nil
+	}
+	return Entry{}, false, nil
+}
+
+// lookupContinuedBranch returns the child that routes key in a continued branch without copying its body.
+// It compares separators page by page, so a separator that differs from key early reads no other page.
+// A continued branch has at most two separators (see Node.NeedsSplit), so it checks them in order and does no binary search.
+func lookupContinuedBranch(body *continuedBody, h NodeHeader, key []byte) (page.ID, error) {
+	imageSize := NodeHeaderSize + uint64(h.BodyLength)
+	dataStart, err := branchDataStart(imageSize, h.EntryCount)
+	if err != nil {
+		return 0, err
+	}
+	var scratch [NodeHeaderSize + continuedDirectoryScratchSize]byte
+	directory, err := body.directory(int(dataStart)-NodeHeaderSize, scratch[:])
+	if err != nil {
+		return 0, err
+	}
+	// Find the first separator that is larger than key. Its index is also the index of the child.
+	count, index := int(h.EntryCount), 0
+	for ; index < count; index++ {
+		start, end := branchKey(directory, index)
+		if !validKey(start, end, dataStart, imageSize) {
+			return 0, entryError(index)
+		}
+		comparison, err := body.compare(int(start), int(end-start), key)
+		if err != nil {
+			return 0, err
+		}
+		if comparison > 0 {
+			break
+		}
+	}
+	child, ok := branchChild(directory, count, index)
+	if !ok {
+		return 0, childError(index)
+	}
+	return child, nil
+}
+
+// checkContinuedLeaf checks every entry of a continued leaf in the same way as decodeLeafBody, without a copy of its body.
+// It copies only the root page IDs of nested buckets, and each key except the last for the order check of the next key. The values stay in their pages.
+// A nested bucket entry must store an 8-byte root page ID. visit receives each root page ID. visit can be nil.
+func checkContinuedLeaf(body *continuedBody, h NodeHeader, visit func(page.ID) error) error {
+	imageSize := NodeHeaderSize + uint64(h.BodyLength)
+	dataStart, err := leafDataStart(imageSize, h.EntryCount)
+	if err != nil {
+		return err
+	}
+	var scratch [NodeHeaderSize + continuedDirectoryScratchSize]byte
+	directory, err := body.directory(int(dataStart)-NodeHeaderSize, scratch[:])
+	if err != nil {
+		return err
+	}
+	count, next := int(h.EntryCount), dataStart
+	// previous is a copy of the previous key. Each key is compared with it in place, so one buffer is enough.
+	var previous []byte
+	for index := range count {
+		flags, start, keyEnd, end := leafSpan(directory, index)
+		if !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) || start != next {
+			return entryError(index)
+		}
+		if index > 0 {
+			comparison, err := body.compare(int(start), int(keyEnd-start), previous)
+			if err != nil {
+				return err
+			}
+			if comparison <= 0 {
+				return entryError(index)
+			}
+		}
+		// Only a later key needs the copy, so the last key is not copied.
+		if index+1 < count {
+			previous = slices.Grow(previous[:0], int(keyEnd-start))[:keyEnd-start]
+			if err := body.read(int(start), previous); err != nil {
+				return err
+			}
+		}
+		next = end
+		if flags&BucketLeafFlag != 0 {
+			if end-keyEnd != page.IDSize {
+				return entryError(index)
+			}
+			var root [page.IDSize]byte
+			if err := body.read(int(keyEnd), root[:]); err != nil {
+				return err
+			}
+			if visit != nil {
+				if err := visit(page.ID(binary.LittleEndian.Uint64(root[:]))); err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if next != imageSize {
+		return errBodySize
+	}
+	return nil
+}
+
+// checkContinuedBranch checks every child ID and separator of a continued branch in the same way as decodeBranchBody, without a copy of its body.
+// It copies only each separator except the last, for the order check of the next separator. visit receives each child page ID. visit can be nil.
+func checkContinuedBranch(body *continuedBody, h NodeHeader, visit func(page.ID) error) error {
+	imageSize := NodeHeaderSize + uint64(h.BodyLength)
+	dataStart, err := branchDataStart(imageSize, h.EntryCount)
+	if err != nil {
+		return err
+	}
+	var scratch [NodeHeaderSize + continuedDirectoryScratchSize]byte
+	directory, err := body.directory(int(dataStart)-NodeHeaderSize, scratch[:])
+	if err != nil {
+		return err
+	}
+	count := int(h.EntryCount)
+	for index := range count + 1 {
+		child, ok := branchChild(directory, count, index)
+		if !ok {
+			return childError(index)
+		}
+		if visit != nil {
+			if err := visit(child); err != nil {
+				return err
+			}
+		}
+	}
+	next := dataStart
+	// previous is a copy of the previous separator, as in checkContinuedLeaf.
+	var previous []byte
+	for index := range count {
+		start, end := branchKey(directory, index)
+		if !validKey(start, end, dataStart, imageSize) || start != next {
+			return entryError(index)
+		}
+		if index > 0 {
+			comparison, err := body.compare(int(start), int(end-start), previous)
+			if err != nil {
+				return err
+			}
+			if comparison <= 0 {
+				return entryError(index)
+			}
+		}
+		if index+1 < count {
+			previous = slices.Grow(previous[:0], int(end-start))[:end-start]
+			if err := body.read(int(start), previous); err != nil {
+				return err
+			}
+		}
+		next = end
+	}
+	if next != imageSize {
+		return errBodySize
+	}
+	return nil
 }
 
 // copyContinuationBody copies the body for a full decoded leaf or branch.

@@ -2,7 +2,6 @@ package btree
 
 import (
 	"bytes"
-	"errors"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/page"
@@ -55,43 +54,5 @@ func TestLookupMappedNode_SelectsBranchChild(t *testing.T) {
 	}
 	if found || child != 10 {
 		t.Fatalf("branch lookup: found=%t child=%d, want false and 10", found, child)
-	}
-}
-
-// TestBranchCodecRejectsLeaf checks type ownership through the direct codec entry points.
-func TestBranchCodecRejectsLeaf(t *testing.T) {
-	for _, size := range []int{1, 80} {
-		node := NewLeafNode(8)
-		if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), size))); err != nil {
-			t.Fatal(err)
-		}
-		ids := make([]page.ID, NodePageCount(node, 64))
-		ids[0] = 8
-		for i := 1; i < len(ids); i++ {
-			ids[i] = page.ID(42 + i*3)
-		}
-		pages, err := EncodeLeafNodePages(node, 64, ids)
-		if err != nil {
-			t.Fatal(err)
-		}
-		read := func(id page.ID) ([]byte, error) {
-			t.Fatal("wrong type followed continuation IDs")
-			return nil, ErrInvalid
-		}
-		if _, err := DecodeBranchNode(pages[0], 8, 64, read, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("decode wrong type: %v", err)
-		}
-		if _, _, _, err := ReadMappedBranchNode(pages[0], 8, 64, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("mapped header wrong type: %v", err)
-		}
-		if _, _, _, err := LookupMappedBranchNode(pages[0], 8, []byte("k"), read, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("mapped lookup wrong type: %v", err)
-		}
-		if _, err := DecodeWALBranchNode(EncodeWALNode(node), 8, 4096, nil); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("WAL decode wrong type: %v", err)
-		}
-		if _, err := EncodeBranchNodePages(node, 64, ids); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("encode wrong type: %v", err)
-		}
 	}
 }
