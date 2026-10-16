@@ -124,8 +124,9 @@ func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) 
 // Pass nil readPage for a normal node. A continued node requires readPage.
 // readPage keeps visited continuation pages unchanged until this call returns.
 // checksums selects verification of nonzero checksum fields.
-func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (Entry, bool, page.ID, error) {
-	return lookupNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums)
+func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (entry Entry, found bool, child page.ID, err error) {
+	entry, found, child, err = lookupNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums)
+	return
 }
 
 // EncodeNode writes a compact page image and updates the node's checksum.
