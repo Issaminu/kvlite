@@ -303,15 +303,16 @@ func BenchmarkFocusedWrites(b *testing.B) {
 		b.SetBytes(int64(cycles * 12 * 128))
 		iteration := 0
 		for b.Loop() {
+			b.StopTimer()
 			if iteration > 0 {
-				b.StopTimer()
 				closeBenchmarkEngine(b, engine)
 				engine, err = prepareBenchmarkEngine(b, environment.kind, environment.mode, environment.redisAddress, 1, setupPairs)
 				if err != nil {
 					b.Fatal(err)
 				}
-				b.StartTimer()
 			}
+			warmUpHandle(b, engine, setupPairs[0])
+			b.StartTimer()
 			for cycle := range cycles {
 				update := updates[cycle%len(updates)]
 				if err := engine.Put(b.Context(), update.Key, update.Value); err != nil {
@@ -423,6 +424,10 @@ func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redis
 				b.Fatal(err)
 			}
 		}
+		// A read case makes no commit, so it keeps the state that the setup left.
+		if benchmarkCase.operation != benchmarkRead {
+			warmUpHandle(b, engine, setupPairs[0])
+		}
 		before := readWriteCounters(b, engine, kind)
 		b.StartTimer()
 		if err := runBenchmarkOperations(b, engine, operationPairs, benchmarkCase, schedule); err != nil {
@@ -527,6 +532,18 @@ func makeMissingKey(position string, index int) []byte {
 		return makeKey(2, uint64(index))
 	default:
 		panic("unknown missing-key position: " + position)
+	}
+}
+
+// warmUpHandle makes one untimed commit on a new engine handle before a timed write workload.
+// The first commit of a handle can pay one-time costs, such as the directory sync of a new KVLite WAL file.
+// Each timed run opens a new handle, so a case with few commits would measure mostly those costs instead of steady writes.
+// It writes pair again with its stored value, so the stored data does not change.
+// Call it before the write counters are read.
+func warmUpHandle(tb testing.TB, engine Engine, pair Pair) {
+	tb.Helper()
+	if err := engine.Put(tb.Context(), pair.Key, pair.Value); err != nil {
+		tb.Fatalf("warm-up commit: %v", err)
 	}
 }
 

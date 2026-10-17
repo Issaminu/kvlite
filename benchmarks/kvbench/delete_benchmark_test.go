@@ -76,12 +76,13 @@ func BenchmarkDeleteOperations(b *testing.B) {
 			keysDeleted := transactions * benchmarkCase.batchSize
 			iteration := 0
 			for b.Loop() {
+				b.StopTimer()
 				if iteration > 0 {
-					b.StopTimer()
 					closeBenchmarkEngine(b, engine)
 					engine, _ = prepareDeleteBenchmarkEngine(b, environment, benchmarkCase.clients, setup)
-					b.StartTimer()
 				}
+				warmUpHandle(b, engine, setup[0])
+				b.StartTimer()
 				if err := runDeleteTransactions(b, engine, operations, transactions, benchmarkCase.batchSize, benchmarkCase.clients); err != nil {
 					b.Fatal(err)
 				}

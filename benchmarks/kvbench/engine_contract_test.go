@@ -29,6 +29,39 @@ func TestEmbeddedEngineContract(t *testing.T) {
 	}
 }
 
+// TestWarmUpHandleKeepsStoredData checks that the untimed warm-up commit of a timed run leaves the stored data unchanged.
+func TestWarmUpHandleKeepsStoredData(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		open func(*testing.T, DurabilityMode) Engine
+	}{
+		{name: "kvlite", open: openTestKVLiteEngine},
+		{name: "bbolt", open: openTestBBoltEngine},
+	} {
+		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
+			t.Run(test.name+"/"+string(mode), func(t *testing.T) {
+				engine := test.open(t, mode)
+				pairs, err := makePairs(8, 32, 1, keyOrderSequential, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := loadPairs(t.Context(), engine, pairs, 1_000); err != nil {
+					t.Fatal(err)
+				}
+				warmUpHandle(t, engine, pairs[0])
+				if count, err := engine.Count(t.Context()); err != nil || count != len(pairs) {
+					t.Fatalf("count after warm-up: %d, %v", count, err)
+				}
+				for _, pair := range pairs {
+					if value, err := engine.Get(t.Context(), pair.Key); err != nil || !bytes.Equal(value, pair.Value) {
+						t.Fatalf("value of %x after warm-up: %v", pair.Key, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestRedisEngineContract(t *testing.T) {
 	address := os.Getenv("KVBENCH_REDIS_ADDR")
 	if address == "" {
