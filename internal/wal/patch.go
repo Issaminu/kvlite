@@ -213,7 +213,8 @@ func appendEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte
 		return patch, false
 	}
 	start := len(patch)
-	var baseChild, targetChild [page.IDSize]byte
+	leaf := base.IsLeaf()
+	var child [page.IDSize]byte
 	baseIndex, targetIndex := 0, 0
 	for baseIndex < base.EntryCount() || targetIndex < target.EntryCount() {
 		// A negative comparison deletes a base entry. A positive comparison sets a new target entry.
@@ -236,15 +237,14 @@ func appendEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte
 			baseIndex++
 			continue
 		case comparison == 0:
-			_, beforeFlags, beforeValue := entryPatchEntry(base, baseIndex, &baseChild)
-			_, afterFlags, afterValue := entryPatchEntry(target, targetIndex, &targetChild)
+			same := sameEntryPatchEntry(base, baseIndex, target, targetIndex, leaf)
 			baseIndex++
-			if beforeFlags == afterFlags && bytes.Equal(beforeValue, afterValue) {
+			if same {
 				targetIndex++
 				continue
 			}
 		}
-		key, flags, value := entryPatchEntry(target, targetIndex, &targetChild)
+		key, flags, value := entryPatchEntry(target, targetIndex, &child)
 		if len(patch)-start+entryPatchSetHeaderSize+len(key)+len(value) >= limit {
 			return patch[:start], false
 		}
@@ -252,6 +252,16 @@ func appendEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte
 		targetIndex++
 	}
 	return patch, true
+}
+
+// sameEntryPatchEntry reports whether entry baseIndex of base and entry targetIndex of target, which have the same key, store the same flags and value in an entry patch.
+// leaf selects the node type of both nodes. A branch compares the IDs of the right children as integers, so it needs no encoded copy of them.
+func sameEntryPatchEntry(base *btree.Node, baseIndex int, target *btree.Node, targetIndex int, leaf bool) bool {
+	if !leaf {
+		return base.Children[baseIndex+1] == target.Children[targetIndex+1]
+	}
+	before, after := base.EntryAt(baseIndex), target.EntryAt(targetIndex)
+	return before.Flags() == after.Flags() && bytes.Equal(before.Value(), after.Value())
 }
 
 // entryPatchEntry returns the key, flags, and value that an entry patch stores for entry index of node.

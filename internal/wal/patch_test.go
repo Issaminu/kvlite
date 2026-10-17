@@ -436,6 +436,48 @@ func TestAppendChangedBytePatchRanges_MatchesByteScan(t *testing.T) {
 }
 
 // BenchmarkAppendChangedBytePatchRanges measures range building for one changed value field.
+// BenchmarkAppendEntryPatch measures the entry patch of a node that gets one new entry, as after an insert or a child split.
+// Most of its time is the merge over the entries that did not change.
+func BenchmarkAppendEntryPatch(b *testing.B) {
+	key := func(index int) []byte { return fmt.Appendf(nil, "key-%011d", index) }
+	run := func(b *testing.B, base, target *btree.Node) {
+		patch := make([]byte, 0, 4096)
+		b.ReportAllocs()
+		for b.Loop() {
+			var smaller bool
+			if patch, smaller = appendEntryPatch(patch[:0], base, target, 1<<30); !smaller || len(patch) == 0 {
+				b.Fatal("no entry patch")
+			}
+		}
+	}
+	b.Run("branch/separators=150", func(b *testing.B) {
+		base := btree.NewRootNode(2, btree.NewLeafNode(100), btree.NewLeafNode(1000), key(0))
+		for index := 1; index < 150; index++ {
+			if err := base.InsertOrReplaceSeparator(key(index*2), page.ID(1000+index)); err != nil {
+				b.Fatal(err)
+			}
+		}
+		target := base.Clone()
+		if err := target.InsertOrReplaceSeparator(key(151), 5000); err != nil {
+			b.Fatal(err)
+		}
+		run(b, base, target)
+	})
+	b.Run("leaf/entries=100", func(b *testing.B) {
+		base := btree.NewLeafNode(2)
+		for index := range 100 {
+			if err := base.InsertEntry(btree.NewEntry(0, key(index*2), bytes.Repeat([]byte{byte(index)}, 32))); err != nil {
+				b.Fatal(err)
+			}
+		}
+		target := base.Clone()
+		if err := target.InsertEntry(btree.NewEntry(0, key(101), bytes.Repeat([]byte{0xff}, 32))); err != nil {
+			b.Fatal(err)
+		}
+		run(b, base, target)
+	})
+}
+
 // BenchmarkAppendLeafBytePatch measures the scan of a leaf with 100 entries in which one value changed, as in a typical update.
 // Most of its time is the loop over unchanged entries.
 func BenchmarkAppendLeafBytePatch(b *testing.B) {
