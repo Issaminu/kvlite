@@ -81,9 +81,13 @@ func leafSpan(image []byte, index int) (flags uint32, start, keyEnd, end uint64)
 	return flags, start, keyEnd, end
 }
 
-// validLeaf reports whether the fields that leafSpan read are valid: the key passes validKey, the flags and value size are valid, and the value ends inside the image.
+// validLeaf reports whether the fields that leafSpan read are valid: the key passes validKey, the value ends inside the image, and the flags and value size are valid.
+// A plain value can have up to MaxValueSize bytes. A nested bucket entry stores an 8-byte root page ID.
+// Every path that reads leaf entries uses this rule, so decode, lookup, and the reference check accept the same leaves.
 func validLeaf(flags uint32, start, keyEnd, end, dataStart, imageSize uint64) bool {
-	return validKey(start, keyEnd, dataStart, imageSize) && flags&^BucketLeafFlag == 0 && end-keyEnd <= MaxValueSize && end <= imageSize
+	valueSize := end - keyEnd
+	return validKey(start, keyEnd, dataStart, imageSize) &&
+		(flags == 0 && valueSize <= MaxValueSize || flags == BucketLeafFlag && valueSize == page.IDSize) && end <= imageSize
 }
 
 // leafDataStart checks that count descriptors fit in a leaf image of imageSize bytes and returns the offset of the first key, which follows them.
@@ -127,7 +131,7 @@ func decodeLeafBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
 }
 
 // checkLeafBody checks every entry of one contiguous leaf image in the same way as decodeLeafBody, without a Node.
-// A nested bucket entry must store an 8-byte root page ID. visit receives each root page ID. visit can be nil.
+// visit receives the root page ID of each nested bucket. visit can be nil.
 func checkLeafBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) error) error {
 	dataStart, err := leafDataStart(uint64(len(image)), h.EntryCount)
 	if err != nil {
@@ -145,14 +149,10 @@ func checkLeafBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) e
 			return entryError(index)
 		}
 		next, previous = end, key
-		if flags&BucketLeafFlag != 0 {
-			if end-keyEnd != page.IDSize {
-				return entryError(index)
-			}
-			if visit != nil {
-				if err := visit(page.ID(binary.LittleEndian.Uint64(image[keyEnd:end]))); err != nil {
-					return err
-				}
+		// validLeaf accepts a nested bucket entry only with an 8-byte root page ID.
+		if flags&BucketLeafFlag != 0 && visit != nil {
+			if err := visit(page.ID(binary.LittleEndian.Uint64(image[keyEnd:end]))); err != nil {
+				return err
 			}
 		}
 	}

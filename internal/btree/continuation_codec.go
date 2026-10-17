@@ -356,7 +356,7 @@ func lookupContinuedBranch(body *continuedBody, h NodeHeader, key []byte) (page.
 
 // checkContinuedLeaf checks every entry of a continued leaf in the same way as decodeLeafBody, without a copy of its body.
 // It copies only the root page IDs of nested buckets, and each key except the last for the order check of the next key. The values stay in their pages.
-// A nested bucket entry must store an 8-byte root page ID. visit receives each root page ID. visit can be nil.
+// visit receives the root page ID of each nested bucket. visit can be nil.
 func checkContinuedLeaf(body *continuedBody, h NodeHeader, visit func(page.ID) error) error {
 	imageSize := NodeHeaderSize + uint64(h.BodyLength)
 	dataStart, err := leafDataStart(imageSize, h.EntryCount)
@@ -393,18 +393,14 @@ func checkContinuedLeaf(body *continuedBody, h NodeHeader, visit func(page.ID) e
 			}
 		}
 		next = end
-		if flags&BucketLeafFlag != 0 {
-			if end-keyEnd != page.IDSize {
-				return entryError(index)
-			}
+		// validLeaf accepts a nested bucket entry only with an 8-byte root page ID.
+		if flags&BucketLeafFlag != 0 && visit != nil {
 			var root [page.IDSize]byte
 			if err := body.read(int(keyEnd), root[:]); err != nil {
 				return err
 			}
-			if visit != nil {
-				if err := visit(page.ID(binary.LittleEndian.Uint64(root[:]))); err != nil {
-					return err
-				}
+			if err := visit(page.ID(binary.LittleEndian.Uint64(root[:]))); err != nil {
+				return err
 			}
 		}
 	}

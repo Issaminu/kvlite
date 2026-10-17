@@ -204,3 +204,53 @@ func TestLookupMappedNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 		t.Fatalf("LookupMappedNode: entry=%q found=%t child=%d err=%v", entry.Value(), found, child, lookupErr)
 	}
 }
+
+// TestLeafCodec_RejectsBucketEntryWithoutRootID checks that every path that reads leaf entries applies one rule:
+// a nested bucket entry stores an 8-byte root page ID.
+// Decode, lookup, and the reference check must agree, for a leaf in one page and for a continued leaf.
+func TestLeafCodec_RejectsBucketEntryWithoutRootID(t *testing.T) {
+	key := []byte("bucket")
+	for _, value := range [][]byte{[]byte("short"), bytes.Repeat([]byte("v"), 100)} {
+		node := NewLeafNode(8)
+		if err := node.InsertEntry(NewEntry(BucketLeafFlag, key, value)); err != nil {
+			t.Fatal(err)
+		}
+		const pageSize = 64
+		ids := make([]page.ID, NodePageCount(node, pageSize))
+		ids[0] = 8
+		for i := 1; i < len(ids); i++ {
+			ids[i] = page.ID(40 + i*3)
+		}
+		pages, err := EncodeNodePages(node, pageSize, ids)
+		if err != nil {
+			t.Fatal(err)
+		}
+		read := func(id page.ID) ([]byte, error) {
+			if index := slices.Index(ids, id); index >= 0 {
+				return pages[index], nil
+			}
+			return nil, ErrInvalid
+		}
+		if _, err := DecodeNode(pages[0], 8, pageSize, read, true); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("value %d bytes: decode: %v", len(value), err)
+		}
+		if _, _, _, err := LookupMappedNode(pages[0], 8, key, read, true, true); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("value %d bytes: mapped lookup: %v", len(value), err)
+		}
+		if err := VisitMappedNodeReferences(pages[0], 8, pageSize, read, func(page.ID) error { return nil }, nil, true); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("value %d bytes: reference check: %v", len(value), err)
+		}
+		if len(ids) == 1 {
+			image := EncodeWALNode(node)
+			if _, err := DecodeWALNode(image, 8, pageSize, nil); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL decode: %v", err)
+			}
+			if _, _, _, err := LookupEncodedWALNode(image, 8, key, pageSize, nil, true); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL lookup: %v", err)
+			}
+			if err := ValidateWALNode(image, 8); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL validation: %v", err)
+			}
+		}
+	}
+}
