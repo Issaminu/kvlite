@@ -20,7 +20,7 @@ func TestWALValidationErrors(t *testing.T) {
 	}
 
 	log := New(Config{PageSize: 64})
-	if _, _, err := log.encodeTransaction([]NodeRecord{{}}, nil, nil, 1); !errors.Is(err, ErrNodeRecordMissingFinal) {
+	if _, err := log.encodeTransaction([]NodeRecord{{}}, nil, nil, 1); !errors.Is(err, ErrNodeRecordMissingFinal) {
 		t.Fatalf("node without final state: got %v, want ErrNodeRecordMissingFinal", err)
 	}
 	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1, nil); !errors.Is(err, ErrNodePageMismatch) {
@@ -658,12 +658,12 @@ func TestWALEncodeTransaction_ReusesBuffer(t *testing.T) {
 		nextTxid: 1,
 	}
 	encodedMeta := []byte("value")
-	if _, _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
+	if _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
+		if _, err := log.encodeTransaction(nil, nil, encodedMeta, log.nextTxid); err != nil {
 			panic(err)
 		}
 	})
@@ -685,12 +685,12 @@ func TestWALEncodeTransaction_ReusesBytePatchBuffers(t *testing.T) {
 	log := New(Config{PageSize: 128})
 	log.LoadCommittedRecord(WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: base.PageID()}, Payload: btree.EncodeWALNode(base)})
 	nodes := []NodeRecord{{Original: base, Final: target}}
-	if _, _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
+	if _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 		t.Fatal(err)
 	}
 
 	allocations := testing.AllocsPerRun(100, func() {
-		if _, _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
+		if _, err := log.encodeTransaction(nodes, nil, nil, log.nextTxid); err != nil {
 			panic(err)
 		}
 	})
@@ -864,7 +864,7 @@ func TestWALEncodeTransaction_ReusesLargeEncodingBuffer(t *testing.T) {
 		nodes[index] = NodeRecord{Final: node}
 	}
 	log := &WAL{pageSize: pageSize}
-	first, _, err := log.encodeTransaction(nodes, nil, nil, 1)
+	first, err := log.encodeTransaction(nodes, nil, nil, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -878,7 +878,7 @@ func TestWALEncodeTransaction_ReusesLargeEncodingBuffer(t *testing.T) {
 		if capacity := cap(log.encodingBuffer); capacity > maxRetainedEncodingBufferBytes {
 			t.Fatalf("retained encoding capacity: got %d, want at most %d", capacity, maxRetainedEncodingBufferBytes)
 		}
-		next, _, err := log.encodeTransaction(nodes, nil, nil, TxID(attempt+2))
+		next, err := log.encodeTransaction(nodes, nil, nil, TxID(attempt+2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1212,7 +1212,7 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 		pageSize: pageSize,
 		nextTxid: transactionID,
 	}
-	transaction, _, err := log.encodeTransaction(nil, nil, []byte("meta"), transactionID)
+	transaction, err := log.encodeTransaction(nil, nil, []byte("meta"), transactionID)
 	if err != nil {
 		t.Fatal(err)
 	}

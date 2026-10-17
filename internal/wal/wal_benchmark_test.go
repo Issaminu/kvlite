@@ -35,7 +35,7 @@ func BenchmarkEncodeTransaction(b *testing.B) {
 				b.SetBytes(int64(size))
 				b.ResetTimer()
 				for i := 0; i < b.N; i++ {
-					if _, _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
+					if _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
 						b.Fatal(err)
 					}
 					log.releaseEncodingBuffer()
@@ -61,7 +61,7 @@ func BenchmarkEncodeTransaction_ManyPages(b *testing.B) {
 	b.ReportAllocs()
 	b.SetBytes(pageCount * pageSize)
 	for b.Loop() {
-		if _, _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
+		if _, err := log.encodeTransaction(nodes, nil, nil, 1); err != nil {
 			b.Fatal(err)
 		}
 		log.releaseEncodingBuffer()

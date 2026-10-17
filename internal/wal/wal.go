@@ -23,6 +23,8 @@ const (
 	// The next large transaction can use it again, and the garbage collector can free it.
 	// So one large transaction does not retain memory.
 	maxRetainedEncodingBufferBytes = 2 << 20
+	// maxRetainedPendingPages is the largest pending-page list kept across commits, about 2 MiB of CommittedPage values.
+	maxRetainedPendingPages = 1 << 15
 
 	walFileMagic      uint32 = 0x4c57564b // The little-endian bytes spell "KVWL".
 	walFileHeaderSize        = 20
@@ -60,6 +62,7 @@ type WAL struct {
 	largeEncodingBuffers     sync.Pool                 // *[]byte encoding buffers larger than maxRetainedEncodingBufferBytes
 	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
 	patchBuffer              []byte                    // reusable byte patch or entry patch; copied into encodingBuffer before reuse
+	pending                  []CommittedPage           // pages of the encoded transaction, in record order; Commit publishes them after the append succeeds
 	appendFailure            error                     // set when an append fails after it starts to write; blocks every later commit on this WAL
 	salt                     uint64                    // salt of the current generation; written in the file header
 	checksumSeed             uint32                    // CRC32C checksum of salt; every record checksum starts from it
@@ -105,7 +108,7 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 		// Record checksums depend on the salt, so select it before encoding.
 		wal.startGeneration()
 	}
-	transaction, continuedPages, err := wal.encodeTransaction(nodes, allocationPages, encodedMeta, wal.nextTxid)
+	transaction, err := wal.encodeTransaction(nodes, allocationPages, encodedMeta, wal.nextTxid)
 	if err != nil {
 		return false, err
 	}
@@ -125,37 +128,22 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 	for pageID := range retired {
 		delete(wal.overlay, pageID)
 	}
-	nextContinuedPage := 0
-	for _, node := range nodes {
-		header := RecordHeader{Type: RecordTypeNode, PageID: node.Final.PageID(), TxID: wal.nextTxid}
-		if count := len(node.Final.OverflowPages()); count != 0 {
-			for _, data := range continuedPages[nextContinuedPage : nextContinuedPage+count+1] {
-				header.PageID = page.ID(binary.LittleEndian.Uint64(data[2:10]))
-				wal.overlay[header.PageID] = CommittedPage{Header: header, Payload: data}
-			}
-			nextContinuedPage += count + 1
-			continue
-		}
-		wal.overlay[header.PageID] = CommittedPage{Header: header, Node: node.Final}
-	}
-	for _, record := range allocationPages {
-		header := RecordHeader{Type: RecordTypeAllocation, PageID: record.PageID, TxID: wal.nextTxid}
-		wal.overlay[record.PageID] = CommittedPage{Header: header, Payload: record.Payload}
-	}
-	if len(encodedMeta) > 0 {
-		header := RecordHeader{Type: RecordTypeMeta, TxID: wal.nextTxid}
-		for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
-			header.PageID = pageID
-			wal.overlay[pageID] = CommittedPage{Header: header, Payload: encodedMeta}
-		}
+	for _, committed := range wal.pending {
+		wal.overlay[committed.Header.PageID] = committed
 	}
 	wal.commitCount++
 	wal.nextTxid++
 	return needsCheckpoint, nil
 }
 
-// releaseEncodingBuffer moves an oversized transaction encoding buffer to the pool after Commit returns.
+// releaseEncodingBuffer clears the pending pages and moves an oversized transaction encoding buffer to the pool after Commit returns.
+// The overlay holds the published pages, and a failed append publishes none, so the list keeps only its storage.
 func (wal *WAL) releaseEncodingBuffer() {
+	clear(wal.pending)
+	wal.pending = wal.pending[:0]
+	if cap(wal.pending) > maxRetainedPendingPages {
+		wal.pending = nil
+	}
 	if cap(wal.encodingBuffer) > maxRetainedEncodingBufferBytes {
 		buffer := wal.encodingBuffer[:0]
 		wal.largeEncodingBuffers.Put(&buffer)
@@ -178,20 +166,20 @@ func (wal *WAL) newEncodingBuffer(size int) []byte {
 }
 
 // encodeTransaction encodes changed nodes, allocation pages, optional metadata, and one commit marker.
-// Continued pages borrow the returned transaction, or a new image when byte patches describe the node.
-// Commit publishes them only after a successful append.
-func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, txid TxID) ([]byte, [][]byte, error) {
+// It also fills wal.pending with the committed state of each page, in record order, and Commit publishes it only after a successful append.
+// The payload of a continued page borrows the returned transaction, or a new image when byte patches describe the node.
+func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, txid TxID) ([]byte, error) {
 	transactionSize := HeaderSize + ChecksumSize
 	continuedPageCount := 0
 	for index := range nodes {
 		record := &nodes[index]
 		if record.Final == nil {
-			return nil, nil, ErrNodeRecordMissingFinal
+			return nil, ErrNodeRecordMissingFinal
 		}
 		if len(record.Final.OverflowPages()) != 0 {
 			count := len(record.Final.OverflowPages()) + 1
 			if count != btree.NodePageCount(record.Final, wal.pageSize) {
-				return nil, nil, btree.ErrInvalid
+				return nil, btree.ErrInvalid
 			}
 			transactionSize += count*(HeaderSize+ChecksumSize) + btree.WALNodePagesEncodedSize(record.Final, wal.pageSize)
 			continuedPageCount += count
@@ -200,19 +188,19 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 		// Size for the complete final image: patches are only written when smaller, so this is a safe upper bound for the encoding buffer capacity.
 		payloadSize := btree.WALNodeEncodedSize(record.Final)
 		if int64(payloadSize) > wal.pageSize {
-			return nil, nil, fmt.Errorf("record payload %d bytes, page size %d bytes: %w", payloadSize, wal.pageSize, ErrRecordPayloadTooLarge)
+			return nil, fmt.Errorf("record payload %d bytes, page size %d bytes: %w", payloadSize, wal.pageSize, ErrRecordPayloadTooLarge)
 		}
 		transactionSize += HeaderSize + payloadSize + ChecksumSize
 	}
 	for _, record := range allocationPages {
 		if int64(len(record.Payload)) != wal.pageSize {
-			return nil, nil, fmt.Errorf("allocation page %d has size %d, want %d: %w", record.PageID, len(record.Payload), wal.pageSize, page.ErrInvalid)
+			return nil, fmt.Errorf("allocation page %d has size %d, want %d: %w", record.PageID, len(record.Payload), wal.pageSize, page.ErrInvalid)
 		}
 		transactionSize += HeaderSize + len(record.Payload) + ChecksumSize
 	}
 	if len(encodedMeta) > 0 {
 		if int64(len(encodedMeta)) > wal.pageSize {
-			return nil, nil, fmt.Errorf("metadata payload %d bytes, page size %d bytes: %w", len(encodedMeta), wal.pageSize, ErrRecordPayloadTooLarge)
+			return nil, fmt.Errorf("metadata payload %d bytes, page size %d bytes: %w", len(encodedMeta), wal.pageSize, ErrRecordPayloadTooLarge)
 		}
 		transactionSize += 2 * (HeaderSize + len(encodedMeta) + ChecksumSize)
 	}
@@ -230,45 +218,80 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 	if continuedPageCount != 0 {
 		continuedPages = make([][]byte, continuedPageCount)
 	}
+	clear(wal.pending)
+	wal.pending = wal.pending[:0]
 	nextContinuedPage := 0
 	for index := range nodes {
+		node := &nodes[index]
 		var pages [][]byte
-		if count := len(nodes[index].Final.OverflowPages()); count != 0 {
+		if count := len(node.Final.OverflowPages()); count != 0 {
 			pages = continuedPages[nextContinuedPage : nextContinuedPage+count+1]
 			nextContinuedPage += len(pages)
 		}
 		var err error
-		transaction, err = wal.appendNodeRecord(transaction, &nodes[index], txid, pages)
+		transaction, err = wal.appendNodeRecord(transaction, node, txid, pages)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
+		}
+		header := RecordHeader{Type: RecordTypeNode, PageID: node.Final.PageID(), TxID: txid}
+		if pages == nil {
+			wal.pending = append(wal.pending, CommittedPage{Header: header, Node: node.Final})
+			continue
+		}
+		for _, data := range pages {
+			header.PageID = page.ID(binary.LittleEndian.Uint64(data[2:10]))
+			wal.pending = append(wal.pending, CommittedPage{Header: header, Payload: data})
 		}
 	}
 	for _, record := range allocationPages {
 		header := RecordHeader{Type: RecordTypeAllocation, PageID: record.PageID, TxID: txid}
-		// Like a node, an allocation page needs a complete image for its first change after a checkpoint. See appendNodeRecord.
-		// A later change patches the committed image, which is the latest image of the page in the WAL.
-		if committed, ok := wal.overlay[record.PageID]; ok && committed.Header.Type == RecordTypeAllocation && len(committed.Payload) == len(record.Payload) {
-			wal.patchBuffer = appendChangedBytePatchRanges(wal.patchBuffer[:0], 0, committed.Payload, record.Payload)
-			if len(wal.patchBuffer) < len(record.Payload) {
-				header.Type = RecordTypeBytePatch
-				transaction = appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed)
-				continue
-			}
+		if base, ok := wal.patchBase(record.PageID); ok && base.Header.Type == RecordTypeAllocation && len(base.Payload) == len(record.Payload) {
+			transaction = wal.appendPageChange(transaction, header, base.Payload, record.Payload)
+		} else {
+			transaction = appendEncodedPayloadRecord(transaction, header, record.Payload, wal.checksumSeed)
 		}
-		transaction = appendEncodedPayloadRecord(transaction, header, record.Payload, wal.checksumSeed)
+		wal.pending = append(wal.pending, CommittedPage{Header: header, Payload: record.Payload})
 	}
 	if len(encodedMeta) > 0 {
 		header := RecordHeader{Type: RecordTypeMeta, TxID: txid}
 		for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
 			header.PageID = pageID
 			transaction = appendEncodedPayloadRecord(transaction, header, encodedMeta, wal.checksumSeed)
+			wal.pending = append(wal.pending, CommittedPage{Header: header, Payload: encodedMeta})
 		}
 	}
 	transaction = appendEncodedPayloadRecord(transaction, RecordHeader{Type: RecordTypeCommit, TxID: txid}, nil, wal.checksumSeed)
 	if continuedPageCount == 0 {
 		wal.encodingBuffer = transaction[:0]
 	}
-	return transaction, continuedPages, nil
+	return transaction, nil
+}
+
+// patchBase returns the committed image of a page that a patch can change.
+// A page has a patch base only when the current WAL generation already holds an image of it: a complete image, maybe with later patches.
+// So the first change to a page after a checkpoint has no patch base and writes a complete image.
+// Recovery then never needs a main-file page as the base of a patch, because a partial checkpoint can damage that page.
+// A checkpoint clears the overlay only after the WAL truncate succeeds, so a failed checkpoint keeps every patch base.
+// Nodes, allocation pages, and the pages of continued nodes all use this rule.
+func (wal *WAL) patchBase(pageID page.ID) (CommittedPage, bool) {
+	committed, ok := wal.overlay[pageID]
+	return committed, ok
+}
+
+// appendPageChange appends a record that changes the committed image of one page into image.
+// The record is a byte patch when that is smaller, and otherwise the complete image. header names the complete image type.
+// It appends nothing when image equals committed: the WAL then already holds the latest image of the page.
+// committed must be the patch base of the page (see patchBase), with the size of image.
+func (wal *WAL) appendPageChange(transaction []byte, header RecordHeader, committed, image []byte) []byte {
+	wal.patchBuffer = appendChangedBytePatchRanges(wal.patchBuffer[:0], 0, committed, image)
+	if len(wal.patchBuffer) == 0 {
+		return transaction
+	}
+	if len(wal.patchBuffer) < len(image) {
+		header.Type = RecordTypeBytePatch
+		return appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed)
+	}
+	return appendEncodedPayloadRecord(transaction, header, image, wal.checksumSeed)
 }
 
 // appendNodeRecord appends a complete node image, a byte patch, or an entry patch.
@@ -276,7 +299,7 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 //
 // The record uses the complete final image in these cases:
 //   - Original is nil. A new or reused page has no committed base.
-//   - The page has no image in the WAL. The first change after a checkpoint needs a complete image, because recovery must not depend on a main page that a partial checkpoint can damage.
+//   - The page has no patch base: this is its first change after a checkpoint. See patchBase.
 //   - Final fits in one page, and Original has continuation pages. The two images use different offsets.
 //   - No patch is smaller than the complete image.
 //
@@ -293,8 +316,8 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	if len(record.Final.OverflowPages()) != 0 {
 		return wal.appendContinuedNodeRecords(transaction, record, txid, pages)
 	}
-	_, hasWALImage := wal.overlay[header.PageID]
-	if record.Original == nil || !hasWALImage || len(record.Original.OverflowPages()) != 0 {
+	_, hasBase := wal.patchBase(header.PageID)
+	if record.Original == nil || !hasBase || len(record.Original.OverflowPages()) != 0 {
 		return appendEncodedNodeRecord(transaction, header, record.Final, wal.checksumSeed), nil
 	}
 
@@ -361,16 +384,14 @@ func (wal *WAL) appendContinuedNodeRecords(transaction []byte, record *NodeRecor
 }
 
 // appendContinuedBytePatches appends records only for the changed pages of a continued node.
-// Each page of final must have a committed image of the same size in the WAL: see appendNodeRecord for why a patch needs that image.
-// A changed page gets a byte patch, or its complete image when the patch is not smaller.
-// An unchanged page gets no record, because its WAL image stays the latest image of the page.
-// It returns false and appends nothing when a page has no such WAL image.
+// Each page of final must have a patch base of the same size (see patchBase). Then appendPageChange writes each page.
+// It returns false and appends nothing when a page has no such patch base.
 // The published payloads borrow one new image of final, because the transaction holds only the changes.
 func (wal *WAL) appendContinuedBytePatches(transaction []byte, final *btree.Node, txid TxID, ids []page.ID, pages [][]byte, imageBytes int) ([]byte, bool, error) {
 	pageSize := int(wal.pageSize)
 	for i, id := range ids {
-		committed, ok := wal.overlay[id]
-		if !ok || len(committed.Payload) != min(pageSize, imageBytes-i*pageSize) {
+		base, ok := wal.patchBase(id)
+		if !ok || len(base.Payload) != min(pageSize, imageBytes-i*pageSize) {
 			return transaction, false, nil
 		}
 	}
@@ -383,17 +404,8 @@ func (wal *WAL) appendContinuedBytePatches(transaction []byte, final *btree.Node
 		return nil, false, err
 	}
 	for i, data := range pages {
-		wal.patchBuffer = appendChangedBytePatchRanges(wal.patchBuffer[:0], 0, wal.overlay[ids[i]].Payload, data)
-		if len(wal.patchBuffer) == 0 {
-			continue
-		}
-		header := RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: txid}
-		if len(wal.patchBuffer) < len(data) {
-			header.Type = RecordTypeBytePatch
-			transaction = appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed)
-		} else {
-			transaction = appendEncodedPayloadRecord(transaction, header, data, wal.checksumSeed)
-		}
+		base, _ := wal.patchBase(ids[i])
+		transaction = wal.appendPageChange(transaction, RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: txid}, base.Payload, data)
 	}
 	return transaction, true, nil
 }
