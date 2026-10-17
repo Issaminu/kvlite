@@ -84,6 +84,7 @@ func leafSpan(image []byte, index int) (flags uint32, start, keyEnd, end uint64)
 // validLeaf reports whether the fields that leafSpan read are valid: the key passes validKey, the value ends inside the image, and the flags and value size are valid.
 // A plain value can have up to MaxValueSize bytes. A nested bucket entry stores an 8-byte root page ID.
 // Every path that reads leaf entries uses this rule, so decode, lookup, and the reference check accept the same leaves.
+// The mapped scans of a one-page leaf check only the flags and value rule (see VisitMappedLeafRange).
 func validLeaf(flags uint32, start, keyEnd, end, dataStart, imageSize uint64) bool {
 	valueSize := end - keyEnd
 	return validKey(start, keyEnd, dataStart, imageSize) &&
@@ -229,7 +230,7 @@ func mappedLeafImage(data []byte, id page.ID, checksums bool, readPage func(page
 }
 
 // VisitMappedLeafRange visits entries in the half-open range [start, end).
-// It checks descriptor offsets and byte bounds. checksums selects nonzero checksum checks.
+// It checks descriptor offsets, byte bounds, and the flags and value rule of validLeaf. checksums selects nonzero checksum checks.
 // Normal leaf results borrow data. Continued leaf results borrow a rebuilt image.
 // readPage supplies continuation pages. Pass nil for a normal leaf.
 func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error, checksums bool, readPage func(page.ID) ([]byte, error)) error {
@@ -243,11 +244,14 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 		return err
 	}
 	// Each entry must start where the previous entry ends and must end inside the image.
+	// The flags must select a plain value or a nested bucket entry with an 8-byte root page ID, as validLeaf requires.
+	// A plain value in one page cannot be larger than MaxValueSize, and checkLeafBody checked each rebuilt image.
+	// The scan does not check key sizes: the complete validLeaf check made the scan about 5% slower.
 	// The loop values are int values: uint32 and uint64 loop values made the scan about 7% slower.
 	next := int(dataStart)
 	for index := range int(count) {
 		flags, keyStart, keyEnd, valueEnd := leafSpan(image, index)
-		if keyStart != uint64(next) || valueEnd > uint64(len(image)) {
+		if keyStart != uint64(next) || valueEnd > uint64(len(image)) || flags != 0 && (flags != BucketLeafFlag || valueEnd-keyEnd != page.IDSize) {
 			return entryError(index)
 		}
 		next = int(valueEnd)
@@ -292,7 +296,7 @@ func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint
 	}
 	for index := last; index >= 0; index-- {
 		flags, keyStart, keyEnd, valueEnd := leafSpan(image, index)
-		if keyStart < dataStart || valueEnd != next {
+		if keyStart < dataStart || valueEnd != next || flags != 0 && (flags != BucketLeafFlag || valueEnd-keyEnd != page.IDSize) {
 			return entryError(index)
 		}
 		next = keyStart

@@ -207,7 +207,7 @@ func TestLookupMappedNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 
 // TestLeafCodec_RejectsBucketEntryWithoutRootID checks that every path that reads leaf entries applies one rule:
 // a nested bucket entry stores an 8-byte root page ID.
-// Decode, lookup, and the reference check must agree, for a leaf in one page and for a continued leaf.
+// Decode, lookup, the reference check, and the mapped scans must agree, for a leaf in one page and for a continued leaf.
 func TestLeafCodec_RejectsBucketEntryWithoutRootID(t *testing.T) {
 	key := []byte("bucket")
 	for _, value := range [][]byte{[]byte("short"), bytes.Repeat([]byte("v"), 100)} {
@@ -239,6 +239,13 @@ func TestLeafCodec_RejectsBucketEntryWithoutRootID(t *testing.T) {
 		}
 		if err := VisitMappedNodeReferences(pages[0], 8, pageSize, read, func(page.ID) error { return nil }, nil, true); !errors.Is(err, ErrInvalid) {
 			t.Fatalf("value %d bytes: reference check: %v", len(value), err)
+		}
+		visit := func(uint32, []byte, []byte) error { return nil }
+		if err := VisitMappedLeafRange(pages[0], 8, nil, nil, visit, true, read); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("value %d bytes: mapped range scan: %v", len(value), err)
+		}
+		if err := VisitMappedLeafReverse(pages[0], 8, visit, true, read); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("value %d bytes: mapped reverse scan: %v", len(value), err)
 		}
 		if len(ids) == 1 {
 			image := EncodeWALNode(node)
