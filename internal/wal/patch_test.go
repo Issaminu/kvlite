@@ -436,6 +436,29 @@ func TestAppendChangedBytePatchRanges_MatchesByteScan(t *testing.T) {
 }
 
 // BenchmarkAppendChangedBytePatchRanges measures range building for one changed value field.
+// BenchmarkAppendLeafBytePatch measures the scan of a leaf with 100 entries in which one value changed, as in a typical update.
+// Most of its time is the loop over unchanged entries.
+func BenchmarkAppendLeafBytePatch(b *testing.B) {
+	base := btree.NewLeafNode(3)
+	for index := range 100 {
+		if err := base.InsertEntry(btree.NewEntry(0, fmt.Appendf(nil, "key-%011d", index), bytes.Repeat([]byte{byte(index)}, 128))); err != nil {
+			b.Fatal(err)
+		}
+	}
+	target := base.Clone()
+	if err := target.InsertEntry(btree.NewEntry(0, fmt.Appendf(nil, "key-%011d", 50), bytes.Repeat([]byte{0xff}, 128))); err != nil {
+		b.Fatal(err)
+	}
+	patch := make([]byte, 0, 4096)
+	b.ReportAllocs()
+	for b.Loop() {
+		patch = patch[:0]
+		if _, compatible := appendLeafBytePatch(&patch, base, target); !compatible {
+			b.Fatal("leaf layout changed")
+		}
+	}
+}
+
 func BenchmarkAppendChangedBytePatchRanges(b *testing.B) {
 	cases := []struct {
 		name   string

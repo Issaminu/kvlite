@@ -323,10 +323,11 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 
 	var encodedSize int
 	var compatible bool
+	wal.patchBuffer = wal.patchBuffer[:0]
 	if record.Final.IsLeaf() {
-		wal.patchBuffer, encodedSize, compatible = appendLeafBytePatch(wal.patchBuffer[:0], record.Original, record.Final)
+		encodedSize, compatible = appendLeafBytePatch(&wal.patchBuffer, record.Original, record.Final)
 	} else {
-		wal.patchBuffer, encodedSize, compatible = appendBranchBytePatch(wal.patchBuffer[:0], record.Original, record.Final)
+		encodedSize, compatible = appendBranchBytePatch(&wal.patchBuffer, record.Original, record.Final)
 	}
 	if compatible && encodedSize == targetSize && len(wal.patchBuffer) < targetSize {
 		header.Type = RecordTypeBytePatch
@@ -405,12 +406,13 @@ func (wal *WAL) appendContinuedBytePatches(transaction []byte, final *btree.Node
 	return transaction, true, nil
 }
 
-// appendLeafBytePatch scans one leaf once and appends the ranges of changed value bytes to patch.
+// appendLeafBytePatch scans one leaf once and appends the ranges of changed value bytes to *patch.
 // A patch is possible only when flags, keys, and value lengths keep the same encoded layout.
-// It returns the patch, the encoded size of target, and false when the layout changes.
-func appendLeafBytePatch(patch []byte, base, target *btree.Node) ([]byte, int, bool) {
+// It returns the encoded size of target, and false when the layout changes.
+// patch is a pointer, so the loop does not keep the slice in registers: each bytes.Equal call would then store and load it again for every entry.
+func appendLeafBytePatch(patch *[]byte, base, target *btree.Node) (int, bool) {
 	if !base.IsLeaf() || base.EntryCount() != target.EntryCount() {
-		return patch, 0, false
+		return 0, false
 	}
 
 	offset := target.WALBodyOffset()
@@ -422,27 +424,27 @@ func appendLeafBytePatch(patch []byte, base, target *btree.Node) ([]byte, int, b
 		baseValue := baseEntry.Value()
 		targetValue := targetEntry.Value()
 		if baseEntry.Flags() != targetEntry.Flags() || !bytes.Equal(baseKey, targetKey) || len(baseValue) != len(targetValue) {
-			return patch, 0, false
+			return 0, false
 		}
 
 		valueOffset := offset + len(targetKey)
 		if !bytes.Equal(baseValue, targetValue) {
-			patch = appendChangedBytePatchRanges(patch, valueOffset, baseValue, targetValue)
+			*patch = appendChangedBytePatchRanges(*patch, valueOffset, baseValue, targetValue)
 		}
 		offset = valueOffset + len(targetValue)
 	}
-	return patch, offset, true
+	return offset, true
 }
 
-// appendBranchBytePatch scans one branch once and appends the ranges of changed child IDs and separator keys to patch.
+// appendBranchBytePatch scans one branch once and appends the ranges of changed child IDs and separator keys to *patch.
 // A patch is possible only when the child count and separator-key lengths keep the same encoded layout.
-// It returns the patch, the encoded size of target, and false when the layout changes.
-func appendBranchBytePatch(patch []byte, base, target *btree.Node) ([]byte, int, bool) {
+// It returns the encoded size of target, and false when the layout changes. patch is a pointer for the reason in appendLeafBytePatch.
+func appendBranchBytePatch(patch *[]byte, base, target *btree.Node) (int, bool) {
 	if base.IsLeaf() || base.EntryCount() != target.EntryCount() {
-		return patch, 0, false
+		return 0, false
 	}
 	if len(base.Children) != base.EntryCount()+1 || len(target.Children) != target.EntryCount()+1 {
-		return patch, 0, false
+		return 0, false
 	}
 
 	offset := target.WALBodyOffset()
@@ -451,7 +453,7 @@ func appendBranchBytePatch(patch []byte, base, target *btree.Node) ([]byte, int,
 		if base.Children[index] != target.Children[index] {
 			binary.LittleEndian.PutUint64(baseChild[:], uint64(base.Children[index]))
 			binary.LittleEndian.PutUint64(targetChild[:], uint64(target.Children[index]))
-			patch = appendChangedBytePatchRanges(patch, offset, baseChild[:], targetChild[:])
+			*patch = appendChangedBytePatchRanges(*patch, offset, baseChild[:], targetChild[:])
 		}
 		offset += page.IDSize
 	}
@@ -459,14 +461,14 @@ func appendBranchBytePatch(patch []byte, base, target *btree.Node) ([]byte, int,
 		baseKey := base.EntryAt(index).Key()
 		targetKey := target.EntryAt(index).Key()
 		if len(baseKey) != len(targetKey) {
-			return patch, 0, false
+			return 0, false
 		}
 		if !bytes.Equal(baseKey, targetKey) {
-			patch = appendChangedBytePatchRanges(patch, offset, baseKey, targetKey)
+			*patch = appendChangedBytePatchRanges(*patch, offset, baseKey, targetKey)
 		}
 		offset += len(targetKey)
 	}
-	return patch, offset, true
+	return offset, true
 }
 
 // rollbackAppend removes bytes from a failed commit and restores the counters that describe the retained WAL prefix.
