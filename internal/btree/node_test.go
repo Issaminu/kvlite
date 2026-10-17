@@ -441,7 +441,7 @@ func TestNodeSavedSizeTracksMutations(t *testing.T) {
 		t.Fatal(err)
 	}
 	check(leaf)
-	if err := leaf.DeleteKeyIfPresent([]byte("m")); err != nil {
+	if err := leaf.DeleteKey([]byte("m")); err != nil {
 		t.Fatal(err)
 	}
 	check(leaf)
@@ -1547,7 +1547,7 @@ func TestLeafDeletionCopiesOnlyRetainedEntries(t *testing.T) {
 			before := EncodeWALNode(base)
 			want := base.Clone()
 			for i := len(indexes) - 1; i >= 0; i-- {
-				want.applyDelete(indexes[i])
+				want.entries = slices.Delete(want.entries, indexes[i], indexes[i]+1)
 			}
 			private := base.CloneWithoutLeafEntries(indexes[0], indexes[1:], 0)
 			if !bytes.Equal(EncodeWALNode(private), EncodeWALNode(want)) || private.EncodedSize() != want.EncodedSize() {

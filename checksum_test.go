@@ -336,30 +336,16 @@ func TestDataPageChecksums_RecoveryUsesWALMetadata(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Remove the base transaction to model a WAL from the older writer.
+				patched := false
+				for _, record := range records {
+					patched = patched || record.Header.Type == wal.RecordTypeBytePatch
+				}
+				if !patched {
+					t.Fatal("fixture did not write a byte patch")
+				}
 				log, err := os.ReadFile(path + "-wal")
 				if err != nil {
 					t.Fatal(err)
-				}
-				headerSize := len(log)
-				for _, record := range records {
-					headerSize -= wal.HeaderSize + len(record.Payload) + wal.ChecksumSize
-				}
-				log = log[:headerSize]
-				checksumSeed, err := wal.RecordChecksumSeed(log)
-				if err != nil {
-					t.Fatal(err)
-				}
-				patched := false
-				for _, record := range records {
-					if record.Header.TxID == records[0].Header.TxID {
-						continue
-					}
-					log = wal.AppendEncodedWALRecord(log, &record, checksumSeed)
-					patched = patched || record.Header.Type == wal.RecordTypePatch
-				}
-				if !patched {
-					t.Fatal("fixture did not write a patch that needs a main-page base")
 				}
 				main, err := os.ReadFile(path)
 				if err != nil {

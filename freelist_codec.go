@@ -80,7 +80,7 @@ func decodeAllocationSegment(data []byte, pageSize int64, pageID page.ID) (alloc
 }
 
 // readAllocationBitmap reads the allocation pages named by meta.
-// A committed WAL image replaces the main-file image of the same page.
+// A committed WAL image, changed by the byte patches after it, replaces the main-file image of the same page.
 // It reads one page per segment and does not scan tree pages.
 // The records must contain only committed WAL records in file order.
 // The caller must not change records or their payloads while it uses the returned bitmap.
@@ -97,19 +97,12 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 	if mainPages != 0 {
 		availableLastPage = page.ID(mainPages - 1)
 	}
-	var latest map[page.ID][]byte
 	for _, record := range records {
-		switch record.Header.Type {
-		case wal.RecordTypeNode, wal.RecordTypePatch, wal.RecordTypeLeafDelete, wal.RecordTypeAllocation:
+		if isWALPageRecord(record.Header.Type) {
 			availableLastPage = max(availableLastPage, record.Header.PageID)
 		}
-		if record.Header.Type == wal.RecordTypeAllocation {
-			if latest == nil {
-				latest = make(map[page.ID][]byte)
-			}
-			latest[record.Header.PageID] = record.Payload
-		}
 	}
+	chains := walPageChains(records)
 	if meta.LastPage() > availableLastPage {
 		return nil, fmt.Errorf("metadata last page %d exceeds main-file and WAL page IDs: %w", meta.LastPage(), page.ErrInvalid)
 	}
@@ -119,8 +112,17 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 	bitmap.segments = make([]allocationSegment, segmentCount)
 	for index := range bitmap.segments {
 		pageID := bitmap.segmentPageID(index)
-		data, inWAL := latest[pageID]
-		if !inWAL {
+		var data []byte
+		if chain, inWAL := chains[pageID]; inWAL {
+			record, err := db.materializeWALPage(records, chain)
+			if err != nil {
+				return nil, err
+			}
+			if record.Header.Type != wal.RecordTypeAllocation {
+				return nil, fmt.Errorf("WAL record type %d for allocation page %d: %w", record.Header.Type, pageID, page.ErrInvalid)
+			}
+			data = record.Payload
+		} else {
 			data, err = db.readMainPage(pageID)
 			if err != nil {
 				return nil, fmt.Errorf("read allocation page %d: %w", pageID, err)

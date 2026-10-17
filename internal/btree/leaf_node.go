@@ -123,12 +123,6 @@ func (n *Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
 	return index, true, nil
 }
 
-func (n *Node) applyDelete(index int) {
-	n.encodedSize = 0
-	n.entries = slices.Delete(n.entries, index, index+1)
-	n.header.Checksum = 0
-}
-
 // DeleteLeafEntries removes selected entries from a private leaf in one pass.
 // n must be a leaf owned by the caller. firstIndex and rest must contain
 // distinct, ascending entry indexes. It clears unused entry slots.
@@ -153,16 +147,29 @@ func copyLeafEntriesExcept(dst, entries []Entry, firstIndex int, rest []int) {
 	copy(dst[write:], entries[read:])
 }
 
-// DeleteKeyIfPresent removes a leaf entry. A missing key makes no change.
-// WAL recovery can call it when a checkpoint already wrote the final leaf.
-func (n *Node) DeleteKeyIfPresent(key []byte) error {
+// DeleteKey removes the leaf entry that has key. It returns [ErrKeyNotFound] when the leaf has no such entry.
+// WAL recovery uses it to replay an entry patch. It removes the entry with DeleteLeafEntries, as the normal delete path does.
+func (n *Node) DeleteKey(key []byte) error {
 	index, found, err := n.findKeyIndex(key)
 	if err != nil {
 		return err
 	}
-	if found {
-		n.applyDelete(index)
+	if !found {
+		return ErrKeyNotFound
 	}
+	n.DeleteLeafEntries(index, nil)
+	return nil
+}
+
+// InsertOrReplaceLeafEntry inserts entry, or it replaces the entry that has the same key.
+// Unlike InsertEntry, it does not compare the bucket flags of the two entries: an entry patch can replace a value with a nested bucket in one change, or the reverse.
+// WAL recovery uses it to replay an entry patch. It copies the key and value bytes.
+func (n *Node) InsertOrReplaceLeafEntry(entry Entry) error {
+	index, found, err := n.findKeyIndex(entry.key)
+	if err != nil {
+		return err
+	}
+	n.applyInsert(leafInsert{entry: entry, index: index, found: found})
 	return nil
 }
 

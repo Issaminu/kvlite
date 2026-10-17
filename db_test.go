@@ -348,7 +348,7 @@ func TestWriteTx_PreservesOriginalNodeAcrossWriteBatchCallbacks(t *testing.T) {
 	}
 }
 
-func TestOpen_RecoversPagePatch(t *testing.T) {
+func TestOpen_RecoversBytePatch(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
 	defer os.RemoveAll(path + "-wal")
@@ -378,10 +378,10 @@ func TestOpen_RecoversPagePatch(t *testing.T) {
 	}
 	foundPatch := false
 	for _, record := range records {
-		foundPatch = foundPatch || record.Header.Type == wal.RecordTypePatch
+		foundPatch = foundPatch || record.Header.Type == wal.RecordTypeBytePatch
 	}
 	if !foundPatch {
-		t.Fatal("update did not write a page patch")
+		t.Fatal("update did not write a byte patch")
 	}
 	if err := db.unmapMainFile(); err != nil {
 		t.Fatal(err)

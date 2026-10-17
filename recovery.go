@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -85,7 +84,7 @@ func (db *DB) readOrCreateWal(path string, pageSize int64, syncDirectory func() 
 }
 
 func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
-	committed, err := db.materializeWALNodeChanges(committed)
+	committed, err := db.materializeWALPages(committed)
 	if err != nil {
 		return err
 	}
@@ -149,7 +148,7 @@ func metaFromCommittedRecords(committed []wal.WALRecord) (*page.Meta, error) {
 
 // loadCommittedIntoOverlay makes committed WAL pages visible to a read-only database. It does not change the main file.
 func (db *DB) loadCommittedIntoOverlay(committed []wal.WALRecord) error {
-	committed, err := db.materializeWALNodeChanges(committed)
+	committed, err := db.materializeWALPages(committed)
 	if err != nil {
 		return err
 	}
@@ -168,120 +167,101 @@ func (db *DB) loadCommittedIntoOverlay(committed []wal.WALRecord) error {
 	return nil
 }
 
-// materializeWALNodeChanges rebuilds the latest complete image for each data page.
-// A later Delete can free a page that has an older WAL patch.
-// A later full node can replace an older patch for a page that was reused.
-// Neither older patch needs its old main-file page during recovery.
-func (db *DB) materializeWALNodeChanges(records []wal.WALRecord) ([]wal.WALRecord, error) {
-	pageImages := make(map[page.ID][]byte)
-	lastRecord := make(map[page.ID]int)
-	lastFullRecord := make(map[page.ID]int)
-	loadMain := func(pageID page.ID) ([]byte, uint32, error) {
-		mainPage, err := db.readMainNodePage(pageID)
-		if err != nil {
-			return nil, 0, fmt.Errorf("read page %d for WAL change: %w", pageID, err)
-		}
-		node, err := btree.DecodeNode(slices.Clone(mainPage), pageID, db.meta.PageSize(), nil, db.meta.DataPageChecksums())
-		if err != nil {
-			return nil, 0, fmt.Errorf("decode page %d for WAL change: %w", pageID, err)
-		}
-		return btree.EncodeWALNode(node), uint32(node.EntryCount()), nil
+// isWALPageRecord reports whether recordType stores a complete image or a patch of one tree or allocation page.
+func isWALPageRecord(recordType wal.RecordType) bool {
+	switch recordType {
+	case wal.RecordTypeNode, wal.RecordTypeBytePatch, wal.RecordTypeEntryPatch, wal.RecordTypeAllocation:
+		return true
 	}
-	for index, record := range records {
-		if record.Header.Type == wal.RecordTypeNode {
-			lastFullRecord[record.Header.PageID] = index
-		}
-	}
-	// A checkpoint can write the final main page and fail before it clears the WAL.
-	// If the main leaf already has a delete record's final entry count, it has
-	// also received every earlier change to that page. Skip that prefix so an
-	// older same-size patch cannot run against the smaller leaf image.
-	skipThrough := make(map[page.ID]int)
-	mainCounts := make(map[page.ID]uint32)
-	for index, record := range records {
-		if record.Header.Type != wal.RecordTypeLeafDelete {
-			continue
-		}
-		pageID := record.Header.PageID
-		if db.allocation != nil && !db.allocation.allocated(pageID) {
-			continue
-		}
-		if _, hasFull := lastFullRecord[pageID]; hasFull {
-			continue
-		}
-		_, targetCount, err := wal.LeafDeleteEntryCounts(record.Payload)
-		if err != nil {
-			return nil, fmt.Errorf("read leaf delete for page %d: %w", pageID, err)
-		}
-		count, loaded := mainCounts[pageID]
-		if !loaded {
-			image, mainCount, err := loadMain(pageID)
-			if err != nil {
-				return nil, err
-			}
-			pageImages[pageID] = image
-			mainCounts[pageID] = mainCount
-			count = mainCount
-		}
-		if count == targetCount {
-			skipThrough[pageID] = index
-		}
-	}
-	for index, record := range records {
-		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch || record.Header.Type == wal.RecordTypeLeafDelete {
-			if db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
-				continue
-			}
-			if fullIndex, ok := lastFullRecord[record.Header.PageID]; ok && index < fullIndex {
-				continue
-			}
-			if through, ok := skipThrough[record.Header.PageID]; ok && index <= through {
-				lastRecord[record.Header.PageID] = through
-				continue
-			}
-		}
-		var image []byte
-		switch record.Header.Type {
-		case wal.RecordTypeNode:
-			image = record.Payload
-		case wal.RecordTypePatch, wal.RecordTypeLeafDelete:
-			base, ok := pageImages[record.Header.PageID]
-			if !ok {
-				var err error
-				base, _, err = loadMain(record.Header.PageID)
-				if err != nil {
-					return nil, err
-				}
-			}
-			var err error
-			if record.Header.Type == wal.RecordTypePatch {
-				image, err = wal.ApplyPagePatch(base, record.Payload, db.meta.PageSize())
-			} else {
-				image, err = wal.ApplyLeafDeletes(base, record.Payload, record.Header.PageID)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("apply WAL node change for page %d: %w", record.Header.PageID, err)
-			}
-		default:
-			continue
-		}
-		pageImages[record.Header.PageID] = image
-		lastRecord[record.Header.PageID] = index
-	}
+	return false
+}
 
+// walPageChains returns the indexes of the page records of each page, in file order.
+func walPageChains(records []wal.WALRecord) map[page.ID][]int {
+	chains := make(map[page.ID][]int)
+	for index, record := range records {
+		if isWALPageRecord(record.Header.Type) {
+			chains[record.Header.PageID] = append(chains[record.Header.PageID], index)
+		}
+	}
+	return chains
+}
+
+// materializeWALPages rebuilds the latest complete image of each tree and allocation page from its WAL records.
+// It puts one complete record at the position of the last record of each page.
+// A later Delete can free a page that has older WAL records. Recovery skips that page.
+func (db *DB) materializeWALPages(records []wal.WALRecord) ([]wal.WALRecord, error) {
+	chains := walPageChains(records)
 	materialized := make([]wal.WALRecord, 0, len(records))
 	for index, record := range records {
-		if record.Header.Type == wal.RecordTypeNode || record.Header.Type == wal.RecordTypePatch || record.Header.Type == wal.RecordTypeLeafDelete {
-			if db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
+		if isWALPageRecord(record.Header.Type) {
+			chain := chains[record.Header.PageID]
+			if chain[len(chain)-1] != index || db.allocation != nil && !db.allocation.allocated(record.Header.PageID) {
 				continue
 			}
-			if lastRecord[record.Header.PageID] != index {
-				continue
+			var err error
+			if record, err = db.materializeWALPage(records, chain); err != nil {
+				return nil, err
 			}
-			record.Header.Type = wal.RecordTypeNode
-			record.Payload = pageImages[record.Header.PageID]
 		}
 		materialized = append(materialized, record)
 	}
 	return materialized, nil
+}
+
+// materializeWALPage replays the records of one page, at the chain indexes, from the last complete image of the page.
+// It returns one complete record of the type of that image, with the header of the last record.
+// A later complete image replaces the older records of a page that was reused.
+// The first change to a page after a checkpoint is a complete image (see [wal.WAL.Commit]).
+// So each patch changes the image that the earlier WAL records of the page give, and byte patches and entry patches can follow each other in any order.
+// Recovery never reads a main-file page as the base of a patch: a partial checkpoint can damage that page.
+// A patch with no complete image of its page before it is invalid.
+func (db *DB) materializeWALPage(records []wal.WALRecord, chain []int) (wal.WALRecord, error) {
+	last := records[chain[len(chain)-1]]
+	pageID := last.Header.PageID
+	first := len(chain) - 1
+	for first >= 0 && records[chain[first]].Header.Type != wal.RecordTypeNode && records[chain[first]].Header.Type != wal.RecordTypeAllocation {
+		first--
+	}
+	if first < 0 {
+		return wal.WALRecord{}, fmt.Errorf("WAL patch for page %d has no complete image before it: %w", pageID, page.ErrInvalid)
+	}
+	base := records[chain[first]]
+	image := base.Payload
+	// After an entry patch, node holds the latest state instead of image. So a series of entry patches decodes the page once.
+	var node *btree.Node
+	for _, index := range chain[first+1:] {
+		record := records[index]
+		switch record.Header.Type {
+		case wal.RecordTypeBytePatch:
+			if node != nil {
+				image, node = btree.EncodeWALNode(node), nil
+			}
+			var err error
+			if image, err = wal.ApplyBytePatch(image, record.Payload, db.meta.PageSize()); err != nil {
+				return wal.WALRecord{}, fmt.Errorf("apply WAL byte patch for page %d: %w", pageID, err)
+			}
+		case wal.RecordTypeEntryPatch:
+			if base.Header.Type != wal.RecordTypeNode {
+				return wal.WALRecord{}, fmt.Errorf("WAL entry patch for allocation page %d: %w", pageID, page.ErrInvalid)
+			}
+			if node == nil {
+				var err error
+				if node, err = btree.DecodeWALNode(image, pageID, db.meta.PageSize(), nil); err != nil {
+					return wal.WALRecord{}, fmt.Errorf("read base of WAL entry patch for page %d: %w", pageID, err)
+				}
+			}
+			if err := wal.ApplyEntryPatch(node, record.Payload); err != nil {
+				return wal.WALRecord{}, fmt.Errorf("apply WAL entry patch for page %d: %w", pageID, err)
+			}
+			if int64(btree.WALNodeEncodedSize(node)) > db.meta.PageSize() {
+				return wal.WALRecord{}, fmt.Errorf("WAL entry patch makes page %d larger than one page: %w", pageID, page.ErrInvalid)
+			}
+		}
+	}
+	if node != nil {
+		image = btree.EncodeWALNode(node)
+	}
+	last.Header.Type, last.Payload = base.Header.Type, image
+	return last, nil
 }

@@ -672,7 +672,7 @@ func TestWALEncodeTransaction_ReusesBuffer(t *testing.T) {
 	}
 }
 
-func TestWALEncodeTransaction_ReusesNodePatchBuffers(t *testing.T) {
+func TestWALEncodeTransaction_ReusesBytePatchBuffers(t *testing.T) {
 	base := btree.NewLeafNode(2)
 	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("old-value"))); err != nil {
 		t.Fatal(err)
@@ -695,11 +695,11 @@ func TestWALEncodeTransaction_ReusesNodePatchBuffers(t *testing.T) {
 		}
 	})
 	if allocations != 0 {
-		t.Fatalf("allocations per warmed node-patch encoding: got %.0f, want 0", allocations)
+		t.Fatalf("allocations per warmed entry-patch encoding: got %.0f, want 0", allocations)
 	}
 }
 
-func TestWALCommit_EncodesSmallerPagePatchAndPublishesFinalNode(t *testing.T) {
+func TestWALCommit_EncodesSmallerBytePatchAndPublishesFinalNode(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -730,15 +730,15 @@ func TestWALCommit_EncodesSmallerPagePatchAndPublishesFinalNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 4 || decoded[0].Header.Type != RecordTypeNode || decoded[2].Header.Type != RecordTypePatch {
-		t.Fatalf("decoded WAL records: got %+v, want a complete image followed by a page patch", decoded)
+	if len(decoded) != 4 || decoded[0].Header.Type != RecordTypeNode || decoded[2].Header.Type != RecordTypeBytePatch {
+		t.Fatalf("decoded WAL records: got %+v, want a complete image followed by a byte patch", decoded)
 	}
-	patched, err := ApplyPagePatch(btree.EncodeWALNode(base), decoded[2].Payload, 128)
+	patched, err := ApplyBytePatch(btree.EncodeWALNode(base), decoded[2].Payload, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(patched, btree.EncodeWALNode(target)) {
-		t.Fatal("page patch did not rebuild the final node")
+		t.Fatal("byte patch did not rebuild the final node")
 	}
 	published, ok := log.Lookup(target.PageID())
 	if !ok || published.Node != target || published.Payload != nil {
@@ -746,7 +746,7 @@ func TestWALCommit_EncodesSmallerPagePatchAndPublishesFinalNode(t *testing.T) {
 	}
 }
 
-func TestWALCommit_UsesFullImageWhenEntryCountChanges(t *testing.T) {
+func TestWALCommit_EncodesEntryPatchWhenEntryCountChanges(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -776,11 +776,22 @@ func TestWALCommit_UsesFullImageWhenEntryCountChanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 4 || decoded[2].Header.Type != RecordTypeNode {
-		t.Fatalf("decoded WAL records: got %+v, want a complete image after the entry count changes", decoded)
+	if len(decoded) != 4 || decoded[2].Header.Type != RecordTypeEntryPatch {
+		t.Fatalf("decoded WAL records: got %+v, want an entry patch after the complete image", decoded)
 	}
-	if err := btree.ValidateWALNode(decoded[2].Payload, target.PageID()); err != nil {
-		t.Fatalf("validate complete node image: %v", err)
+	if got, want := decoded[2].Payload, appendEntryPatchSet(nil, 0, []byte("next"), []byte("value")); !bytes.Equal(got, want) {
+		t.Fatalf("entry patch: got %v, want %v", got, want)
+	}
+	rebuilt := base.Clone()
+	if err := ApplyEntryPatch(rebuilt, decoded[2].Payload); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(btree.EncodeWALNode(rebuilt), btree.EncodeWALNode(target)) {
+		t.Fatal("entry patch did not rebuild the final node")
+	}
+	published, ok := log.Lookup(target.PageID())
+	if !ok || published.Node != target {
+		t.Fatalf("committed overlay: got %+v, want the final node", published)
 	}
 }
 
@@ -806,15 +817,15 @@ func TestWALCommit_EncodesPatchForBranchNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(decoded) != 4 || decoded[0].Header.Type != RecordTypeNode || decoded[2].Header.Type != RecordTypePatch {
-		t.Fatalf("decoded WAL records: got %+v, want a complete image followed by a page patch", decoded)
+	if len(decoded) != 4 || decoded[0].Header.Type != RecordTypeNode || decoded[2].Header.Type != RecordTypeBytePatch {
+		t.Fatalf("decoded WAL records: got %+v, want a complete image followed by a byte patch", decoded)
 	}
-	patched, err := ApplyPagePatch(btree.EncodeWALNode(base), decoded[2].Payload, 128)
+	patched, err := ApplyBytePatch(btree.EncodeWALNode(base), decoded[2].Payload, 128)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !bytes.Equal(patched, btree.EncodeWALNode(target)) {
-		t.Fatal("page patch did not rebuild the final branch node")
+		t.Fatal("byte patch did not rebuild the final branch node")
 	}
 }
 
@@ -1130,7 +1141,7 @@ func TestWALRecordCodec_UsesFixedLittleEndianLayout(t *testing.T) {
 	// Layout: record type, page ID, transaction ID, content length, content,
 	// and the CRC32C checksum of the little-endian generation salt and all preceding bytes.
 	want := []byte{
-		2,
+		3,
 		1, 0, 0, 0, 0, 0, 0, 0,
 		2, 0, 0, 0, 0, 0, 0, 0,
 		2, 0, 0, 0,

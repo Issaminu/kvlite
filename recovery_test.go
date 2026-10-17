@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -492,10 +493,10 @@ func TestRecoverySkipsOldPatchesAfterFreeOrFullNode(t *testing.T) {
 	fullRoot := btree.EncodeWALNode(root)
 	records := []wal.WALRecord{
 		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID + 1, TxID: 1}, Payload: btree.EncodeWALNode(btree.NewLeafNode(firstTreePageID + 1))},
-		{Header: wal.RecordHeader{Type: wal.RecordTypePatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeLeafDelete, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypePatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeLeafDelete, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeBytePatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeEntryPatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeBytePatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeEntryPatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
 		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID, TxID: 2}, Payload: fullRoot},
 	}
 	if err := db.loadCommittedIntoOverlay(records); err != nil {
@@ -510,7 +511,132 @@ func TestRecoverySkipsOldPatchesAfterFreeOrFullNode(t *testing.T) {
 	}
 }
 
-func TestLeafDeleteWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
+// TestRecoveryRejectsPatchWithoutCompleteImage checks that recovery never uses a main-file page as the base of a patch.
+// The first change to a page after a checkpoint is a complete image, so a WAL that has a patch without one is invalid.
+func TestRecoveryRejectsPatchWithoutCompleteImage(t *testing.T) {
+	for _, recordType := range []wal.RecordType{wal.RecordTypeBytePatch, wal.RecordTypeEntryPatch} {
+		t.Run(fmt.Sprintf("type=%d", recordType), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			records := []wal.WALRecord{
+				{Header: wal.RecordHeader{Type: recordType, PageID: firstTreePageID, TxID: 1}},
+			}
+			if err := db.loadCommittedIntoOverlay(records); !errors.Is(err, page.ErrInvalid) {
+				t.Fatalf("patch without a complete image: got %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+// TestMixedPatchChainRecoversInReadOnlyAndWritableModes replays one leaf from a chain of byte patches and entry patches.
+func TestMixedPatchChainRecoversInReadOnlyAndWritableModes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	name := []byte("bucket")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		for index := range 50 {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%03d", index), []byte("value")); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first change after the checkpoint writes a complete image.
+	// Then a same-size value change writes a byte patch, and a change of the entry count writes an entry patch.
+	for _, step := range []struct {
+		key, value string
+	}{
+		{"key-001", "VALU1"},
+		{"key-001", "VALU2"},
+		{"key-100", "new"},
+		{"key-002", "VALU3"},
+		{"key-003", ""},
+	} {
+		if step.value == "" {
+			err = db.Delete(name, []byte(step.key))
+		} else {
+			err = db.Put(name, []byte(step.key), []byte(step.value))
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	var leafPageID page.ID
+	if err := db.View(func(tx *Tx) error {
+		leafPageID = mustBucket(t, tx, name).rootPageID
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	records, err := db.wal.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var types []wal.RecordType
+	for _, record := range records {
+		if record.Header.PageID == leafPageID && record.Header.Type != wal.RecordTypeCommit {
+			types = append(types, record.Header.Type)
+		}
+	}
+	want := []wal.RecordType{wal.RecordTypeNode, wal.RecordTypeBytePatch, wal.RecordTypeEntryPatch, wal.RecordTypeBytePatch, wal.RecordTypeEntryPatch}
+	if !slices.Equal(types, want) {
+		t.Fatalf("leaf %d record types: got %v, want %v", leafPageID, types, want)
+	}
+	// Close the file handles without a checkpoint to test both recovery modes.
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	check := func(db *DB) {
+		t.Helper()
+		for key, want := range map[string]string{"key-001": "VALU2", "key-002": "VALU3", "key-004": "value", "key-100": "new"} {
+			if value, err := db.Get(name, []byte(key)); err != nil || string(value) != want {
+				t.Fatalf("key %s: got %q, error %v; want %q", key, value, err, want)
+			}
+		}
+		if value, err := db.Get(name, []byte("key-003")); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("deleted key: got %q, error %v", value, err)
+		}
+	}
+	for _, readOnly := range []bool{true, false} {
+		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+		if err != nil {
+			t.Fatal(err)
+		}
+		check(recovered)
+		if err := recovered.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
@@ -565,12 +691,12 @@ func TestLeafDeleteWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	foundDelete := false
+	foundPatch := false
 	for _, record := range records {
-		foundDelete = foundDelete || record.Header.Type == wal.RecordTypeLeafDelete
+		foundPatch = foundPatch || record.Header.Type == wal.RecordTypeEntryPatch
 	}
-	if !foundDelete {
-		t.Fatal("WAL did not use a leaf-delete record")
+	if !foundPatch {
+		t.Fatal("WAL did not use an entry patch")
 	}
 	// Close the file handles without a checkpoint to test both recovery modes.
 	if err := db.wal.Close(); err != nil {
@@ -630,7 +756,7 @@ func TestLeafDeleteWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	}
 }
 
-func TestLeafDeleteWALReplayAfterCheckpointWrite(t *testing.T) {
+func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
@@ -697,7 +823,7 @@ func TestLeafDeleteWALReplayAfterCheckpointWrite(t *testing.T) {
 	}
 }
 
-func TestLeafDeleteWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
+func TestEntryPatchWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
@@ -835,5 +961,130 @@ func TestLoadCommittedIntoOverlay_RejectsInvalidNodeDirectory(t *testing.T) {
 	}
 	if db.wal.Stats().CommittedRecordCount != 0 {
 		t.Fatal("read-only recovery published an invalid node")
+	}
+}
+
+// closeWithoutCheckpoint closes the file handles of db without a checkpoint, so the next Open must recover the WAL.
+func closeWithoutCheckpoint(t *testing.T, db *DB) {
+	t.Helper()
+	if err := db.wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAllocationBytePatchRecoversInReadOnlyAndWritableModes rebuilds an allocation page from a complete WAL image and later byte patches.
+func TestAllocationBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	name := []byte("bucket")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, name)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Each leaf split allocates a page. The first allocation change writes a complete image, and later ones write byte patches.
+	value := bytes.Repeat([]byte("v"), 200)
+	keys := 0
+	for patched := false; !patched; keys++ {
+		if keys == 10000 {
+			t.Fatal("inserts did not write an allocation byte patch")
+		}
+		if err := db.Put(name, fmt.Appendf(nil, "key-%05d", keys), value); err != nil {
+			t.Fatal(err)
+		}
+		records, err := db.wal.ReadRecords()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, record := range records {
+			patched = patched || record.Header.Type == wal.RecordTypeBytePatch && db.allocation.isSegmentPage(record.Header.PageID)
+		}
+	}
+	allocated := db.allocation.allocatedPageCount()
+	closeWithoutCheckpoint(t, db)
+	for _, readOnly := range []bool{true, false} {
+		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := recovered.allocation.allocatedPageCount(); got != allocated {
+			t.Fatalf("readOnly=%t: allocated pages after recovery: got %d, want %d", readOnly, got, allocated)
+		}
+		for index := range keys {
+			if got, err := recovered.Get(name, fmt.Appendf(nil, "key-%05d", index)); err != nil || !bytes.Equal(got, value) {
+				t.Fatalf("readOnly=%t: key %d after recovery: error %v", readOnly, index, err)
+			}
+		}
+		if err := recovered.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestContinuedNodeBytePatchRecoversInReadOnlyAndWritableModes rebuilds a continued leaf from complete WAL page images and later byte patches.
+func TestContinuedNodeBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	name := []byte("bucket")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, name)
+	value := bytes.Repeat([]byte("v"), 40<<10)
+	if err := db.Put(name, []byte("large"), value); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first edit after the checkpoint writes complete page images. The second edit writes a byte patch.
+	for _, offset := range []int{100, 30 << 10} {
+		value = bytes.Clone(value)
+		copy(value[offset:], "edited")
+		if err := db.Put(name, []byte("large"), value); err != nil {
+			t.Fatal(err)
+		}
+	}
+	records, err := db.wal.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	patches := 0
+	for _, record := range records {
+		if record.Header.Type == wal.RecordTypeBytePatch {
+			patches++
+		}
+	}
+	if patches != 1 {
+		t.Fatalf("WAL byte patches: got %d, want one for the page that the second edit changed", patches)
+	}
+	closeWithoutCheckpoint(t, db)
+	for _, readOnly := range []bool{true, false} {
+		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := recovered.Get(name, []byte("large")); err != nil || !bytes.Equal(got, value) {
+			t.Fatalf("readOnly=%t: continued value after recovery: error %v", readOnly, err)
+		}
+		if err := recovered.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

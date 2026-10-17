@@ -20,14 +20,14 @@ const (
 	RecordTypeCommit RecordType = 0
 	// RecordTypeMeta stores one complete metadata image.
 	RecordTypeMeta RecordType = 1
-	// RecordTypeNode stores one complete node-page image.
-	RecordTypeNode RecordType = 2
-	// RecordTypePatch stores replacement ranges for one existing data node.
-	RecordTypePatch RecordType = 3
 	// RecordTypeAllocation stores one complete allocation page.
-	RecordTypeAllocation RecordType = 4
-	// RecordTypeLeafDelete stores removed leaf keys in byte order.
-	RecordTypeLeafDelete RecordType = 5
+	RecordTypeAllocation RecordType = 2
+	// RecordTypeNode stores one complete node-page image.
+	RecordTypeNode RecordType = 3
+	// RecordTypeBytePatch stores replacement byte ranges for one existing data or allocation page image. See [BytePatch].
+	RecordTypeBytePatch RecordType = 4
+	// RecordTypeEntryPatch stores entry changes, addressed by key, for one existing leaf or branch that fits in one page.
+	RecordTypeEntryPatch RecordType = 5
 
 	recordTypeSize          = 1 // A record type uses one byte.
 	recordTransactionIDSize = 8 // A transaction ID uses one uint64 value.
@@ -47,8 +47,8 @@ type RecordHeader struct {
 
 // NodeRecord carries one changed data node from a write transaction to [WAL.Commit].
 // Commit writes a complete image for the first change to each page after a checkpoint.
-// Later changes can use a page patch or leaf-delete record when it is smaller than the complete final image.
-// Commit uses full records if Original or Final has continuation pages.
+// Later changes can use a byte patch or an entry patch when it is smaller than the complete final image.
+// A continued node uses a complete image or a byte patch for each page. See [WAL.Commit].
 // Final must have allocated continuation IDs, set with [btree.Node.SetOverflowPages].
 // A single-page image has different offsets from a page with continuation IDs.
 // NodeRecord exists only in memory. The WAL file does not store this structure.
@@ -70,7 +70,7 @@ type AllocationRecord struct {
 // WALRecord represents one record in the WAL file format.
 // [WAL.ReadRecords] returns WALRecord values during recovery.
 // Header.Type defines whether Payload contains a compact node, complete physical page,
-// page-patch ranges, leaf-delete keys, encoded metadata, or no bytes for a commit marker.
+// byte-patch ranges, entry-patch operations, encoded metadata, or no bytes for a commit marker.
 type WALRecord struct {
 	Header RecordHeader
 	// Payload contains bytes that can be written to the WAL file.
@@ -122,7 +122,7 @@ func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.Node,
 	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
 }
 
-func appendEncodedPagePatchRecord(data []byte, header RecordHeader, patch *PagePatch, checksumSeed uint32) []byte {
+func appendEncodedBytePatchRecord(data []byte, header RecordHeader, patch *BytePatch, checksumSeed uint32) []byte {
 	headerStart := len(data)
 	data = appendRecordHeader(data, header, patch.encodedSize())
 	payloadStart := len(data)

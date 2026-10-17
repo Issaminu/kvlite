@@ -47,9 +47,9 @@ func TestWALCommit_KeepsFullImageUntilCheckpoint(t *testing.T) {
 		failedCheckpoint bool
 	}{
 		{value: "first", wantType: RecordTypeNode},
-		{value: "later", wantType: RecordTypePatch, failedCheckpoint: true},
+		{value: "later", wantType: RecordTypeBytePatch, failedCheckpoint: true},
 		{value: "reset", wantType: RecordTypeNode, checkpoint: true},
-		{value: "after", wantType: RecordTypePatch},
+		{value: "after", wantType: RecordTypeBytePatch},
 	} {
 		if step.failedCheckpoint {
 			readOnly, err := os.Open(main.Name())

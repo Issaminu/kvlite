@@ -48,6 +48,54 @@ func (parent *Node) InsertSplitChild(leftIndex int, rightNode *Node, separator [
 	parent.header.Checksum = 0
 }
 
+// findSeparatorIndex returns the index of the first separator that is not smaller than key, and whether that separator equals key.
+func (n *Node) findSeparatorIndex(key []byte) (int, bool, error) {
+	if n.IsLeaf() {
+		return 0, false, ErrNotBranchNode
+	}
+	index := sort.Search(len(n.entries), func(index int) bool {
+		return bytes.Compare(n.entries[index].key, key) >= 0
+	})
+	return index, index < len(n.entries) && bytes.Equal(n.entries[index].key, key), nil
+}
+
+// InsertOrReplaceSeparator makes child the child on the right side of the separator key.
+// If n has no separator equal to key, it inserts key and child at their sorted positions.
+// WAL recovery uses it to replay an entry patch. It copies key.
+func (n *Node) InsertOrReplaceSeparator(key []byte, child page.ID) error {
+	index, found, err := n.findSeparatorIndex(key)
+	if err != nil {
+		return err
+	}
+	n.encodedSize = 0
+	n.header.Checksum = 0
+	if found {
+		n.Children[index+1] = child
+		return nil
+	}
+	n.entries = slices.Insert(n.entries, index, Entry{key: slices.Clone(key)})
+	n.Children = slices.Insert(n.Children, index+1, child)
+	return nil
+}
+
+// DeleteSeparator removes the separator key and the child on its right side.
+// It returns [ErrKeyNotFound] when n has no separator equal to key.
+// WAL recovery uses it to replay an entry patch.
+func (n *Node) DeleteSeparator(key []byte) error {
+	index, found, err := n.findSeparatorIndex(key)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return ErrKeyNotFound
+	}
+	n.encodedSize = 0
+	n.header.Checksum = 0
+	n.entries = slices.Delete(n.entries, index, index+1)
+	n.Children = slices.Delete(n.Children, index+1, index+2)
+	return nil
+}
+
 // chooseBranchRedistribution finds which key should move up to the parent.
 // The keys before it stay in the left branch. The keys after it stay in the
 // right branch. Each branch must keep a key, at least two children, and fit in

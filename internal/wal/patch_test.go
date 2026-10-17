@@ -4,32 +4,34 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-func makePagePatch(base, target []byte) []byte {
+func makeBytePatch(base, target []byte) []byte {
 	if len(base) != len(target) {
-		panic("page patch test images have different sizes")
+		panic("byte patch test images have different sizes")
 	}
-	var patch PagePatch
+	var patch BytePatch
 	patch.reset()
 	patch.appendChangedRanges(0, base, target)
 	return patch.appendEncoded(nil)
 }
 
-func TestPagePatch_RoundTripsChangedRanges(t *testing.T) {
+func TestBytePatch_RoundTripsChangedRanges(t *testing.T) {
 	base := []byte("0123456789abcdefghijkl")
 	target := bytes.Clone(base)
 	copy(target[4:6], "AB")
 	copy(target[14:17], "XYZ")
-	patch := makePagePatch(base, target)
+	patch := makeBytePatch(base, target)
 
-	got, err := ApplyPagePatch(base, patch, 64)
+	got, err := ApplyBytePatch(base, patch, 64)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,19 +40,19 @@ func TestPagePatch_RoundTripsChangedRanges(t *testing.T) {
 	}
 }
 
-func TestPagePatch_ReplayChainRestoresLatestImage(t *testing.T) {
+func TestBytePatch_ReplayChainRestoresLatestImage(t *testing.T) {
 	base := []byte("0123456789")
 	first := []byte("01AA456789")
 	latest := []byte("01AA45ZZ89")
-	firstPatch := makePagePatch(base, first)
-	latestPatch := makePagePatch(first, latest)
+	firstPatch := makeBytePatch(base, first)
+	latestPatch := makeBytePatch(first, latest)
 
 	for _, start := range [][]byte{base, latest} {
-		got, err := ApplyPagePatch(start, firstPatch, 64)
+		got, err := ApplyBytePatch(start, firstPatch, 64)
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err = ApplyPagePatch(got, latestPatch, 64)
+		got, err = ApplyBytePatch(got, latestPatch, 64)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -60,32 +62,201 @@ func TestPagePatch_ReplayChainRestoresLatestImage(t *testing.T) {
 	}
 }
 
-func TestApplyPagePatch_RejectsInvalidRange(t *testing.T) {
-	patch := makePagePatch([]byte("base"), []byte("targ"))
+func TestApplyBytePatch_RejectsInvalidRange(t *testing.T) {
+	patch := makeBytePatch([]byte("base"), []byte("targ"))
 	binary.LittleEndian.PutUint32(patch[4:8], ^uint32(0))
 
-	if _, err := ApplyPagePatch([]byte("base"), patch, 64); !errors.Is(err, page.ErrInvalid) {
+	if _, err := ApplyBytePatch([]byte("base"), patch, 64); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("invalid range error: got %v, want ErrInvalid", err)
 	}
 }
 
-func TestApplyPagePatch_RejectsIncompleteRangeHeader(t *testing.T) {
-	patch := append(makePagePatch([]byte("base"), []byte("targ")), 0)
+func TestApplyBytePatch_RejectsIncompleteRangeHeader(t *testing.T) {
+	patch := append(makeBytePatch([]byte("base"), []byte("targ")), 0)
 
-	if _, err := ApplyPagePatch([]byte("base"), patch, 64); !errors.Is(err, page.ErrInvalid) {
+	if _, err := ApplyBytePatch([]byte("base"), patch, 64); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("incomplete range header error: got %v, want ErrInvalid", err)
 	}
 }
 
-func TestApplyPagePatch_RejectsBaseLargerThanPage(t *testing.T) {
-	patch := makePagePatch([]byte("base"), []byte("targ"))
+func TestApplyBytePatch_RejectsBaseLargerThanPage(t *testing.T) {
+	patch := makeBytePatch([]byte("base"), []byte("targ"))
 
-	if _, err := ApplyPagePatch([]byte("base"), patch, 3); !errors.Is(err, page.ErrInvalid) {
+	if _, err := ApplyBytePatch([]byte("base"), patch, 3); !errors.Is(err, page.ErrInvalid) {
 		t.Fatalf("large base error: got %v, want ErrInvalid", err)
 	}
 }
 
-func TestWALCommit_EncodesLeafDeletes(t *testing.T) {
+// leafFromState builds one sorted leaf from a key-to-value state.
+// A value of nine bytes that starts with 'B' becomes a nested bucket entry with the other eight bytes as its root ID.
+func leafFromState(t *testing.T, id page.ID, state map[string]string) *btree.Node {
+	t.Helper()
+	node := btree.NewLeafNode(id)
+	for key, value := range state {
+		flags := uint32(0)
+		if len(value) == page.IDSize+1 && value[0] == 'B' {
+			flags = btree.BucketLeafFlag
+			value = value[1:]
+		}
+		if err := node.InsertEntry(btree.NewEntry(flags, []byte(key), []byte(value))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return node
+}
+
+// branchFromState builds one branch with first child 100 and one right child for each separator key.
+func branchFromState(id page.ID, state map[string]page.ID) *btree.Node {
+	keys := make([]string, 0, len(state))
+	for key := range state {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	node := btree.NewRootNode(id, btree.NewLeafNode(100), btree.NewLeafNode(state[keys[0]]), []byte(keys[0]))
+	for _, key := range keys[1:] {
+		if err := node.InsertOrReplaceSeparator([]byte(key), state[key]); err != nil {
+			panic(err)
+		}
+	}
+	return node
+}
+
+func mustEntryPatch(t *testing.T, base, target *btree.Node) []byte {
+	t.Helper()
+	var patch []byte
+	var smaller bool
+	if base.IsLeaf() {
+		patch, smaller = appendLeafEntryPatch(nil, base, target, 1<<30)
+	} else {
+		patch, smaller = appendBranchEntryPatch(nil, base, target, 1<<30)
+	}
+	if !smaller {
+		t.Fatal("entry patch was not created")
+	}
+	return patch
+}
+
+// replayEntryPatches applies every patch, in order, to a decoded copy of start and returns the compact result.
+func replayEntryPatches(t *testing.T, start *btree.Node, patches [][]byte) []byte {
+	t.Helper()
+	node, err := btree.DecodeWALNode(btree.EncodeWALNode(start), start.PageID(), 1<<20, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, patch := range patches {
+		if err := ApplyEntryPatch(node, patch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return btree.EncodeWALNode(node)
+}
+
+func TestEntryPatch_LeafSetsAndDeletesByKey(t *testing.T) {
+	base := leafFromState(t, 2, map[string]string{"a": "1", "b": "2", "c": "3", "d": "4"})
+	target := leafFromState(t, 2, map[string]string{"a": "1", "b": "two", "bb": "new", "d": "4"})
+	patch := mustEntryPatch(t, base, target)
+
+	want := appendEntryPatchSet(nil, 0, []byte("b"), []byte("two"))
+	want = appendEntryPatchSet(want, 0, []byte("bb"), []byte("new"))
+	want = appendEntryPatchDelete(want, []byte("c"))
+	if !bytes.Equal(patch, want) {
+		t.Fatalf("leaf entry patch: got %v, want %v", patch, want)
+	}
+	if got := replayEntryPatches(t, base, [][]byte{patch}); !bytes.Equal(got, btree.EncodeWALNode(target)) {
+		t.Fatal("leaf entry patch did not rebuild the final leaf")
+	}
+}
+
+func TestEntryPatch_BranchSetsAndDeletesSeparators(t *testing.T) {
+	base := branchFromState(2, map[string]page.ID{"d": 10, "h": 11, "m": 12})
+	target := branchFromState(2, map[string]page.ID{"d": 10, "f": 13, "h": 14})
+	patch := mustEntryPatch(t, base, target)
+	if got := replayEntryPatches(t, base, [][]byte{patch}); !bytes.Equal(got, btree.EncodeWALNode(target)) {
+		t.Fatal("branch entry patch did not rebuild the final branch")
+	}
+
+	changedFirst := base.Clone()
+	changedFirst.Children[0] = 99
+	if _, smaller := appendBranchEntryPatch(nil, base, changedFirst, 1<<30); smaller {
+		t.Fatal("branch entry patch changed the first child")
+	}
+}
+
+// TestEntryPatch_RandomChainsRebuildFinalNode replays chains of random changes from their first state.
+// The changes insert, replace, and delete entries, and they replace values with nested buckets and the reverse.
+func TestEntryPatch_RandomChainsRebuildFinalNode(t *testing.T) {
+	rng := rand.New(rand.NewPCG(3, 5))
+	for trial := range 200 {
+		leafState := map[string]string{}
+		branchState := map[string]page.ID{"k10": 10}
+		leaves := []*btree.Node{leafFromState(t, 2, leafState)}
+		branches := []*btree.Node{branchFromState(3, branchState)}
+		for range 12 {
+			for range 1 + rng.IntN(4) {
+				key := fmt.Sprintf("k%02d", rng.IntN(20))
+				switch rng.IntN(4) {
+				case 0:
+					delete(leafState, key)
+					if len(branchState) > 1 {
+						delete(branchState, key)
+					}
+				case 1:
+					var root [page.IDSize]byte
+					binary.LittleEndian.PutUint64(root[:], rng.Uint64())
+					leafState[key] = "B" + string(root[:])
+					branchState[key] = page.ID(10 + rng.IntN(50))
+				default:
+					leafState[key] = string(bytes.Repeat([]byte{byte('a' + rng.IntN(26))}, rng.IntN(12)))
+					branchState[key] = page.ID(10 + rng.IntN(50))
+				}
+			}
+			leaves = append(leaves, leafFromState(t, 2, leafState))
+			branches = append(branches, branchFromState(3, branchState))
+		}
+		for _, states := range [][]*btree.Node{leaves, branches} {
+			patches := make([][]byte, 0, len(states)-1)
+			for index := 1; index < len(states); index++ {
+				patches = append(patches, mustEntryPatch(t, states[index-1], states[index]))
+			}
+			if got := replayEntryPatches(t, states[0], patches); !bytes.Equal(got, btree.EncodeWALNode(states[len(states)-1])) {
+				t.Fatalf("trial %d: replay did not give the final node", trial)
+			}
+		}
+	}
+}
+
+func TestApplyEntryPatch_RejectsInvalidOperations(t *testing.T) {
+	leaf := leafFromState(t, 2, map[string]string{"a": "value"})
+	branch := branchFromState(3, map[string]page.ID{"m": 10})
+	var metaChild [page.IDSize]byte
+	for name, test := range map[string]struct {
+		node  *btree.Node
+		patch []byte
+	}{
+		"unknown operation": {leaf, []byte{9, 1, 0, 'a'}},
+		"short header":      {leaf, []byte{entryPatchDelete, 1}},
+		"empty key":         {leaf, []byte{entryPatchDelete, 0, 0}},
+		"short key":         {leaf, []byte{entryPatchDelete, 4, 0, 'a'}},
+		"key order":         {leaf, appendEntryPatchDelete(appendEntryPatchDelete(nil, []byte("b")), []byte("a"))},
+		"duplicate key":     {leaf, appendEntryPatchDelete(appendEntryPatchDelete(nil, []byte("a")), []byte("a"))},
+		"missing leaf key":  {leaf, appendEntryPatchDelete(nil, []byte("b"))},
+		"short value":       {leaf, appendEntryPatchSet(nil, 0, []byte("a"), []byte("value"))[:12]},
+		"leaf flags":        {leaf, appendEntryPatchSet(nil, 2, []byte("a"), []byte("value"))},
+		"bucket value size": {leaf, appendEntryPatchSet(nil, btree.BucketLeafFlag, []byte("a"), []byte("short"))},
+		"branch flags":      {branch, appendEntryPatchSet(nil, 1, []byte("m"), make([]byte, page.IDSize))},
+		"branch child size": {branch, appendEntryPatchSet(nil, 0, []byte("m"), []byte("short"))},
+		"branch meta child": {branch, appendEntryPatchSet(nil, 0, []byte("m"), metaChild[:])},
+		"missing separator": {branch, appendEntryPatchDelete(nil, []byte("n"))},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ApplyEntryPatch(test.node.Clone(), test.patch); !errors.Is(err, page.ErrInvalid) {
+				t.Fatalf("invalid entry patch: got %v, want ErrInvalid", err)
+			}
+		})
+	}
+}
+
+func TestWALCommit_EncodesLeafDeletesAsEntryPatch(t *testing.T) {
 	file, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +270,7 @@ func TestWALCommit_EncodesLeafDeletes(t *testing.T) {
 	}
 	target := base.Clone()
 	for _, key := range []string{"b", "d"} {
-		if err := target.DeleteKeyIfPresent([]byte(key)); err != nil {
+		if err := target.DeleteKey([]byte(key)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -114,50 +285,14 @@ func TestWALCommit_EncodesLeafDeletes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(records) != 4 || records[0].Header.Type != RecordTypeNode || records[2].Header.Type != RecordTypeLeafDelete {
-		t.Fatalf("WAL records: got %+v, want a complete image followed by a leaf delete", records)
+	if len(records) != 4 || records[0].Header.Type != RecordTypeNode || records[2].Header.Type != RecordTypeEntryPatch {
+		t.Fatalf("WAL records: got %+v, want a complete image followed by an entry patch", records)
 	}
-	if got := records[2].Payload; !bytes.Equal(got, []byte{5, 0, 0, 0, 3, 0, 0, 0, 1, 0, 'b', 1, 0, 'd'}) {
+	if got := records[2].Payload; !bytes.Equal(got, []byte{entryPatchDelete, 1, 0, 'b', entryPatchDelete, 1, 0, 'd'}) {
 		t.Fatalf("deleted keys: got %v, want b and d", got)
 	}
-	image, err := ApplyLeafDeletes(btree.EncodeWALNode(base), records[2].Payload, base.PageID())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(image, btree.EncodeWALNode(target)) {
-		t.Fatal("leaf delete did not rebuild the final node")
-	}
-	image, err = ApplyLeafDeletes(btree.EncodeWALNode(target), records[2].Payload, base.PageID())
-	if err != nil || !bytes.Equal(image, btree.EncodeWALNode(target)) {
-		t.Fatalf("repeated leaf delete changed final node: error %v", err)
-	}
-}
-
-func TestApplyLeafDeletes_RejectsInvalidKeys(t *testing.T) {
-	base := btree.NewLeafNode(2)
-	for _, key := range []string{"a", "b", "c"} {
-		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), []byte("value"))); err != nil {
-			t.Fatal(err)
-		}
-	}
-	image := btree.EncodeWALNode(base)
-	for name, keys := range map[string][]byte{
-		"empty":     nil,
-		"short":     {1},
-		"duplicate": {3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 'a', 1, 0, 'a'},
-		"reverse":   {3, 0, 0, 0, 1, 0, 0, 0, 1, 0, 'b', 1, 0, 'a'},
-		"short-key": {3, 0, 0, 0, 2, 0, 0, 0, 4, 0, 'a'},
-		"empty-key": {3, 0, 0, 0, 2, 0, 0, 0, 0, 0},
-	} {
-		t.Run(name, func(t *testing.T) {
-			if _, err := ApplyLeafDeletes(image, keys, base.PageID()); !errors.Is(err, page.ErrInvalid) {
-				t.Fatalf("invalid keys: got %v, want invalid page", err)
-			}
-		})
-	}
-	branch := btree.NewRootNode(2, btree.NewLeafNode(3), btree.NewLeafNode(4), []byte("b"))
-	if _, err := ApplyLeafDeletes(btree.EncodeWALNode(branch), []byte{1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 'a'}, branch.PageID()); !errors.Is(err, page.ErrInvalid) {
-		t.Fatalf("branch delete: got %v, want invalid page", err)
+	if got := replayEntryPatches(t, base, [][]byte{records[2].Payload}); !bytes.Equal(got, btree.EncodeWALNode(target)) {
+		t.Fatal("entry patch did not rebuild the final leaf")
 	}
 }
 
@@ -184,7 +319,7 @@ func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
 	base.SetOverflowPages([]page.ID{7, 9})
 	target := base.Clone()
 	target.SetOverflowPages(nil)
-	if err := target.DeleteKeyIfPresent([]byte("b")); err != nil {
+	if err := target.DeleteKey([]byte("b")); err != nil {
 		t.Fatal(err)
 	}
 	if int64(base.EncodedSize()) <= pageSize || int64(target.EncodedSize()) > pageSize {
@@ -240,9 +375,9 @@ func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
 	}
 }
 
-// referencePagePatchRanges is the original byte-by-byte range builder.
+// referenceBytePatchRanges is the original byte-by-byte range builder.
 // The word-based builder must produce the same ranges.
-func referencePagePatchRanges(patch []byte, baseOffset int, base, target []byte) []byte {
+func referenceBytePatchRanges(patch []byte, baseOffset int, base, target []byte) []byte {
 	for index := 0; index < len(target); {
 		for index < len(target) && index < len(base) && base[index] == target[index] {
 			index++
@@ -260,7 +395,7 @@ func referencePagePatchRanges(patch []byte, baseOffset int, base, target []byte)
 			for index < len(target) && index < len(base) && base[index] == target[index] {
 				index++
 			}
-			if index-equalStart > pagePatchRangeHeaderSize {
+			if index-equalStart > bytePatchRangeHeaderSize {
 				index = equalStart
 				break
 			}
@@ -272,7 +407,7 @@ func referencePagePatchRanges(patch []byte, baseOffset int, base, target []byte)
 	return patch
 }
 
-func TestAppendChangedPagePatchRanges_MatchesByteScan(t *testing.T) {
+func TestAppendChangedBytePatchRanges_MatchesByteScan(t *testing.T) {
 	random := rand.New(rand.NewPCG(1, 2))
 	for trial := range 20000 {
 		size := random.IntN(80)
@@ -298,16 +433,16 @@ func TestAppendChangedPagePatchRanges_MatchesByteScan(t *testing.T) {
 			shortBase = base[:random.IntN(size)]
 		}
 		offset := random.IntN(1000)
-		want := referencePagePatchRanges(nil, offset, shortBase, target)
-		got := appendChangedPagePatchRanges(nil, offset, shortBase, target)
+		want := referenceBytePatchRanges(nil, offset, shortBase, target)
+		got := appendChangedBytePatchRanges(nil, offset, shortBase, target)
 		if !bytes.Equal(got, want) {
 			t.Fatalf("trial %d: size %d, base size %d: got %x, want %x", trial, size, len(shortBase), got, want)
 		}
 	}
 }
 
-// BenchmarkAppendChangedPagePatchRanges measures range building for one changed value field.
-func BenchmarkAppendChangedPagePatchRanges(b *testing.B) {
+// BenchmarkAppendChangedBytePatchRanges measures range building for one changed value field.
+func BenchmarkAppendChangedBytePatchRanges(b *testing.B) {
 	cases := []struct {
 		name   string
 		size   int
@@ -339,8 +474,110 @@ func BenchmarkAppendChangedPagePatchRanges(b *testing.B) {
 			b.SetBytes(int64(test.size))
 			b.ReportAllocs()
 			for b.Loop() {
-				patch = appendChangedPagePatchRanges(patch[:0], 64, base, target)
+				patch = appendChangedBytePatchRanges(patch[:0], 64, base, target)
 			}
 		})
+	}
+}
+
+func TestWALCommit_EncodesAllocationBytePatch(t *testing.T) {
+	const pageSize = 128
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: pageSize, CheckpointThresholdBytes: 1 << 20})
+	first := bytes.Repeat([]byte{1}, pageSize)
+	second := bytes.Clone(first)
+	second[40], second[41] = 2, 3
+	for _, payload := range [][]byte{first, second} {
+		if _, err := log.Commit(nil, []AllocationRecord{{PageID: 2, Payload: payload}}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first change after a checkpoint needs a complete image. The second change patches it.
+	if len(records) != 4 || records[0].Header.Type != RecordTypeAllocation || records[2].Header.Type != RecordTypeBytePatch {
+		t.Fatalf("WAL records: got %+v, want a complete allocation image followed by a byte patch", records)
+	}
+	patched, err := ApplyBytePatch(first, records[2].Payload, pageSize)
+	if err != nil || !bytes.Equal(patched, second) {
+		t.Fatalf("byte patch did not rebuild the final allocation page: %v", err)
+	}
+	if committed, ok := log.Lookup(2); !ok || committed.Header.Type != RecordTypeAllocation || !bytes.Equal(committed.Payload, second) {
+		t.Fatalf("committed allocation page: got %+v, want the final image", committed)
+	}
+}
+
+func TestWALCommit_EncodesContinuedNodeBytePatches(t *testing.T) {
+	const pageSize = 128
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	value := bytes.Repeat([]byte("v"), 500)
+	base := btree.NewLeafNode(2)
+	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]page.ID, btree.NodePageCount(base, pageSize))
+	ids[0] = 2
+	for i := 1; i < len(ids); i++ {
+		ids[i] = page.ID(10 + i)
+	}
+	base.SetOverflowPages(ids[1:])
+	target := base.Clone()
+	value = bytes.Clone(value)
+	value[300] = 'X'
+	if err := target.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	basePages, err := btree.EncodeWALNodePages(base, pageSize, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetPages, err := btree.EncodeWALNodePages(target, pageSize, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	log := New(Config{File: file, PageSize: pageSize, CheckpointThresholdBytes: 1 << 20})
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first transaction writes every page. The second writes a byte patch only for the page that changed.
+	if len(records) != len(ids)+3 {
+		t.Fatalf("WAL records: got %d, want %d complete pages, one byte patch, and two commit markers", len(records), len(ids))
+	}
+	patch := records[len(ids)+1]
+	changed := slices.Index(ids, patch.Header.PageID)
+	if patch.Header.Type != RecordTypeBytePatch || changed < 0 {
+		t.Fatalf("second transaction: got %+v, want one byte patch for a page of the node", patch.Header)
+	}
+	for i := range ids {
+		if i != changed && !bytes.Equal(basePages[i], targetPages[i]) {
+			t.Fatalf("page %d changed without a record", ids[i])
+		}
+	}
+	patched, err := ApplyBytePatch(basePages[changed], patch.Payload, pageSize)
+	if err != nil || !bytes.Equal(patched, targetPages[changed]) {
+		t.Fatalf("byte patch did not rebuild page %d: %v", ids[changed], err)
+	}
+	for i, id := range ids {
+		if committed, ok := log.Lookup(id); !ok || !bytes.Equal(committed.Payload, targetPages[i]) {
+			t.Fatalf("committed page %d: got %+v, want the final page image", id, committed.Header)
+		}
 	}
 }
