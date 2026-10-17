@@ -125,7 +125,7 @@ func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) 
 // readPage keeps visited continuation pages unchanged until this call returns.
 // checksums selects verification of nonzero checksum fields.
 func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID) ([]byte, error), includeKey, checksums bool) (entry Entry, found bool, child page.ID, err error) {
-	entry, found, child, err = lookupNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums)
+	found, child, err = lookupNode(data, id, key, int64(len(data)), readPage, false, includeKey, checksums, &entry)
 	return
 }
 
@@ -180,8 +180,9 @@ func ValidateWALNode(data []byte, id page.ID) error {
 // A continued node is read in place, and the lookup reads only the pages that it needs.
 // The entry of a continued leaf owns a copy of its value, and its key is a copy of key.
 // Set includeKey to false to omit the returned key.
-func LookupEncodedWALNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (Entry, bool, page.ID, error) {
-	return lookupNode(data, id, key, pageSize, readPage, true, includeKey, false)
+func LookupEncodedWALNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (entry Entry, found bool, child page.ID, err error) {
+	found, child, err = lookupNode(data, id, key, pageSize, readPage, true, includeKey, false, &entry)
+	return
 }
 
 // EncodeWALNode returns an owned compact node image without padding or a node checksum.
@@ -534,42 +535,42 @@ func continuationPagesError(id page.ID) error {
 // A node in one page is searched in place, so the result borrows data.
 // A continued node is read page by page with a continuedBody, so a lookup reads only the pages that it needs.
 // forWAL uses verified compact payloads and requires zero page checksums.
-func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, includeKey, checksums bool) (Entry, bool, page.ID, error) {
+func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, includeKey, checksums bool, entry *Entry) (bool, page.ID, error) {
 	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, 0, err
+		return false, 0, err
 	}
 	// Most lookups read a one-page node with no checksum to check.
 	if kind, count, ok := plainNodeHeader(data, id, pageSize, forWAL, checksums); ok {
 		if kind == NodeTypeBranch {
 			child, err := lookupBranchBody(data, count, key)
-			return Entry{}, false, child, err
+			return false, child, err
 		}
-		entry, found, err := lookupLeafBody(data, count, key, includeKey)
-		return entry, found, 0, err
+		found, err := lookupLeafBody(data, count, key, includeKey, entry)
+		return found, 0, err
 	}
 	h, err := readNodeHeader(data, id, pageSize, forWAL, checksums)
 	if err != nil {
-		return Entry{}, false, 0, err
+		return false, 0, err
 	}
 	if h.isContinued() {
 		if readPage == nil {
-			return Entry{}, false, 0, continuationPagesError(id)
+			return false, 0, continuationPagesError(id)
 		}
 		var cursor continuationCursor
 		body := continuedBody{first: data, readPage: readPage, forWAL: forWAL, checksums: checksums, cursor: &cursor}
 		if h.kind() == NodeTypeBranch {
 			child, err := lookupContinuedBranch(&body, h, key)
-			return Entry{}, false, child, err
+			return false, child, err
 		}
-		entry, found, err := lookupContinuedLeaf(&body, h, key, includeKey)
-		return entry, found, 0, err
+		found, err := lookupContinuedLeaf(&body, h, key, includeKey, entry)
+		return found, 0, err
 	}
 	if h.kind() == NodeTypeBranch {
 		child, err := lookupBranchBody(data, h.EntryCount, key)
-		return Entry{}, false, child, err
+		return false, child, err
 	}
-	entry, found, err := lookupLeafBody(data, h.EntryCount, key, includeKey)
-	return entry, found, 0, err
+	found, err := lookupLeafBody(data, h.EntryCount, key, includeKey, entry)
+	return found, 0, err
 }
 
 // visitNodeReferences checks the complete body and every owned page of a leaf or branch.

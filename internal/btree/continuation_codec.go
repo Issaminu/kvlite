@@ -279,43 +279,44 @@ func (body *continuedBody) directory(size int, scratch []byte) ([]byte, error) {
 // It compares keys page by page and copies only the value of the matching entry.
 // A continued leaf has one entry (see Node.NeedsSplit), so it checks the entries in order and does no binary search.
 // The value is a private copy, and the key is a copy of key.
-// Set includeKey to false to omit the key.
-func lookupContinuedLeaf(body *continuedBody, h NodeHeader, key []byte, includeKey bool) (Entry, bool, error) {
+// A found entry is written into entry, which must be zero (see lookupNode). Set includeKey to false to omit the key.
+func lookupContinuedLeaf(body *continuedBody, h NodeHeader, key []byte, includeKey bool, entry *Entry) (bool, error) {
 	imageSize := NodeHeaderSize + uint64(h.BodyLength)
 	dataStart, err := leafDataStart(imageSize, h.EntryCount)
 	if err != nil {
-		return Entry{}, false, err
+		return false, err
 	}
 	var scratch [NodeHeaderSize + continuedDirectoryScratchSize]byte
 	directory, err := body.directory(int(dataStart)-NodeHeaderSize, scratch[:])
 	if err != nil {
-		return Entry{}, false, err
+		return false, err
 	}
 	for index := range int(h.EntryCount) {
 		flags, start, keyEnd, end := leafSpan(directory, index)
 		if !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) {
-			return Entry{}, false, entryError(index)
+			return false, entryError(index)
 		}
 		comparison, err := body.compare(int(start), int(keyEnd-start), key)
 		if err != nil || comparison > 0 {
 			// Keys are in order, so a larger key ends the search.
-			return Entry{}, false, err
+			return false, err
 		}
 		if comparison < 0 {
 			continue
 		}
-		entry := Entry{flags: flags, value: make([]byte, end-keyEnd), valueOwned: true}
-		if err := body.read(int(keyEnd), entry.value); err != nil {
-			return Entry{}, false, err
+		value := make([]byte, end-keyEnd)
+		if err := body.read(int(keyEnd), value); err != nil {
+			return false, err
 		}
+		entry.flags, entry.value, entry.valueOwned = flags, value, true
 		if includeKey {
 			// The stored key equals key, so a copy of key needs no more page reads.
 			// The result never borrows from body: escape analysis treats body as one value, so readPage would escape and allocate in every caller.
 			entry.key = bytes.Clone(key)
 		}
-		return entry, true, nil
+		return true, nil
 	}
-	return Entry{}, false, nil
+	return false, nil
 }
 
 // lookupContinuedBranch returns the child that routes key in a continued branch without copying its body.

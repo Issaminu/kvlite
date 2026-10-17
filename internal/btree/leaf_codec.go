@@ -165,11 +165,11 @@ func checkLeafBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) e
 
 // lookupLeafBody finds key in a contiguous leaf image with a binary search.
 // It reads only the descriptors and keys on the search path.
-// The returned key and value borrow image. Set includeKey to false to omit the key.
-func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool) (Entry, bool, error) {
+// A found entry is written into entry, which must be zero (see lookupNode). Its key and value borrow image. Set includeKey to false to omit the key.
+func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool, entry *Entry) (bool, error) {
 	dataStart, err := leafDataStart(uint64(len(image)), entryCount)
 	if err != nil {
-		return Entry{}, false, err
+		return false, err
 	}
 	count, imageSize := int(entryCount), uint64(len(image))
 	low, high := 0, count
@@ -177,7 +177,7 @@ func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool
 		middle := (low + high) / 2
 		flags, start, keyEnd, end := leafSpan(image, middle)
 		if !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) {
-			return Entry{}, false, entryError(middle)
+			return false, entryError(middle)
 		}
 		switch comparison := bytes.Compare(image[start:keyEnd], key); {
 		case comparison < 0:
@@ -185,20 +185,20 @@ func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool
 		case comparison > 0:
 			high = middle
 		default:
-			entry := Entry{flags: flags, value: image[keyEnd:end:end]}
+			entry.flags, entry.value = flags, image[keyEnd:end:end]
 			if includeKey {
 				entry.key = image[start:keyEnd:keyEnd]
 			}
-			return entry, true, nil
+			return true, nil
 		}
 	}
 	// A missing key also checks the descriptor at its sorted position.
 	if low < count {
 		if flags, start, keyEnd, end := leafSpan(image, low); !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) {
-			return Entry{}, false, entryError(low)
+			return false, entryError(low)
 		}
 	}
-	return Entry{}, false, nil
+	return false, nil
 }
 
 // mappedLeafImage checks the header of a mapped leaf for an ordered scan and returns one contiguous image of the leaf.
