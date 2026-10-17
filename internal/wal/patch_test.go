@@ -18,10 +18,7 @@ func makeBytePatch(base, target []byte) []byte {
 	if len(base) != len(target) {
 		panic("byte patch test images have different sizes")
 	}
-	var patch BytePatch
-	patch.reset()
-	patch.appendChangedRanges(0, base, target)
-	return patch.appendEncoded(nil)
+	return appendChangedBytePatchRanges(nil, 0, base, target)
 }
 
 func TestBytePatch_RoundTripsChangedRanges(t *testing.T) {

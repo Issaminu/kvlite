@@ -59,7 +59,7 @@ type WAL struct {
 	encodingBuffer           []byte                    // reusable transaction encoding buffer; capacity may be cleared after large commits
 	largeEncodingBuffers     sync.Pool                 // *[]byte encoding buffers larger than maxRetainedEncodingBufferBytes
 	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
-	bytePatch                BytePatch                 // reusable byte patch; encoded into encodingBuffer before reuse
+	patchBuffer              []byte                    // reusable byte patch or entry patch; copied into encodingBuffer before reuse
 	appendFailure            error                     // set when an append fails after it starts to write; blocks every later commit on this WAL
 	salt                     uint64                    // salt of the current generation; written in the file header
 	checksumSeed             uint32                    // CRC32C checksum of salt; every record checksum starts from it
@@ -161,8 +161,8 @@ func (wal *WAL) releaseEncodingBuffer() {
 		wal.largeEncodingBuffers.Put(&buffer)
 		wal.encodingBuffer = nil
 	}
-	if cap(wal.bytePatch.ranges) > maxRetainedEncodingBufferBytes {
-		wal.bytePatch.ranges = nil
+	if cap(wal.patchBuffer) > maxRetainedEncodingBufferBytes {
+		wal.patchBuffer = nil
 	}
 }
 
@@ -248,11 +248,10 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 		// Like a node, an allocation page needs a complete image for its first change after a checkpoint. See appendNodeRecord.
 		// A later change patches the committed image, which is the latest image of the page in the WAL.
 		if committed, ok := wal.overlay[record.PageID]; ok && committed.Header.Type == RecordTypeAllocation && len(committed.Payload) == len(record.Payload) {
-			wal.bytePatch.reset()
-			wal.bytePatch.appendChangedRanges(0, committed.Payload, record.Payload)
-			if wal.bytePatch.encodedSize() < len(record.Payload) {
+			wal.patchBuffer = appendChangedBytePatchRanges(wal.patchBuffer[:0], 0, committed.Payload, record.Payload)
+			if len(wal.patchBuffer) < len(record.Payload) {
 				header.Type = RecordTypeBytePatch
-				transaction = appendEncodedBytePatchRecord(transaction, header, &wal.bytePatch, wal.checksumSeed)
+				transaction = appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed)
 				continue
 			}
 		}
@@ -299,31 +298,28 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 		return appendEncodedNodeRecord(transaction, header, record.Final, wal.checksumSeed), nil
 	}
 
-	wal.bytePatch.reset()
 	var encodedSize int
 	var compatible bool
 	if record.Final.IsLeaf() {
-		encodedSize, compatible = appendLeafBytePatch(&wal.bytePatch, record.Original, record.Final)
+		wal.patchBuffer, encodedSize, compatible = appendLeafBytePatch(wal.patchBuffer[:0], record.Original, record.Final)
 	} else {
-		encodedSize, compatible = appendBranchBytePatch(&wal.bytePatch, record.Original, record.Final)
+		wal.patchBuffer, encodedSize, compatible = appendBranchBytePatch(wal.patchBuffer[:0], record.Original, record.Final)
 	}
-	if compatible && encodedSize == targetSize && wal.bytePatch.encodedSize() < targetSize {
+	if compatible && encodedSize == targetSize && len(wal.patchBuffer) < targetSize {
 		header.Type = RecordTypeBytePatch
-		return appendEncodedBytePatchRecord(transaction, header, &wal.bytePatch, wal.checksumSeed), nil
+		return appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed), nil
 	}
 	// A different entry count or field length moves later bytes to new offsets, so a byte patch cannot describe it.
-	// An entry patch describes the changed entries. It reuses the storage of the byte patch.
-	var patch []byte
+	// An entry patch describes the changed entries.
 	var smaller bool
 	if record.Final.IsLeaf() {
-		patch, smaller = appendLeafEntryPatch(wal.bytePatch.ranges[:0], record.Original, record.Final, targetSize)
+		wal.patchBuffer, smaller = appendLeafEntryPatch(wal.patchBuffer[:0], record.Original, record.Final, targetSize)
 	} else {
-		patch, smaller = appendBranchEntryPatch(wal.bytePatch.ranges[:0], record.Original, record.Final, targetSize)
+		wal.patchBuffer, smaller = appendBranchEntryPatch(wal.patchBuffer[:0], record.Original, record.Final, targetSize)
 	}
-	wal.bytePatch.ranges = patch
 	if smaller {
 		header.Type = RecordTypeEntryPatch
-		return appendEncodedPayloadRecord(transaction, header, patch, wal.checksumSeed), nil
+		return appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed), nil
 	}
 	return appendEncodedNodeRecord(transaction, header, record.Final, wal.checksumSeed), nil
 }
@@ -387,15 +383,14 @@ func (wal *WAL) appendContinuedBytePatches(transaction []byte, final *btree.Node
 		return nil, false, err
 	}
 	for i, data := range pages {
-		wal.bytePatch.reset()
-		wal.bytePatch.appendChangedRanges(0, wal.overlay[ids[i]].Payload, data)
-		if wal.bytePatch.encodedSize() == 0 {
+		wal.patchBuffer = appendChangedBytePatchRanges(wal.patchBuffer[:0], 0, wal.overlay[ids[i]].Payload, data)
+		if len(wal.patchBuffer) == 0 {
 			continue
 		}
 		header := RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: txid}
-		if wal.bytePatch.encodedSize() < len(data) {
+		if len(wal.patchBuffer) < len(data) {
 			header.Type = RecordTypeBytePatch
-			transaction = appendEncodedBytePatchRecord(transaction, header, &wal.bytePatch, wal.checksumSeed)
+			transaction = appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed)
 		} else {
 			transaction = appendEncodedPayloadRecord(transaction, header, data, wal.checksumSeed)
 		}
@@ -403,11 +398,12 @@ func (wal *WAL) appendContinuedBytePatches(transaction []byte, final *btree.Node
 	return transaction, true, nil
 }
 
-// appendLeafBytePatch scans one leaf once and appends changed value bytes.
+// appendLeafBytePatch scans one leaf once and appends the ranges of changed value bytes to patch.
 // A patch is possible only when flags, keys, and value lengths keep the same encoded layout.
-func appendLeafBytePatch(patch *BytePatch, base, target *btree.Node) (encodedSize int, compatible bool) {
+// It returns the patch, the encoded size of target, and false when the layout changes.
+func appendLeafBytePatch(patch []byte, base, target *btree.Node) ([]byte, int, bool) {
 	if !base.IsLeaf() || base.EntryCount() != target.EntryCount() {
-		return 0, false
+		return patch, 0, false
 	}
 
 	offset := target.WALBodyOffset()
@@ -419,26 +415,27 @@ func appendLeafBytePatch(patch *BytePatch, base, target *btree.Node) (encodedSiz
 		baseValue := baseEntry.Value()
 		targetValue := targetEntry.Value()
 		if baseEntry.Flags() != targetEntry.Flags() || !bytes.Equal(baseKey, targetKey) || len(baseValue) != len(targetValue) {
-			return 0, false
+			return patch, 0, false
 		}
 
 		valueOffset := offset + len(targetKey)
 		if !bytes.Equal(baseValue, targetValue) {
-			patch.appendChangedRanges(valueOffset, baseValue, targetValue)
+			patch = appendChangedBytePatchRanges(patch, valueOffset, baseValue, targetValue)
 		}
 		offset = valueOffset + len(targetValue)
 	}
-	return offset, true
+	return patch, offset, true
 }
 
-// appendBranchBytePatch scans one branch once and appends changed child IDs and separator keys.
+// appendBranchBytePatch scans one branch once and appends the ranges of changed child IDs and separator keys to patch.
 // A patch is possible only when the child count and separator-key lengths keep the same encoded layout.
-func appendBranchBytePatch(patch *BytePatch, base, target *btree.Node) (encodedSize int, compatible bool) {
+// It returns the patch, the encoded size of target, and false when the layout changes.
+func appendBranchBytePatch(patch []byte, base, target *btree.Node) ([]byte, int, bool) {
 	if base.IsLeaf() || base.EntryCount() != target.EntryCount() {
-		return 0, false
+		return patch, 0, false
 	}
 	if len(base.Children) != base.EntryCount()+1 || len(target.Children) != target.EntryCount()+1 {
-		return 0, false
+		return patch, 0, false
 	}
 
 	offset := target.WALBodyOffset()
@@ -447,7 +444,7 @@ func appendBranchBytePatch(patch *BytePatch, base, target *btree.Node) (encodedS
 		if base.Children[index] != target.Children[index] {
 			binary.LittleEndian.PutUint64(baseChild[:], uint64(base.Children[index]))
 			binary.LittleEndian.PutUint64(targetChild[:], uint64(target.Children[index]))
-			patch.appendChangedRanges(offset, baseChild[:], targetChild[:])
+			patch = appendChangedBytePatchRanges(patch, offset, baseChild[:], targetChild[:])
 		}
 		offset += page.IDSize
 	}
@@ -455,14 +452,14 @@ func appendBranchBytePatch(patch *BytePatch, base, target *btree.Node) (encodedS
 		baseKey := base.EntryAt(index).Key()
 		targetKey := target.EntryAt(index).Key()
 		if len(baseKey) != len(targetKey) {
-			return 0, false
+			return patch, 0, false
 		}
 		if !bytes.Equal(baseKey, targetKey) {
-			patch.appendChangedRanges(offset, baseKey, targetKey)
+			patch = appendChangedBytePatchRanges(patch, offset, baseKey, targetKey)
 		}
 		offset += len(targetKey)
 	}
-	return offset, true
+	return patch, offset, true
 }
 
 // rollbackAppend removes bytes from a failed commit and restores the counters that describe the retained WAL prefix.

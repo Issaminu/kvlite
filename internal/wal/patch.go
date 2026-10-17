@@ -13,56 +13,10 @@ import (
 // Each encoded range starts with a four-byte offset and a four-byte size.
 const bytePatchRangeHeaderSize = 8
 
-// BytePatch contains the encoded byte ranges that change one existing page image.
-// The image can be a leaf or branch, one page of a continued node, or an allocation page.
-// One [RecordTypeBytePatch] record contains one BytePatch. The record header identifies the page.
-// A patch does not change the image size. A node image is compact: it has no page padding.
-//
-// Each range in the record payload has this layout:
-//
-//	Offset  Size  Field
-//	0       4     Absolute offset in the image as a uint32
-//	4       4     Replacement byte count as a uint32
-//	8       size  Final bytes to write
-//
-// All integers use little-endian byte order. The payload has no range count.
-// Recovery reads ranges until it reaches the payload size in the WAL record header.
-// Ranges must be ordered, must not overlap, and must fit in the base image.
-//
-// Recovery copies the base image and writes each replacement range into the copy.
-// Bytes outside the ranges stay unchanged.
-// The base is the image that the earlier WAL records of the page give. It is never a main-file page: see [WAL.Commit].
-// The zero value is ready to use.
-type BytePatch struct {
-	ranges []byte // Encoded range headers and replacement bytes in record order.
-}
-
-// reset removes the previous ranges and keeps their storage for the next node.
-func (patch *BytePatch) reset() {
-	patch.ranges = patch.ranges[:0]
-}
-
-// appendChangedRanges compares one same-size field and appends the ranges that change base into target.
-// The field can be a leaf value, a branch separator key, or a child page ID.
-// base and target must have the same length.
-// baseOffset is the absolute offset of that field in the compact node image.
-// Existing ranges remain in patch.
-func (patch *BytePatch) appendChangedRanges(baseOffset int, base, target []byte) {
-	patch.ranges = appendChangedBytePatchRanges(patch.ranges, baseOffset, base, target)
-}
-
-// encodedSize returns the number of bytes used by all range headers and replacement data.
-func (patch *BytePatch) encodedSize() int {
-	return len(patch.ranges)
-}
-
-// appendEncoded appends the complete patch payload to data.
-func (patch *BytePatch) appendEncoded(data []byte) []byte {
-	return append(data, patch.ranges...)
-}
-
-// appendChangedBytePatchRanges appends encoded replacement ranges for one same-size field.
-// base and target must have the same length.
+// appendChangedBytePatchRanges compares one same-size region and appends the byte-patch ranges that change base into target.
+// The region can be a field of a node image, such as a leaf value, a branch separator key, or a child page ID, or a whole page image.
+// baseOffset is the absolute offset of the region in the image. Existing ranges remain in patch.
+// base and target must have the same length. See [ApplyBytePatch] for the range format.
 // Here's how it works:
 // 1. Skip bytes that are equal.
 // 2. Mark the first different byte.
@@ -92,7 +46,7 @@ func appendChangedBytePatchRanges(patch []byte, baseOffset int, base, target []b
 		start := index
 		index = nextLongEqualRun(base, comparedTarget, start, len(target))
 
-		// Store an absolute node offset, the replacement size, and the final bytes.
+		// Store an absolute image offset, the replacement size, and the final bytes.
 		patch = binary.LittleEndian.AppendUint32(patch, uint32(baseOffset+start))
 		patch = binary.LittleEndian.AppendUint32(patch, uint32(index-start))
 		patch = append(patch, target[start:index]...)
@@ -163,49 +117,56 @@ func nextLongEqualRun(base, target []byte, index, end int) int {
 	return end
 }
 
-// ApplyBytePatch applies an encoded patch to a new same-size copy of base.
-// It does not change or retain base or patch data.
+// ApplyBytePatch applies the payload of a [RecordTypeBytePatch] record to a new same-size copy of base.
+// The patch changes one existing page image: a leaf or branch, one page of a continued node, or an allocation page.
+// The base is the image that the earlier WAL records of the page give. It is never a main-file page: see [WAL.Commit].
+// A patch does not change the image size. A node image is compact: it has no page padding.
 //
-// An empty patch returns an unchanged copy of base. Bytes outside replacement ranges also come from base.
-// ApplyBytePatch validates the base size, range headers, range order, and range bounds.
+// The payload is a list of ranges. Each range has this layout:
+//
+//	Offset  Size  Field
+//	0       4     Absolute offset in the image as a uint32
+//	4       4     Replacement byte count as a uint32
+//	8       size  Final bytes to write
+//
+// All integers use little-endian byte order.
+// The payload has no range count: recovery reads ranges until it reaches the payload size in the WAL record header.
+// Ranges must be ordered, must not overlap, and must fit in the base image.
+// Bytes outside the ranges stay unchanged. An empty patch returns an unchanged copy of base.
+//
+// ApplyBytePatch does not change or retain base or patch data.
+// It validates the base size, range headers, range order, and range bounds.
 // It returns an error that wraps [page.ErrInvalid] when the patch is invalid.
-// It does not validate the rebuilt node format or checksum.
+// It does not validate the format or checksum of the result.
 func ApplyBytePatch(base, patch []byte, pageSize int64) ([]byte, error) {
 	if int64(len(base)) > pageSize {
 		return nil, fmt.Errorf("read byte patch base size %d: %w", len(base), page.ErrInvalid)
 	}
-	decoded := BytePatch{ranges: patch}
-	return decoded.apply(base)
-}
-
-// apply parses the encoded ranges and writes them into a new copy of base.
-func (patch *BytePatch) apply(base []byte) ([]byte, error) {
 	// Start with the base so bytes outside the encoded ranges stay unchanged.
 	target := make([]byte, len(base))
 	copy(target, base)
 
-	ranges := patch.ranges
 	// previousEnd rejects ranges that overlap or arrive out of order.
 	previousEnd := uint64(0)
-	for len(ranges) > 0 {
-		if len(ranges) < bytePatchRangeHeaderSize {
+	for len(patch) > 0 {
+		if len(patch) < bytePatchRangeHeaderSize {
 			return nil, fmt.Errorf("read byte patch range header: %w", page.ErrInvalid)
 		}
-		rangeOffset := uint64(binary.LittleEndian.Uint32(ranges[:4]))
-		rangeSize := uint64(binary.LittleEndian.Uint32(ranges[4:8]))
-		// Remove the header so ranges starts with this range's replacement data.
-		ranges = ranges[bytePatchRangeHeaderSize:]
+		rangeOffset := uint64(binary.LittleEndian.Uint32(patch[:4]))
+		rangeSize := uint64(binary.LittleEndian.Uint32(patch[4:8]))
+		// Remove the header so patch starts with this range's replacement data.
+		patch = patch[bytePatchRangeHeaderSize:]
 		rangeEnd := rangeOffset + rangeSize
 		empty := rangeSize == 0
 		overlapsPrevious := rangeOffset < previousEnd
 		outsideBase := rangeEnd > uint64(len(target))
-		missingData := rangeSize > uint64(len(ranges))
+		missingData := rangeSize > uint64(len(patch))
 		if empty || overlapsPrevious || outsideBase || missingData {
 			return nil, fmt.Errorf("read byte patch range: %w", page.ErrInvalid)
 		}
-		copy(target[int(rangeOffset):int(rangeEnd)], ranges[:int(rangeSize)])
-		// Remove the replacement data so ranges starts with the next range header.
-		ranges = ranges[int(rangeSize):]
+		copy(target[int(rangeOffset):int(rangeEnd)], patch[:int(rangeSize)])
+		// Remove the replacement data so patch starts with the next range header.
+		patch = patch[int(rangeSize):]
 		previousEnd = rangeEnd
 	}
 	return target, nil

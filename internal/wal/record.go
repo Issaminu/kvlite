@@ -24,7 +24,7 @@ const (
 	RecordTypeAllocation RecordType = 2
 	// RecordTypeNode stores one complete node-page image.
 	RecordTypeNode RecordType = 3
-	// RecordTypeBytePatch stores replacement byte ranges for one existing data or allocation page image. See [BytePatch].
+	// RecordTypeBytePatch stores replacement byte ranges for one existing data or allocation page image. See [ApplyBytePatch].
 	RecordTypeBytePatch RecordType = 4
 	// RecordTypeEntryPatch stores entry changes, addressed by key, for one existing leaf or branch that fits in one page.
 	RecordTypeEntryPatch RecordType = 5
@@ -119,14 +119,6 @@ func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.Node,
 	data = appendRecordHeader(data, header, btree.WALNodeEncodedSize(node))
 	payloadStart := len(data)
 	data = btree.AppendEncodedWALNode(data, node)
-	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
-}
-
-func appendEncodedBytePatchRecord(data []byte, header RecordHeader, patch *BytePatch, checksumSeed uint32) []byte {
-	headerStart := len(data)
-	data = appendRecordHeader(data, header, patch.encodedSize())
-	payloadStart := len(data)
-	data = patch.appendEncoded(data)
 	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
 }
 
