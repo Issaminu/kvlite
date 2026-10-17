@@ -335,12 +335,7 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 	// A different entry count or field length moves later bytes to new offsets, so a byte patch cannot describe it.
 	// An entry patch describes the changed entries.
 	var smaller bool
-	if record.Final.IsLeaf() {
-		wal.patchBuffer, smaller = appendLeafEntryPatch(wal.patchBuffer[:0], record.Original, record.Final, targetSize)
-	} else {
-		wal.patchBuffer, smaller = appendBranchEntryPatch(wal.patchBuffer[:0], record.Original, record.Final, targetSize)
-	}
-	if smaller {
+	if wal.patchBuffer, smaller = appendEntryPatch(wal.patchBuffer[:0], record.Original, record.Final, targetSize); smaller {
 		header.Type = RecordTypeEntryPatch
 		return appendEncodedPayloadRecord(transaction, header, wal.patchBuffer, wal.checksumSeed), nil
 	}

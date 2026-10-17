@@ -200,14 +200,20 @@ func appendEntryPatchDelete(patch []byte, key []byte) []byte {
 	return append(patch, key...)
 }
 
-// appendLeafEntryPatch appends the set and delete operations that change base into target.
-// It merges both sorted entry lists once. An entry with equal flags, key, and value makes no operation.
-// It returns false without new bytes when the payload would not be smaller than limit.
-func appendLeafEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte, bool) {
-	if !base.IsLeaf() || !target.IsLeaf() {
+// appendEntryPatch appends the set and delete operations that change base into target, two leaves or two branches.
+// It merges both sorted entry lists once. An entry with equal key, flags, and value makes no operation.
+// A branch entry is a separator key with zero flags, and its value is the 8-byte ID of the child on its right side (see entryPatchEntry).
+// It returns false without new bytes when the node types differ, when a branch changes its first child, or when the payload would not be smaller than limit.
+func appendEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte, bool) {
+	if base.IsLeaf() != target.IsLeaf() {
+		return patch, false
+	}
+	// No separator owns the first child, so an entry patch cannot change it.
+	if !base.IsLeaf() && (len(base.Children) != base.EntryCount()+1 || len(target.Children) != target.EntryCount()+1 || base.Children[0] != target.Children[0]) {
 		return patch, false
 	}
 	start := len(patch)
+	var baseChild, targetChild [page.IDSize]byte
 	baseIndex, targetIndex := 0, 0
 	for baseIndex < base.EntryCount() || targetIndex < target.EntryCount() {
 		// A negative comparison deletes a base entry. A positive comparison sets a new target entry.
@@ -230,73 +236,34 @@ func appendLeafEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]
 			baseIndex++
 			continue
 		case comparison == 0:
-			before, after := base.EntryAt(baseIndex), target.EntryAt(targetIndex)
+			_, beforeFlags, beforeValue := entryPatchEntry(base, baseIndex, &baseChild)
+			_, afterFlags, afterValue := entryPatchEntry(target, targetIndex, &targetChild)
 			baseIndex++
-			if before.Flags() == after.Flags() && bytes.Equal(before.Value(), after.Value()) {
+			if beforeFlags == afterFlags && bytes.Equal(beforeValue, afterValue) {
 				targetIndex++
 				continue
 			}
 		}
-		entry := target.EntryAt(targetIndex)
-		if len(patch)-start+entryPatchSetHeaderSize+len(entry.Key())+len(entry.Value()) >= limit {
+		key, flags, value := entryPatchEntry(target, targetIndex, &targetChild)
+		if len(patch)-start+entryPatchSetHeaderSize+len(key)+len(value) >= limit {
 			return patch[:start], false
 		}
-		patch = appendEntryPatchSet(patch, entry.Flags(), entry.Key(), entry.Value())
+		patch = appendEntryPatchSet(patch, flags, key, value)
 		targetIndex++
 	}
 	return patch, true
 }
 
-// appendBranchEntryPatch appends the set and delete operations that change base into target.
-// Each separator key owns the child page ID on its right side.
-// It returns false without new bytes when the first child changes or the payload would not be smaller than limit.
-func appendBranchEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte, bool) {
-	if base.IsLeaf() || target.IsLeaf() || len(base.Children) != base.EntryCount()+1 || len(target.Children) != target.EntryCount()+1 {
-		return patch, false
+// entryPatchEntry returns the key, flags, and value that an entry patch stores for entry index of node.
+// A leaf returns its stored entry.
+// A branch returns separator index with zero flags, and the ID of the child on its right side, encoded into child.
+func entryPatchEntry(node *btree.Node, index int, child *[page.IDSize]byte) ([]byte, uint32, []byte) {
+	entry := node.EntryAt(index)
+	if node.IsLeaf() {
+		return entry.Key(), entry.Flags(), entry.Value()
 	}
-	if base.Children[0] != target.Children[0] {
-		return patch, false
-	}
-	start := len(patch)
-	var child [page.IDSize]byte
-	baseIndex, targetIndex := 0, 0
-	for baseIndex < base.EntryCount() || targetIndex < target.EntryCount() {
-		// A negative comparison deletes a base separator. A positive comparison sets a new target separator.
-		var comparison int
-		switch {
-		case baseIndex == base.EntryCount():
-			comparison = 1
-		case targetIndex == target.EntryCount():
-			comparison = -1
-		default:
-			comparison = bytes.Compare(base.EntryAt(baseIndex).Key(), target.EntryAt(targetIndex).Key())
-		}
-		switch {
-		case comparison < 0:
-			key := base.EntryAt(baseIndex).Key()
-			if len(patch)-start+entryPatchDeleteHeaderSize+len(key) >= limit {
-				return patch[:start], false
-			}
-			patch = appendEntryPatchDelete(patch, key)
-			baseIndex++
-			continue
-		case comparison == 0:
-			sameChild := base.Children[baseIndex+1] == target.Children[targetIndex+1]
-			baseIndex++
-			if sameChild {
-				targetIndex++
-				continue
-			}
-		}
-		key := target.EntryAt(targetIndex).Key()
-		if len(patch)-start+entryPatchSetHeaderSize+len(key)+page.IDSize >= limit {
-			return patch[:start], false
-		}
-		binary.LittleEndian.PutUint64(child[:], uint64(target.Children[targetIndex+1]))
-		patch = appendEntryPatchSet(patch, 0, key, child[:])
-		targetIndex++
-	}
-	return patch, true
+	binary.LittleEndian.PutUint64(child[:], uint64(node.Children[index+1]))
+	return entry.Key(), 0, child[:]
 }
 
 // ApplyEntryPatch applies the operations of an encoded entry patch to node.

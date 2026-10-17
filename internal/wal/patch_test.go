@@ -120,13 +120,7 @@ func branchFromState(id page.ID, state map[string]page.ID) *btree.Node {
 
 func mustEntryPatch(t *testing.T, base, target *btree.Node) []byte {
 	t.Helper()
-	var patch []byte
-	var smaller bool
-	if base.IsLeaf() {
-		patch, smaller = appendLeafEntryPatch(nil, base, target, 1<<30)
-	} else {
-		patch, smaller = appendBranchEntryPatch(nil, base, target, 1<<30)
-	}
+	patch, smaller := appendEntryPatch(nil, base, target, 1<<30)
 	if !smaller {
 		t.Fatal("entry patch was not created")
 	}
@@ -174,8 +168,11 @@ func TestEntryPatch_BranchSetsAndDeletesSeparators(t *testing.T) {
 
 	changedFirst := base.Clone()
 	changedFirst.Children[0] = 99
-	if _, smaller := appendBranchEntryPatch(nil, base, changedFirst, 1<<30); smaller {
+	if _, smaller := appendEntryPatch(nil, base, changedFirst, 1<<30); smaller {
 		t.Fatal("branch entry patch changed the first child")
+	}
+	if _, smaller := appendEntryPatch(nil, base, leafFromState(t, 2, map[string]string{"d": "1"}), 1<<30); smaller {
+		t.Fatal("entry patch changed a branch into a leaf")
 	}
 }
 
