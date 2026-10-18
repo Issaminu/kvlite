@@ -1,0 +1,55 @@
+# Example systemd unit for the Blackout supervisor (see the package documentation).
+#
+# Setup:
+#   1. Make a user "blackout" with the home directory /var/lib/blackout.
+#   2. Clone KVLite into /var/lib/blackout/kvlite with a deploy key that has read-only access.
+#      The runner fetches and never pushes.
+#      Only the runner uses this checkout, because follow mode checks out each new commit in it.
+#   3. Compile the supervisor:
+#        cd /var/lib/blackout/kvlite && go build -o /var/lib/blackout/bin/blackout-supervisor ./internal/blackout/supervisor
+#   4. Copy this file to /etc/systemd/system/blackout.service and change the paths.
+#   5. Start the service: systemctl enable --now blackout
+#
+# The status is in /var/lib/blackout/results/status.json, and the log is in journalctl -u blackout.
+
+[Unit]
+Description=Blackout deterministic simulation runner for KVLite
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=blackout
+Group=blackout
+WorkingDirectory=/var/lib/blackout
+Environment=HOME=/var/lib/blackout
+Environment=GOCACHE=/var/lib/blackout/.cache/go-build
+Environment=PATH=/usr/local/go/bin:/usr/bin:/bin
+ExecStart=/var/lib/blackout/bin/blackout-supervisor -repo /var/lib/blackout/kvlite -out /var/lib/blackout/results -follow
+
+# Restart the supervisor when it stops, for example after a failed compile at startup.
+Restart=always
+RestartSec=60s
+
+# Low priority: the runner uses spare CPU time only.
+Nice=10
+CPUSchedulingPolicy=batch
+IOSchedulingClass=idle
+
+# A stop sends SIGTERM to the supervisor only.
+# The supervisor then lets the running workers finish, up to -timeout (5 minutes).
+KillMode=mixed
+TimeoutStopSec=6min
+
+# GOMEMLIMIT is a soft limit for each worker; MemoryMax is a hard limit for all processes together.
+#MemoryMax=8G
+
+# The service writes only in its own directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/blackout
+
+[Install]
+WantedBy=multi-user.target

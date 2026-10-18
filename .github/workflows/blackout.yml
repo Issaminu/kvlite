@@ -1,0 +1,29 @@
+name: Blackout
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  blackout:
+    name: Blackout simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      # Each commit gets its own fixed seed range: the first 15 hexadecimal digits of the commit SHA give the first seed.
+      # A failure report prints its seed and a replay command.
+      - name: Run 200 Blackout seeds for this commit
+        run: |
+          start=$((16#${GITHUB_SHA:0:15}))
+          echo "Blackout seeds $start to $((start + 199)) of commit $GITHUB_SHA"
+          go test -timeout=20m -run 'TestBlackout$' -blackout.start="$start" -blackout.seeds=200 .
+
+      - name: Test the Blackout packages
+        run: go test ./internal/blackout/...

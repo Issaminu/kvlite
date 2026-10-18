@@ -7,9 +7,12 @@ package kvlite_test
 //	go test -run 'TestBlackout$' -blackout.seed=N -blackout.trace=200 -v .
 
 import (
+	"encoding/json"
 	"flag"
+	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -27,11 +30,63 @@ var (
 	blackoutSteps       = flag.Int("blackout.steps", blackout.DefaultSteps, "safety-phase steps per Blackout run")
 	blackoutTrace       = flag.Int("blackout.trace", 0, "with -blackout.seed, print this many of the last steps and storage events on failure")
 	blackoutMaxFailures = flag.Int("blackout.max-failures", 3, "stop the seed range after this many failed seeds")
+	blackoutJSON        = flag.String("blackout.json", "", "with -blackout.seed, write the result to this file as JSON (the autonomous runner reads it)")
 	blackoutDeepCheck   = flag.Bool("blackout.deep-check", false, "run the slow checks after every step: the process-crash image and the memory database")
 	blackoutStressSeeds = flag.Int("blackout.stress-seeds", 4, "number of seeds of TestBlackoutStress")
 	blackoutStressSize  = flag.Int("blackout.stress-operations", 0, "operations of each stress client (zero means the default)")
 	blackoutStressCount = flag.Int("blackout.stress-clients", 0, "goroutines of each stress run (zero means the default)")
 )
+
+// blackoutResult is the JSON that -blackout.json writes. The autonomous runner (internal/blackout/supervisor) reads it.
+type blackoutResult struct {
+	Seed          uint64 `json:"seed"`
+	Steps         int    `json:"steps"`
+	Passed        bool   `json:"passed"`
+	Failure       string `json:"failure,omitempty"` // first line of the report
+	Report        string `json:"report,omitempty"`
+	Config        string `json:"config"`
+	TraceHash     string `json:"trace_hash"`
+	GoVersion     string `json:"go_version"`
+	GOOS          string `json:"goos"`
+	GOARCH        string `json:"goarch"`
+	PageSize      int    `json:"page_size"` // the operating-system page size: the default checkpoint threshold depends on it, so a replay needs the same size
+	Commits       int    `json:"commits"`
+	Recoveries    int    `json:"recoveries"`
+	Crashes       int    `json:"crashes"`
+	PowerFailures int    `json:"power_failures"`
+}
+
+// writeBlackoutResult writes result to path through a temporary file, so a reader never sees a partial file.
+func writeBlackoutResult(path string, result blackout.Result, steps int) error {
+	data := blackoutResult{
+		Seed:          result.Seed,
+		Steps:         steps,
+		Passed:        result.Err == nil,
+		Config:        result.Config.String(),
+		TraceHash:     fmt.Sprintf("%016x", result.TraceHash),
+		GoVersion:     runtime.Version(),
+		GOOS:          runtime.GOOS,
+		GOARCH:        runtime.GOARCH,
+		PageSize:      os.Getpagesize(),
+		Commits:       result.Stats.Commits,
+		Recoveries:    result.Stats.Recoveries,
+		Crashes:       result.Stats.Disk.ProcessCrashes + result.Stats.Disk.PowerFailures,
+		PowerFailures: result.Stats.Disk.PowerFailures,
+	}
+	if result.Err != nil {
+		data.Report = result.Err.Error()
+		data.Failure, _, _ = strings.Cut(data.Report, "\n")
+	}
+	encoded, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return err
+	}
+	temporary := path + ".tmp"
+	if err := os.WriteFile(temporary, encoded, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(temporary, path)
+}
 
 // target connects the Blackout engine to the internals that export_test.go exports.
 var target = blackout.Target{
@@ -61,6 +116,11 @@ func TestBlackout(t *testing.T) {
 			DeepCheck:  *blackoutDeepCheck,
 		})
 		t.Logf("seed %d config: %s\n%s", result.Seed, result.Config, result.Stats)
+		if *blackoutJSON != "" {
+			if err := writeBlackoutResult(*blackoutJSON, result, *blackoutSteps); err != nil {
+				t.Fatalf("write the JSON result: %v", err)
+			}
+		}
 		if result.Err != nil {
 			t.Fatal(result.Err)
 		}
