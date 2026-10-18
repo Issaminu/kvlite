@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -350,4 +351,66 @@ func TestSyncLieLosesSyncedData(t *testing.T) {
 		}
 	}
 	t.Fatal("SyncLieAllFiles never lost synced data")
+}
+func TestFailedSyncCanDropChangesForGood(t *testing.T) {
+	for seed := range uint64(100) {
+		fsys := New(seed, Config{SyncFault: Always})
+		file := openRW(t, fsys, testName)
+		mustSync(t, file)
+		if err := fsys.SyncDir(testDir); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, file, []byte("dropped"), 0)
+		fsys.SetFaults(true)
+		if err := file.Sync(); !errors.Is(err, ErrInjected) || !errors.Is(err, syscall.EIO) {
+			t.Fatalf("failed sync: %v, want ErrInjected and EIO", err)
+		}
+		fsys.SetFaults(false)
+		// The kernel marked the dropped pages clean, so this sync writes nothing.
+		mustSync(t, file)
+		fsys.Restart(true)
+		if got := content(fsys, testName); !bytes.Equal(got, []byte("dropped")) {
+			return
+		}
+	}
+	t.Fatal("a failed sync never dropped a change for good")
+}
+
+func TestFailedSyncCanDropTheCacheView(t *testing.T) {
+	for seed := range uint64(100) {
+		fsys := New(seed, Config{SyncFault: Always, DropCache: Always})
+		file := openRW(t, fsys, testName)
+		mustSync(t, file)
+		mustWrite(t, file, []byte("dropped"), 0)
+		fsys.SetFaults(true)
+		if err := file.Sync(); !errors.Is(err, ErrInjected) {
+			t.Fatalf("failed sync: %v, want ErrInjected", err)
+		}
+		fsys.SetFaults(false)
+		if fsys.Stats().DroppedCaches == 0 {
+			continue
+		}
+		// The running process now reads the durable bytes: the write is gone without a crash.
+		if got := content(fsys, testName); bytes.Equal(got, []byte("dropped")) {
+			t.Fatalf("seed %d: a dropped cache view still holds the write", seed)
+		}
+		return
+	}
+	t.Fatal("a failed sync never dropped the cache view")
+}
+
+func TestInjectedErrorsNeedEnabledFaults(t *testing.T) {
+	fsys := New(4, Config{ReadFault: Always, WriteFault: Always})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("data"), 0)
+	fsys.SetFaults(true)
+	if _, err := file.ReadAt(make([]byte, 4), 0); !errors.Is(err, ErrInjected) {
+		t.Fatalf("read with faults: %v, want ErrInjected", err)
+	}
+	if _, err := file.WriteAt([]byte("data"), 0); !errors.Is(err, ErrInjected) {
+		t.Fatalf("write with faults: %v, want ErrInjected", err)
+	}
+	if got := fsys.Stats().InjectedFaults; got != 2 {
+		t.Fatalf("InjectedFaults = %d, want 2", got)
+	}
 }

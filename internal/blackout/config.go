@@ -55,6 +55,9 @@ type Config struct {
 	MaxMutations     int
 	Abort            disk.Ratio
 
+	// I/O errors.
+	IOFaults bool // the disk injects errors in the safety phase
+
 	// Crash settings.
 	CrashNow      disk.Ratio // chance per step of a crash between operations
 	ScheduleCrash disk.Ratio // chance per step of a crash inside one of the next file calls
@@ -72,10 +75,10 @@ func (config Config) String() string {
 			operations = append(operations, fmt.Sprintf("%s=%d", operationNames[op], weight))
 		}
 	}
-	return fmt.Sprintf("sync=%s checksums=%t checkpoint=%d buckets=%d keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t sector=%d keep=%v in-order=%v ops=[%s]",
+	return fmt.Sprintf("sync=%s checksums=%t checkpoint=%d buckets=%d keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
 		syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.KeyCount, config.KeyShape, config.Access,
 		config.ValueWeights, config.MutationWeights, config.MaxMutations, config.Abort, config.CrashNow, config.ScheduleCrash,
-		config.PowerFailures, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
+		config.PowerFailures, config.IOFaults, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
 }
 
 // streamSeed derives the seed of one random generator from the run seed.
@@ -151,6 +154,21 @@ func newConfig(seed uint64) Config {
 		SectorSize: [...]int{512, 4096}[rand.IntN(2)],
 		KeepChange: disk.Ratio{Num: uint64(rand.Range(1, 3)), Den: 4},
 		InOrder:    disk.OneIn(uint64(rand.Range(2, 8))),
+	}
+
+	config.IOFaults = rand.Bool()
+	config.Disk.DropCache = disk.OneIn(2)
+	if config.IOFaults {
+		// Each kind of call fails with its own rate, or never.
+		fault := func() disk.Ratio { return sometimes(rand, 20, 500) }
+		config.Disk.ReadFault = fault()
+		config.Disk.WriteFault = fault()
+		config.Disk.SyncFault = fault()
+		config.Disk.TruncateFault = fault()
+		config.Disk.StatFault = fault()
+		config.Disk.OpenFault = fault()
+		config.Disk.RemoveFault = fault()
+		config.Disk.SyncDirFault = fault()
 	}
 	return config
 }

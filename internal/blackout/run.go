@@ -13,8 +13,10 @@ import (
 const (
 	// databasePath is the database file on the simulated storage.
 	databasePath = "/sim/db"
-	// openTries is the number of failed opens before recovery must succeed with crashes turned off.
+	// openTries is the number of failed opens before recovery must succeed with faults and crashes turned off.
 	openTries = 12
+	// closeTries is the number of failed closes before Close must succeed with faults turned off.
+	closeTries = 4
 )
 
 // runner runs one seed.
@@ -29,9 +31,12 @@ type runner struct {
 	db              *kvlite.DB
 	model           *stateModel
 	step            int
+	faults          bool   // injected errors are enabled outside the checks
+	stopped         bool   // the handle returned ErrWALWriteFailed
 	powerLost       bool   // a power failure happened since the last verified open
 	uncertainOpen   bool   // a commit result is unknown, and no open has resolved it yet
 	checkpointCount uint64 // checkpoints of the current handle
+	droppedCaches   int    // disk.Stats.DroppedCaches at the last verified open
 	failure         error
 	events          []string
 	trace           []string // every step and storage event, when the settings ask for it
@@ -135,6 +140,8 @@ func (runner *runner) run() (err error) {
 	}()
 	runner.event("config %s", runner.config)
 	runner.openAndVerify(false)
+	runner.faults = runner.config.IOFaults
+	runner.fsys.SetFaults(runner.faults)
 	for step := 0; step < runner.settings.Steps && runner.failure == nil; step++ {
 		runner.step = step
 		runner.event("step %d", step)
@@ -179,7 +186,7 @@ func (runner *runner) runOperation(op operation) {
 	}
 }
 
-// afterStep recovers from a crash and moves the durable floor.
+// afterStep recovers from a crash or a stopped handle and moves the durable floor.
 func (runner *runner) afterStep() {
 	if runner.failure != nil {
 		return
@@ -188,7 +195,28 @@ func (runner *runner) afterStep() {
 		runner.recoverCrash()
 		return
 	}
+	if runner.stopped {
+		runner.recoverStopped()
+		return
+	}
 	runner.updateFloor()
+}
+
+// recoverStopped follows the documented procedure after ErrWALWriteFailed: check that the handle stopped, then close it and open the file again.
+// The crash generator can crash the process instead.
+func (runner *runner) recoverStopped() {
+	runner.stopped = false
+	if err := runner.db.View(func(*kvlite.Tx) error { return nil }); !errors.Is(err, kvlite.ErrWALWriteFailed) {
+		runner.fail("View after ErrWALWriteFailed returned %v, want ErrWALWriteFailed", err)
+		return
+	}
+	if runner.crash.enabled && runner.crash.afterWALFailure() {
+		runner.event("crash after the WAL write failure")
+		runner.fsys.Crash()
+		runner.recoverCrash()
+		return
+	}
+	runner.reopen()
 }
 
 // updateFloor moves the durable floor to the latest state when KVLite promises its durability.
@@ -210,22 +238,33 @@ func (runner *runner) updateFloor() {
 }
 
 // closeDB closes the handle.
+// It retries after injected errors and finally turns faults off, because Close must succeed once the storage works.
 // It reports false when a crash interrupted Close.
 func (runner *runner) closeDB() bool {
-	err := runner.db.Close()
-	runner.event("close: %v", err)
-	if err == nil {
-		runner.db = nil
-		if runner.config.Sync != kvlite.SyncNone {
-			// Close checkpoints with syncs, so the latest state is durable.
-			runner.model.setFloor()
+	for attempt := 0; ; attempt++ {
+		if attempt == closeTries {
+			runner.fsys.SetFaults(false)
+			defer runner.fsys.SetFaults(runner.faults)
 		}
-		return true
+		err := runner.db.Close()
+		runner.event("close: %v", err)
+		if err == nil {
+			runner.db = nil
+			if runner.config.Sync != kvlite.SyncNone {
+				// Close checkpoints with syncs, so the latest state is durable.
+				runner.model.setFloor()
+			}
+			return true
+		}
+		if crashed, _ := runner.fsys.Crashed(); crashed {
+			return false
+		}
+		runner.stats.FailedCloses++
+		if !explained(err) || attempt >= closeTries {
+			runner.fail("Close: unexpected error after %d attempts: %v", attempt+1, err)
+			return false
+		}
 	}
-	if crashed, _ := runner.fsys.Crashed(); !crashed {
-		runner.fail("Close: unexpected error: %v", err)
-	}
-	return false
 }
 
 // recoverCrash drops the crashed handle, restarts the simulated process, and checks the recovered state.
@@ -244,6 +283,7 @@ func (runner *runner) recoverCrash() {
 		runner.target.Abandon(runner.db)
 		runner.db = nil
 	}
+	runner.stopped = false
 	powerFailure := runner.crash.powerFailure(disk.Ratio{Num: 2, Den: 3})
 	runner.powerLost = runner.powerLost || powerFailure
 	runner.event("restart after %s (power failure: %t)", event, powerFailure)
@@ -255,8 +295,10 @@ func (runner *runner) recoverCrash() {
 func (runner *runner) openAndVerify(afterCrash bool) {
 	for attempt := 0; ; attempt++ {
 		if attempt == openTries {
-			// Recovery must finish once the machine stops crashing.
+			// Recovery must finish once the storage works and the machine stops crashing.
+			runner.fsys.SetFaults(false)
 			runner.fsys.CancelCrash()
+			defer runner.fsys.SetFaults(runner.faults)
 		} else if afterCrash {
 			if crash, calls := runner.crash.duringRecovery(); crash {
 				runner.fsys.ScheduleCrash(calls)
@@ -278,6 +320,9 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 			afterCrash = true
 			continue
 		}
+		if explained(err) && attempt < openTries {
+			continue
+		}
 		runner.fail("Open: unexpected error after %d attempts: %v", attempt+1, err)
 		return
 	}
@@ -292,12 +337,23 @@ func (runner *runner) livenessPhase() {
 	runner.event("liveness phase")
 	runner.crash.enabled = false
 	runner.fsys.CancelCrash()
+	runner.faults = false
+	runner.fsys.SetFaults(false)
+	if crashed, _ := runner.fsys.Crashed(); crashed {
+		runner.recoverCrash()
+	}
+	if runner.stopped {
+		runner.recoverStopped()
+	}
 	weights := slices.Clone(runner.config.OperationWeights)
 	weights[opReopen] = 0
 	for step := 0; step < LivenessSteps && runner.failure == nil; step++ {
 		runner.runOperation(runner.work.nextOperation(weights))
 		if crashed, _ := runner.fsys.Crashed(); crashed {
 			runner.fail("the process crashed in the liveness phase")
+		}
+		if runner.stopped && runner.failure == nil {
+			runner.fail("a WAL write failed in the liveness phase, without injected faults")
 		}
 		runner.updateFloor()
 	}

@@ -94,6 +94,7 @@ func TestBlackoutIsDeterministic(t *testing.T) {
 
 // TestBlackoutDetectsDurabilityDefects gives Blackout storage that lies about durability.
 // Blackout must report lost data for each lie, or a passing run proves nothing.
+// A seed counts only when the same seed passes without the lie, so an open KVLite bug cannot stand in for the lie.
 // It is a test of Blackout itself.
 func TestBlackoutDetectsDurabilityDefects(t *testing.T) {
 	for _, test := range []struct {
@@ -105,18 +106,27 @@ func TestBlackoutDetectsDurabilityDefects(t *testing.T) {
 		{"directory syncs do nothing", disk.SyncLieDirectory},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			for seed := uint64(1); seed <= 40; seed++ {
-				result := blackout.Run(target, seed, blackout.Settings{Steps: 150, Change: func(config *blackout.Config) {
+			settings := func(lie disk.SyncLie) blackout.Settings {
+				return blackout.Settings{Steps: 150, Change: func(config *blackout.Config) {
 					config.Sync = kvlite.SyncFull
 					config.PowerFailures = true
 					config.CheckpointBytes = 1
 					config.CrashNow = disk.OneIn(8)
-					config.Disk.SyncLie = test.lie
-				}})
-				if result.Err != nil {
-					t.Logf("seed %d detected the defect: %s", seed, strings.SplitN(result.Err.Error(), "\n", 2)[0])
-					return
+					// Only crashes and power failures, so the control run does not hit open bugs of other faults.
+					config.IOFaults = false
+					config.Disk = disk.Config{SectorSize: config.Disk.SectorSize, KeepChange: config.Disk.KeepChange, InOrder: config.Disk.InOrder, SyncLie: lie}
+				}}
+			}
+			for seed := uint64(1); seed <= 40; seed++ {
+				result := blackout.Run(target, seed, settings(test.lie))
+				if result.Err == nil {
+					continue
 				}
+				if control := blackout.Run(target, seed, settings(disk.SyncLieNone)); control.Err != nil {
+					continue
+				}
+				t.Logf("seed %d detected the defect: %s", seed, strings.SplitN(result.Err.Error(), "\n", 2)[0])
+				return
 			}
 			t.Fatal("40 seeds did not detect the durability defect")
 		})

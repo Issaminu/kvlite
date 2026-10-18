@@ -23,6 +23,8 @@ type Stats struct {
 	CrashesInCalls      map[string]int
 	CrashesInOpen       int
 	FailedOpens         int
+	FailedCloses        int
+	StoppedHandles      int // handles that ErrWALWriteFailed stopped
 	Recoveries          int // opens whose state the checks compared with the model
 	Disk                disk.Stats
 }
@@ -47,6 +49,11 @@ func (stats *Stats) Add(other Stats) {
 	}
 	stats.CrashesInOpen += other.CrashesInOpen
 	stats.FailedOpens += other.FailedOpens
+	stats.FailedCloses += other.FailedCloses
+	stats.StoppedHandles += other.StoppedHandles
+	stats.Disk.InjectedFaults += other.Disk.InjectedFaults
+	stats.Disk.DroppedSyncs += other.Disk.DroppedSyncs
+	stats.Disk.DroppedCaches += other.Disk.DroppedCaches
 	stats.Recoveries += other.Recoveries
 	stats.Disk.ProcessCrashes += other.Disk.ProcessCrashes
 	stats.Disk.PowerFailures += other.Disk.PowerFailures
@@ -66,7 +73,7 @@ func (stats Stats) String() string {
 	for _, kind := range slices.Sorted(maps.Keys(stats.CrashesInCalls)) {
 		crashes = append(crashes, fmt.Sprintf("%s=%d", kind, stats.CrashesInCalls[kind]))
 	}
-	return fmt.Sprintf("steps: %s\ncommits=%d aborts=%d uncertain=%d (kept %d, lost %d) lost-unsynced=%d recoveries=%d failed-opens=%d crashes-now=%d crashes-in-open=%d\ncrashes inside calls: %s\ndisk: %+v",
+	return fmt.Sprintf("steps: %s\ncommits=%d aborts=%d uncertain=%d (kept %d, lost %d) lost-unsynced=%d recoveries=%d stopped=%d failed-opens=%d failed-closes=%d crashes-now=%d crashes-in-open=%d\ncrashes inside calls: %s\ndisk: %+v",
 		strings.Join(steps, " "), stats.Commits, stats.Aborts, stats.Uncertain, stats.UncertainKept, stats.UncertainLost, stats.LostUnsyncedCommits,
-		stats.Recoveries, stats.FailedOpens, stats.CrashesNow, stats.CrashesInOpen, strings.Join(crashes, " "), stats.Disk)
+		stats.Recoveries, stats.StoppedHandles, stats.FailedOpens, stats.FailedCloses, stats.CrashesNow, stats.CrashesInOpen, strings.Join(crashes, " "), stats.Disk)
 }

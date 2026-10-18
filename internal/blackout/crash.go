@@ -43,6 +43,12 @@ func (crash *crasher) powerFailure(chance disk.Ratio) bool {
 	return crash.config.PowerFailures && crash.rand.Chance(chance)
 }
 
+// afterWALFailure decides what happens after a WAL write failure stopped the handle.
+// It returns true for a crash, and false for the documented recovery: close the handle and open the file again.
+func (crash *crasher) afterWALFailure() bool {
+	return crash.rand.Bool()
+}
+
 // duringRecovery decides whether the process crashes again while Open recovers.
 // For such a crash it returns the number of mutating file calls before it.
 func (crash *crasher) duringRecovery() (bool, int) {

@@ -12,10 +12,10 @@ import (
 // errCheckFailed is the error a callback returns after a failed check, so that its transaction ends.
 var errCheckFailed = errors.New("blackout check failed")
 
-// explained reports whether a simulated crash explains err.
+// explained reports whether an injected I/O error or a simulated crash explains err.
 // The error chain must contain the cause; "some error after some fault" is not enough.
 func explained(err error) bool {
-	return errors.Is(err, disk.ErrCrashed)
+	return errors.Is(err, disk.ErrInjected) || errors.Is(err, disk.ErrCrashed)
 }
 
 // expectError checks a call that the model expects to fail with want.
@@ -102,7 +102,10 @@ func readState(db *kvlite.DB, bucketNames []string) (dbState, error) {
 }
 
 // checkPages walks the tree and compares it with the allocation bitmap.
+// The walk runs with faults disabled, so the check cannot fail because of an injected error.
 func (runner *runner) checkPages(when string) {
+	runner.fsys.SetFaults(false)
+	defer runner.fsys.SetFaults(runner.faults)
 	if err := runner.target.CheckPages(runner.db); err != nil {
 		runner.fail("page ownership %s: %v", when, err)
 	}
@@ -112,6 +115,9 @@ func (runner *runner) checkPages(when string) {
 // After a crash, the state can be any state that the model allows.
 // After a clean close, it must be the latest state.
 func (runner *runner) verify(afterCrash bool) {
+	// The checks run with faults disabled, so they cannot fail because of an injected error.
+	runner.fsys.SetFaults(false)
+	defer runner.fsys.SetFaults(runner.faults)
 	runner.stats.Recoveries++
 	recovered, err := readState(runner.db, runner.work.bucketNames)
 	if err != nil {
@@ -123,14 +129,17 @@ func (runner *runner) verify(afterCrash bool) {
 		return
 	}
 
+	// A failed sync that dropped the cache view loses unsynced changes without a crash, as a power failure does.
+	droppedCache := runner.fsys.Stats().DroppedCaches > runner.droppedCaches
+	runner.droppedCaches = runner.fsys.Stats().DroppedCaches
 	lowest := runner.model.latest
-	if afterCrash && runner.powerLost {
+	if afterCrash && runner.powerLost || droppedCache {
 		lowest = runner.model.floor
 	}
 	before := runner.model.latest
-	result, branch, err := runner.model.resolve(recovered, lowest, afterCrash)
+	result, branch, err := runner.model.resolve(recovered, lowest, afterCrash || droppedCache)
 	if err != nil {
-		runner.fail("recovery (after crash: %t, power lost: %t): %v", afterCrash, runner.powerLost, err)
+		runner.fail("recovery (after crash: %t, power lost: %t, cache dropped: %t): %v", afterCrash, runner.powerLost, droppedCache, err)
 		return
 	}
 	if runner.model.latest < before {

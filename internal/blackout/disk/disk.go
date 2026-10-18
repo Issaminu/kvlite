@@ -11,6 +11,10 @@
 // A sector is the unit of persistence: a sector keeps a prefix of its own writes, and sectors have no order between them.
 // A power failure can also keep or lose a truncate, keep a longer file length without its data, and keep or lose each name change that no directory sync made durable.
 //
+// Calls can also fail while the process keeps running.
+// A failed call does not mean that nothing happened: a failed write can still write a prefix, and a failed truncate or remove can still take effect.
+// A failed sync can make some changes durable and drop the others for good, as Linux does after a writeback error ("fsyncgate").
+//
 // A seed selects every decision.
 // The same seed and the same calls give the same results.
 //
@@ -18,6 +22,7 @@
 package disk
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -34,9 +39,15 @@ import (
 	"github.com/Issaminu/kvlite/internal/fileio"
 )
 
-// ErrCrashed means the simulated process crashed.
-// Every call fails with it until [FS.Restart].
-var ErrCrashed = errors.New("disk: process crashed")
+var (
+	// ErrInjected marks an I/O error that the configuration injected.
+	// Each such error also matches [syscall.EIO].
+	ErrInjected = errors.New("disk: injected I/O error")
+
+	// ErrCrashed means the simulated process crashed.
+	// Every call fails with it until [FS.Restart].
+	ErrCrashed = errors.New("disk: process crashed")
+)
 
 // cachePageSize is the unit that a process crash can split a write at.
 // The kernel copies one page at a time.
@@ -57,12 +68,25 @@ const (
 	SyncLieDirectory
 )
 
-// Config selects how one FS persists data at a power failure.
-// The zero Config uses 512-byte sectors and keeps each unsynced change with probability one half.
+// Config selects the faults of one FS and how it persists data at a power failure.
+// The zero Config injects no errors, uses 512-byte sectors, and keeps each unsynced change with probability one half.
 type Config struct {
 	// SectorSize is the unit of persistence at a power failure.
 	// Zero means 512 bytes.
 	SectorSize int
+
+	// Probabilities of an injected error, for each call while faults are enabled.
+	ReadFault     Ratio
+	WriteFault    Ratio // A failed write can still change a prefix of its bytes.
+	SyncFault     Ratio // A failed sync can make some changes durable and drop the others for good.
+	TruncateFault Ratio // A failed truncate can still take effect.
+	StatFault     Ratio
+	OpenFault     Ratio
+	RemoveFault   Ratio // A failed remove can still take effect.
+	SyncDirFault  Ratio // A failed directory sync can make some names durable.
+
+	// DropCache is the probability that a failed sync also drops the dropped changes from the cache view, so reads return the durable bytes.
+	DropCache Ratio
 
 	// KeepChange is the probability that a power failure keeps one unsynced sector, truncate, file length, or name change.
 	// Zero means one half.
@@ -80,8 +104,11 @@ type Config struct {
 	OnEvent func(Event)
 }
 
-// Stats counts the crash decisions of one FS.
+// Stats counts the faults and crash decisions of one FS.
 type Stats struct {
+	InjectedFaults   int // injected errors of all kinds
+	DroppedSyncs     int // failed syncs that dropped unsynced changes for good
+	DroppedCaches    int // failed syncs that also dropped those changes from the cache view, so a running process loses them
 	ProcessCrashes   int // restarts that kept the cache view
 	PowerFailures    int // restarts that kept only the durable view and a random part of the unsynced changes
 	ScheduledCrashes int // crashes inside a call
@@ -122,6 +149,7 @@ type FS struct {
 	crashAt      uint64 // mutation that crashes; zero means none
 	crashed      bool
 	crashEvent   Event
+	faults       bool // enables the injected errors of Config
 	stats        Stats
 	recent       []Event
 	traceHash    uint64
@@ -145,7 +173,9 @@ type change struct {
 }
 
 // New returns an empty FS.
-// The seed selects every crash decision.
+// The seed selects every fault and crash decision.
+// Injected errors start disabled.
+// Call [FS.SetFaults] to enable them.
 func New(seed uint64, config Config) *FS {
 	if config.SectorSize <= 0 {
 		config.SectorSize = 512
@@ -163,6 +193,15 @@ func New(seed uint64, config Config) *FS {
 }
 
 var _ fileio.FS = (*FS)(nil)
+
+// SetFaults enables or disables the injected errors of the Config.
+// Crashes do not depend on it.
+// With faults disabled, no call uses the random source for an error decision, so checks with faults disabled do not change later decisions.
+func (fsys *FS) SetFaults(enabled bool) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	fsys.faults = enabled
+}
 
 // ScheduleCrash makes the n-th next mutating call crash the process, for n >= 1.
 // That call can take full, partial, or no effect.
@@ -461,6 +500,20 @@ func (fsys *FS) mutate(op, name string, offset int64, length int) bool {
 	return true
 }
 
+// inject reports whether this call returns an injected error.
+// The caller must hold mu.
+func (fsys *FS) inject(ratio Ratio) bool {
+	if !fsys.faults || !fsys.rand.Chance(ratio) {
+		return false
+	}
+	fsys.stats.InjectedFaults++
+	return true
+}
+
+func injectedError(op, name string) error {
+	return &fs.PathError{Op: op, Path: name, Err: fmt.Errorf("%w: %w", ErrInjected, syscall.EIO)}
+}
+
 func crashedError(op, name string) error {
 	return &fs.PathError{Op: op, Path: name, Err: ErrCrashed}
 }
@@ -475,6 +528,10 @@ func (fsys *FS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, 
 	}
 	if flag&^(os.O_RDONLY|os.O_RDWR|os.O_WRONLY|os.O_CREATE) != 0 {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: errors.ErrUnsupported}
+	}
+	if fsys.inject(fsys.config.OpenFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "open", Name: name, Result: "injected"})
+		return nil, injectedError("open", name)
 	}
 	node, ok := fsys.names[name]
 	if !ok {
@@ -529,6 +586,13 @@ func (fsys *FS) Remove(name string) error {
 		fsys.record(fsys.crashEvent)
 		return crashedError("remove", name)
 	}
+	if fsys.inject(fsys.config.RemoveFault) {
+		if fsys.rand.Bool() {
+			delete(fsys.names, name)
+		}
+		fsys.record(Event{Mutation: fsys.mutations, Op: "remove", Name: name, Result: "injected"})
+		return injectedError("remove", name)
+	}
 	delete(fsys.names, name)
 	fsys.record(Event{Mutation: fsys.mutations, Op: "remove", Name: name, Result: "ok"})
 	return nil
@@ -562,6 +626,11 @@ func (fsys *FS) SyncDir(dir string) error {
 		}
 		fsys.record(fsys.crashEvent)
 		return crashedError("sync", dir)
+	}
+	if fsys.inject(fsys.config.SyncDirFault) {
+		fsys.persistNames(names, Ratio{Num: 1, Den: 2})
+		fsys.record(Event{Mutation: fsys.mutations, Op: "syncdir", Name: dir, Result: "injected"})
+		return injectedError("sync", dir)
 	}
 	if fsys.config.SyncLie != SyncLieDirectory {
 		fsys.persistNames(names, Always)
@@ -638,6 +707,10 @@ func (f *file) ReadAt(p []byte, offset int64) (int, error) {
 	if offset < 0 {
 		return 0, &fs.PathError{Op: "read", Path: f.name, Err: syscall.EINVAL}
 	}
+	if fsys.inject(fsys.config.ReadFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "read", Name: f.name, Offset: offset, Length: len(p), Result: "injected"})
+		return 0, injectedError("read", f.name)
+	}
 	if offset >= int64(len(f.node.data)) {
 		if len(p) == 0 {
 			return 0, nil
@@ -672,6 +745,13 @@ func (f *file) WriteAt(p []byte, offset int64) (int, error) {
 		fsys.crashEvent.Result = fmt.Sprintf("crash after %d bytes", n)
 		fsys.record(fsys.crashEvent)
 		return n, crashedError("write", f.name)
+	}
+	if fsys.inject(fsys.config.WriteFault) {
+		boundaries := sectorBoundaries(offset, len(p), cachePageSize)
+		n := boundaries[fsys.rand.IntN(len(boundaries))]
+		fsys.write(f.node, p[:n], offset)
+		fsys.record(Event{Mutation: fsys.mutations, Op: "write", Name: f.name, Offset: offset, Length: len(p), Result: fmt.Sprintf("injected after %d bytes", n)})
+		return n, injectedError("write", f.name)
 	}
 	fsys.write(f.node, p, offset)
 	fsys.record(Event{Mutation: fsys.mutations, Op: "write", Name: f.name, Offset: offset, Length: len(p), Result: "ok"})
@@ -716,6 +796,15 @@ func (f *file) Truncate(size int64) error {
 		fsys.record(fsys.crashEvent)
 		return crashedError("truncate", f.name)
 	}
+	if fsys.inject(fsys.config.TruncateFault) {
+		result := "injected, not applied"
+		if fsys.rand.Bool() {
+			fsys.truncate(f.node, size)
+			result = "injected, applied"
+		}
+		fsys.record(Event{Mutation: fsys.mutations, Op: "truncate", Name: f.name, Offset: size, Result: result})
+		return injectedError("truncate", f.name)
+	}
 	fsys.truncate(f.node, size)
 	fsys.record(Event{Mutation: fsys.mutations, Op: "truncate", Name: f.name, Offset: size, Result: "ok"})
 	return nil
@@ -737,6 +826,28 @@ func (f *file) Sync() error {
 		}
 		fsys.record(fsys.crashEvent)
 		return crashedError("sync", f.name)
+	}
+	if fsys.inject(fsys.config.SyncFault) {
+		// Like Linux after a writeback error: some changes reach storage, the kernel marks the others clean, and a later sync does not write them.
+		for _, pending := range node.pending {
+			if fsys.rand.Bool() {
+				node.durable = applyChange(node.durable, pending)
+			}
+		}
+		if len(node.pending) > 0 {
+			fsys.stats.DroppedSyncs++
+		}
+		node.pending = nil
+		result := "injected"
+		if fsys.rand.Chance(fsys.config.DropCache) {
+			if !bytes.Equal(node.data, node.durable) {
+				fsys.stats.DroppedCaches++
+				result = "injected, cache dropped"
+			}
+			node.data = slices.Clone(node.durable)
+		}
+		fsys.record(Event{Mutation: fsys.mutations, Op: "sync", Name: f.name, Result: result})
+		return injectedError("sync", f.name)
 	}
 	lie := fsys.config.SyncLie == SyncLieAllFiles || fsys.config.SyncLie == SyncLieMainFile && !strings.HasSuffix(f.name, "-wal")
 	if !lie {
@@ -761,6 +872,10 @@ func (f *file) Stat() (os.FileInfo, error) {
 	defer fsys.mu.Unlock()
 	if err := f.check("stat"); err != nil {
 		return nil, err
+	}
+	if fsys.inject(fsys.config.StatFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "stat", Name: f.name, Result: "injected"})
+		return nil, injectedError("stat", f.name)
 	}
 	return fileInfo{name: filepath.Base(f.name), size: int64(len(f.node.data)), mode: f.node.perm}, nil
 }
