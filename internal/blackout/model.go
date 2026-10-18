@@ -3,15 +3,36 @@ package blackout
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 
 	"github.com/Issaminu/kvlite/internal/checksum"
 )
 
-// dbState is the reference content of a database: bucket name, then key, then value.
+// dbState is the reference content of a database.
+// It maps each bucket path to the entries of that bucket.
+// A path joins bucket names with "/", for example "bucket-0/n1"; generated bucket names never contain "/".
+// A nil value names a nested bucket, whose own path holds its entries.
+// A stored empty value is a non-nil empty slice.
 type dbState map[string]map[string][]byte
+
+// parentPath returns the path of the bucket that holds the bucket at path, and the bucket's name.
+// A top-level bucket has the parent "".
+func parentPath(path string) (string, string) {
+	index := strings.LastIndexByte(path, '/')
+	if index < 0 {
+		return "", path
+	}
+	return path[:index], path[index+1:]
+}
+
+// pathDepth returns the number of bucket names in path.
+func pathDepth(path string) int {
+	return strings.Count(path, "/") + 1
+}
 
 type mutationKind uint8
 
@@ -21,31 +42,36 @@ const (
 	mutationCreateBucket
 	mutationDeleteBucket
 	mutationGet
+	mutationDeleteBatch
+	mutationScan
+	mutationKindCount
 )
 
-var mutationNames = [...]string{"put", "delete", "create-bucket", "delete-bucket", "get"}
+var mutationNames = [mutationKindCount]string{"put", "delete", "create-bucket", "delete-bucket", "get", "delete-batch", "scan"}
 
 // txMutation is one call inside a write transaction.
-// A get changes nothing.
+// A get or a scan changes nothing.
 type txMutation struct {
-	kind   mutationKind
-	bucket string
-	key    string
-	value  []byte
+	kind  mutationKind
+	path  string // bucket path; for create-bucket and delete-bucket, the path of that bucket
+	key   string
+	value []byte
+	keys  []string // keys of a delete-batch
 }
 
 func (mutation txMutation) String() string {
-	return fmt.Sprintf("%s(%q, %d-byte key, %d-byte value)", mutationNames[mutation.kind], mutation.bucket, len(mutation.key), len(mutation.value))
+	return fmt.Sprintf("%s(%q, %d-byte key, %d-byte value, %d keys)", mutationNames[mutation.kind], mutation.path, len(mutation.key), len(mutation.value), len(mutation.keys))
 }
 
 // undoRecord reverts one change of the model.
+// It saves every entry and bucket that the change replaced.
 type undoRecord struct {
-	bucket      string
-	key         string
-	bucketLevel bool              // the change created or deleted the bucket
-	existed     bool              // the key or bucket existed before the change
-	value       []byte            // previous value of the key
-	content     map[string][]byte // previous content of a deleted bucket
+	path    string
+	key     string
+	existed bool                         // the key existed before the change
+	value   []byte                       // previous value of the key; nil for a nested bucket
+	buckets map[string]map[string][]byte // previous content of each replaced bucket path
+	created string                       // path of a bucket that the change created
 }
 
 // commitRecord is one acknowledged commit after the durable floor.
@@ -77,27 +103,31 @@ type stateModel struct {
 	latest    int
 	commits   []commitRecord
 	branches  []branchRecord
+	// past holds the hash of every state from 0 to latest, so a failure report can name an older state that recovery returned.
+	past []uint64
 }
 
 func newStateModel() *stateModel {
-	return &stateModel{state: dbState{}}
+	return &stateModel{state: dbState{}, past: []uint64{0}}
 }
 
-// entryHash returns a 64-bit hash of one entry or, with bucketLevel, of one bucket.
+const (
+	hashValue  byte = iota // a plain entry
+	hashNested             // an entry that names a nested bucket
+	hashBucket             // the existence of a bucket path
+)
+
+// entryHash returns a 64-bit hash of one entry, or of one bucket path.
 // The model combines entry hashes with XOR, so the order of changes does not matter.
 // It uses CRC32C, like the rest of KVLite, and then a splitmix64 finish.
 // The finish is required: CRC is linear, so XOR-combined raw CRCs give the same hash to two states that swap equal-length values between equal-length keys.
-// Length prefixes keep bucket "a" with key "bc" apart from bucket "ab" with key "c".
-func entryHash(bucket, key string, value []byte, bucketLevel bool) uint64 {
+// Length prefixes keep path "a" with key "bc" apart from path "ab" with key "c".
+func entryHash(path, key string, value []byte, kind byte) uint64 {
 	var lengths [12]byte
-	binary.LittleEndian.PutUint32(lengths[0:4], uint32(len(bucket)))
+	binary.LittleEndian.PutUint32(lengths[0:4], uint32(len(path)))
 	binary.LittleEndian.PutUint32(lengths[4:8], uint32(len(key)))
 	binary.LittleEndian.PutUint32(lengths[8:12], uint32(len(value)))
-	kind := []byte{0}
-	if bucketLevel {
-		kind[0] = 1
-	}
-	hash := uint64(checksum.Sum32(kind, lengths[:], []byte(bucket), []byte(key), value))
+	hash := uint64(checksum.Sum32([]byte{kind}, lengths[:], []byte(path), []byte(key), value))
 	hash ^= hash >> 30
 	hash *= 0xbf58476d1ce4e5b9
 	hash ^= hash >> 27
@@ -105,13 +135,154 @@ func entryHash(bucket, key string, value []byte, bucketLevel bool) uint64 {
 	return hash ^ hash>>31
 }
 
+// valueHash returns the hash of one entry of the bucket at path.
+func valueHash(path, key string, value []byte) uint64 {
+	if value == nil {
+		return entryHash(path, key, nil, hashNested)
+	}
+	return entryHash(path, key, value, hashValue)
+}
+
+// bucketHash returns the hash of the bucket at path and all of its entries.
+func bucketHash(path string, content map[string][]byte) uint64 {
+	hash := entryHash(path, "", nil, hashBucket)
+	for key, value := range content {
+		hash ^= valueHash(path, key, value)
+	}
+	return hash
+}
+
 func stateHash(state dbState) uint64 {
 	var hash uint64
-	for bucket, content := range state {
-		hash ^= entryHash(bucket, "", nil, true)
-		for key, value := range content {
-			hash ^= entryHash(bucket, key, value, false)
+	for path, content := range state {
+		hash ^= bucketHash(path, content)
+	}
+	return hash
+}
+
+// subtree returns path and every bucket path below it, in sorted order.
+func (state dbState) subtree(path string) []string {
+	paths := []string{path}
+	prefix := path + "/"
+	for other := range state {
+		if strings.HasPrefix(other, prefix) {
+			paths = append(paths, other)
 		}
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// applyChange applies mutation to state.
+// It returns the undo record, the hash change, and whether the state changed.
+// The caller must first check every precondition that KVLite checks: an applied mutation always succeeds.
+func applyChange(state dbState, mutation txMutation) (undoRecord, uint64, bool) {
+	content := state[mutation.path]
+	switch mutation.kind {
+	case mutationPut:
+		old, existed := content[mutation.key]
+		undo := undoRecord{path: mutation.path, key: mutation.key, existed: existed, value: old}
+		var hash uint64
+		if existed {
+			hash ^= valueHash(mutation.path, mutation.key, old)
+		}
+		value := slices.Clone(mutation.value)
+		if value == nil {
+			value = []byte{}
+		}
+		content[mutation.key] = value
+		hash ^= valueHash(mutation.path, mutation.key, value)
+		return undo, hash, true
+	case mutationDelete:
+		old, existed := content[mutation.key]
+		if !existed {
+			return undoRecord{}, 0, false
+		}
+		delete(content, mutation.key)
+		return undoRecord{path: mutation.path, key: mutation.key, existed: true, value: old}, valueHash(mutation.path, mutation.key, old), true
+	case mutationDeleteBatch:
+		// A batch is several deletes. Its undo record saves the bucket.
+		var hash uint64
+		saved := maps.Clone(content)
+		changed := false
+		for _, key := range mutation.keys {
+			if old, existed := content[key]; existed {
+				hash ^= valueHash(mutation.path, key, old)
+				delete(content, key)
+				changed = true
+			}
+		}
+		if !changed {
+			return undoRecord{}, 0, false
+		}
+		return undoRecord{buckets: map[string]map[string][]byte{mutation.path: saved}}, hash, true
+	case mutationCreateBucket:
+		parent, name := parentPath(mutation.path)
+		state[mutation.path] = map[string][]byte{}
+		hash := entryHash(mutation.path, "", nil, hashBucket)
+		if parent != "" {
+			state[parent][name] = nil
+			hash ^= valueHash(parent, name, nil)
+		}
+		return undoRecord{created: mutation.path}, hash, true
+	case mutationDeleteBucket:
+		parent, name := parentPath(mutation.path)
+		removed := map[string]map[string][]byte{}
+		var hash uint64
+		for _, path := range state.subtree(mutation.path) {
+			removed[path] = state[path]
+			hash ^= bucketHash(path, state[path])
+			delete(state, path)
+		}
+		undo := undoRecord{buckets: removed}
+		if parent != "" {
+			undo.path, undo.key, undo.existed = parent, name, true
+			delete(state[parent], name)
+			hash ^= valueHash(parent, name, nil)
+		}
+		return undo, hash, true
+	}
+	return undoRecord{}, 0, false
+}
+
+// undoChange reverts one change in state and returns the hash change.
+func undoChange(state dbState, undo undoRecord) uint64 {
+	var hash uint64
+	if undo.created != "" {
+		parent, name := parentPath(undo.created)
+		hash ^= bucketHash(undo.created, state[undo.created])
+		delete(state, undo.created)
+		if parent != "" {
+			delete(state[parent], name)
+			hash ^= valueHash(parent, name, nil)
+		}
+		return hash
+	}
+	if undo.buckets != nil {
+		for path, content := range undo.buckets {
+			if current, ok := state[path]; ok {
+				hash ^= bucketHash(path, current)
+			}
+			restored := maps.Clone(content)
+			state[path] = restored
+			hash ^= bucketHash(path, restored)
+		}
+		if undo.existed {
+			// The parent entry of a deleted nested bucket.
+			state[undo.path][undo.key] = nil
+			hash ^= valueHash(undo.path, undo.key, nil)
+		}
+		return hash
+	}
+	content := state[undo.path]
+	if current, ok := content[undo.key]; ok {
+		hash ^= valueHash(undo.path, undo.key, current)
+	}
+	if undo.existed {
+		content[undo.key] = undo.value
+		hash ^= valueHash(undo.path, undo.key, undo.value)
+	} else {
+		delete(content, undo.key)
 	}
 	return hash
 }
@@ -119,72 +290,13 @@ func stateHash(state dbState) uint64 {
 // apply changes the model and records the undo record in the journal.
 // It reports whether the mutation changed the state.
 func (model *stateModel) apply(mutation txMutation) bool {
-	content := model.state[mutation.bucket]
-	switch mutation.kind {
-	case mutationPut:
-		old, existed := content[mutation.key]
-		model.journal = append(model.journal, undoRecord{bucket: mutation.bucket, key: mutation.key, existed: existed, value: old})
-		if existed {
-			model.hash ^= entryHash(mutation.bucket, mutation.key, old, false)
-		}
-		value := slices.Clone(mutation.value)
-		if value == nil {
-			value = []byte{}
-		}
-		content[mutation.key] = value
-		model.hash ^= entryHash(mutation.bucket, mutation.key, value, false)
-	case mutationDelete:
-		old, existed := content[mutation.key]
-		if !existed {
-			return false
-		}
-		model.journal = append(model.journal, undoRecord{bucket: mutation.bucket, key: mutation.key, existed: true, value: old})
-		model.hash ^= entryHash(mutation.bucket, mutation.key, old, false)
-		delete(content, mutation.key)
-	case mutationCreateBucket:
-		model.journal = append(model.journal, undoRecord{bucket: mutation.bucket, bucketLevel: true})
-		model.state[mutation.bucket] = map[string][]byte{}
-		model.hash ^= entryHash(mutation.bucket, "", nil, true)
-	case mutationDeleteBucket:
-		model.journal = append(model.journal, undoRecord{bucket: mutation.bucket, bucketLevel: true, existed: true, content: content})
-		model.hash ^= entryHash(mutation.bucket, "", nil, true)
-		for key, value := range content {
-			model.hash ^= entryHash(mutation.bucket, key, value, false)
-		}
-		delete(model.state, mutation.bucket)
-	default:
+	undo, hash, changed := applyChange(model.state, mutation)
+	if !changed {
 		return false
 	}
+	model.journal = append(model.journal, undo)
+	model.hash ^= hash
 	return true
-}
-
-// undoInto reverts one change in state and returns the hash change.
-func undoInto(state dbState, undo undoRecord) uint64 {
-	var hash uint64
-	if undo.bucketLevel {
-		hash ^= entryHash(undo.bucket, "", nil, true)
-		if !undo.existed {
-			delete(state, undo.bucket)
-			return hash
-		}
-		content := maps.Clone(undo.content)
-		for key, value := range content {
-			hash ^= entryHash(undo.bucket, key, value, false)
-		}
-		state[undo.bucket] = content
-		return hash
-	}
-	content := state[undo.bucket]
-	if current, ok := content[undo.key]; ok {
-		hash ^= entryHash(undo.bucket, undo.key, current, false)
-	}
-	if undo.existed {
-		content[undo.key] = undo.value
-		hash ^= entryHash(undo.bucket, undo.key, undo.value, false)
-	} else {
-		delete(content, undo.key)
-	}
-	return hash
 }
 
 // mark returns the journal position for a later commit or rollback.
@@ -195,7 +307,7 @@ func (model *stateModel) mark() int {
 // rollback reverts the journal back to mark.
 func (model *stateModel) rollback(mark int) {
 	for index := len(model.journal) - 1; index >= mark; index-- {
-		model.hash ^= undoInto(model.state, model.journal[index])
+		model.hash ^= undoChange(model.state, model.journal[index])
 	}
 	model.journal = model.journal[:mark]
 }
@@ -210,6 +322,7 @@ func (model *stateModel) commit(mark int) bool {
 	model.journal = model.journal[:mark]
 	model.latest++
 	model.commits = append(model.commits, commitRecord{undo: undo, hash: model.hash})
+	model.past = append(model.past, model.hash)
 	return true
 }
 
@@ -225,6 +338,7 @@ func (model *stateModel) uncertain(mark int, mutations []txMutation) {
 
 // setFloor marks every state before latest as unrecoverable after a power failure.
 // The caller knows that latest is durable.
+// A branch whose parent is older than the new floor can no longer appear: a later durable commit overwrote its WAL generation.
 func (model *stateModel) setFloor() {
 	model.floor = model.latest
 	model.floorHash = model.hash
@@ -240,16 +354,23 @@ func (model *stateModel) hashAt(index int) uint64 {
 	return model.commits[index-model.floor-1].hash
 }
 
+// cloneState returns a deep copy of state.
+// Values are never changed in place, so the copy shares them.
+func cloneState(state dbState) dbState {
+	copied := make(dbState, len(state))
+	for path, content := range state {
+		copied[path] = maps.Clone(content)
+	}
+	return copied
+}
+
 // stateAt returns a copy of state index, for floor <= index <= latest.
 func (model *stateModel) stateAt(index int) dbState {
-	state := make(dbState, len(model.state))
-	for bucket, content := range model.state {
-		state[bucket] = maps.Clone(content)
-	}
+	state := cloneState(model.state)
 	for commit := len(model.commits) - 1; commit >= index-model.floor; commit-- {
 		undo := model.commits[commit].undo
 		for change := len(undo) - 1; change >= 0; change-- {
-			undoInto(state, undo[change])
+			undoChange(state, undo[change])
 		}
 	}
 	return state
@@ -265,6 +386,7 @@ func (model *stateModel) reset(index int) {
 	model.hash = model.hashAt(index)
 	model.commits = model.commits[:index-model.floor]
 	model.latest = index
+	model.past = model.past[:index+1]
 	model.branches = slices.DeleteFunc(model.branches, func(branch branchRecord) bool { return branch.parent > index })
 }
 
@@ -294,7 +416,7 @@ func (model *stateModel) resolve(recovered dbState, lowest int, allowBranches bo
 			}
 			expected := model.stateAt(branch.parent)
 			for _, mutation := range branch.mutations {
-				applyInto(expected, mutation)
+				applyChange(expected, mutation)
 			}
 			if !statesEqual(expected, recovered) {
 				continue
@@ -309,40 +431,42 @@ func (model *stateModel) resolve(recovered dbState, lowest int, allowBranches bo
 			return fmt.Sprintf("state %d plus the commit whose result was unknown", branch.parent), true, nil
 		}
 	}
-	return "", false, fmt.Errorf("recovered state matches no allowed state %d..%d (branches allowed: %t, %d branches)\n%s",
-		lowest, model.latest, allowBranches, len(model.branches), stateDiff(model.state, recovered))
-}
-
-// applyInto applies a mutation to a state without journal records.
-func applyInto(state dbState, mutation txMutation) {
-	switch mutation.kind {
-	case mutationPut:
-		value := slices.Clone(mutation.value)
-		if value == nil {
-			value = []byte{}
+	report := fmt.Sprintf("recovered state matches no allowed state %d..%d (branches allowed: %t, %d branches)",
+		lowest, model.latest, allowBranches, len(model.branches))
+	for index := len(model.past) - 1; index >= 0; index-- {
+		if model.past[index] == hash {
+			// Only the hash matches, because the model keeps no content before the floor.
+			report += fmt.Sprintf("\nthe recovered state has the hash of older state %d, so recovery possibly lost %d acknowledged commits", index, lowest-index)
+			break
 		}
-		state[mutation.bucket][mutation.key] = value
-	case mutationDelete:
-		delete(state[mutation.bucket], mutation.key)
-	case mutationCreateBucket:
-		state[mutation.bucket] = map[string][]byte{}
-	case mutationDeleteBucket:
-		delete(state, mutation.bucket)
 	}
+	report += "\ndifference from the latest state:\n" + stateDiff(model.state, recovered)
+	for _, branch := range model.branches {
+		// The difference from each branch helps to find a commit that recovery kept only in part.
+		expected := model.stateAt(branch.parent)
+		for _, mutation := range branch.mutations {
+			applyChange(expected, mutation)
+		}
+		report += fmt.Sprintf("\ndifference from state %d plus the %d changes of the commit whose result was unknown:\n%s", branch.parent, len(branch.mutations), stateDiff(expected, recovered))
+		for index, mutation := range branch.mutations[:min(len(branch.mutations), 10)] {
+			report += fmt.Sprintf("\n  change %d: %s bucket %q key %s, %d-byte value", index, mutationNames[mutation.kind], mutation.path, shortKey(mutation.key), len(mutation.value))
+		}
+	}
+	return "", false, errors.New(report)
 }
 
 func statesEqual(left, right dbState) bool {
 	if len(left) != len(right) {
 		return false
 	}
-	for bucket, leftContent := range left {
-		rightContent, ok := right[bucket]
+	for path, leftContent := range left {
+		rightContent, ok := right[path]
 		if !ok || len(leftContent) != len(rightContent) {
 			return false
 		}
 		for key, value := range leftContent {
 			other, ok := rightContent[key]
-			if !ok || !bytes.Equal(value, other) {
+			if !ok || (value == nil) != (other == nil) || !bytes.Equal(value, other) {
 				return false
 			}
 		}
@@ -358,50 +482,45 @@ func stateDiff(want, got dbState) string {
 			lines = append(lines, fmt.Sprintf(format, args...))
 		}
 	}
-	for _, bucket := range slices.Sorted(maps.Keys(want)) {
-		gotContent, ok := got[bucket]
+	for _, path := range slices.Sorted(maps.Keys(want)) {
+		gotContent, ok := got[path]
 		if !ok {
-			add("  bucket %q: missing (want %d keys)", bucket, len(want[bucket]))
+			add("  bucket %q: missing (want %d entries)", path, len(want[path]))
 			continue
 		}
-		for _, key := range slices.Sorted(maps.Keys(want[bucket])) {
+		for _, key := range slices.Sorted(maps.Keys(want[path])) {
 			value, ok := gotContent[key]
 			switch {
 			case !ok:
-				add("  bucket %q key %x: missing", bucket, shortKey(key))
-			case !bytes.Equal(value, want[bucket][key]):
-				add("  bucket %q key %x: %d-byte value differs from the %d-byte expected value", bucket, shortKey(key), len(value), len(want[bucket][key]))
+				add("  bucket %q key %s: missing", path, shortKey(key))
+			case (value == nil) != (want[path][key] == nil):
+				add("  bucket %q key %s: nested bucket and plain value differ", path, shortKey(key))
+			case !bytes.Equal(value, want[path][key]):
+				add("  bucket %q key %s: %d-byte value differs from the %d-byte expected value", path, shortKey(key), len(value), len(want[path][key]))
 			}
 		}
 		for _, key := range slices.Sorted(maps.Keys(gotContent)) {
-			if _, ok := want[bucket][key]; !ok {
-				add("  bucket %q key %x: unexpected", bucket, shortKey(key))
+			if _, ok := want[path][key]; !ok {
+				add("  bucket %q key %s: unexpected", path, shortKey(key))
 			}
 		}
 	}
-	for _, bucket := range slices.Sorted(maps.Keys(got)) {
-		if _, ok := want[bucket]; !ok {
-			add("  bucket %q: unexpected (%d keys)", bucket, len(got[bucket]))
+	for _, path := range slices.Sorted(maps.Keys(got)) {
+		if _, ok := want[path]; !ok {
+			add("  bucket %q: unexpected (%d entries)", path, len(got[path]))
 		}
 	}
 	if len(lines) == 0 {
-		return "  (no difference from the latest state)"
+		return "  (no difference)"
 	}
-	return "  difference from the latest state:\n" + joinLines(lines)
+	return strings.Join(lines, "\n")
 }
 
+// shortKey returns key in hexadecimal for a report.
+// A long key shows its first and last 8 bytes and its length, so keys with a long shared prefix stay distinct.
 func shortKey(key string) string {
-	if len(key) > 12 {
-		return key[:12]
+	if len(key) > 24 {
+		return fmt.Sprintf("%x..%x (%d bytes)", key[:8], key[len(key)-8:], len(key))
 	}
-	return key
-}
-
-func joinLines(lines []string) string {
-	var buffer bytes.Buffer
-	for _, line := range lines {
-		buffer.WriteString(line)
-		buffer.WriteByte('\n')
-	}
-	return buffer.String()
+	return fmt.Sprintf("%x", key)
 }

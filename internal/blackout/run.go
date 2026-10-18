@@ -183,6 +183,12 @@ func (runner *runner) runOperation(op operation) {
 		runner.checkpoint()
 	case opReopen:
 		runner.reopen()
+	case opBatch:
+		runner.batch()
+	case opChecksums:
+		runner.toggleChecksums()
+	case opContracts:
+		runner.contracts()
 	}
 }
 

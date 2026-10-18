@@ -12,26 +12,33 @@ import (
 type operation uint8
 
 const (
-	opUpdate operation = iota
-	opGet
-	opView
-	opCheckpoint
-	opReopen
+	opUpdate     operation = iota
+	opBatch                // several callbacks in one WAL commit (SyncFull only)
+	opGet                  // DB.Get
+	opView                 // point reads and one scan
+	opCheckpoint           // copy the WAL into the main file now
+	opReopen               // a clean Close and Open
+	opChecksums            // turn data-page checksums on or off
+	opContracts            // one check of an API promise, such as an error for misuse
 	operationCount
 )
 
-var operationNames = [operationCount]string{"update", "get", "view", "checkpoint", "reopen"}
+var operationNames = [operationCount]string{"update", "batch", "get", "view", "checkpoint", "reopen", "checksums", "contracts"}
 
 const (
-	keysOrdered = iota // 8-character decimal IDs
-	keysShort          // 1 to 24 random bytes
-	keysLong           // up to two pages, so some keys need continuation pages
+	keysOrdered  = iota // 8-character decimal IDs
+	keysShort           // 1 to 24 random bytes
+	keysLong            // up to two pages, so some keys need continuation pages
+	keysPrefixed        // long shared prefixes, then a decimal ID
+	keyShapeCount
 )
 
 const (
-	accessHotCold = iota
-	accessAscending
-	accessDescending
+	accessHotCold    = iota // half of the picks use 4 hot keys
+	accessAscending         // mostly the next key in order
+	accessDescending        // mostly the previous key in order
+	accessSkewed            // small key IDs are much more likely than large ones
+	accessCount
 )
 
 // Config is the configuration that the config generator selects for one seed.
@@ -47,9 +54,10 @@ type Config struct {
 	KeyCount     int
 	KeyShape     int
 	Access       int
-	ValueWeights []uint64 // small, medium, large
+	ValueWeights []uint64 // small, medium, large, huge (several MiB)
 
 	// Workload mix.
+	NestedBuckets    bool     // create buckets inside buckets
 	OperationWeights []uint64 // indexed by operation
 	MutationWeights  []uint64 // indexed by mutationKind
 	MaxMutations     int
@@ -75,8 +83,8 @@ func (config Config) String() string {
 			operations = append(operations, fmt.Sprintf("%s=%d", operationNames[op], weight))
 		}
 	}
-	return fmt.Sprintf("sync=%s checksums=%t checkpoint=%d buckets=%d keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
-		syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.KeyCount, config.KeyShape, config.Access,
+	return fmt.Sprintf("sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
+		syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
 		config.ValueWeights, config.MutationWeights, config.MaxMutations, config.Abort, config.CrashNow, config.ScheduleCrash,
 		config.PowerFailures, config.IOFaults, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
 }
@@ -135,14 +143,36 @@ func newConfig(seed uint64) Config {
 
 	config.BucketCount = rand.Range(1, 4)
 	config.KeyCount = [...]int{8, 64, 512}[rand.IntN(3)]
-	config.KeyShape = rand.IntN(3)
-	config.Access = rand.IntN(3)
-	config.ValueWeights = swarmWeights(rand, 3)
+	config.KeyShape = rand.IntN(keyShapeCount)
+	config.Access = rand.IntN(accessCount)
+	config.ValueWeights = append(swarmWeights(rand, 3), 0)
+	if config.KeyCount <= 64 && rand.Chance(disk.OneIn(10)) {
+		// Rare values of several MiB need long continuation chains. Few keys keep the memory small.
+		config.ValueWeights[3] = 1
+	}
 
+	config.NestedBuckets = rand.Bool()
 	config.OperationWeights = swarmWeights(rand, int(operationCount))
 	config.OperationWeights[opUpdate] = max(config.OperationWeights[opUpdate], 50)
-	config.MutationWeights = []uint64{uint64(rand.Range(20, 100)), uint64(rand.Range(0, 60)), uint64(rand.Range(1, 10)), uint64(rand.Range(0, 4)), uint64(rand.Range(0, 30))}
+	config.OperationWeights[opContracts] = min(config.OperationWeights[opContracts], 10)
+	if config.Sync != kvlite.SyncFull {
+		// Group commit exists only in SyncFull.
+		config.OperationWeights[opBatch] = 0
+	}
+	config.MutationWeights = []uint64{
+		mutationPut:          uint64(rand.Range(20, 100)),
+		mutationDelete:       uint64(rand.Range(0, 60)),
+		mutationCreateBucket: uint64(rand.Range(1, 10)),
+		mutationDeleteBucket: uint64(rand.Range(0, 4)),
+		mutationGet:          uint64(rand.Range(0, 30)),
+		mutationDeleteBatch:  uint64(rand.Range(0, 5)),
+		mutationScan:         uint64(rand.Range(0, 5)),
+	}
 	config.MaxMutations = [...]int{1, 4, 16, 64}[rand.IntN(4)]
+	if rand.Chance(disk.OneIn(20)) {
+		// Thousands of changes in one commit.
+		config.MaxMutations = 2000
+	}
 	config.Abort = disk.OneIn(uint64(rand.Range(5, 40)))
 
 	config.CrashNow = sometimes(rand, 4, 60)

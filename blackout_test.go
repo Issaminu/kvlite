@@ -17,11 +17,12 @@ import (
 )
 
 var (
-	blackoutSeed  = flag.Uint64("blackout.seed", 0, "run only this Blackout seed (zero runs -blackout.seeds seeds from -blackout.start)")
-	blackoutStart = flag.Uint64("blackout.start", 1, "first Blackout seed of the range")
-	blackoutSeeds = flag.Int("blackout.seeds", 32, "number of Blackout seeds in the range")
-	blackoutSteps = flag.Int("blackout.steps", blackout.DefaultSteps, "safety-phase steps per Blackout run")
-	blackoutTrace = flag.Int("blackout.trace", 0, "with -blackout.seed, print this many of the last steps and storage events on failure")
+	blackoutSeed        = flag.Uint64("blackout.seed", 0, "run only this Blackout seed (zero runs -blackout.seeds seeds from -blackout.start)")
+	blackoutStart       = flag.Uint64("blackout.start", 1, "first Blackout seed of the range")
+	blackoutSeeds       = flag.Int("blackout.seeds", 32, "number of Blackout seeds in the range")
+	blackoutSteps       = flag.Int("blackout.steps", blackout.DefaultSteps, "safety-phase steps per Blackout run")
+	blackoutTrace       = flag.Int("blackout.trace", 0, "with -blackout.seed, print this many of the last steps and storage events on failure")
+	blackoutMaxFailures = flag.Int("blackout.max-failures", 3, "stop the seed range after this many failed seeds")
 )
 
 // target connects the Blackout engine to the internals that export_test.go exports.
@@ -32,6 +33,14 @@ var target = blackout.Target{
 	CheckpointCount: kvlite.BlackoutCheckpointCount,
 	Abandon:         kvlite.BlackoutAbandon,
 	Quiesce:         kvlite.BlackoutQuiesce,
+	Batch: func(db *kvlite.DB, callbacks []func(*kvlite.Tx) error) []blackout.BatchResult {
+		results := make([]blackout.BatchResult, len(callbacks))
+		for index, result := range kvlite.BlackoutBatch(db, callbacks) {
+			results[index] = blackout.BatchResult(result)
+		}
+		return results
+	},
+	DataPageChecksums: kvlite.BlackoutDataPageChecksums,
 }
 
 func TestBlackout(t *testing.T) {
@@ -58,8 +67,8 @@ func TestBlackout(t *testing.T) {
 		total.Add(result.Stats)
 		if result.Err != nil {
 			t.Error(result.Err)
-			if failures++; failures == 3 {
-				t.Fatal("stopped after 3 failed seeds")
+			if failures++; failures == *blackoutMaxFailures {
+				t.Fatalf("stopped after %d failed seeds", failures)
 			}
 		}
 	}

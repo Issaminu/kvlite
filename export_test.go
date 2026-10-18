@@ -47,3 +47,43 @@ func BlackoutQuiesce(db *DB) {
 	db.operationMu.Lock()
 	db.operationMu.Unlock()
 }
+
+// BlackoutBatchResult is the result of one callback of [BlackoutBatch].
+type BlackoutBatchResult struct {
+	Err        error
+	Panicked   bool
+	PanicValue any
+	Goexited   bool
+}
+
+// BlackoutBatch runs the callbacks as one SyncFull batch through the batch executor, in order.
+// It calls the executor directly, so the grouping does not depend on goroutine scheduling.
+func BlackoutBatch(db *DB, callbacks []func(*Tx) error) []BlackoutBatchResult {
+	results := make([]BlackoutBatchResult, len(callbacks))
+	if err := db.beginOperation(); err != nil {
+		for index := range results {
+			results[index].Err = err
+		}
+		return results
+	}
+	defer db.endOperation()
+	requests := make([]*writeRequest, len(callbacks))
+	for index, callback := range callbacks {
+		requests[index] = &writeRequest{transaction: callback, result: make(chan writeResult, 1)}
+	}
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	for index, request := range requests {
+		result := <-request.result
+		results[index] = BlackoutBatchResult{Err: result.err, Panicked: result.panicked, PanicValue: result.panicValue, Goexited: result.goexited}
+	}
+	return results
+}
+
+// BlackoutDataPageChecksums reports whether db checks data-page checksums now.
+func BlackoutDataPageChecksums(db *DB) bool {
+	db.operationMu.RLock()
+	defer db.operationMu.RUnlock()
+	return db.meta.DataPageChecksums()
+}

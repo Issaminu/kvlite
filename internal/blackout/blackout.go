@@ -41,6 +41,18 @@ type Target struct {
 	Abandon func(db *kvlite.DB)
 	// Quiesce waits until the write worker finishes its current batch, including the checkpoint after it.
 	Quiesce func(db *kvlite.DB)
+	// Batch runs the callbacks as one SyncFull WAL commit through the batch executor, in order, and returns one result for each callback.
+	Batch func(db *kvlite.DB, callbacks []func(*kvlite.Tx) error) []BatchResult
+	// DataPageChecksums reports whether db checks data-page checksums now.
+	DataPageChecksums func(db *kvlite.DB) bool
+}
+
+// BatchResult is the result of one callback of [Target.Batch].
+type BatchResult struct {
+	Err        error
+	Panicked   bool
+	PanicValue any
+	Goexited   bool
 }
 
 // Settings are the knobs of one run.

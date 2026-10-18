@@ -51,18 +51,18 @@ func (runner *runner) checkValue(op, bucket, key string, value []byte, err error
 		return runner.checkCallError(op, err)
 	}
 	if !found {
-		runner.fail("%s: bucket %q key %x: got a %d-byte value for a missing key", op, bucket, shortKey(key), len(value))
+		runner.fail("%s: bucket %q key %s: got a %d-byte value for a missing key", op, bucket, shortKey(key), len(value))
 		return errCheckFailed
 	}
 	if !bytes.Equal(value, want) || value == nil {
-		runner.fail("%s: bucket %q key %x: got %d bytes, want %d bytes", op, bucket, shortKey(key), len(value), len(want))
+		runner.fail("%s: bucket %q key %s: got %d bytes, want %d bytes", op, bucket, shortKey(key), len(value), len(want))
 		return errCheckFailed
 	}
 	return nil
 }
 
-// readState reads every bucket of the name universe in one read transaction.
-// It checks that keys are in strictly increasing order and that no value is nil.
+// readState reads every bucket of the name universe, and every nested bucket below it, in one read transaction.
+// It checks that keys are in strictly increasing order.
 func readState(db *kvlite.DB, bucketNames []string) (dbState, error) {
 	state := dbState{}
 	err := db.View(func(tx *kvlite.Tx) error {
@@ -74,31 +74,48 @@ func readState(db *kvlite.DB, bucketNames []string) (dbState, error) {
 			if err != nil {
 				return fmt.Errorf("open bucket %q: %w", name, err)
 			}
-			content := map[string][]byte{}
-			cursor, err := bucket.Cursor()
-			if err != nil {
+			if err := readBucket(bucket, name, state); err != nil {
 				return err
 			}
-			var previous []byte
-			key, value, err := cursor.First()
-			for ; err == nil && key != nil; key, value, err = cursor.Next() {
-				if previous != nil && bytes.Compare(previous, key) >= 0 {
-					return fmt.Errorf("bucket %q: key %x does not sort after %x", name, key, previous)
-				}
-				previous = bytes.Clone(key)
-				if value == nil {
-					return fmt.Errorf("bucket %q: key %x has a nil value", name, key)
-				}
-				content[string(key)] = bytes.Clone(value)
-			}
-			if err != nil {
-				return fmt.Errorf("scan bucket %q: %w", name, err)
-			}
-			state[name] = content
 		}
 		return nil
 	})
 	return state, err
+}
+
+// readBucket reads the bucket at path into state, and each nested bucket below it.
+// A nested bucket is an entry with a nil value.
+func readBucket(bucket *kvlite.Bucket, path string, state dbState) error {
+	content := map[string][]byte{}
+	state[path] = content
+	cursor, err := bucket.Cursor()
+	if err != nil {
+		return fmt.Errorf("cursor of bucket %q: %w", path, err)
+	}
+	var previous []byte
+	key, value, err := cursor.First()
+	for ; err == nil && key != nil; key, value, err = cursor.Next() {
+		if previous != nil && bytes.Compare(previous, key) >= 0 {
+			return fmt.Errorf("bucket %q: key %x does not sort after %x", path, key, previous)
+		}
+		previous = bytes.Clone(key)
+		if value != nil {
+			content[string(key)] = bytes.Clone(value)
+			continue
+		}
+		content[string(key)] = nil
+		child, err := bucket.Bucket(key)
+		if err != nil {
+			return fmt.Errorf("open nested bucket %x in %q: %w", key, path, err)
+		}
+		if err := readBucket(child, path+"/"+string(key), state); err != nil {
+			return err
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("scan bucket %q: %w", path, err)
+	}
+	return nil
 }
 
 // checkPages walks the tree and compares it with the allocation bitmap.
