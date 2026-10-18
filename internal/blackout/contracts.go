@@ -67,7 +67,7 @@ func (runner *runner) existingBucket() (string, bool) {
 // viewCheck runs check in a read transaction and accepts only a nil error or an error that a fault explains.
 func (runner *runner) viewCheck(op string, check func(tx *kvlite.Tx) error) {
 	err := runner.db.View(check)
-	if err != nil && runner.failure == nil && !explained(err) {
+	if err != nil && runner.failure == nil && !runner.explained(err) {
 		runner.fail("%s: unexpected error: %v", op, err)
 	}
 }
@@ -81,7 +81,7 @@ func (runner *runner) checkWriteInView() {
 		if !ok {
 			return nil
 		}
-		bucket, err := runner.openPath(tx, path)
+		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			return err
 		}
@@ -110,7 +110,7 @@ func (runner *runner) checkClosedTx() {
 	err := runner.db.Update(func(tx *kvlite.Tx) error {
 		saved = tx
 		if path, ok := runner.existingBucket(); ok {
-			bucket, err := runner.openPath(tx, path)
+			bucket, err := runner.openBucketPath(tx, path)
 			if bucket == nil {
 				return err
 			}
@@ -146,7 +146,7 @@ func (runner *runner) checkCursorInvalidated() {
 		return
 	}
 	err := runner.db.Update(func(tx *kvlite.Tx) error {
-		bucket, err := runner.openPath(tx, path)
+		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			return err
 		}
@@ -160,7 +160,7 @@ func (runner *runner) checkCursorInvalidated() {
 		if err := bucket.Put([]byte("blackout-cursor-key"), []byte("value")); err != nil {
 			return runner.checkCallError("Put", err)
 		}
-		if _, _, err := cursor.Next(); !errors.Is(err, kvlite.ErrCursorInvalidated) && !explained(err) {
+		if _, _, err := cursor.Next(); !errors.Is(err, kvlite.ErrCursorInvalidated) && !runner.explained(err) {
 			runner.fail("Cursor.Next after a Put returned %v, want ErrCursorInvalidated", err)
 		}
 		// Abort, so the Put changes nothing.
@@ -178,7 +178,7 @@ func (runner *runner) checkNilScanCallback() {
 		return
 	}
 	runner.viewCheck("nil scan callback", func(tx *kvlite.Tx) error {
-		bucket, err := runner.openPath(tx, path)
+		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			return err
 		}
@@ -201,7 +201,7 @@ func (runner *runner) checkScanCallbackError() {
 		return
 	}
 	runner.viewCheck("scan callback error", func(tx *kvlite.Tx) error {
-		bucket, err := runner.openPath(tx, path)
+		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			return err
 		}
@@ -217,7 +217,7 @@ func (runner *runner) checkScanCallbackError() {
 		} {
 			calls = 0
 			err := scan()
-			if explained(err) {
+			if runner.explained(err) {
 				return err
 			}
 			if len(runner.model.state[path]) == 0 {
@@ -249,7 +249,7 @@ func (runner *runner) checkKeyLimits() {
 		if !ok {
 			return errAbort
 		}
-		bucket, err := runner.openPath(tx, path)
+		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			if err != nil {
 				return err
@@ -267,14 +267,14 @@ func (runner *runner) checkKeyLimits() {
 			{"Put with a key over MaxKeySize", bucket.Put(tooLarge, []byte("value")), kvlite.ErrKeyTooLarge},
 			{"Delete with a key over MaxKeySize", bucket.Delete(tooLarge), kvlite.ErrKeyTooLarge},
 		} {
-			if !errors.Is(test.err, test.want) && !explained(test.err) {
+			if !errors.Is(test.err, test.want) && !runner.explained(test.err) {
 				runner.fail("%s returned %v, want %v", test.name, test.err, test.want)
 			}
 		}
-		if _, err := bucket.Get(nil); !errors.Is(err, kvlite.ErrKeyRequired) && !explained(err) {
+		if _, err := bucket.Get(nil); !errors.Is(err, kvlite.ErrKeyRequired) && !runner.explained(err) {
 			runner.fail("Get with an empty key returned %v, want ErrKeyRequired", err)
 		}
-		if _, err := bucket.CreateBucket(nil); !errors.Is(err, kvlite.ErrBucketNameRequired) && !explained(err) {
+		if _, err := bucket.CreateBucket(nil); !errors.Is(err, kvlite.ErrBucketNameRequired) && !runner.explained(err) {
 			runner.fail("Bucket.CreateBucket with an empty name returned %v, want ErrBucketNameRequired", err)
 		}
 		// A returned error does not change the bucket, but abort anyway, so the check changes nothing.

@@ -8,18 +8,20 @@ import (
 	"os"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
 // mapMainFile maps the current main-file length for read-only access.
 // File reads remain available if mapping fails.
-// A file of a simulated test FS has no descriptor, so its reads always use ReadAt.
+// A file of a test FS is mapped only when it implements [fileio.Mapper]. Otherwise its reads use ReadAt.
 func (db *DB) mapMainFile() error {
-	osFile, ok := db.file.(*os.File)
-	if !ok {
+	mapper, isMapper := db.file.(fileio.Mapper)
+	osFile, isOSFile := db.file.(*os.File)
+	if !isMapper && !isOSFile {
 		return nil
 	}
-	info, err := osFile.Stat()
+	info, err := db.file.Stat()
 	if err != nil {
 		return err
 	}
@@ -27,7 +29,12 @@ func (db *DB) mapMainFile() error {
 		return nil
 	}
 
-	data, err := systemMapMainFile(osFile, int(info.Size()))
+	var data []byte
+	if isMapper {
+		data, err = mapper.Map(int(info.Size()))
+	} else {
+		data, err = systemMapMainFile(osFile, int(info.Size()))
+	}
 	if err != nil {
 		return nil
 	}
@@ -41,7 +48,13 @@ func (db *DB) unmapMainFile() error {
 		db.mappedFile = nil
 		return nil
 	}
-	if err := systemUnmapMainFile(db.mappedFile); err != nil {
+	var err error
+	if mapper, ok := db.file.(fileio.Mapper); ok {
+		err = mapper.Unmap(db.mappedFile)
+	} else {
+		err = systemUnmapMainFile(db.mappedFile)
+	}
+	if err != nil {
 		return err
 	}
 	db.mappedFile = nil
@@ -54,7 +67,11 @@ func (db *DB) refreshMainFileMapping() error {
 	if err != nil {
 		return err
 	}
-	if systemMainFileMappingIsCurrent(int64(len(db.mappedFile)), info.Size()) {
+	current := systemMainFileMappingIsCurrent(int64(len(db.mappedFile)), info.Size())
+	if mapper, ok := db.file.(fileio.Mapper); ok {
+		current = mapper.MappingFollowsWrites() && int64(len(db.mappedFile)) == info.Size()
+	}
+	if current {
 		return nil
 	}
 	if err := db.unmapMainFile(); err != nil {

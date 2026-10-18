@@ -32,6 +32,7 @@ type writeNodeCacheEntry struct {
 // DB is an open handle to a KVLite database in a file or in memory. Create it with [Open] or [OpenMemory]. Its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
 type DB struct {
 	path              string
+	fs                fileio.FS // the file system of the database files; nil for a memory database
 	file              fileio.File
 	meta              *page.Meta
 	rootNode          *btree.Node
@@ -123,7 +124,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	if err != nil {
 		return nil, err
 	}
-	filePath, err := filepath.Abs(path)
+	filePath, err := fsys.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
@@ -142,6 +143,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 
 	db := &DB{
 		path:       path,
+		fs:         fsys,
 		file:       dbFile,
 		options:    resolvedOptions,
 		writeNodes: make(map[page.ID]*writeNodeCacheEntry),
@@ -161,7 +163,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	var mainMetaErr error
 	var walPageSize int64
 	if isNew {
-		db.meta = page.NewMeta(int64(os.Getpagesize()))
+		db.meta = page.NewMeta(db.options.newFilePageSize())
 		db.meta.SetDataPageChecksums(db.options.DataPageChecksums)
 		walPageSize = db.meta.PageSize()
 	} else {
@@ -736,14 +738,14 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 		meta0Err = validateMeta(meta0)
 	}
 
-	// Metadata page 1 starts at the database page size. A supported page-size field from page 0 can locate it after page 0 fails validation. The operating system page size is the second choice because every new database uses that size.
+	// Metadata page 1 starts at the database page size. A supported page-size field from page 0 can locate it after page 0 fails validation. The new-file page size is the second choice because every new database uses that size.
 	pageSizes := make([]int64, 0, 2)
 	if meta0 != nil && validMetaPageSize(meta0.PageSize()) {
 		pageSizes = append(pageSizes, meta0.PageSize())
 	}
-	operatingSystemPageSize := int64(os.Getpagesize())
-	if validMetaPageSize(operatingSystemPageSize) && (len(pageSizes) == 0 || pageSizes[0] != operatingSystemPageSize) {
-		pageSizes = append(pageSizes, operatingSystemPageSize)
+	newFilePageSize := db.options.newFilePageSize()
+	if validMetaPageSize(newFilePageSize) && (len(pageSizes) == 0 || pageSizes[0] != newFilePageSize) {
+		pageSizes = append(pageSizes, newFilePageSize)
 	}
 
 	var meta1 *page.Meta

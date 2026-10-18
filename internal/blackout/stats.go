@@ -33,6 +33,10 @@ type Stats struct {
 	StatsChecks         int // DB.Stats checks
 	ImageChecks         int // opens of the process-crash image
 	MemoryChecks        int // comparisons of the memory database
+	DamageProbes        int // first opens after damage
+	DamageDetected      int // probes that failed, so KVLite found the damage
+	DamageHarmless      int // probes that returned an allowed state
+	ReadOnlyRecoveries  int // read-only opens after a crash that showed an allowed state
 	Disk                disk.Stats
 }
 
@@ -54,6 +58,10 @@ func (stats *Stats) Add(other Stats) {
 	stats.StatsChecks += other.StatsChecks
 	stats.ImageChecks += other.ImageChecks
 	stats.MemoryChecks += other.MemoryChecks
+	stats.DamageProbes += other.DamageProbes
+	stats.DamageDetected += other.DamageDetected
+	stats.DamageHarmless += other.DamageHarmless
+	stats.ReadOnlyRecoveries += other.ReadOnlyRecoveries
 	stats.Commits += other.Commits
 	stats.Aborts += other.Aborts
 	stats.Uncertain += other.Uncertain
@@ -74,6 +82,12 @@ func (stats *Stats) Add(other Stats) {
 	stats.Disk.InjectedFaults += other.Disk.InjectedFaults
 	stats.Disk.DroppedSyncs += other.Disk.DroppedSyncs
 	stats.Disk.DroppedCaches += other.Disk.DroppedCaches
+	stats.Disk.NoSpaceErrors += other.Disk.NoSpaceErrors
+	stats.Disk.ReadCorruptions += other.Disk.ReadCorruptions
+	stats.Disk.TornSectors += other.Disk.TornSectors
+	stats.Disk.GarbageFills += other.Disk.GarbageFills
+	stats.Disk.MisdirectedWrites += other.Disk.MisdirectedWrites
+	stats.Disk.BitRot += other.Disk.BitRot
 	stats.Recoveries += other.Recoveries
 	stats.Disk.ProcessCrashes += other.Disk.ProcessCrashes
 	stats.Disk.PowerFailures += other.Disk.PowerFailures
@@ -103,8 +117,8 @@ func (stats Stats) String() string {
 	for _, kind := range slices.Sorted(maps.Keys(stats.CrashesInCalls)) {
 		crashes = append(crashes, fmt.Sprintf("%s=%d", kind, stats.CrashesInCalls[kind]))
 	}
-	return fmt.Sprintf("steps: %s\nchanges: %s\nscans: %s\ncontracts: %s\nchecks: pages=%d stats=%d image=%d memory=%d\ncommits=%d aborts=%d uncertain=%d (kept %d, lost %d) lost-unsynced=%d recoveries=%d stopped=%d failed-opens=%d failed-closes=%d crashes-now=%d crashes-in-open=%d\ncrashes inside calls: %s\ndisk: %+v",
+	return fmt.Sprintf("steps: %s\nchanges: %s\nscans: %s\ncontracts: %s\nchecks: pages=%d stats=%d image=%d memory=%d damage-probes=%d (detected %d, harmless %d)\ncommits=%d aborts=%d uncertain=%d (kept %d, lost %d) lost-unsynced=%d recoveries=%d stopped=%d failed-opens=%d failed-closes=%d crashes-now=%d crashes-in-open=%d\ncrashes inside calls: %s\ndisk: %+v",
 		strings.Join(steps, " "), strings.Join(mutations, " "), strings.Join(scans, " "), strings.Join(contracts, " "),
-		stats.PageChecks, stats.StatsChecks, stats.ImageChecks, stats.MemoryChecks, stats.Commits, stats.Aborts, stats.Uncertain, stats.UncertainKept, stats.UncertainLost, stats.LostUnsyncedCommits,
+		stats.PageChecks, stats.StatsChecks, stats.ImageChecks, stats.MemoryChecks, stats.DamageProbes, stats.DamageDetected, stats.DamageHarmless, stats.Commits, stats.Aborts, stats.Uncertain, stats.UncertainKept, stats.UncertainLost, stats.LostUnsyncedCommits,
 		stats.Recoveries, stats.StoppedHandles, stats.FailedOpens, stats.FailedCloses, stats.CrashesNow, stats.CrashesInOpen, strings.Join(crashes, " "), stats.Disk)
 }

@@ -21,6 +21,9 @@ func MissingCoverage(results []Result) []string {
 		}
 		reached[fmt.Sprintf("injected I/O errors=%t", config.IOFaults)] = true
 		reached[fmt.Sprintf("nested buckets=%t", config.NestedBuckets)] = true
+		reached[fmt.Sprintf("page size %d", config.PageSize)] = true
+		reached["main-file mapping "+config.mappingName()] = true
+		reached["path "+pathModeNames[config.PathMode]] = true
 		reached[fmt.Sprintf("key shape %d", config.KeyShape)] = true
 		reached[fmt.Sprintf("access pattern %d", config.Access)] = true
 		if config.ValueWeights[len(config.ValueWeights)-1] > 0 {
@@ -52,6 +55,16 @@ func MissingCoverage(results []Result) []string {
 			name := fmt.Sprintf(format, enabled)
 			require(name, reached[name])
 		}
+	}
+	for _, mode := range pathModeNames {
+		require("path "+mode, reached["path "+mode])
+	}
+	for _, mode := range []string{"on", "stale", "off"} {
+		require("main-file mapping "+mode, reached["main-file mapping "+mode])
+	}
+	for _, size := range []int{4096, 8192, 16384, 65536} {
+		name := fmt.Sprintf("page size %d", size)
+		require(name, reached[name])
 	}
 	for shape := range keyShapeCount {
 		name := fmt.Sprintf("key shape %d", shape)
@@ -97,6 +110,15 @@ func MissingCoverage(results []Result) []string {
 		{"injected I/O error", total.Disk.InjectedFaults},
 		{"failed sync that dropped changes", total.Disk.DroppedSyncs},
 		{"failed sync that dropped the cache view", total.Disk.DroppedCaches},
+		{"disk-full error", total.Disk.NoSpaceErrors},
+		{"read that returned a flipped bit", total.Disk.ReadCorruptions},
+		{"torn sector", total.Disk.TornSectors},
+		{"random bytes in kept file space", total.Disk.GarbageFills},
+		{"misdirected write", total.Disk.MisdirectedWrites},
+		{"bit rot at rest", total.Disk.BitRot},
+		{"damage that KVLite found", total.DamageDetected},
+		{"damage that did not change the state", total.DamageHarmless},
+		{"read-only recovery", total.ReadOnlyRecoveries},
 		{"process crash", total.Disk.ProcessCrashes},
 		{"power failure", total.Disk.PowerFailures},
 		{"crash inside a call", total.Disk.ScheduledCrashes},

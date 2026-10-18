@@ -2,6 +2,7 @@ package blackout
 
 import (
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/Issaminu/kvlite"
@@ -20,10 +21,21 @@ const (
 	opReopen               // a clean Close and Open
 	opChecksums            // turn data-page checksums on or off
 	opContracts            // one check of an API promise, such as an error for misuse
+	opBackup               // DB.Backup, then a check of the backup file
+	opReadOnly             // a clean Close, a read-only handle, and then a writable handle again
 	operationCount
 )
 
-var operationNames = [operationCount]string{"update", "batch", "get", "view", "checkpoint", "reopen", "checksums", "contracts"}
+var operationNames = [operationCount]string{"update", "batch", "get", "view", "checkpoint", "reopen", "checksums", "contracts", "backup", "read-only"}
+
+const (
+	pathAbsolute = iota // Open gets the absolute path of the main file
+	pathRelative        // Open gets a path relative to the working directory
+	pathSymlink         // Open gets a symbolic link in another directory
+	pathModeCount
+)
+
+var pathModeNames = [pathModeCount]string{"absolute", "relative", "symlink"}
 
 const (
 	keysOrdered  = iota // 8-character decimal IDs
@@ -48,6 +60,9 @@ type Config struct {
 	Sync            kvlite.Sync
 	Checksums       bool
 	CheckpointBytes uint64
+	PageSize        int         // the page size of a new file; the seed selects it, so a replay does not depend on the platform
+	PathMode        int         // the kind of path that Open gets
+	FileMode        os.FileMode // the permission bits of new files
 
 	// Data shape.
 	BucketCount  int
@@ -71,8 +86,21 @@ type Config struct {
 	ScheduleCrash disk.Ratio // chance per step of a crash inside one of the next file calls
 	PowerFailures bool
 
+	// Damage settings.
+	CorruptAtRest disk.Ratio // chance per restart of bit rot in the stored main file
+
+	// ReadOnlyRecovery is the chance per crash of a read-only open before the writable open.
+	// Both recoveries read the same files, so they must show the same state.
+	ReadOnlyRecovery disk.Ratio
+
 	// Storage settings.
 	Disk disk.Config
+}
+
+// fixedChecksums reports whether every data page has a checksum for the whole run: the option is on, and no step turns it off.
+// Only then can KVLite find damaged key and value bytes.
+func (config Config) fixedChecksums() bool {
+	return config.Checksums && config.OperationWeights[opChecksums] == 0
 }
 
 // syncNames are the short names of the sync modes in reports.
@@ -86,8 +114,9 @@ func (config Config) String() string {
 			operations = append(operations, fmt.Sprintf("%s=%d", operationNames[op], weight))
 		}
 	}
-	return fmt.Sprintf("sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
-		syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
+	return fmt.Sprintf("path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v main=%t rot=%v misdirect=%v page=%d map=%s sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
+		pathModeNames[config.PathMode], config.FileMode, config.Disk.TornSectors, config.Disk.Garbage, config.Disk.FullFault, config.Disk.ReadCorruption, config.Disk.CorruptMainReads, config.CorruptAtRest, config.Disk.Misdirect,
+		config.PageSize, config.mappingName(), syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
 		config.ValueWeights, config.MutationWeights, config.MaxMutations, config.Abort, config.CrashNow, config.ScheduleCrash,
 		config.PowerFailures, config.IOFaults, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
 }
@@ -159,6 +188,7 @@ func newConfig(seed uint64) Config {
 	config.OperationWeights = swarmWeights(rand, int(operationCount))
 	config.OperationWeights[opUpdate] = max(config.OperationWeights[opUpdate], 50)
 	config.OperationWeights[opContracts] = min(config.OperationWeights[opContracts], 10)
+	config.OperationWeights[opBackup] = min(config.OperationWeights[opBackup], 10)
 	if config.Sync != kvlite.SyncFull {
 		// Group commit exists only in SyncFull.
 		config.OperationWeights[opBatch] = 0
@@ -204,5 +234,55 @@ func newConfig(seed uint64) Config {
 		config.Disk.RemoveFault = fault()
 		config.Disk.SyncDirFault = fault()
 	}
+
+	config.PageSize = [...]int{4096, 8192, 16384, 65536}[rand.Weighted([]uint64{4, 1, 3, 1})]
+
+	// Production maps the main file for reads.
+	// Some runs read through ReadAt, the fallback after a failed mapping, and some have Windows mappings, which do not show later writes.
+	config.Disk.DisableMap = rand.Chance(disk.OneIn(8))
+	config.Disk.StaleMappings = !config.Disk.DisableMap && rand.Chance(disk.OneIn(4))
+	if config.IOFaults {
+		config.Disk.MapFault = sometimes(rand, 4, 40)
+	}
+
+	// Hostile storage: sectors that a power failure tears, and random bytes in kept file space.
+	config.Disk.TornSectors = rand.Bool()
+	config.Disk.Garbage = rand.Bool()
+	if config.IOFaults {
+		config.Disk.FullFault = sometimes(rand, 20, 200)
+		config.Disk.ReadCorruption = sometimes(rand, 20, 300)
+		config.Disk.CorruptMainReads = config.fixedChecksums()
+		config.CorruptAtRest = sometimes(rand, 2, 12)
+	}
+	if config.PowerFailures && config.fixedChecksums() {
+		// Without data-page checksums, a misdirected write can hide wrong data.
+		config.Disk.Misdirect = sometimes(rand, 2, 12)
+	}
+
+	config.PathMode = rand.Weighted([]uint64{2, 1, 1})
+	config.FileMode = [...]os.FileMode{0o600, 0o640, 0o644}[rand.IntN(3)]
+	config.ReadOnlyRecovery = sometimes(rand, 2, 6)
 	return config
+}
+
+// paths returns the path that Open gets and the absolute path of the main file.
+func (config Config) paths() (openPath, realPath string) {
+	switch config.PathMode {
+	case pathRelative:
+		return "db", simDir + "/db"
+	case pathSymlink:
+		return simDir + "/link", simDir + "/data/db"
+	}
+	return simDir + "/db", simDir + "/db"
+}
+
+// mappingName describes the mapping mode of the disk.
+func (config Config) mappingName() string {
+	switch {
+	case config.Disk.DisableMap:
+		return "off"
+	case config.Disk.StaleMappings:
+		return "stale"
+	}
+	return "on"
 }

@@ -132,7 +132,7 @@ func TestBlackoutCoverage(t *testing.T) {
 func TestBlackoutWatchdogStopsAHang(t *testing.T) {
 	if os.Getenv("BLACKOUT_WATCHDOG_CHILD") == "1" {
 		hang := target
-		hang.Open = func(string, *kvlite.Options, fileio.FS) (*kvlite.DB, error) { select {} }
+		hang.Open = func(string, os.FileMode, *kvlite.Options, fileio.FS, int) (*kvlite.DB, error) { select {} }
 		blackout.Run(hang, 1, blackout.Settings{StepTimeout: 100 * time.Millisecond})
 		return
 	}
@@ -171,6 +171,7 @@ func TestBlackoutDetectsDurabilityDefects(t *testing.T) {
 					config.CrashNow = disk.OneIn(8)
 					// Only crashes and power failures, so the control run does not hit open bugs of other faults.
 					config.IOFaults = false
+					config.CorruptAtRest = disk.Never
 					config.Disk = disk.Config{SectorSize: config.Disk.SectorSize, KeepChange: config.Disk.KeepChange, InOrder: config.Disk.InOrder, SyncLie: lie}
 				}}
 			}

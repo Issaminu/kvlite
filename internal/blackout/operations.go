@@ -28,10 +28,10 @@ const (
 // panicValue is the value that a callback panics with. Each panic has its own step number.
 type panicValue struct{ step int }
 
-// openPath opens the bucket at path, one level at a time, and checks each level against the model.
+// openBucketPath opens the bucket at path, one level at a time, and checks each level against the model.
 // It returns the bucket, or nil when a level fails.
 // For a failure that the model expects, err is nil and the caller skips the change; otherwise err is the error that the callback returns.
-func (runner *runner) openPath(tx *kvlite.Tx, path string) (*kvlite.Bucket, error) {
+func (runner *runner) openBucketPath(tx *kvlite.Tx, path string) (*kvlite.Bucket, error) {
 	names := strings.Split(path, "/")
 	var bucket *kvlite.Bucket
 	var err error
@@ -81,7 +81,7 @@ func (runner *runner) runMutation(tx *kvlite.Tx, mutation txMutation, applied *[
 	case mutationCreateBucket, mutationDeleteBucket:
 		return runner.runBucketChange(tx, mutation, applied)
 	}
-	bucket, err := runner.openPath(tx, mutation.path)
+	bucket, err := runner.openBucketPath(tx, mutation.path)
 	if bucket == nil {
 		return err
 	}
@@ -159,7 +159,7 @@ func (runner *runner) runBucketChange(tx *kvlite.Tx, mutation txMutation, applie
 			err = tx.DeleteBucket([]byte(name))
 		}
 	} else {
-		bucket, openErr := runner.openPath(tx, parent)
+		bucket, openErr := runner.openBucketPath(tx, parent)
 		if bucket == nil {
 			return openErr
 		}
@@ -235,7 +235,7 @@ func (runner *runner) finishCommit(op string, mark int, err error, mutations []t
 		runner.uncertainOpen = true
 		runner.model.uncertain(mark, mutations)
 		runner.event("%s: WAL write failed, result unknown: %v", op, err)
-	case explained(err):
+	case runner.explained(err):
 		// The failure happened before the WAL append, so nothing was written.
 		runner.stats.Aborts++
 		runner.model.rollback(mark)
@@ -446,7 +446,7 @@ func (runner *runner) view() {
 		}
 		for range runner.work.rand.Range(0, 3) {
 			path, key := runner.work.pickBucket(runner.model), runner.work.pickKey()
-			bucket, err := runner.openPath(tx, path)
+			bucket, err := runner.openBucketPath(tx, path)
 			if bucket == nil {
 				if err != nil {
 					return err
@@ -465,13 +465,13 @@ func (runner *runner) view() {
 			}
 		}
 		path := runner.work.pickBucket(runner.model)
-		bucket, err := runner.openPath(tx, path)
+		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			return err
 		}
 		return runner.scan(bucket, path, runner.model.state[path])
 	})
-	if err != nil && runner.failure == nil && !explained(err) {
+	if err != nil && runner.failure == nil && !runner.explained(err) {
 		runner.fail("View: unexpected error: %v", err)
 	}
 }
@@ -601,6 +601,7 @@ func (runner *runner) reopen() {
 		return
 	}
 	runner.checkClosed(db)
+	runner.corruptAtRest()
 	runner.openAndVerify(false)
 }
 
@@ -618,7 +619,7 @@ func (runner *runner) checkClosed(db *kvlite.DB) {
 	if err := db.Close(); !errors.Is(err, kvlite.ErrDatabaseNotOpen) {
 		runner.fail("a second Close returned %v, want ErrDatabaseNotOpen", err)
 	}
-	if db.Path() != databasePath {
-		runner.fail("Path after Close returned %q, want %q", db.Path(), databasePath)
+	if db.Path() != runner.openPath {
+		runner.fail("Path after Close returned %q, want %q", db.Path(), runner.openPath)
 	}
 }

@@ -13,10 +13,15 @@ import (
 // errCheckFailed is the error a callback returns after a failed check, so that its transaction ends.
 var errCheckFailed = errors.New("blackout check failed")
 
-// explained reports whether an injected I/O error or a simulated crash explains err.
-// The error chain must contain the cause; "some error after some fault" is not enough.
-func explained(err error) bool {
-	return errors.Is(err, disk.ErrInjected) || errors.Is(err, disk.ErrCrashed)
+// explained reports whether a fault explains err.
+// The error chain must contain an injected I/O error or a simulated crash; "some error after some fault" is not enough.
+// The one exception is a read that returned a flipped bit in the current step: KVLite then reports a checksum or format error, without the cause in the chain.
+func (runner *runner) explained(err error) bool {
+	if errors.Is(err, disk.ErrInjected) || errors.Is(err, disk.ErrCrashed) {
+		return true
+	}
+	corrupted := runner.fsys.Stats().ReadCorruptions > runner.readCorruptions
+	return corrupted && (errors.Is(err, kvlite.ErrChecksum) || errors.Is(err, kvlite.ErrInvalid))
 }
 
 // expectError checks a call that the model expects to fail with want.
@@ -25,7 +30,7 @@ func (runner *runner) expectError(op string, err, want error) error {
 	if errors.Is(err, want) {
 		return nil
 	}
-	if explained(err) {
+	if runner.explained(err) {
 		return err
 	}
 	runner.fail("%s: got error %v, want %v", op, err, want)
@@ -34,7 +39,7 @@ func (runner *runner) expectError(op string, err, want error) error {
 
 // checkCallError accepts nil, or an error that a fault explains.
 func (runner *runner) checkCallError(op string, err error) error {
-	if err == nil || explained(err) {
+	if err == nil || runner.explained(err) {
 		return err
 	}
 	runner.fail("%s: unexpected error: %v", op, err)
@@ -182,26 +187,30 @@ func (runner *runner) verify(afterCrash bool) {
 		runner.fail("read the recovered database: %v", err)
 		return
 	}
+	runner.checkMappings(runner.fsys)
 	runner.checkPages("after open")
 	if runner.failure != nil {
 		return
 	}
 
 	// A failed sync that dropped the cache view loses unsynced changes without a crash, as a power failure does.
+	lowest, allowBranches := runner.allowedStates(afterCrash)
 	droppedCache := runner.fsys.Stats().DroppedCaches > runner.droppedCaches
 	runner.droppedCaches = runner.fsys.Stats().DroppedCaches
-	lowest := runner.model.latest
-	if afterCrash && runner.powerLost || droppedCache {
-		lowest = runner.model.floor
-	}
 	before := runner.model.latest
-	result, branch, err := runner.model.resolve(recovered, lowest, afterCrash || droppedCache)
+	result, branch, err := runner.model.resolve(recovered, lowest, allowBranches)
 	if err != nil {
 		runner.fail("recovery (after crash: %t, power lost: %t, cache dropped: %t): %v", afterCrash, runner.powerLost, droppedCache, err)
 		return
 	}
 	if runner.model.latest < before {
 		runner.stats.LostUnsyncedCommits += before - runner.model.latest
+	}
+	if runner.readOnlyState != nil {
+		if !statesEqual(runner.readOnlyState, recovered) {
+			runner.fail("the read-only recovery showed another state than the writable recovery:\n%s", stateDiff(runner.readOnlyState, recovered))
+		}
+		runner.readOnlyState = nil
 	}
 	if runner.uncertainOpen {
 		runner.uncertainOpen = false

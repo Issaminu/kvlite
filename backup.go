@@ -37,6 +37,19 @@ func (db *DB) Backup(path string) error {
 }
 
 func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, error), syncFile func(*os.File) error) error {
+	fsys := db.fs
+	if osFS, ok := fsys.(fileio.OSFS); ok {
+		// An operating-system directory is synced with syncFile too, so tests can count and fail that call.
+		osFS.SyncDirectory = syncFile
+		fsys = osFS
+	}
+	// syncBackupFile syncs the new file: an operating-system file with syncFile, and a file of another FS with its own Sync.
+	syncBackupFile := func(file fileio.File) error {
+		if osFile, ok := file.(*os.File); ok {
+			return syncFile(osFile)
+		}
+		return file.Sync()
+	}
 	if err := db.beginOperation(); err != nil {
 		return err
 	}
@@ -47,7 +60,7 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	if db.memoryNodes != nil {
 		return errors.ErrUnsupported
 	}
-	if err := backupPathAvailable(path); err != nil {
+	if err := backupPathAvailable(fsys, path); err != nil {
 		return err
 	}
 
@@ -84,19 +97,19 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	}()
 
 	dir := filepath.Dir(path)
-	temp, err := os.CreateTemp(dir, ".kvlite-backup-*")
+	temp, tempName, err := fsys.CreateTemp(dir, ".kvlite-backup-*")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(temp.Name())
+	defer fsys.Remove(tempName)
 	defer temp.Close()
-	if err := temp.Chmod(info.Mode().Perm()); err != nil {
+	if err := fsys.Chmod(tempName, info.Mode().Perm()); err != nil {
 		return err
 	}
 	// The main file stays unchanged until this backup releases activeBackups.
 	// New pages can exist only in the saved WAL images.
 	length := min(info.Size(), size)
-	n, err := copyFile(temp, io.NewSectionReader(db.file, 0, length))
+	n, err := copyFile(io.NewOffsetWriter(temp, 0), io.NewSectionReader(db.file, 0, length))
 	if err != nil {
 		return err
 	}
@@ -117,36 +130,32 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 		return err
 	}
 	if db.options.Synchronous != SyncNone {
-		if err := syncFile(temp); err != nil {
+		if err := syncBackupFile(temp); err != nil {
 			return err
 		}
 	}
 	if err := temp.Close(); err != nil {
 		return err
 	}
-	if err := backupPathAvailable(path); err != nil {
+	if err := backupPathAvailable(fsys, path); err != nil {
 		return err
 	}
 	// A hard link publishes the complete file without replacing an existing path.
-	if err := os.Link(temp.Name(), path); err != nil {
+	if err := fsys.Link(tempName, path); err != nil {
 		return err
 	}
-	if err := os.Remove(temp.Name()); err != nil {
+	if err := fsys.Remove(tempName); err != nil {
 		return err
 	}
 	if db.options.Synchronous == SyncNone {
 		return nil
 	}
-	parent, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	return errors.Join(syncFile(parent), parent.Close())
+	return fsys.SyncDir(dir)
 }
 
-func backupPathAvailable(path string) error {
+func backupPathAvailable(fsys fileio.FS, path string) error {
 	for _, name := range []string{path, path + "-wal"} {
-		if _, err := os.Lstat(name); err == nil {
+		if _, err := fsys.Lstat(name); err == nil {
 			return fmt.Errorf("backup path %s: %w", name, os.ErrExist)
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err

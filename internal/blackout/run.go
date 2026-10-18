@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	// databasePath is the database file on the simulated storage.
-	databasePath = "/sim/db"
+	// simDir is the directory of the database files on the simulated storage.
+	simDir = "/sim"
 	// openTries is the number of failed opens before recovery must succeed with faults and crashes turned off.
 	openTries = 12
 	// closeTries is the number of failed closes before Close must succeed with faults turned off.
@@ -37,9 +37,16 @@ type runner struct {
 	uncertainOpen   bool          // a commit result is unknown, and no open has resolved it yet
 	checkpointCount uint64        // checkpoints of the current handle
 	checkRand       *disk.Rand    // picks the steps of the slow checks
+	openPath        string        // the path that the run gives Open: absolute, relative, or a symbolic link
+	realPath        string        // the absolute path of the main file
+	backups         int           // backups made so far, for unique names
+	lastBackup      *backupRecord // the last complete backup, which must survive a power failure
+	crashedBackup   *backupRecord // a backup that a crash stopped; if its file exists, it must be complete
+	readOnlyState   dbState       // the state that a read-only recovery showed, which the writable recovery must match
 	memory          *kvlite.DB    // the memory database of the differential check
 	lastStats       *kvlite.Stats // the last DB.Stats of the current handle
 	droppedCaches   int           // disk.Stats.DroppedCaches at the last verified open
+	readCorruptions int           // disk.Stats.ReadCorruptions at the start of the current step or open
 	failure         error
 	events          []string
 	trace           []string // every step and storage event, when the settings ask for it
@@ -63,10 +70,17 @@ func newRunner(target Target, seed uint64, config Config, settings Settings) *ru
 			runner.trace = append(runner.trace, "  "+event.String())
 		}
 	}
-	runner.work = newWorkload(seed, &runner.config, osPageSize)
+	runner.work = newWorkload(seed, &runner.config, runner.config.PageSize)
 	runner.crash = newCrasher(seed, &runner.config)
 	runner.checkRand = disk.NewRand(streamSeed(seed, streamCheck))
+	runner.openPath, runner.realPath = runner.config.paths()
+	if runner.config.PathMode == pathRelative {
+		runner.config.Disk.WorkingDir = simDir
+	}
 	runner.fsys = disk.New(streamSeed(seed, streamDisk), runner.config.Disk)
+	if runner.config.PathMode == pathSymlink {
+		runner.fsys.Symlink("data/db", runner.openPath)
+	}
 	return runner
 }
 
@@ -127,6 +141,13 @@ func (runner *runner) options() *kvlite.Options {
 	}
 }
 
+// openDB opens the database of the run on fsys.
+func (runner *runner) openDB(fsys *disk.FS, readOnly bool) (*kvlite.DB, error) {
+	options := runner.options()
+	options.ReadOnly = readOnly
+	return runner.target.Open(runner.openPath, runner.config.FileMode, options, fsys, runner.config.PageSize)
+}
+
 // run runs the safety phase and the liveness phase.
 func (runner *runner) run() (err error) {
 	defer func() {
@@ -162,6 +183,7 @@ func (runner *runner) run() (err error) {
 
 // safetyStep runs one step of the safety phase: a crash now, or one operation with an optional crash inside it.
 func (runner *runner) safetyStep() {
+	runner.readCorruptions = runner.fsys.Stats().ReadCorruptions
 	switch event, calls := runner.crash.beforeStep(); event {
 	case crashNow:
 		runner.stats.CrashesNow++
@@ -196,6 +218,10 @@ func (runner *runner) runOperation(op operation) {
 		runner.toggleChecksums()
 	case opContracts:
 		runner.contracts()
+	case opBackup:
+		runner.backup()
+	case opReadOnly:
+		runner.readOnly()
 	}
 }
 
@@ -274,7 +300,7 @@ func (runner *runner) closeDB() bool {
 			return false
 		}
 		runner.stats.FailedCloses++
-		if !explained(err) || attempt >= closeTries {
+		if !runner.explained(err) || attempt >= closeTries {
 			runner.fail("Close: unexpected error after %d attempts: %v", attempt+1, err)
 			return false
 		}
@@ -288,7 +314,7 @@ func (runner *runner) recoverCrash() {
 		kind := event.Op
 		if strings.HasSuffix(event.Name, "-wal") {
 			kind += " wal"
-		} else if strings.HasPrefix(event.Name, databasePath) {
+		} else if strings.HasPrefix(event.Name, runner.realPath) {
 			kind += " main"
 		}
 		runner.stats.CrashesInCalls[kind]++
@@ -302,12 +328,26 @@ func (runner *runner) recoverCrash() {
 	runner.powerLost = runner.powerLost || powerFailure
 	runner.event("restart after %s (power failure: %t)", event, powerFailure)
 	runner.fsys.Restart(powerFailure)
+	runner.corruptAtRest()
+	if runner.crash.enabled && runner.crash.rand.Chance(runner.config.ReadOnlyRecovery) {
+		runner.readOnlyRecovery()
+	}
 	runner.openAndVerify(true)
+	if runner.failure == nil {
+		runner.checkBackupAfterCrash()
+	}
 }
 
 // openAndVerify opens the database and checks the recovered state.
 func (runner *runner) openAndVerify(afterCrash bool) {
 	for attempt := 0; ; attempt++ {
+		if runner.fsys.Damaged() {
+			runner.probeDamage(afterCrash)
+			if runner.failure != nil {
+				return
+			}
+		}
+		runner.readCorruptions = runner.fsys.Stats().ReadCorruptions
 		if attempt == openTries {
 			// Recovery must finish once the storage works and the machine stops crashing.
 			runner.fsys.SetFaults(false)
@@ -318,7 +358,7 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 				runner.fsys.ScheduleCrash(calls)
 			}
 		}
-		db, err := runner.target.Open(databasePath, runner.options(), runner.fsys)
+		db, err := runner.openDB(runner.fsys, false)
 		if err == nil {
 			runner.db = db
 			runner.fsys.CancelCrash()
@@ -330,11 +370,15 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 			runner.stats.CrashesInOpen++
 			powerFailure := runner.crash.powerFailure(disk.Ratio{Num: 1, Den: 2})
 			runner.powerLost = runner.powerLost || powerFailure
+			if powerFailure {
+				// The power failure changed the files, so the read-only recovery saw other files.
+				runner.readOnlyState = nil
+			}
 			runner.fsys.Restart(powerFailure)
 			afterCrash = true
 			continue
 		}
-		if explained(err) && attempt < openTries {
+		if runner.explained(err) && attempt < openTries {
 			continue
 		}
 		runner.fail("Open: unexpected error after %d attempts: %v", attempt+1, err)
@@ -365,6 +409,7 @@ func (runner *runner) livenessPhase() {
 	}
 	weights := slices.Clone(runner.config.OperationWeights)
 	weights[opReopen] = 0
+	weights[opReadOnly] = 0
 	for step := 0; step < LivenessSteps && runner.failure == nil; step++ {
 		runner.step = runner.settings.Steps + step
 		runner.guard(func() {

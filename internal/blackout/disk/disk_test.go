@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 
@@ -434,5 +435,312 @@ func TestCloneCacheHoldsTheCacheViewAsDurable(t *testing.T) {
 	mustWrite(t, cloneFile, []byte("X"), 0)
 	if got := content(fsys, testName); string(got) != "syncedcached" {
 		t.Fatalf("original after a write to the clone: got %q", got)
+	}
+}
+
+func TestMappingFollowsWritesUnlessStale(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		fsys := New(1, Config{StaleMappings: stale})
+		file := openRW(t, fsys, testName)
+		mustWrite(t, file, []byte("before"), 0)
+		mapper := file.(fileio.Mapper)
+		data, err := mapper.Map(6)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, file, []byte("AFTER!"), 0)
+		want := "AFTER!"
+		if stale {
+			want = "before"
+		}
+		if string(data) != want || mapper.MappingFollowsWrites() == stale {
+			t.Errorf("stale=%t: mapping holds %q, want %q", stale, data, want)
+		}
+		if err := mapper.Unmap(data); err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, bytes.Repeat([]byte{0xEE}, 6)) {
+			t.Errorf("stale=%t: an unmapped mapping holds %q, want poison bytes", stale, data)
+		}
+		if err := mapper.Unmap(data); err == nil {
+			t.Errorf("stale=%t: a second Unmap succeeded", stale)
+		}
+	}
+}
+
+func TestTruncateUnderMappingIsAViolation(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("0123456789"), 0)
+	data, err := file.(fileio.Mapper).Map(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Growth does not cut the mapping.
+	if err := file.Truncate(20); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsys.Stats().MappingViolations; got != 0 {
+		t.Fatalf("violations after growth: %d", got)
+	}
+	if err := file.Truncate(4); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsys.Stats().MappingViolations; got != 1 {
+		t.Fatalf("violations after a truncate under the mapping: %d, want 1", got)
+	}
+	if string(data[:4]) != "0123" || data[4] != 0xEE {
+		t.Fatalf("mapping after the truncate: %q, want the first 4 bytes and then poison", data)
+	}
+}
+
+func TestRestartEndsMappings(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("data"), 0)
+	data, err := file.(fileio.Mapper).Map(4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fsys.Crash()
+	fsys.Restart(false)
+	if data[0] != 0xEE {
+		t.Fatalf("a mapping of the crashed process holds %q, want poison bytes", data)
+	}
+	// The new process can truncate: the old mapping is gone.
+	reopened := openRW(t, fsys, testName)
+	if err := reopened.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	if got := fsys.Stats().MappingViolations; got != 0 {
+		t.Fatalf("violations after a restart: %d", got)
+	}
+}
+
+func TestDisableMapFails(t *testing.T) {
+	fsys := New(1, Config{DisableMap: true})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("data"), 0)
+	if _, err := file.(fileio.Mapper).Map(4); !errors.Is(err, errors.ErrUnsupported) {
+		t.Fatalf("Map with DisableMap: %v, want ErrUnsupported", err)
+	}
+}
+
+func TestTornSectorsKeepPartOfASector(t *testing.T) {
+	torn := false
+	for seed := range uint64(200) {
+		fsys := New(seed, Config{TornSectors: true, SectorSize: 512})
+		file := openRW(t, fsys, testName)
+		mustWrite(t, file, bytes.Repeat([]byte{'a'}, 512), 0)
+		mustSync(t, file)
+		mustWrite(t, file, bytes.Repeat([]byte{'b'}, 512), 0)
+		fsys.Crash()
+		fsys.Restart(true)
+		got := content(fsys, testName)
+		count := bytes.Count(got, []byte{'b'})
+		if count > 0 && count < 512 {
+			torn = true
+			if !bytes.Equal(got[:count], bytes.Repeat([]byte{'b'}, count)) {
+				t.Fatalf("seed %d: a torn sector must keep a prefix of the write: %q", seed, got)
+			}
+		}
+	}
+	if !torn || New(1, Config{}).Stats().TornSectors != 0 {
+		t.Fatal("200 seeds did not tear a sector")
+	}
+}
+
+func TestGarbageFillsLengthWithoutData(t *testing.T) {
+	garbage := false
+	for seed := range uint64(200) {
+		fsys := New(seed, Config{Garbage: true})
+		file := openRW(t, fsys, testName)
+		mustSync(t, file)
+		if err := fsys.SyncDir(testDir); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, file, bytes.Repeat([]byte{'x'}, 4096), 0)
+		fsys.Crash()
+		fsys.Restart(true)
+		// A lost sector of the kept length holds random bytes: neither the written byte nor zero.
+		for _, value := range content(fsys, testName) {
+			if value != 'x' && value != 0 {
+				garbage = true
+			}
+		}
+	}
+	if !garbage {
+		t.Fatal("200 seeds did not fill kept length with random bytes")
+	}
+}
+
+func TestDiskFullEpisodeFailsGrowth(t *testing.T) {
+	fsys := New(1, Config{FullFault: Always})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("data"), 0)
+	fsys.SetFaults(true)
+	defer fsys.SetFaults(false)
+	// An overwrite inside the file needs no space.
+	if _, err := file.WriteAt([]byte("DA"), 0); err != nil {
+		t.Fatalf("overwrite during a disk-full episode: %v", err)
+	}
+	n, err := file.WriteAt([]byte("TAIL+more"), 2)
+	if !errors.Is(err, syscall.ENOSPC) || !errors.Is(err, ErrInjected) || n != 2 {
+		t.Fatalf("growth during a disk-full episode: n=%d err=%v, want n=2 and ENOSPC", n, err)
+	}
+	if got := content(fsys, testName); string(got) != "DATA" {
+		t.Fatalf("file after the failed growth: %q, want %q", got, "DATA")
+	}
+	if err := file.Truncate(100); !errors.Is(err, syscall.ENOSPC) {
+		t.Fatalf("growing truncate during a disk-full episode: %v, want ENOSPC", err)
+	}
+}
+
+func TestReadCorruptionLeavesStoredBytes(t *testing.T) {
+	fsys := New(1, Config{ReadCorruption: Always})
+	wal := openRW(t, fsys, testName+"-wal")
+	mustWrite(t, wal, []byte("record"), 0)
+	main := openRW(t, fsys, testName)
+	mustWrite(t, main, []byte("record"), 0)
+	fsys.SetFaults(true)
+	buffer := make([]byte, 6)
+	if _, err := wal.ReadAt(buffer, 0); err != nil || string(buffer) == "record" {
+		t.Fatalf("WAL read with ReadCorruption: %q, %v, want one flipped bit", buffer, err)
+	}
+	if _, err := main.ReadAt(buffer, 0); err != nil || string(buffer) != "record" {
+		t.Fatalf("main-file read without CorruptMainReads: %q, %v", buffer, err)
+	}
+	fsys.SetFaults(false)
+	if got := content(fsys, testName+"-wal"); string(got) != "record" {
+		t.Fatalf("stored WAL bytes after a corrupted read: %q", got)
+	}
+}
+
+func TestHealUndoesBitRotAndKeepsLaterWrites(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	original := bytes.Repeat([]byte{'a'}, 64)
+	mustWrite(t, file, original, 0)
+	mustSync(t, file)
+	if !fsys.Corrupt(testName, 0, 64, 4) || !fsys.Damaged() {
+		t.Fatal("Corrupt did not change the file")
+	}
+	if got := content(fsys, testName); bytes.Equal(got, original) {
+		t.Fatal("bit rot left the stored bytes unchanged")
+	}
+	// A later write replaces the first damaged bytes.
+	mustWrite(t, file, bytes.Repeat([]byte{'b'}, 8), 0)
+	fsys.Heal()
+	want := append(bytes.Repeat([]byte{'b'}, 8), original[8:]...)
+	if got := content(fsys, testName); !bytes.Equal(got, want) || fsys.Damaged() {
+		t.Fatalf("after Heal: %q, want %q", got, want)
+	}
+}
+
+func TestMisdirectedWriteMovesDataAndHealRestoresIt(t *testing.T) {
+	moved := false
+	for seed := range uint64(200) {
+		fsys := New(seed, Config{Misdirect: Always, KeepChange: Always})
+		file := openRW(t, fsys, testName)
+		mustWrite(t, file, bytes.Repeat([]byte{'.'}, 8*4096), 0)
+		mustSync(t, file)
+		if err := fsys.SyncDir(testDir); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, file, bytes.Repeat([]byte{'w'}, 4096), 4*4096)
+		fsys.Crash()
+		fsys.Restart(true)
+		if !fsys.Damaged() {
+			continue
+		}
+		moved = true
+		got := content(fsys, testName)
+		if bytes.Count(got[4*4096:5*4096], []byte{'w'}) != 0 || bytes.Count(got, []byte{'w'}) != 4096 {
+			t.Fatalf("seed %d: a misdirected write must leave the intended block old and land elsewhere", seed)
+		}
+		fsys.Heal()
+		got = content(fsys, testName)
+		if !bytes.Equal(got[4*4096:5*4096], bytes.Repeat([]byte{'w'}, 4096)) || bytes.Count(got, []byte{'w'}) != 4096 {
+			t.Fatalf("seed %d: Heal did not restore the correct result", seed)
+		}
+	}
+	if !moved {
+		t.Fatal("200 seeds did not misdirect a write")
+	}
+}
+
+func TestHealKeepsTheDamagedPartsOutsideALaterWrite(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, bytes.Repeat([]byte{'a'}, 64), 0)
+	mustSync(t, file)
+	// Damage every byte, so one run covers the whole file.
+	fsys.mu.Lock()
+	node := fsys.names[testName]
+	correct := slices.Clone(node.durable)
+	for index := range node.durable {
+		node.durable[index] = 'x'
+	}
+	node.data = slices.Clone(node.durable)
+	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, node.durable)})
+	fsys.mu.Unlock()
+	// A write replaces the middle of the run.
+	mustWrite(t, file, bytes.Repeat([]byte{'b'}, 8), 28)
+	fsys.Heal()
+	want := append(append(bytes.Repeat([]byte{'a'}, 28), bytes.Repeat([]byte{'b'}, 8)...), bytes.Repeat([]byte{'a'}, 28)...)
+	if got := content(fsys, testName); !bytes.Equal(got, want) {
+		t.Fatalf("after Heal: %q, want %q", got, want)
+	}
+}
+
+func TestRelativeNamesAndSymbolicLinks(t *testing.T) {
+	fsys := New(1, Config{WorkingDir: testDir})
+	file := openRW(t, fsys, "data")
+	mustWrite(t, file, []byte("x"), 0)
+	if got := content(fsys, testDir+"/data"); string(got) != "x" {
+		t.Fatalf("a relative name: got %q at the absolute name", got)
+	}
+	fsys.Symlink("data", testDir+"/link")
+	if resolved, err := fsys.EvalSymlinks("link"); err != nil || resolved != testDir+"/data" {
+		t.Fatalf("EvalSymlinks: %q, %v", resolved, err)
+	}
+	if info, err := fsys.Lstat("link"); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("Lstat of a link: %v, %v", info, err)
+	}
+	through, err := fsys.OpenFile("link", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, through, []byte("y"), 1)
+	if got := content(fsys, testDir+"/data"); string(got) != "xy" {
+		t.Fatalf("a write through a link: %q", got)
+	}
+}
+
+func TestHardLinkSharesTheFileUntilADirectorySync(t *testing.T) {
+	fsys := New(1, Config{KeepChange: Ratio{Num: 1, Den: 1 << 30}})
+	temp, tempName, err := fsys.CreateTemp(testDir, ".tmp-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, temp, []byte("backup"), 0)
+	mustSync(t, temp)
+	if err := fsys.Link(tempName, testName); err != nil {
+		t.Fatal(err)
+	}
+	if err := fsys.Link(tempName, testName); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("a second link to an existing name: %v, want ErrExist", err)
+	}
+	if err := fsys.Remove(tempName); err != nil {
+		t.Fatal(err)
+	}
+	if got := content(fsys, testName); string(got) != "backup" {
+		t.Fatalf("the linked name after the remove: %q", got)
+	}
+	// Without a directory sync, a power failure loses both name changes.
+	fsys.Crash()
+	fsys.Restart(true)
+	if _, _, ok := fsys.FileData(testName); ok {
+		t.Fatal("the new name survived a power failure without a directory sync")
 	}
 }

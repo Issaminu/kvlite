@@ -18,7 +18,14 @@
 // A seed selects every decision.
 // The same seed and the same calls give the same results.
 //
-// The model has these limits: no memory mapping, no file locks, no hard links or renames, and one level of directories.
+// A file can be mapped into memory ([fileio.Mapper]).
+// A mapping shows later writes, as a shared mapping on Unix does, or keeps its first bytes, as on Windows.
+// A truncate that cuts a live mapping counts as a violation, because a read of the cut part stops a real process.
+//
+// Names can be relative to Config.WorkingDir, and the last name element can be a symbolic link.
+// Hard links share one inode, which a power failure decides once.
+//
+// The model has these limits: no file locks, no renames, and symbolic links only in the last name element.
 package disk
 
 import (
@@ -28,6 +35,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -37,6 +45,7 @@ import (
 	"time"
 
 	"github.com/Issaminu/kvlite/internal/fileio"
+	"unsafe"
 )
 
 var (
@@ -75,6 +84,9 @@ type Config struct {
 	// Zero means 512 bytes.
 	SectorSize int
 
+	// WorkingDir resolves relative names. Empty means "/".
+	WorkingDir string
+
 	// Probabilities of an injected error, for each call while faults are enabled.
 	ReadFault     Ratio
 	WriteFault    Ratio // A failed write can still change a prefix of its bytes.
@@ -84,6 +96,34 @@ type Config struct {
 	OpenFault     Ratio
 	RemoveFault   Ratio // A failed remove can still take effect.
 	SyncDirFault  Ratio // A failed directory sync can make some names durable.
+	MapFault      Ratio // A failed map makes KVLite read through ReadAt.
+
+	// DisableMap makes every map fail, so readers use ReadAt, the fallback after a failed mapping.
+	DisableMap bool
+
+	// StaleMappings makes a mapping keep the bytes of its start, as on Windows.
+	// Without it, a mapping shows later writes, as a shared mapping on Unix does.
+	StaleMappings bool
+
+	// FullFault is the probability that a write starts a disk-full episode.
+	// For the next 1 to 30 mutating calls, each write or truncate that grows a file fails with ENOSPC, after it writes the part inside the current length.
+	FullFault Ratio
+
+	// ReadCorruption is the probability that a read returns one flipped bit, while the stored bytes stay correct.
+	// It applies to WAL files, and to other files only with CorruptMainReads.
+	ReadCorruption   Ratio
+	CorruptMainReads bool
+
+	// TornSectors lets a power failure keep part of a sector, so a sector is not atomic.
+	TornSectors bool
+
+	// Garbage fills file space that a power failure kept without its data with random bytes instead of zeros.
+	Garbage bool
+
+	// Misdirect is the probability that a power failure moves one kept write of a file that is not a WAL to a wrong offset, 1 to 4 blocks of 4096 bytes away.
+	// The intended range keeps its older bytes.
+	// [FS.Heal] undoes the damage.
+	Misdirect Ratio
 
 	// DropCache is the probability that a failed sync also drops the dropped changes from the cache view, so reads return the durable bytes.
 	DropCache Ratio
@@ -116,6 +156,17 @@ type Stats struct {
 	LostWrites       int // writes that a power failure lost completely
 	LostTruncates    int // truncates that a power failure lost
 	LostNameChanges  int // name changes that a power failure lost
+
+	NoSpaceErrors     int // writes and truncates that failed with ENOSPC
+	ReadCorruptions   int // reads that returned a flipped bit
+	TornSectors       int // sectors that a power failure kept in part
+	GarbageFills      int // extensions that a power failure filled with random bytes
+	MisdirectedWrites int // writes that a power failure moved to a wrong offset
+	BitRot            int // calls of Corrupt that changed stored bytes
+
+	// MappingViolations counts truncates that cut a live mapping.
+	// A read of the cut part stops a real process with SIGBUS, so each one is a bug of the caller.
+	MappingViolations int
 }
 
 // Event is one call or decision of the FS, for failure reports.
@@ -143,26 +194,44 @@ type FS struct {
 	rand         *Rand
 	names        map[string]*inode // cache view of the directory entries
 	durableNames map[string]*inode // durable view of the directory entries
+	links        map[string]string // symbolic links, from absolute name to target; they are always durable
 	generation   uint64            // a restart increments it, so earlier handles fail
 	nextInodeID  uint64
 	mutations    uint64 // mutating calls so far; a scheduled crash counts them
 	crashAt      uint64 // mutation that crashes; zero means none
 	crashed      bool
 	crashEvent   Event
-	faults       bool // enables the injected errors of Config
+	faults       bool   // enables the injected errors of Config
+	fullUntil    uint64 // a disk-full episode lasts until this mutation
+	damage       []damage
 	stats        Stats
 	recent       []Event
 	traceHash    uint64
 }
 
 // inode is the content of one file.
-// Several names never share one inode.
+// Several names share one inode after a hard link.
 type inode struct {
-	id      uint64
-	perm    os.FileMode
-	data    []byte   // cache view
-	durable []byte   // durable view
-	pending []change // unsynced changes, oldest first
+	id       uint64
+	perm     os.FileMode
+	data     []byte     // cache view
+	durable  []byte     // durable view
+	pending  []change   // unsynced changes, oldest first
+	mappings []*mapping // live mappings of the running process
+}
+
+// mapping is one live memory mapping of a file.
+type mapping struct {
+	data    []byte
+	follows bool // the mapping shows later writes
+}
+
+// poison fills bytes that a real process cannot read any more, after an unmap or past a truncate.
+// A later read returns garbage, so the checks find a reader that uses them.
+func poison(data []byte) {
+	for index := range data {
+		data[index] = 0xEE
+	}
 }
 
 // change is one unsynced write or truncate.
@@ -188,6 +257,7 @@ func New(seed uint64, config Config) *FS {
 		rand:         NewRand(seed),
 		names:        make(map[string]*inode),
 		durableNames: make(map[string]*inode),
+		links:        make(map[string]string),
 		traceHash:    14695981039346656037,
 	}
 }
@@ -200,13 +270,20 @@ var _ fileio.FS = (*FS)(nil)
 func (fsys *FS) CloneCache(seed uint64) *FS {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
-	clone := New(seed, Config{SectorSize: fsys.config.SectorSize})
-	for name, node := range fsys.names {
-		clone.nextInodeID++
-		copied := &inode{id: clone.nextInodeID, perm: node.perm, data: slices.Clone(node.data), durable: slices.Clone(node.data)}
+	clone := New(seed, Config{SectorSize: fsys.config.SectorSize, WorkingDir: fsys.config.WorkingDir})
+	copies := make(map[*inode]*inode)
+	for _, name := range slices.Sorted(maps.Keys(fsys.names)) {
+		node := fsys.names[name]
+		copied, ok := copies[node]
+		if !ok {
+			clone.nextInodeID++
+			copied = &inode{id: clone.nextInodeID, perm: node.perm, data: slices.Clone(node.data), durable: slices.Clone(node.data)}
+			copies[node] = copied
+		}
 		clone.names[name] = copied
 		clone.durableNames[name] = copied
 	}
+	maps.Copy(clone.links, fsys.links)
 	return clone
 }
 
@@ -267,6 +344,13 @@ func (fsys *FS) Restart(powerFailure bool) {
 	fsys.generation++
 	fsys.crashed = false
 	fsys.crashAt = 0
+	// The process ends, and its mappings with it.
+	for _, node := range fsys.names {
+		for _, live := range node.mappings {
+			poison(live.data)
+		}
+		node.mappings = nil
+	}
 	if !powerFailure {
 		fsys.stats.ProcessCrashes++
 		fsys.record(Event{Mutation: fsys.mutations, Op: "restart", Result: "process crash"})
@@ -296,8 +380,13 @@ func (fsys *FS) Restart(powerFailure bool) {
 			survivors[name] = chosen
 		}
 	}
+	// Hard links share an inode, which a power failure decides once.
+	decided := make(map[*inode]bool)
 	for _, name := range slices.Sorted(maps.Keys(survivors)) {
-		fsys.powerFail(name, survivors[name])
+		if node := survivors[name]; !decided[node] {
+			decided[node] = true
+			fsys.powerFail(name, node)
+		}
 	}
 	fsys.names = survivors
 	fsys.durableNames = maps.Clone(survivors)
@@ -327,10 +416,174 @@ func (fsys *FS) powerFail(name string, node *inode) {
 				result = fsys.keepPart(name, result, pending, stopped)
 			}
 		}
+		if !strings.HasSuffix(name, "-wal") && fsys.rand.Chance(fsys.config.Misdirect) {
+			result = fsys.misdirect(name, node, result)
+		}
 	}
 	node.data = result
 	node.durable = slices.Clone(result)
 	node.pending = nil
+}
+
+// misdirect moves one unsynced write in the result of a power failure to a wrong offset, like a firmware bug.
+// The intended range gets its durable bytes from before the write, and the wrong range gets the write.
+// It records the damage, so Heal can restore the correct result.
+func (fsys *FS) misdirect(name string, node *inode, result []byte) []byte {
+	var candidates []change
+	for _, pending := range node.pending {
+		if !pending.truncate && pending.offset+int64(len(pending.data)) <= int64(len(result)) {
+			candidates = append(candidates, pending)
+		}
+	}
+	if len(candidates) == 0 {
+		return result
+	}
+	write := candidates[fsys.rand.IntN(len(candidates))]
+	shift := int64(fsys.rand.Range(1, 4)) * 4096
+	if fsys.rand.Bool() {
+		shift = -shift
+	}
+	target := write.offset + shift
+	if target < 0 || target+int64(len(write.data)) > int64(len(result)) {
+		return result
+	}
+	damaged := slices.Clone(result)
+	end := write.offset + int64(len(write.data))
+	older := make([]byte, len(write.data))
+	if write.offset < int64(len(node.durable)) {
+		copy(older, node.durable[write.offset:min(end, int64(len(node.durable)))])
+	}
+	copy(damaged[write.offset:end], older)
+	copy(damaged[target:], write.data)
+	if bytes.Equal(damaged, result) {
+		return result
+	}
+	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(result, damaged)})
+	fsys.stats.MisdirectedWrites++
+	fsys.record(Event{Mutation: fsys.mutations, Op: "misdirect-write", Name: name, Offset: write.offset, Length: len(write.data), Result: fmt.Sprintf("landed at %d", target)})
+	return damaged
+}
+
+// damage is a change of the stored bytes of a file that is not a correct result: bit rot or a misdirected write.
+// A later write or truncate replaces the damage in its range, so it drops the runs there.
+type damage struct {
+	node *inode
+	runs []damageRun
+}
+
+// damageRun is one range of damaged bytes and its correct bytes.
+type damageRun struct {
+	offset  int64
+	correct []byte
+}
+
+// diffRuns returns the ranges where damaged differs from correct, with the correct bytes.
+// Both have one length.
+func diffRuns(correct, damaged []byte) []damageRun {
+	var runs []damageRun
+	for index := 0; index < len(correct); {
+		if correct[index] == damaged[index] {
+			index++
+			continue
+		}
+		start := index
+		for index < len(correct) && correct[index] != damaged[index] {
+			index++
+		}
+		runs = append(runs, damageRun{offset: int64(start), correct: slices.Clone(correct[start:index])})
+	}
+	return runs
+}
+
+// forgetDamage cuts from the damage runs of node the bytes that a write of length bytes at offset replaces, or that a truncate to offset removes (length -1).
+// The parts of a run outside that range stay damaged.
+// The caller must hold mu.
+func (fsys *FS) forgetDamage(node *inode, offset int64, length int) {
+	end := int64(math.MaxInt64)
+	if length >= 0 {
+		end = offset + int64(length)
+	}
+	for index := range fsys.damage {
+		if fsys.damage[index].node != node {
+			continue
+		}
+		var kept []damageRun
+		for _, run := range fsys.damage[index].runs {
+			runEnd := run.offset + int64(len(run.correct))
+			if runEnd <= offset || end <= run.offset {
+				kept = append(kept, run)
+				continue
+			}
+			if run.offset < offset {
+				kept = append(kept, damageRun{offset: run.offset, correct: run.correct[:offset-run.offset]})
+			}
+			if end < runEnd {
+				kept = append(kept, damageRun{offset: end, correct: run.correct[end-run.offset:]})
+			}
+		}
+		fsys.damage[index].runs = kept
+	}
+}
+
+// Corrupt flips bits random bits of the stored bytes of name between start and end, as bit rot does.
+// It changes the durable and the cache view, and records the damage for Heal.
+// It reports whether it changed the file.
+func (fsys *FS) Corrupt(name string, start, end int64, bits int) bool {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	node, ok := fsys.names[fsys.follow(name)]
+	if !ok || len(node.pending) != 0 {
+		return false
+	}
+	end = min(end, int64(len(node.durable)))
+	if start < 0 || start >= end {
+		return false
+	}
+	correct := slices.Clone(node.durable)
+	for range bits {
+		offset := start + int64(fsys.rand.Uint64N(uint64(end-start)))
+		node.durable[offset] ^= 1 << fsys.rand.IntN(8)
+	}
+	if bytes.Equal(correct, node.durable) {
+		return false
+	}
+	node.data = slices.Clone(node.durable)
+	refreshMappings(node)
+	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, node.durable)})
+	fsys.stats.BitRot++
+	fsys.record(Event{Mutation: fsys.mutations, Op: "bit-rot", Name: name, Offset: start, Length: int(end - start), Result: fmt.Sprintf("%d bits", bits)})
+	return true
+}
+
+// Damaged reports whether some damage is not healed yet and no write replaced it.
+func (fsys *FS) Damaged() bool {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	for _, damaged := range fsys.damage {
+		if len(damaged.runs) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Heal restores the correct bytes of each damage run that no later write or truncate replaced.
+func (fsys *FS) Heal() {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	for _, damaged := range fsys.damage {
+		node := damaged.node
+		for _, run := range damaged.runs {
+			for _, data := range [][]byte{node.data, node.durable} {
+				if run.offset+int64(len(run.correct)) <= int64(len(data)) {
+					copy(data[run.offset:], run.correct)
+				}
+			}
+		}
+		refreshMappings(node)
+		fsys.record(Event{Mutation: fsys.mutations, Op: "heal", Length: len(damaged.runs)})
+	}
+	fsys.damage = nil
 }
 
 func (fsys *FS) countLost(name string, pending change) {
@@ -396,6 +649,16 @@ func (fsys *FS) keepPart(name string, data []byte, pending change, stopped map[i
 		index := start / sector
 		if !stopped[index] && !fsys.rand.Chance(keepRatio) {
 			stopped[index] = true
+			if fsys.config.TornSectors && stop-start > 1 && fsys.rand.Bool() {
+				// A torn sector keeps a byte prefix of this write, and then nothing more.
+				torn := start + int64(fsys.rand.Range(1, int(stop-start)-1))
+				if torn > int64(len(data)) {
+					data = fsys.extend(data, torn)
+				}
+				copy(data[start:], pending.data[start-pending.offset:torn-pending.offset])
+				kept += int(torn - start)
+				fsys.stats.TornSectors++
+			}
 		}
 		if !stopped[index] {
 			if stop > int64(len(data)) {
@@ -417,9 +680,15 @@ func (fsys *FS) keepPart(name string, data []byte, pending change, stopped map[i
 }
 
 // extend makes data size bytes long.
-// The new space holds zeros, as ext4 and XFS give after a crash.
+// The new space holds zeros, as ext4 and XFS give after a crash, or random bytes with Config.Garbage.
 func (fsys *FS) extend(data []byte, size int64) []byte {
-	return resize(data, size)
+	old := len(data)
+	data = resize(data, size)
+	if fsys.config.Garbage && int(size) > old {
+		fsys.rand.Fill(data[old:])
+		fsys.stats.GarbageFills++
+	}
+	return data
 }
 
 // sectorBoundaries returns each possible kept length of a write: zero, each sector boundary inside the write, and the full length.
@@ -475,7 +744,7 @@ func (fsys *FS) Mutations() uint64 {
 func (fsys *FS) FileData(name string) (cache, durable []byte, ok bool) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
-	node, ok := fsys.names[name]
+	node, ok := fsys.names[fsys.follow(name)]
 	if !ok {
 		return nil, nil, false
 	}
@@ -539,6 +808,7 @@ func crashedError(op, name string) error {
 func (fsys *FS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
+	name = fsys.follow(name)
 	if fsys.crashed {
 		return nil, crashedError("open", name)
 	}
@@ -589,8 +859,14 @@ func (fsys *FS) create(name string, perm os.FileMode) *inode {
 func (fsys *FS) Remove(name string) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
+	name = fsys.abs(name)
 	if fsys.crashed {
 		return crashedError("remove", name)
+	}
+	if _, ok := fsys.links[name]; ok {
+		delete(fsys.links, name)
+		fsys.record(Event{Mutation: fsys.mutations, Op: "remove", Name: name, Result: "ok, a symbolic link"})
+		return nil
 	}
 	if _, ok := fsys.names[name]; !ok {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
@@ -614,24 +890,193 @@ func (fsys *FS) Remove(name string) error {
 	return nil
 }
 
-// EvalSymlinks returns name when it exists.
-// The FS has no symbolic links.
+// EvalSymlinks returns the absolute name of the file that name names after it follows symbolic links.
+// The file must exist.
 func (fsys *FS) EvalSymlinks(name string) (string, error) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
+	resolved := fsys.follow(name)
 	if fsys.crashed {
 		return "", crashedError("lstat", name)
 	}
-	if _, ok := fsys.names[name]; !ok {
+	if _, ok := fsys.names[resolved]; !ok {
 		return "", &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrNotExist}
 	}
-	return name, nil
+	return resolved, nil
+}
+
+// abs returns the absolute, clean form of name.
+func (fsys *FS) abs(name string) string {
+	if !filepath.IsAbs(name) {
+		dir := fsys.config.WorkingDir
+		if dir == "" {
+			dir = "/"
+		}
+		name = filepath.Join(dir, name)
+	}
+	return filepath.Clean(name)
+}
+
+// follow returns the absolute name after it follows the symbolic links of the last name element.
+// The caller must hold mu.
+func (fsys *FS) follow(name string) string {
+	name = fsys.abs(name)
+	for range 8 {
+		target, ok := fsys.links[name]
+		if !ok {
+			return name
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(name), target)
+		}
+		name = filepath.Clean(target)
+	}
+	return name
+}
+
+// Abs returns the absolute form of name. A relative name starts at Config.WorkingDir.
+func (fsys *FS) Abs(name string) (string, error) {
+	return fsys.abs(name), nil
+}
+
+// Symlink makes name a symbolic link to target, like os.Symlink.
+// Symbolic links are always durable; Blackout makes them only before a run.
+func (fsys *FS) Symlink(target, name string) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	fsys.links[fsys.abs(name)] = target
+}
+
+// Lstat returns the file information of name without following a symbolic link.
+func (fsys *FS) Lstat(name string) (os.FileInfo, error) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	name = fsys.abs(name)
+	if fsys.crashed {
+		return nil, crashedError("lstat", name)
+	}
+	if fsys.inject(fsys.config.StatFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "lstat", Name: name, Result: "injected"})
+		return nil, injectedError("lstat", name)
+	}
+	if _, ok := fsys.links[name]; ok {
+		return fileInfo{name: filepath.Base(name), mode: os.ModeSymlink | 0o777}, nil
+	}
+	node, ok := fsys.names[name]
+	if !ok {
+		return nil, &fs.PathError{Op: "lstat", Path: name, Err: fs.ErrNotExist}
+	}
+	return fileInfo{name: filepath.Base(name), size: int64(len(node.data)), mode: node.perm}, nil
+}
+
+// CreateTemp creates a new file in dir whose name is pattern with its last "*" replaced by a random number.
+func (fsys *FS) CreateTemp(dir, pattern string) (fileio.File, string, error) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	dir = fsys.abs(dir)
+	prefix, suffix := pattern, ""
+	if index := strings.LastIndex(pattern, "*"); index >= 0 {
+		prefix, suffix = pattern[:index], pattern[index+1:]
+	}
+	var name string
+	for {
+		name = filepath.Join(dir, fmt.Sprintf("%s%d%s", prefix, fsys.rand.Uint64N(1_000_000_000), suffix))
+		if _, ok := fsys.names[name]; !ok {
+			break
+		}
+	}
+	if fsys.crashed {
+		return nil, "", crashedError("open", name)
+	}
+	if fsys.inject(fsys.config.OpenFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "create", Name: name, Result: "injected"})
+		return nil, "", injectedError("open", name)
+	}
+	if fsys.mutate("create", name, 0, 0) {
+		if fsys.rand.Bool() {
+			fsys.create(name, 0o600)
+		}
+		fsys.record(fsys.crashEvent)
+		return nil, "", crashedError("open", name)
+	}
+	node := fsys.create(name, 0o600)
+	fsys.record(Event{Mutation: fsys.mutations, Op: "create", Name: name, Result: "ok"})
+	return &file{fsys: fsys, name: name, node: node, generation: fsys.generation, writable: true}, name, nil
+}
+
+// Link makes newname a second name of the file oldname.
+// Like any new name, it is durable only after a directory sync.
+func (fsys *FS) Link(oldname, newname string) error {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	oldname, newname = fsys.follow(oldname), fsys.abs(newname)
+	if fsys.crashed {
+		return crashedError("link", newname)
+	}
+	node, ok := fsys.names[oldname]
+	if !ok {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: fs.ErrNotExist}
+	}
+	_, nameExists := fsys.names[newname]
+	_, linkExists := fsys.links[newname]
+	if nameExists || linkExists {
+		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: fs.ErrExist}
+	}
+	if fsys.mutate("link", newname, 0, 0) {
+		if fsys.rand.Bool() {
+			fsys.names[newname] = node
+		}
+		fsys.record(fsys.crashEvent)
+		return crashedError("link", newname)
+	}
+	if fsys.inject(fsys.config.OpenFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "link", Name: newname, Result: "injected"})
+		return injectedError("link", newname)
+	}
+	fsys.names[newname] = node
+	fsys.record(Event{Mutation: fsys.mutations, Op: "link", Name: newname, Result: "ok"})
+	return nil
+}
+
+// Chmod changes the permission bits of name.
+func (fsys *FS) Chmod(name string, mode os.FileMode) error {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	name = fsys.follow(name)
+	if fsys.crashed {
+		return crashedError("chmod", name)
+	}
+	node, ok := fsys.names[name]
+	if !ok {
+		return &fs.PathError{Op: "chmod", Path: name, Err: fs.ErrNotExist}
+	}
+	node.perm = mode.Perm()
+	return nil
+}
+
+// Perm returns the permission bits of the file that name names.
+func (fsys *FS) Perm(name string) (os.FileMode, bool) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	node, ok := fsys.names[fsys.follow(name)]
+	if !ok {
+		return 0, false
+	}
+	return node.perm, true
+}
+
+// Names returns the name of every file in the cache view, in order.
+func (fsys *FS) Names() []string {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	return slices.Sorted(maps.Keys(fsys.names))
 }
 
 // SyncDir makes the current names in directory dir durable.
 func (fsys *FS) SyncDir(dir string) error {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
+	dir = fsys.abs(dir)
 	if fsys.crashed {
 		return crashedError("sync", dir)
 	}
@@ -699,7 +1144,10 @@ type file struct {
 	closed     bool
 }
 
-var _ fileio.File = (*file)(nil)
+var (
+	_ fileio.File   = (*file)(nil)
+	_ fileio.Mapper = (*file)(nil)
+)
 
 // check returns the error of a call on a closed handle, a handle from before a restart, or a crashed process.
 // The caller must hold mu.
@@ -734,11 +1182,43 @@ func (f *file) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, io.EOF
 	}
 	n := copy(p, f.node.data[offset:])
+	if n > 0 && (fsys.config.CorruptMainReads || strings.HasSuffix(f.name, "-wal")) && fsys.faults && fsys.rand.Chance(fsys.config.ReadCorruption) {
+		bit := fsys.rand.IntN(n * 8)
+		p[bit/8] ^= 1 << (bit % 8)
+		fsys.stats.ReadCorruptions++
+		fsys.record(Event{Mutation: fsys.mutations, Op: "read", Name: f.name, Offset: offset, Length: len(p), Result: fmt.Sprintf("bit %d flipped", bit)})
+	}
 	if n < len(p) {
 		return n, io.EOF
 	}
 	return n, nil
 }
+
+// noSpace starts or continues a disk-full episode for a call that grows a file to size.
+// It reports whether the call must fail with ENOSPC.
+// The caller must hold mu.
+func (fsys *FS) noSpace(node *inode, size int64) bool {
+	if !fsys.faults || size <= int64(len(node.data)) {
+		return false
+	}
+	if fsys.mutations >= fsys.fullUntil {
+		if !fsys.rand.Chance(fsys.config.FullFault) {
+			return false
+		}
+		fsys.fullUntil = fsys.mutations + uint64(fsys.rand.Range(1, 30))
+	}
+	fsys.stats.NoSpaceErrors++
+	fsys.stats.InjectedFaults++
+	return true
+}
+
+// noSpaceError is the error of a call that needs space during a disk-full episode.
+// It matches syscall.ENOSPC and ErrInjected.
+type noSpaceError struct{}
+
+func (noSpaceError) Error() string { return "disk: no space left on device (injected)" }
+
+func (noSpaceError) Is(target error) bool { return target == ErrInjected || target == syscall.ENOSPC }
 
 func (f *file) WriteAt(p []byte, offset int64) (int, error) {
 	fsys := f.fsys
@@ -769,6 +1249,13 @@ func (f *file) WriteAt(p []byte, offset int64) (int, error) {
 		fsys.record(Event{Mutation: fsys.mutations, Op: "write", Name: f.name, Offset: offset, Length: len(p), Result: fmt.Sprintf("injected after %d bytes", n)})
 		return n, injectedError("write", f.name)
 	}
+	if fsys.noSpace(f.node, offset+int64(len(p))) {
+		// The part inside the current length needs no new space.
+		n := int(max(0, min(int64(len(p)), int64(len(f.node.data))-offset)))
+		fsys.write(f.node, p[:n], offset)
+		fsys.record(Event{Mutation: fsys.mutations, Op: "write", Name: f.name, Offset: offset, Length: len(p), Result: fmt.Sprintf("no space after %d bytes", n)})
+		return n, &fs.PathError{Op: "write", Path: f.name, Err: noSpaceError{}}
+	}
 	fsys.write(f.node, p, offset)
 	fsys.record(Event{Mutation: fsys.mutations, Op: "write", Name: f.name, Offset: offset, Length: len(p), Result: "ok"})
 	return len(p), nil
@@ -783,6 +1270,12 @@ func (fsys *FS) write(node *inode, p []byte, offset int64) {
 	pending := change{offset: offset, data: slices.Clone(p)}
 	node.data = applyChange(node.data, pending)
 	node.pending = append(node.pending, pending)
+	fsys.forgetDamage(node, offset, len(p))
+	for _, live := range node.mappings {
+		if live.follows && offset < int64(len(live.data)) {
+			copy(live.data[offset:], p)
+		}
+	}
 }
 
 // truncate changes the cache view and records the unsynced change.
@@ -790,6 +1283,71 @@ func (fsys *FS) write(node *inode, p []byte, offset int64) {
 func (fsys *FS) truncate(node *inode, size int64) {
 	node.data = resize(node.data, size)
 	node.pending = append(node.pending, change{truncate: true, offset: size})
+	fsys.forgetDamage(node, size, -1)
+	for _, live := range node.mappings {
+		if int64(len(live.data)) > size {
+			fsys.stats.MappingViolations++
+			fsys.record(Event{Mutation: fsys.mutations, Op: "truncate-under-mapping", Offset: size, Length: len(live.data)})
+			poison(live.data[size:])
+		}
+	}
+}
+
+// refreshMappings copies the cache view into each mapping that follows writes.
+// The caller must hold mu.
+func refreshMappings(node *inode) {
+	for _, live := range node.mappings {
+		if !live.follows {
+			continue
+		}
+		copied := copy(live.data, node.data)
+		poison(live.data[copied:])
+	}
+}
+
+// Map maps the first length bytes of the file for reads. It implements [fileio.Mapper].
+func (f *file) Map(length int) ([]byte, error) {
+	fsys := f.fsys
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	if err := f.check("map"); err != nil {
+		return nil, err
+	}
+	if fsys.config.DisableMap {
+		return nil, &fs.PathError{Op: "map", Path: f.name, Err: errors.ErrUnsupported}
+	}
+	if fsys.inject(fsys.config.MapFault) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "map", Name: f.name, Length: length, Result: "injected"})
+		return nil, injectedError("map", f.name)
+	}
+	if length <= 0 || length > len(f.node.data) {
+		return nil, &fs.PathError{Op: "map", Path: f.name, Err: syscall.EINVAL}
+	}
+	live := &mapping{data: slices.Clone(f.node.data[:length]), follows: !fsys.config.StaleMappings}
+	f.node.mappings = append(f.node.mappings, live)
+	fsys.record(Event{Mutation: fsys.mutations, Op: "map", Name: f.name, Length: length, Result: "ok"})
+	return live.data, nil
+}
+
+// Unmap releases a mapping that Map returned. It implements [fileio.Mapper].
+func (f *file) Unmap(data []byte) error {
+	fsys := f.fsys
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	for index, live := range f.node.mappings {
+		if len(live.data) == len(data) && unsafe.SliceData(live.data) == unsafe.SliceData(data) {
+			poison(live.data)
+			f.node.mappings = slices.Delete(f.node.mappings, index, index+1)
+			fsys.record(Event{Mutation: fsys.mutations, Op: "unmap", Name: f.name, Length: len(data), Result: "ok"})
+			return nil
+		}
+	}
+	return &fs.PathError{Op: "unmap", Path: f.name, Err: syscall.EINVAL}
+}
+
+// MappingFollowsWrites reports whether a mapping shows later writes. It implements [fileio.Mapper].
+func (f *file) MappingFollowsWrites() bool {
+	return !f.fsys.config.StaleMappings
 }
 
 func (f *file) Truncate(size int64) error {
@@ -820,6 +1378,10 @@ func (f *file) Truncate(size int64) error {
 		}
 		fsys.record(Event{Mutation: fsys.mutations, Op: "truncate", Name: f.name, Offset: size, Result: result})
 		return injectedError("truncate", f.name)
+	}
+	if fsys.noSpace(f.node, size) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "truncate", Name: f.name, Offset: size, Result: "no space"})
+		return &fs.PathError{Op: "truncate", Path: f.name, Err: noSpaceError{}}
 	}
 	fsys.truncate(f.node, size)
 	fsys.record(Event{Mutation: fsys.mutations, Op: "truncate", Name: f.name, Offset: size, Result: "ok"})
@@ -861,6 +1423,7 @@ func (f *file) Sync() error {
 				result = "injected, cache dropped"
 			}
 			node.data = slices.Clone(node.durable)
+			refreshMappings(node)
 		}
 		fsys.record(Event{Mutation: fsys.mutations, Op: "sync", Name: f.name, Result: result})
 		return injectedError("sync", f.name)

@@ -33,11 +33,34 @@ func (runner *runner) checkAfterStep() {
 	if crashed, _ := runner.fsys.Crashed(); crashed {
 		return
 	}
+	runner.checkMappings(runner.fsys)
 	runner.checkPages("after step")
 	runner.checkStats()
 	if runner.failure == nil && (runner.settings.DeepCheck || runner.checkRand.Chance(slowCheckRatio)) {
 		runner.checkImage()
 		runner.checkMemory()
+	}
+}
+
+// checkFiles checks the names and permission bits of the database files.
+// The WAL lives next to the main file, also when Open got a symbolic link, and it has the mode of the main file.
+func (runner *runner) checkFiles() {
+	for _, name := range []string{runner.realPath, runner.realPath + "-wal"} {
+		if perm, ok := runner.fsys.Perm(name); ok && perm != runner.config.FileMode {
+			runner.fail("%s has mode %o, want %o", name, perm, runner.config.FileMode)
+		}
+	}
+	if runner.config.PathMode == pathSymlink {
+		if _, _, exists := runner.fsys.FileData(simDir + "/link-wal"); exists {
+			runner.fail("a WAL exists next to the symbolic link, not next to the main file")
+		}
+	}
+}
+
+// checkMappings fails the run after a truncate that cut a live mapping of fsys.
+func (runner *runner) checkMappings(fsys *disk.FS) {
+	if count := fsys.Stats().MappingViolations; count > 0 {
+		runner.fail("KVLite truncated the main file %d times under a live mapping; a read of the cut part stops a real process with SIGBUS", count)
 	}
 }
 
@@ -51,8 +74,8 @@ func (runner *runner) checkStats() {
 		return
 	}
 	runner.stats.StatsChecks++
-	mainFile, _, _ := runner.fsys.FileData(databasePath)
-	walFile, _, _ := runner.fsys.FileData(databasePath + "-wal")
+	mainFile, _, _ := runner.fsys.FileData(runner.realPath)
+	walFile, _, _ := runner.fsys.FileData(runner.realPath + "-wal")
 	switch {
 	case stats.PageSize != runner.work.pageSize:
 		runner.fail("DB.Stats: PageSize is %d, want %d", stats.PageSize, runner.work.pageSize)
@@ -67,6 +90,7 @@ func (runner *runner) checkStats() {
 	case stats.WALPageCount == 0 && stats.WALSize == 0 && stats.FileSize != stats.DataSize:
 		runner.fail("DB.Stats: with an empty WAL, FileSize %d differs from DataSize %d", stats.FileSize, stats.DataSize)
 	}
+	runner.checkFiles()
 	if previous := runner.lastStats; previous != nil {
 		// The counters of one handle never decrease.
 		for _, counter := range []struct {
@@ -95,7 +119,7 @@ func (runner *runner) checkStats() {
 func (runner *runner) checkImage() {
 	runner.stats.ImageChecks++
 	image := runner.fsys.CloneCache(streamSeed(runner.seed, streamCheck) ^ uint64(runner.step))
-	db, err := runner.target.Open(databasePath, runner.options(), image)
+	db, err := runner.openDB(image, false)
 	if err != nil {
 		runner.fail("open the process-crash image: %v", err)
 		return
@@ -105,6 +129,7 @@ func (runner *runner) checkImage() {
 		err = runner.target.CheckPages(db)
 	}
 	closeErr := db.Close()
+	runner.checkMappings(image)
 	switch {
 	case err != nil:
 		runner.fail("the process-crash image: %v", err)

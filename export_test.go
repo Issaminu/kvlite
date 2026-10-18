@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"os"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -12,8 +13,11 @@ import (
 // Go compiles it only for tests, so KVLite's public API does not change.
 
 // BlackoutOpen opens the database at path through fsys.
-func BlackoutOpen(path string, options *Options, fsys fileio.FS) (*DB, error) {
-	return open(path, 0o600, options, fsys)
+// A new file uses mode and pageSize, so each run selects them.
+func BlackoutOpen(path string, mode os.FileMode, options *Options, fsys fileio.FS, pageSize int) (*DB, error) {
+	withPageSize := *options
+	withPageSize.pageSize = int64(pageSize)
+	return open(path, mode, &withPageSize, fsys)
 }
 
 // BlackoutCheckpoint copies the committed WAL pages into the main file now.
@@ -80,11 +84,17 @@ func BlackoutCheckpointCount(db *DB) uint64 {
 }
 
 // BlackoutAbandon drops db without Close, as a crashed process does, and stops its write worker.
+// A crashed process loses its mappings too, so it releases the main-file mapping.
 func BlackoutAbandon(db *DB) {
 	db.lifecycleMu.Lock()
 	db.closed = true
 	db.lifecycleMu.Unlock()
 	db.stopWriteBatcherAndWait()
+	db.operationMu.Lock()
+	// After a simulated restart the mapping is already gone, so an error is expected.
+	_ = db.unmapMainFile()
+	db.mappedFile = nil
+	db.operationMu.Unlock()
 }
 
 // BlackoutQuiesce waits until the write worker finishes its current batch, including the checkpoint after it.

@@ -30,8 +30,8 @@ import (
 // Target gives the engine the KVLite internals that the public API does not expose.
 // The root package's test binary fills it from export_test.go, so KVLite's API stays unchanged.
 type Target struct {
-	// Open opens the database at path through fsys.
-	Open func(path string, options *kvlite.Options, fsys fileio.FS) (*kvlite.DB, error)
+	// Open opens the database at path through fsys. A new file uses mode and pageSize.
+	Open func(path string, mode os.FileMode, options *kvlite.Options, fsys fileio.FS, pageSize int) (*kvlite.DB, error)
 	// Checkpoint copies the committed WAL pages into the main file now.
 	Checkpoint func(db *kvlite.DB) error
 	// CheckPages walks every tree page and requires that each reachable page is allocated once and that each allocated page is reachable.
@@ -126,6 +126,3 @@ func Run(target Target, seed uint64, settings Settings) Result {
 		Err:       err,
 	}
 }
-
-// osPageSize is the page size of a new database.
-var osPageSize = os.Getpagesize()

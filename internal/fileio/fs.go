@@ -19,9 +19,26 @@ type File interface {
 	Close() error
 }
 
+// Mapper is a [File] that KVLite can map into memory for reads.
+// KVLite maps an [*os.File] with the operating system, so only a File of another FS implements Mapper.
+// A test file system uses it to check the mapped read path.
+type Mapper interface {
+	// Map maps the first length bytes of the file for reads.
+	Map(length int) ([]byte, error)
+
+	// Unmap releases a mapping that Map returned.
+	// The caller must not read the mapping after Unmap.
+	Unmap(data []byte) error
+
+	// MappingFollowsWrites reports whether a mapping shows later writes to the file.
+	// It is true for a shared mapping on Unix, and false on Windows.
+	MappingFollowsWrites() bool
+}
+
 // FS opens, removes, and syncs the files of a database.
 // [OSFS] uses the operating system.
-// Memory mapping and file locks need an [*os.File], so KVLite skips them for files of another FS.
+// File locks need an [*os.File], so KVLite skips them for files of another FS.
+// A file of another FS is mapped into memory only when it implements [Mapper].
 type FS interface {
 	// OpenFile opens name like [os.OpenFile].
 	// It returns a nil File when it returns an error.
@@ -35,6 +52,22 @@ type FS interface {
 
 	// SyncDir makes the file names in directory dir durable.
 	SyncDir(dir string) error
+
+	// Abs returns an absolute form of name, like [filepath.Abs].
+	Abs(name string) (string, error)
+
+	// Lstat returns the file information of name without following a final symbolic link, like [os.Lstat].
+	Lstat(name string) (os.FileInfo, error)
+
+	// CreateTemp creates a new file in dir, like [os.CreateTemp], and returns the file and its name.
+	// It returns a nil File when it returns an error.
+	CreateTemp(dir, pattern string) (File, string, error)
+
+	// Link creates newname as a hard link to oldname, like [os.Link].
+	Link(oldname, newname string) error
+
+	// Chmod changes the permission bits of name, like [os.Chmod].
+	Chmod(name string, mode os.FileMode) error
 }
 
 // OSFS is the [FS] of the operating system.
@@ -63,6 +96,36 @@ func (OSFS) Remove(name string) error {
 // EvalSymlinks resolves name with [filepath.EvalSymlinks].
 func (OSFS) EvalSymlinks(name string) (string, error) {
 	return filepath.EvalSymlinks(name)
+}
+
+// Abs returns an absolute form of name with [filepath.Abs].
+func (OSFS) Abs(name string) (string, error) {
+	return filepath.Abs(name)
+}
+
+// Lstat returns the file information of name with [os.Lstat].
+func (OSFS) Lstat(name string) (os.FileInfo, error) {
+	return os.Lstat(name)
+}
+
+// CreateTemp creates a new file in dir with [os.CreateTemp].
+func (OSFS) CreateTemp(dir, pattern string) (File, string, error) {
+	file, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		// Return an untyped nil, so the caller's nil check works.
+		return nil, "", err
+	}
+	return file, file.Name(), nil
+}
+
+// Link creates newname as a hard link to oldname with [os.Link].
+func (OSFS) Link(oldname, newname string) error {
+	return os.Link(oldname, newname)
+}
+
+// Chmod changes the permission bits of name with [os.Chmod].
+func (OSFS) Chmod(name string, mode os.FileMode) error {
+	return os.Chmod(name, mode)
 }
 
 // SyncDir opens dir, syncs it, and closes it.

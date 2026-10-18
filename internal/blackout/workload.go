@@ -46,12 +46,13 @@ func newWorkload(seed uint64, config *Config, pageSize int) *workload {
 			// Long shared prefixes shape branch separators and prefix scans.
 			key = fmt.Appendf(append([]byte(nil), prefix[:work.rand.Range(1, len(prefix))]...), "/%06d", id)
 		default:
-			size := work.rand.Range(100, pageSize/2)
+			size := work.rand.Range(100, min(pageSize/2, kvlite.MaxKeySize))
 			switch {
 			case work.rand.Chance(disk.OneIn(40)):
 				// The largest key that KVLite accepts.
 				size = kvlite.MaxKeySize
-			case work.rand.Chance(disk.OneIn(20)):
+			case pageSize < kvlite.MaxKeySize && work.rand.Chance(disk.OneIn(20)):
+				// A key longer than one page needs continuation pages.
 				size = work.rand.Range(pageSize, min(2*pageSize, kvlite.MaxKeySize))
 			}
 			key = make([]byte, size)

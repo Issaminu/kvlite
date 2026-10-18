@@ -52,6 +52,18 @@ type Options struct {
 
 	// CheckpointThresholdBytes is the number of committed write-ahead log bytes that starts a checkpoint. A zero value uses about 1,000 operating-system pages, while a smaller value keeps the log smaller at the cost of more frequent checkpoints.
 	CheckpointThresholdBytes uint64
+
+	// pageSize is the page size of a new file. Zero means the operating-system page size.
+	// Only tests set it, so that a simulation can select the page size of each run.
+	pageSize int64
+}
+
+// newFilePageSize returns the page size of a new file.
+func (options *Options) newFilePageSize() int64 {
+	if options.pageSize != 0 {
+		return options.pageSize
+	}
+	return int64(os.Getpagesize())
 }
 
 func defaultOptions() Options {
