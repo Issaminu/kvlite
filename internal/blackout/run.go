@@ -37,6 +37,10 @@ type runner struct {
 	uncertainOpen   bool          // a commit result is unknown, and no open has resolved it yet
 	checkpointCount uint64        // checkpoints of the current handle
 	checkRand       *disk.Rand    // picks the steps of the slow checks
+	optionsRand     *disk.Rand    // the options generator: picks the options of each open
+	session         session       // the options of the current open
+	sessions        int           // opens of the main handle so far
+	tainted         bool          // a SyncNone session wrote data that no sync has made durable yet
 	openPath        string        // the path that the run gives Open: absolute, relative, or a symbolic link
 	realPath        string        // the absolute path of the main file
 	backups         int           // backups made so far, for unique names
@@ -73,6 +77,7 @@ func newRunner(target Target, seed uint64, config Config, settings Settings) *ru
 	runner.work = newWorkload(seed, &runner.config, runner.config.PageSize)
 	runner.crash = newCrasher(seed, &runner.config)
 	runner.checkRand = disk.NewRand(streamSeed(seed, streamCheck))
+	runner.optionsRand = disk.NewRand(streamSeed(seed, streamOptions))
 	runner.openPath, runner.realPath = runner.config.paths()
 	if runner.config.PathMode == pathRelative {
 		runner.config.Disk.WorkingDir = simDir
@@ -133,18 +138,12 @@ func (runner *runner) report() error {
 	return errors.New(text.String())
 }
 
-func (runner *runner) options() *kvlite.Options {
-	return &kvlite.Options{
-		Synchronous:              runner.config.Sync,
-		DataPageChecksums:        runner.config.Checksums,
-		CheckpointThresholdBytes: runner.config.CheckpointBytes,
-	}
-}
-
-// openDB opens the database of the run on fsys.
+// openDB opens the database of the run on fsys with the options of the current session.
 func (runner *runner) openDB(fsys *disk.FS, readOnly bool) (*kvlite.DB, error) {
 	options := runner.options()
-	options.ReadOnly = readOnly
+	if readOnly {
+		options = runner.readOnlyOptions()
+	}
 	return runner.target.Open(runner.openPath, runner.config.FileMode, options, fsys, runner.config.PageSize)
 }
 
@@ -264,7 +263,11 @@ func (runner *runner) updateFloor() {
 	if runner.db == nil {
 		return
 	}
-	switch runner.config.Sync {
+	if runner.tainted {
+		runner.clearTaint()
+		return
+	}
+	switch runner.session.sync {
 	case kvlite.SyncFull:
 		// Every acknowledged commit is durable.
 		runner.model.setFloor()
@@ -290,9 +293,11 @@ func (runner *runner) closeDB() bool {
 		runner.event("close: %v", err)
 		if err == nil {
 			runner.db = nil
-			if runner.config.Sync != kvlite.SyncNone {
+			if runner.syncing() {
 				// Close checkpoints with syncs, so the latest state is durable.
 				runner.model.setFloor()
+			} else {
+				runner.clearTaint()
 			}
 			return true
 		}
@@ -324,7 +329,8 @@ func (runner *runner) recoverCrash() {
 		runner.db = nil
 	}
 	runner.stopped = false
-	powerFailure := runner.crash.powerFailure(disk.Ratio{Num: 2, Den: 3})
+	// A tainted storage gets no power failure, because SyncNone promises nothing after one.
+	powerFailure := runner.crash.powerFailure(disk.Ratio{Num: 2, Den: 3}) && !runner.tainted
 	runner.powerLost = runner.powerLost || powerFailure
 	runner.event("restart after %s (power failure: %t)", event, powerFailure)
 	runner.fsys.Restart(powerFailure)
@@ -340,6 +346,7 @@ func (runner *runner) recoverCrash() {
 
 // openAndVerify opens the database and checks the recovered state.
 func (runner *runner) openAndVerify(afterCrash bool) {
+	runner.startSession()
 	for attempt := 0; ; attempt++ {
 		if runner.fsys.Damaged() {
 			runner.probeDamage(afterCrash)
@@ -368,7 +375,7 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 		runner.event("open: %v", err)
 		if crashed, _ := runner.fsys.Crashed(); crashed && attempt < openTries {
 			runner.stats.CrashesInOpen++
-			powerFailure := runner.crash.powerFailure(disk.Ratio{Num: 1, Den: 2})
+			powerFailure := runner.crash.powerFailure(disk.Ratio{Num: 1, Den: 2}) && !runner.tainted
 			runner.powerLost = runner.powerLost || powerFailure
 			if powerFailure {
 				// The power failure changed the files, so the read-only recovery saw other files.
@@ -432,7 +439,7 @@ func (runner *runner) livenessPhase() {
 		return
 	}
 	runner.openAndVerify(false)
-	if runner.failure != nil || !runner.config.PowerFailures {
+	if runner.failure != nil || !runner.config.PowerFailures || runner.tainted {
 		return
 	}
 	// Close made the latest state durable, so a power failure after Close keeps it.

@@ -744,3 +744,25 @@ func TestHardLinkSharesTheFileUntilADirectorySync(t *testing.T) {
 		t.Fatal("the new name survived a power failure without a directory sync")
 	}
 }
+
+func TestDurableNeedsSyncedDataAndNames(t *testing.T) {
+	fsys := New(1, Config{})
+	if !fsys.Durable() {
+		t.Fatal("an empty FS is not durable")
+	}
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("data"), 0)
+	if fsys.Durable() {
+		t.Fatal("an unsynced write is durable")
+	}
+	mustSync(t, file)
+	if fsys.Durable() {
+		t.Fatal("a name without a directory sync is durable")
+	}
+	if err := fsys.SyncDir(testDir); err != nil {
+		t.Fatal(err)
+	}
+	if !fsys.Durable() {
+		t.Fatal("synced data and a synced name are not durable")
+	}
+}

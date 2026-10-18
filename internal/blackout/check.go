@@ -225,8 +225,10 @@ func (runner *runner) verify(afterCrash bool) {
 	// A lost branch that appears in a later recovery is a revived commit, not a valid answer.
 	runner.model.branches = nil
 	runner.powerLost = false
-	if runner.config.Sync != kvlite.SyncNone {
+	if runner.syncing() {
 		// Writable recovery syncs the WAL and the main file before it clears the WAL.
 		runner.model.setFloor()
+	} else {
+		runner.clearTaint()
 	}
 }

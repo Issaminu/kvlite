@@ -12,32 +12,38 @@ import (
 // Stats counts what one or more runs reached.
 // The coverage test requires that the default seeds reach every important case.
 type Stats struct {
-	Steps               [operationCount]int
-	Commits             int // acknowledged commits that changed data
-	Aborts              int // transactions that their callback or a fault ended before the commit
-	Uncertain           int // commits whose result was unknown
-	UncertainKept       int // unknown results that recovery showed
-	UncertainLost       int // unknown results that recovery did not show
-	LostUnsyncedCommits int // acknowledged commits that a power failure legally lost
-	CrashesNow          int // crashes between operations
-	CrashesInCalls      map[string]int
-	CrashesInOpen       int
-	FailedOpens         int
-	FailedCloses        int
-	StoppedHandles      int // handles that ErrWALWriteFailed stopped
-	Recoveries          int // opens whose state the checks compared with the model
-	Mutations           [mutationKindCount]int
-	Scans               [scanKindCount]int
-	Contracts           [contractCount]int
-	PageChecks          int // page walks
-	StatsChecks         int // DB.Stats checks
-	ImageChecks         int // opens of the process-crash image
-	MemoryChecks        int // comparisons of the memory database
-	DamageProbes        int // first opens after damage
-	DamageDetected      int // probes that failed, so KVLite found the damage
-	DamageHarmless      int // probes that returned an allowed state
-	ReadOnlyRecoveries  int // read-only opens after a crash that showed an allowed state
-	Disk                disk.Stats
+	Steps                [operationCount]int
+	Commits              int // acknowledged commits that changed data
+	Aborts               int // transactions that their callback or a fault ended before the commit
+	Uncertain            int // commits whose result was unknown
+	UncertainKept        int // unknown results that recovery showed
+	UncertainLost        int // unknown results that recovery did not show
+	LostUnsyncedCommits  int // acknowledged commits that a power failure legally lost
+	CrashesNow           int // crashes between operations
+	CrashesInCalls       map[string]int
+	CrashesInOpen        int
+	FailedOpens          int
+	FailedCloses         int
+	StoppedHandles       int // handles that ErrWALWriteFailed stopped
+	Recoveries           int // opens whose state the checks compared with the model
+	Mutations            [mutationKindCount]int
+	Scans                [scanKindCount]int
+	Contracts            [contractCount]int
+	PageChecks           int            // page walks
+	StatsChecks          int            // DB.Stats checks
+	ImageChecks          int            // opens of the process-crash image
+	MemoryChecks         int            // comparisons of the memory database
+	DamageProbes         int            // first opens after damage
+	DamageDetected       int            // probes that failed, so KVLite found the damage
+	DamageHarmless       int            // probes that returned an allowed state
+	ReadOnlyRecoveries   int            // read-only opens after a crash that showed an allowed state
+	Forms                [formCount]int // opens with explicit, nil, and zero Options
+	OptionChanges        int            // opens whose options differ from the previous open
+	TaintsCleared        int            // SyncNone sessions that a later syncing session made durable
+	InvalidOpens         int            // checks that Open refuses invalid options
+	LargeWALSessions     int            // sessions without an automatic checkpoint
+	BatchSizeOneSessions int            // SyncFull or other sessions with MaxWriteBatchSize 1
+	Disk                 disk.Stats
 }
 
 // Add adds other to stats.
@@ -62,6 +68,14 @@ func (stats *Stats) Add(other Stats) {
 	stats.DamageDetected += other.DamageDetected
 	stats.DamageHarmless += other.DamageHarmless
 	stats.ReadOnlyRecoveries += other.ReadOnlyRecoveries
+	for form := range stats.Forms {
+		stats.Forms[form] += other.Forms[form]
+	}
+	stats.OptionChanges += other.OptionChanges
+	stats.TaintsCleared += other.TaintsCleared
+	stats.InvalidOpens += other.InvalidOpens
+	stats.LargeWALSessions += other.LargeWALSessions
+	stats.BatchSizeOneSessions += other.BatchSizeOneSessions
 	stats.Commits += other.Commits
 	stats.Aborts += other.Aborts
 	stats.Uncertain += other.Uncertain

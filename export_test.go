@@ -15,6 +15,10 @@ import (
 // BlackoutOpen opens the database at path through fsys.
 // A new file uses mode and pageSize, so each run selects them.
 func BlackoutOpen(path string, mode os.FileMode, options *Options, fsys fileio.FS, pageSize int) (*DB, error) {
+	if options == nil {
+		// Nil Options take every default, also the page size of a new file.
+		return open(path, mode, nil, fsys)
+	}
 	withPageSize := *options
 	withPageSize.pageSize = int64(pageSize)
 	return open(path, mode, &withPageSize, fsys)

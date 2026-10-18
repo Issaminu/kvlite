@@ -57,8 +57,9 @@ const (
 // Each seed selects different weights and settings, so some runs grow the tree, some delete, and some crash often (swarm testing).
 type Config struct {
 	// Database options.
-	Sync            kvlite.Sync
+	Sync            kvlite.Sync // the sync mode of the first open
 	Checksums       bool
+	OptionChanges   bool // each open picks new options (see sessions.go); without it, every open uses the options above
 	CheckpointBytes uint64
 	PageSize        int         // the page size of a new file; the seed selects it, so a replay does not depend on the platform
 	PathMode        int         // the kind of path that Open gets
@@ -114,8 +115,8 @@ func (config Config) String() string {
 			operations = append(operations, fmt.Sprintf("%s=%d", operationNames[op], weight))
 		}
 	}
-	return fmt.Sprintf("path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v main=%t rot=%v misdirect=%v page=%d map=%s sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
-		pathModeNames[config.PathMode], config.FileMode, config.Disk.TornSectors, config.Disk.Garbage, config.Disk.FullFault, config.Disk.ReadCorruption, config.Disk.CorruptMainReads, config.CorruptAtRest, config.Disk.Misdirect,
+	return fmt.Sprintf("option-changes=%t path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v main=%t rot=%v misdirect=%v page=%d map=%s sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t sector=%d keep=%v in-order=%v ops=[%s]",
+		config.OptionChanges, pathModeNames[config.PathMode], config.FileMode, config.Disk.TornSectors, config.Disk.Garbage, config.Disk.FullFault, config.Disk.ReadCorruption, config.Disk.CorruptMainReads, config.CorruptAtRest, config.Disk.Misdirect,
 		config.PageSize, config.mappingName(), syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
 		config.ValueWeights, config.MutationWeights, config.MaxMutations, config.Abort, config.CrashNow, config.ScheduleCrash,
 		config.PowerFailures, config.IOFaults, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
@@ -137,7 +138,8 @@ const (
 	streamWorkload
 	streamCrash
 	streamDisk
-	streamCheck // decides which steps run the slow checks; the checks change nothing else
+	streamCheck   // decides which steps run the slow checks; the checks change nothing else
+	streamOptions // picks the options of each open when they change between opens
 )
 
 // swarmWeights enables a random non-empty subset of n choices with random weights.
@@ -170,6 +172,7 @@ func newConfig(seed uint64) Config {
 	rand := disk.NewRand(streamSeed(seed, streamConfig))
 	var config Config
 	config.Sync = [...]kvlite.Sync{kvlite.SyncFull, kvlite.SyncNormal, kvlite.SyncNone}[rand.Weighted([]uint64{6, 3, 1})]
+	config.OptionChanges = rand.Bool()
 	config.Checksums = rand.Bool()
 	// One byte checkpoints after every commit. Zero selects the default threshold.
 	config.CheckpointBytes = [...]uint64{1, 16 << 10, 64 << 10, 256 << 10, 0}[rand.IntN(5)]
@@ -189,7 +192,7 @@ func newConfig(seed uint64) Config {
 	config.OperationWeights[opUpdate] = max(config.OperationWeights[opUpdate], 50)
 	config.OperationWeights[opContracts] = min(config.OperationWeights[opContracts], 10)
 	config.OperationWeights[opBackup] = min(config.OperationWeights[opBackup], 10)
-	if config.Sync != kvlite.SyncFull {
+	if config.Sync != kvlite.SyncFull && !config.OptionChanges {
 		// Group commit exists only in SyncFull.
 		config.OperationWeights[opBatch] = 0
 	}
@@ -212,7 +215,8 @@ func newConfig(seed uint64) Config {
 	config.CrashNow = sometimes(rand, 4, 60)
 	config.ScheduleCrash = sometimes(rand, 4, 60)
 	// SyncNone promises nothing after a power failure, so its runs crash only the process.
-	config.PowerFailures = config.Sync != kvlite.SyncNone && !rand.Chance(disk.OneIn(5))
+	// SyncNone promises nothing after a power failure. A SyncNone session taints the storage, so no power failure happens until a syncing session makes it durable.
+	config.PowerFailures = (config.Sync != kvlite.SyncNone || config.OptionChanges) && !rand.Chance(disk.OneIn(5))
 
 	config.Disk = disk.Config{
 		SectorSize: [...]int{512, 4096}[rand.IntN(2)],
@@ -256,7 +260,7 @@ func newConfig(seed uint64) Config {
 	}
 	if config.PowerFailures && config.fixedChecksums() {
 		// Without data-page checksums, a misdirected write can hide wrong data.
-		config.Disk.Misdirect = sometimes(rand, 2, 12)
+		config.Disk.Misdirect = sometimes(rand, 1, 4)
 	}
 
 	config.PathMode = rand.Weighted([]uint64{2, 1, 1})

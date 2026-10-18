@@ -171,6 +171,7 @@ func TestBlackoutDetectsDurabilityDefects(t *testing.T) {
 					config.CrashNow = disk.OneIn(8)
 					// Only crashes and power failures, so the control run does not hit open bugs of other faults.
 					config.IOFaults = false
+					config.OptionChanges = false
 					config.CorruptAtRest = disk.Never
 					config.Disk = disk.Config{SectorSize: config.Disk.SectorSize, KeepChange: config.Disk.KeepChange, InOrder: config.Disk.InOrder, SyncLie: lie}
 				}}

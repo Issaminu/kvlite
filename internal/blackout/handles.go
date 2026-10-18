@@ -52,7 +52,7 @@ func (runner *runner) backup() {
 // keepBackup returns the backup to keep for the power-failure check: the new one when it is complete and durable, else the old one.
 // It removes the backup that it does not keep, so the simulated storage stays small.
 func (runner *runner) keepBackup(old, record *backupRecord, complete bool) *backupRecord {
-	if !complete || runner.config.Sync == kvlite.SyncNone {
+	if !complete || runner.session.sync == kvlite.SyncNone {
 		return old
 	}
 	if old != nil {
@@ -67,9 +67,7 @@ func (runner *runner) keepBackup(old, record *backupRecord, complete bool) *back
 func (runner *runner) checkBackup(record *backupRecord) {
 	runner.fsys.SetFaults(false)
 	defer runner.fsys.SetFaults(runner.faults)
-	options := runner.options()
-	options.ReadOnly = true
-	db, err := runner.target.Open(record.path, runner.config.FileMode, options, runner.fsys, runner.config.PageSize)
+	db, err := runner.target.Open(record.path, runner.config.FileMode, runner.readOnlyOptions(), runner.fsys, runner.config.PageSize)
 	if err != nil {
 		runner.fail("open backup %s: %v", record.path, err)
 		return

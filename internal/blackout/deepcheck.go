@@ -85,8 +85,8 @@ func (runner *runner) checkStats() {
 		runner.fail("DB.Stats: WALSize is %d, but the WAL file has %d bytes", stats.WALSize, len(walFile))
 	case stats.CheckpointCount != runner.target.CheckpointCount(runner.db):
 		runner.fail("DB.Stats: CheckpointCount is %d, but the WAL counts %d", stats.CheckpointCount, runner.target.CheckpointCount(runner.db))
-	case runner.config.CheckpointBytes != 0 && stats.CheckpointThresholdBytes != runner.config.CheckpointBytes:
-		runner.fail("DB.Stats: CheckpointThresholdBytes is %d, want the option value %d", stats.CheckpointThresholdBytes, runner.config.CheckpointBytes)
+	case stats.CheckpointThresholdBytes != runner.checkpointThreshold():
+		runner.fail("DB.Stats: CheckpointThresholdBytes is %d, want %d for %s", stats.CheckpointThresholdBytes, runner.checkpointThreshold(), runner.session)
 	case stats.WALPageCount == 0 && stats.WALSize == 0 && stats.FileSize != stats.DataSize:
 		runner.fail("DB.Stats: with an empty WAL, FileSize %d differs from DataSize %d", stats.FileSize, stats.DataSize)
 	}

@@ -555,6 +555,22 @@ func (fsys *FS) Corrupt(name string, start, end int64, bits int) bool {
 	return true
 }
 
+// Durable reports whether storage holds the cache view: no file has unsynced changes, and no name change waits for a directory sync.
+// A power failure then keeps every file exactly as the running process sees it.
+func (fsys *FS) Durable() bool {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	if len(fsys.names) != len(fsys.durableNames) {
+		return false
+	}
+	for name, node := range fsys.names {
+		if fsys.durableNames[name] != node || len(node.pending) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // Damaged reports whether some damage is not healed yet and no write replaced it.
 func (fsys *FS) Damaged() bool {
 	fsys.mu.Lock()

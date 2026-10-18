@@ -331,6 +331,11 @@ func (runner *runner) shortcut(mutation txMutation) bool {
 // batch runs several callbacks as one SyncFull WAL commit, like concurrent Update calls that share a commit.
 // It calls the batch executor directly, so the grouping does not depend on goroutine scheduling.
 func (runner *runner) batch() {
+	if runner.session.sync != kvlite.SyncFull {
+		// Group commit exists only in SyncFull.
+		runner.update()
+		return
+	}
 	type callback struct {
 		mutations []txMutation
 		abort     bool
@@ -601,6 +606,9 @@ func (runner *runner) reopen() {
 		return
 	}
 	runner.checkClosed(db)
+	if runner.config.OptionChanges && runner.optionsRand.Chance(disk.OneIn(4)) {
+		runner.openInvalid()
+	}
 	runner.corruptAtRest()
 	runner.openAndVerify(false)
 }
