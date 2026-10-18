@@ -1,7 +1,9 @@
 package kvlite
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -180,6 +182,10 @@ func (tx *Tx) prepareCommit() error {
 			delete(tx.store.dirty, id)
 		}
 	}
+	// Map order is random.
+	// Nodes that need new continuation IDs wait in growing, and the next loop allocates them in page-ID order.
+	// So the same changes always give the same file layout, and a simulation seed can replay it.
+	var growing []dirtyNode
 	for _, change := range tx.store.dirty {
 		// The final node stays unchanged through WAL encoding. Reuse its exact size.
 		change.final.CacheEncodedSize()
@@ -192,6 +198,10 @@ func (tx *Tx) prepareCommit() error {
 			previous = change.original.OverflowPages()
 		}
 		required := count - 1
+		if required > len(previous) {
+			growing = append(growing, change)
+			continue
+		}
 		var ids []page.ID
 		if required > 0 {
 			ids = make([]page.ID, required)
@@ -200,21 +210,34 @@ func (tx *Tx) prepareCommit() error {
 		if required != len(previous) {
 			allocation := tx.writableAllocation()
 			// Retired IDs stay allocated until every node's new IDs are assigned.
-			for _, id := range previous[min(required, len(previous)):] {
+			for _, id := range previous[required:] {
 				if err := allocation.retire(id); err != nil {
 					return err
 				}
 			}
-			for i := len(previous); i < required; i++ {
-				id, err := allocation.allocate(tx.meta.LastPage())
-				if err != nil {
-					return err
-				}
-				ids[i] = id
-				if id > tx.meta.LastPage() {
-					tx.meta.SetLastPage(id)
-					tx.metaDirty = true
-				}
+		}
+		change.final.SetOverflowPages(ids)
+	}
+	slices.SortFunc(growing, func(left, right dirtyNode) int {
+		return cmp.Compare(left.final.PageID(), right.final.PageID())
+	})
+	for _, change := range growing {
+		var previous []page.ID
+		if change.original != nil {
+			previous = change.original.OverflowPages()
+		}
+		ids := make([]page.ID, btree.NodePageCount(change.final, tx.meta.PageSize())-1)
+		copy(ids, previous)
+		allocation := tx.writableAllocation()
+		for i := len(previous); i < len(ids); i++ {
+			id, err := allocation.allocate(tx.meta.LastPage())
+			if err != nil {
+				return err
+			}
+			ids[i] = id
+			if id > tx.meta.LastPage() {
+				tx.meta.SetLastPage(id)
+				tx.metaDirty = true
 			}
 		}
 		change.final.SetOverflowPages(ids)

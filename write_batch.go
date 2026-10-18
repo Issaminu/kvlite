@@ -216,8 +216,9 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 					db.stats.PagesRetired += state.allocation.pagesRetired
 					db.stats.TailPagesReclaimed += state.allocation.tailPagesRemoved
 				}
-				for _, dirty := range state.dirty {
-					db.cacheWriteNode(dirty.final)
+				// Page-ID order makes cache eviction, and so the later file reads, repeatable.
+				for _, node := range nodes {
+					db.cacheWriteNode(node.Final)
 				}
 			}
 		}

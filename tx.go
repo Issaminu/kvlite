@@ -1,6 +1,9 @@
 package kvlite
 
 import (
+	"cmp"
+	"slices"
+
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
@@ -94,6 +97,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		return err
 	}
 	needsCheckpoint := false
+	var nodes []wal.NodeRecord
 	if db.memoryNodes != nil {
 		// Update holds the write lock until all node and allocation changes are visible.
 		// Retired nodes must leave memory before a later transaction can reuse their page IDs.
@@ -107,7 +111,8 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		if tx.allocationOwned {
 			retired = tx.allocation.walRetiredPages()
 		}
-		nodes, encodedMeta := makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
+		var encodedMeta []byte
+		nodes, encodedMeta = makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
 		var allocationPages []wal.AllocationRecord
 		if tx.allocationOwned {
 			allocationPages = tx.allocation.pageRecords()
@@ -129,12 +134,14 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		db.stats.PagesRetired += tx.allocation.pagesRetired
 		db.stats.TailPagesReclaimed += tx.allocation.tailPagesRemoved
 	}
-	for _, dirty := range tx.store.dirty {
-		if db.memoryNodes != nil {
+	if db.memoryNodes != nil {
+		for _, dirty := range tx.store.dirty {
 			db.memoryNodes[dirty.final.PageID()] = dirty.final
-		} else {
-			db.cacheWriteNode(dirty.final)
 		}
+	}
+	// Page-ID order makes cache eviction, and so the later file reads, repeatable.
+	for _, node := range nodes {
+		db.cacheWriteNode(node.Final)
 	}
 	if needsCheckpoint {
 		// The WAL is already durable. A checkpoint failure must not turn this
@@ -160,8 +167,9 @@ func (tx *Tx) writableAllocation() *allocationChanges {
 	return tx.allocation
 }
 
-// makeWALCommitData returns one original and final node pair for each changed data page.
+// makeWALCommitData returns one original and final node pair for each changed data page, in page-ID order.
 // Repeated node changes produce one node record.
+// The order does not depend on map order, so the same changes always write the same WAL bytes and fill the node cache in the same order.
 // When metadata changed, encodedMeta contains its new image. Otherwise, encodedMeta is nil.
 func makeWALCommitData(dirty map[page.ID]dirtyNode, meta *page.Meta, metaDirty bool) (nodes []wal.NodeRecord, encodedMeta []byte) {
 	if len(dirty) == 0 && !metaDirty {
@@ -172,6 +180,9 @@ func makeWALCommitData(dirty map[page.ID]dirtyNode, meta *page.Meta, metaDirty b
 	for _, dirtyNode := range dirty {
 		nodes = append(nodes, wal.NodeRecord{Original: dirtyNode.original, Final: dirtyNode.final})
 	}
+	slices.SortFunc(nodes, func(left, right wal.NodeRecord) int {
+		return cmp.Compare(left.Final.PageID(), right.Final.PageID())
+	})
 	if metaDirty {
 		meta.AdvanceGeneration()
 		meta.RefreshChecksum()
