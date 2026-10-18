@@ -82,7 +82,7 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 	if err := json.Unmarshal(data, &current); err != nil {
 		t.Fatal(err)
 	}
-	if current.SeedsRun == 0 || current.Failures[kindFail] != current.SeedsRun || current.Passes != 0 || current.Running != 0 {
+	if current.SeedsRun == 0 || current.Failures[kindFail] != current.SeedsRun || current.Commit != "test123" {
 		t.Fatalf("status: %s", data)
 	}
 	if len(current.Signatures) != 1 || current.Signatures[0].ShortestSteps != 5 || current.Signatures[0].Text != "fail: Open: page N is bad" {

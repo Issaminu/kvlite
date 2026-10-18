@@ -512,14 +512,6 @@ func (s *supervisor) status() status {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current := newStatus(s.current, s.counts, records, s.start, time.Now())
-	current.Machine = s.machine
-	current.Workers = s.opts.workers
-	current.Running = s.running
-	current.Stopping = s.stop.Err() != nil
-	current.ShrinksQueued = len(s.shrinks)
-	if s.shrinking != nil {
-		current.Shrinking = s.shrinking.id
-	}
 	current.BuildError = s.buildError
 	return current
 }
