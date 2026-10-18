@@ -33,9 +33,3 @@ func TestClassify(t *testing.T) {
 		}
 	}
 }
-
-func TestShellQuote(t *testing.T) {
-	if got := commandLine([]string{"GOMAXPROCS=1"}, "/bin/x.test", []string{"-test.run", "^TestBlackout$", "-blackout.seed=5"}); got != "GOMAXPROCS=1 /bin/x.test -test.run '^TestBlackout$' -blackout.seed=5" {
-		t.Fatalf("command line: %s", got)
-	}
-}

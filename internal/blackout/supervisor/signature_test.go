@@ -30,11 +30,8 @@ func TestFailSignatureDropsSeedStepAndNumbers(t *testing.T) {
 	if got := signatureText(kindFail, first, ""); got != want {
 		t.Fatalf("signature text:\n got %q\nwant %q", got, want)
 	}
-	if signatureID(signatureText(kindFail, first, "")) != signatureID(signatureText(kindFail, second, "")) {
-		t.Fatal("two reports that differ only in numbers have different signature IDs")
-	}
-	if id := signatureID(want); len(id) != 12 || strings.Trim(id, "0123456789abcdef") != "" {
-		t.Fatalf("signature ID %q is not 12 hexadecimal characters", id)
+	if signatureText(kindFail, second, "") != want {
+		t.Fatal("two reports that differ only in numbers have different signatures")
 	}
 }
 

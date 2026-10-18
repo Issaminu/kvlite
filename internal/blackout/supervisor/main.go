@@ -26,7 +26,7 @@ type options struct {
 	memoryLimit    string
 	lanes          string
 	duration       time.Duration
-	examples       int
+	reports        bool
 	alertCommand   string
 	follow         bool
 	followInterval time.Duration
@@ -52,15 +52,15 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 		flags.PrintDefaults()
 	}
 	flags.StringVar(&opts.repo, "repo", ".", "KVLite `checkout` to compile; follow mode changes it, so give the runner its own checkout")
-	flags.StringVar(&opts.out, "out", "blackout-results", "output `directory` for the status, the failure log, and the signatures")
+	flags.StringVar(&opts.out, "out", "blackout-results", "output `directory` for the status and the reports")
 	flags.StringVar(&opts.goTool, "go", "go", "Go `command` that compiles the test binary")
 	flags.IntVar(&opts.workers, "workers", runtime.NumCPU(), "number of worker processes that run at the same time")
 	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "time limit of one worker")
 	flags.StringVar(&opts.memoryLimit, "memlimit", "2GiB", "soft memory `limit` of one worker (GOMEMLIMIT)")
 	flags.StringVar(&opts.lanes, "lanes", "default=80:steps=300,long=20:steps=3000", "lanes as name=weight:steps=N, with a comma between two lanes")
 	flags.DurationVar(&opts.duration, "duration", 0, "stop after this time; zero runs until a signal")
-	flags.IntVar(&opts.examples, "examples", 10, "maximum number of example folders for each signature")
-	flags.StringVar(&opts.alertCommand, "alert-command", "", "`command` to run for a new signature, with the signature ID and the first line as arguments")
+	flags.BoolVar(&opts.reports, "reports", false, "write the full report of each failed seed to reports/SEED.txt; a replay of the seed gives the same report")
+	flags.StringVar(&opts.alertCommand, "alert-command", "", "`command` to run for a new error, with the seed and the first line of the report as arguments")
 	flags.BoolVar(&opts.follow, "follow", false, "fetch the remote and check out each new commit of the branch in -repo")
 	flags.DurationVar(&opts.followInterval, "follow-interval", 5*time.Minute, "time between two fetches in follow mode")
 	flags.StringVar(&opts.remote, "remote", "origin", "git remote for follow mode")
@@ -78,8 +78,6 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 		return opts, nil, errors.New("-workers must be positive")
 	case opts.timeout <= 0:
 		return opts, nil, errors.New("-timeout must be positive")
-	case opts.examples < 0:
-		return opts, nil, errors.New("-examples must not be negative")
 	case opts.followInterval <= 0:
 		return opts, nil, errors.New("-follow-interval must be positive")
 	case !memoryLimitPattern.MatchString(opts.memoryLimit):

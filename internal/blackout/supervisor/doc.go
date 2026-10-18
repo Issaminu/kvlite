@@ -37,42 +37,41 @@
 // The only key is steps, the number of safety-phase steps.
 // Each new seed picks a lane at random, in proportion to the weights.
 //
-// # Signatures
+// # Errors
 //
-// A signature groups the failures that look the same.
-// The signature of a failed check is its kind and the first line of the report, without the seed and step prefix.
+// An error groups the failures that look the same.
+// The error of a failed check is its kind and the first line of the report, without the seed and step prefix.
 // Each decimal number in it becomes N, and each hexadecimal run of 6 or more characters becomes H.
-// The signature of a panic or a timeout is its kind and the first 3 stack frames in KVLite, without line numbers and addresses.
-// The signature ID is the first 12 hexadecimal characters of the SHA-256 hash of the signature text.
+// The error of a panic or a timeout is its kind and the first 3 stack frames in KVLite, without line numbers and addresses.
+// Errors help triage only: one cause can show several messages, and two causes can show the same message.
 //
-// Signatures help triage only.
-// One cause can show several messages, and two causes can show the same message.
-//
-// The supervisor shrinks the first example of each new signature.
-// It runs the same seed with fewer steps and does a binary search for the smallest step count that fails with the same signature.
+// The supervisor shrinks the first seed of each new error.
+// It runs the same seed with fewer steps and does a binary search for the smallest step count that fails with the same error.
 // The safety phase of a shorter run is a prefix of the longer run, but the liveness phase starts earlier, so the failure can change.
-// The search accepts only a step count that gives the same signature, and it finds a local minimum only.
+// The search accepts only a step count that gives the same error, and it finds a local minimum only.
+// The shorter run then becomes the first seed of the error.
 // At most one shrink runs at a time, and its runs use the same worker slots as the new seeds.
 //
-// When a new signature appears, the supervisor runs -alert-command with the signature ID and the first line as arguments.
-// The command also gets the environment variable BLACKOUT_SIGNATURE_DIR.
+// When a new error appears, the supervisor runs -alert-command with the seed and the first line of the report as arguments.
 // The supervisor does not wait for the command.
 //
 // # Output
 //
-// The -out directory has this layout:
+// status.json is the result of the runs of the current commit, rewritten every few seconds.
+// It holds the commit, the platform, the run and failure counts, and each error with every seed that failed with it.
+// For each seed, it holds the steps of the run, the step of the failure, and the message.
+// Replay a seed at the commit of the status with:
 //
-//	status.json                          the counters, rewritten every few seconds
-//	failures.jsonl                       one JSON object for each failed seed, with a replay command
-//	bin/blackout-COMMIT.test             the test binary of the current commit
-//	tmp/                                 the working directories of the running workers
-//	signatures/ID/signature.json         the signature text, the counts, and the shortest example
-//	signatures/ID/seed-N/report.txt      the full report, or the output of the worker
-//	signatures/ID/seed-N/result.json     the log entry and the JSON result of the worker
+//	go test -run 'TestBlackout$' -blackout.seed=SEED -blackout.steps=STEPS -blackout.trace=200 -v .
+//
+// A new supervisor, or a new commit in follow mode, renames the old status to status-COMMIT.json and starts a new status.
+// The -out directory also has bin/ (the test binary of the current commit) and tmp/ (the working directories of the running workers).
+// With -reports, the supervisor also writes the full report of each failed seed to reports/SEED.txt.
+// A replay gives the same report, so the reports are off by default.
 //
 // COMMIT is the short hash of HEAD, with "-dirty" when the checkout has changes.
 // A run of a dirty checkout does not replay exactly from its commit.
-// The JSON files write seeds as strings, because many JSON readers lose the precision of integers larger than 2^53.
+// Seeds are JSON strings, because many JSON readers lose the precision of integers larger than 2^53.
 //
 // # Follow mode
 //

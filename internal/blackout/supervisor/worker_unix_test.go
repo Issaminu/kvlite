@@ -24,8 +24,9 @@ const (
 
 // TestMain lets the test binary play a worker or the alert command: the standard helper-process pattern.
 func TestMain(m *testing.M) {
-	if dir := os.Getenv("BLACKOUT_SIGNATURE_DIR"); dir != "" {
-		line := strings.Join(append(os.Args[1:], dir), " | ") + "\n"
+	// The alert command gets a seed and a line, and no test flag.
+	if os.Getenv(alertFileEnv) != "" && len(os.Args) == 3 && !strings.HasPrefix(os.Args[1], "-") {
+		line := strings.Join(os.Args[1:], " | ") + "\n"
 		file, err := os.OpenFile(os.Getenv(alertFileEnv), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 		if err != nil {
 			os.Exit(1)
@@ -133,9 +134,6 @@ func TestRunWorkerClassifiesHelperProcesses(t *testing.T) {
 		outcome := runHelper(t, context.Background(), "pass", 30*time.Second)
 		if outcome.Kind != kindPass || outcome.Result == nil || outcome.Result.Recoveries != 3 || outcome.FirstLine != "" {
 			t.Fatalf("outcome: %+v", outcome)
-		}
-		if !strings.Contains(outcome.Command, "GOMAXPROCS=1 GOMEMLIMIT=256MiB ") || !strings.Contains(outcome.Command, "-blackout.seed=42") {
-			t.Fatalf("command line: %s", outcome.Command)
 		}
 	})
 	t.Run("fail", func(t *testing.T) {

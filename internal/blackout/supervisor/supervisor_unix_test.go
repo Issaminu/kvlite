@@ -22,7 +22,7 @@ func (writer testWriter) Write(data []byte) (int, error) {
 }
 
 // TestSupervisorRecordsShrinksAndAlerts runs the loop of the supervisor with the test binary as the worker.
-// Every run of 5 or more steps fails at step 4, so the loop must log each seed, shrink the signature to 5 steps, and alert once.
+// Every run of 5 or more steps fails at step 4, so the status must list each failed seed, the shrink must make one seed 5 steps long, and the alert must run once.
 func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -38,11 +38,15 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 		timeout:      30 * time.Second,
 		memoryLimit:  "256MiB",
 		lanes:        "default=1:steps=20",
-		examples:     3,
+		reports:      true,
 		alertCommand: executable,
 	}
 	lanes, err := parseLanes(opts.lanes)
 	if err != nil {
+		t.Fatal(err)
+	}
+	// A status of an earlier supervisor must be kept, not overwritten.
+	if err := os.WriteFile(filepath.Join(out, "status.json"), []byte(`{"commit": "old1234"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	stop, stopCancel := context.WithCancel(context.Background())
@@ -52,22 +56,25 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 	if err := s.prepare(); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := os.Stat(filepath.Join(out, "status-old1234.json")); err != nil {
+		t.Fatalf("the status of the earlier supervisor: %v", err)
+	}
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		s.serve(&build{Commit: "test123", Binary: executable, GoVersion: "go-test"}, nil, nil)
+		s.serve(&build{Commit: "test123", Binary: executable, GoVersion: "go-test", GOOS: "testos", GOARCH: "testarch"}, nil, nil)
 	}()
 
 	deadline := time.Now().Add(20 * time.Second)
 	for {
-		records := s.failures.snapshot()
-		if len(records) == 1 && records[0].Shrunk {
+		errors := s.errors.snapshot()
+		if len(errors) == 1 && errors[0].Seeds[0].Steps == 5 {
 			break
 		}
 		if time.Now().After(deadline) {
 			stopCancel()
 			<-served
-			t.Fatalf("the shrink did not complete: %+v", records)
+			t.Fatalf("the shrink did not complete: %+v", errors)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -82,28 +89,20 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 	if err := json.Unmarshal(data, &current); err != nil {
 		t.Fatal(err)
 	}
-	if current.SeedsRun == 0 || current.Failures[kindFail] != current.SeedsRun || current.Commit != "test123" {
+	if current.Runs == 0 || current.Failures[kindFail] != current.Runs || current.Commit != "test123" || !strings.HasPrefix(current.Platform, "testos/testarch, ") {
 		t.Fatalf("status: %s", data)
 	}
-	if len(current.Signatures) != 1 || current.Signatures[0].ShortestSteps != 5 || current.Signatures[0].Text != "fail: Open: page N is bad" {
-		t.Fatalf("status signatures: %+v", current.Signatures)
+	// The shrink runs with the same error do not count, so the error has one seed for each run.
+	if len(current.Errors) != 1 || current.Errors[0].Error != "fail: Open: page N is bad" || current.Errors[0].Count != current.Runs || len(current.Errors[0].Seeds) != current.Runs {
+		t.Fatalf("status errors: %s", data)
 	}
-	id := current.Signatures[0].ID
-
-	// The shrink runs with the same signature do not go into the log, so the log has one line for each new seed.
-	logged, err := os.ReadFile(filepath.Join(out, "failures.jsonl"))
-	if err != nil {
-		t.Fatal(err)
+	shortest := current.Errors[0].Seeds[0]
+	if shortest.Steps != 5 || shortest.FailedAt == nil || *shortest.FailedAt != 4 || !strings.HasPrefix(shortest.Message, "Open: page ") {
+		t.Fatalf("the shrunk seed: %+v", shortest)
 	}
-	if lines := strings.Count(string(logged), "\n"); lines != current.SeedsRun {
-		t.Fatalf("failures.jsonl has %d lines for %d failed seeds", lines, current.SeedsRun)
-	}
-	record := readSignature(t, out, id)
-	if record.Shortest.Steps != 5 || !record.Shrunk || record.Examples != min(3, record.Count) || record.Count != current.SeedsRun {
-		t.Fatalf("signature.json: %+v", record)
-	}
-	if !strings.Contains(record.Shortest.Replay, "git checkout test123 && go test -run 'TestBlackout$' -blackout.seed=") {
-		t.Fatalf("replay command: %s", record.Shortest.Replay)
+	reports, err := filepath.Glob(filepath.Join(out, "reports", "*.txt"))
+	if err != nil || len(reports) != current.Runs {
+		t.Fatalf("reports: %d files for %d failed runs, %v", len(reports), current.Runs, err)
 	}
 
 	alerted, err := os.ReadFile(alerts)
@@ -111,7 +110,7 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := strings.Split(strings.TrimSpace(string(alerted)), "\n")
-	if len(lines) != 1 || !strings.HasPrefix(lines[0], id+" | blackout seed ") || !strings.HasSuffix(lines[0], filepath.Join(out, "signatures", id)) {
+	if len(lines) != 1 || !strings.Contains(lines[0], " | blackout seed ") {
 		t.Fatalf("alerts: %q", lines)
 	}
 	if left, _ := os.ReadDir(filepath.Join(out, "tmp")); len(left) != 0 {

@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"regexp"
 	"strconv"
 	"strings"
@@ -62,12 +60,6 @@ func signatureText(kind, firstLine, output string) string {
 		text = kind + ": " + normalize(firstLine)
 	}
 	return truncate(text, maxFirstLine)
-}
-
-// signatureID returns the first 12 hexadecimal characters of the SHA-256 hash of text.
-func signatureID(text string) string {
-	sum := sha256.Sum256([]byte(text))
-	return hex.EncodeToString(sum[:])[:12]
 }
 
 // stackFrames returns the names of the first limit functions of modulePath in a Go traceback.

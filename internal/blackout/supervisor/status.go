@@ -1,9 +1,7 @@
 package main
 
 import (
-	"cmp"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 )
@@ -15,65 +13,50 @@ const (
 	summaryInterval = 30 * time.Second
 )
 
-// counters counts the results of the new seeds.
+// counters counts the results of the new seeds of the current commit.
 // The runs of a shrink do not count.
 type counters struct {
-	Seeds    int
+	Runs     int
 	Failures map[string]int // failed seeds for each kind
 }
 
 // add counts one run.
 func (counts *counters) add(outcome runOutcome) {
-	counts.Seeds++
+	counts.Runs++
 	if outcome.Kind != kindPass {
 		counts.Failures[outcome.Kind]++
 	}
 }
 
-// status is the status.json file: what a person needs to see at a glance.
-// The passes and the rate follow from the other fields, and the failure log keeps the details of each failure.
+// status is the status.json file: the result of the runs of the current commit, with every seed that failed.
+// Replay a seed at the commit with: go test -run 'TestBlackout$' -blackout.seed=SEED -blackout.steps=STEPS -blackout.trace=200 -v .
 type status struct {
-	Commit     string            `json:"commit"` // with "-dirty" when the checkout had changes
-	Time       string            `json:"time"`   // the time of this write; an old time means that the runner stopped
-	Uptime     string            `json:"uptime"`
-	SeedsRun   int               `json:"seeds_run"`
-	Failures   map[string]int    `json:"failures"`
-	BuildError string            `json:"build_error,omitempty"`
-	Signatures []signatureStatus `json:"signatures"`
+	Commit     string         `json:"commit"`   // with "-dirty" when the checkout had changes
+	Platform   string         `json:"platform"` // a replay is exact only with the same operating-system page size
+	Time       string         `json:"time"`     // the time of this write; an old time means that the runner stopped
+	Uptime     string         `json:"uptime"`   // since the first run of this commit
+	Runs       int            `json:"runs"`     // runs of new seeds; shrink runs are not counted
+	Failures   map[string]int `json:"failures"`
+	BuildError string         `json:"build_error,omitempty"`
+	Errors     []errorRecord  `json:"errors"` // the most frequent first; a shrink run that fails with a different error adds a seed here too
 }
 
-// signatureStatus is one signature in status.json. The text starts with the kind of the failure.
-type signatureStatus struct {
-	ID            string `json:"id"`
-	Count         int    `json:"count"`
-	ShortestSteps int    `json:"shortest_steps"`
-	Text          string `json:"text"`
-}
-
-// newStatus makes a status from the counters and the signatures.
-// The signature with the largest count comes first.
-func newStatus(current *build, counts counters, records []signatureRecord, start, now time.Time) status {
+// newStatus makes a status from the counters and the errors.
+func newStatus(current *build, platform string, counts counters, errors []errorRecord, start, now time.Time) status {
 	result := status{
-		Commit:     current.Commit,
-		Time:       now.UTC().Format(time.RFC3339),
-		Uptime:     now.Sub(start).Round(time.Second).String(),
-		SeedsRun:   counts.Seeds,
-		Failures:   make(map[string]int),
-		Signatures: []signatureStatus{},
+		Commit:   current.Commit,
+		Platform: platform,
+		Time:     now.UTC().Format(time.RFC3339),
+		Uptime:   now.Sub(start).Round(time.Second).String(),
+		Runs:     counts.Runs,
+		Failures: make(map[string]int),
+		Errors:   errors,
 	}
 	if current.Dirty {
 		result.Commit += "-dirty"
 	}
 	for _, kind := range []string{kindFail, kindPanic, kindTimeout, kindError} {
 		result.Failures[kind] = counts.Failures[kind]
-	}
-	slices.SortFunc(records, func(a, b signatureRecord) int {
-		return cmp.Or(cmp.Compare(b.Count, a.Count), cmp.Compare(a.ID, b.ID))
-	})
-	for _, record := range records {
-		result.Signatures = append(result.Signatures, signatureStatus{
-			ID: record.ID, Count: record.Count, ShortestSteps: record.Shortest.Steps, Text: record.Text,
-		})
 	}
 	return result
 }
@@ -84,5 +67,5 @@ func (current status) summary() string {
 	for _, kind := range []string{kindFail, kindPanic, kindTimeout, kindError} {
 		fmt.Fprintf(&failures, " %s %d", kind, current.Failures[kind])
 	}
-	return fmt.Sprintf("%s up %s: seeds %d,%s, signatures %d", current.Commit, current.Uptime, current.SeedsRun, failures.String(), len(current.Signatures))
+	return fmt.Sprintf("%s up %s: runs %d,%s, errors %d", current.Commit, current.Uptime, current.Runs, failures.String(), len(current.Errors))
 }

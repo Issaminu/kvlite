@@ -4,6 +4,7 @@ import (
 	"context"
 	cryptorand "crypto/rand"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,20 +25,17 @@ const (
 	gitTimeout = 2 * time.Minute
 	// alertTimeout is the time limit of the alert command.
 	alertTimeout = time.Minute
-	// shrinkLane is the lane name of a failure that a shrink found with a different signature.
-	shrinkLane = "shrink"
 )
 
 // errStopped is the error of a shrink run that the supervisor stopped.
 var errStopped = errors.New("the supervisor stops")
 
-// supervisor runs seeds, records the failures, and shrinks new signatures.
+// supervisor runs seeds, records the failures, and shrinks new errors.
 type supervisor struct {
 	opts       options
 	lanes      []lane
-	failures   *failureLog
+	errors     *errorLog
 	logger     *log.Logger
-	machine    string
 	pageSize   int
 	start      time.Time
 	slots      chan struct{}      // one token for each running worker
@@ -56,25 +55,21 @@ type supervisor struct {
 	buildError string
 }
 
-// shrinkJob is a request to shrink the first example of a new signature.
+// shrinkJob is a request to shrink the first seed of a new error.
 type shrinkJob struct {
 	build *build
-	id    string
+	text  string // the signature text of the error
 	seed  uint64
 	steps int
 	hint  int
 }
 
 func newSupervisor(opts options, lanes []lane, stop context.Context, stopCancel context.CancelFunc, hard context.Context) *supervisor {
-	machine, err := os.Hostname()
-	if err != nil {
-		machine = "unknown"
-	}
 	return &supervisor{
 		opts:       opts,
 		lanes:      lanes,
+		errors:     newErrorLog(),
 		logger:     log.New(os.Stderr, "blackout ", log.LstdFlags),
-		machine:    machine,
 		pageSize:   os.Getpagesize(),
 		start:      time.Now(),
 		slots:      make(chan struct{}, opts.workers),
@@ -107,21 +102,41 @@ func (s *supervisor) run() error {
 	return nil
 }
 
-// prepare makes the output directories and opens the failure log.
+// prepare makes the output directories and keeps the status of an earlier supervisor.
 func (s *supervisor) prepare() error {
 	temporary := filepath.Join(s.opts.out, "tmp")
 	// Remove the working directories that an earlier supervisor left when it died.
 	if err := os.RemoveAll(temporary); err != nil {
 		return err
 	}
-	for _, dir := range []string{temporary, filepath.Join(s.opts.out, "bin")} {
+	dirs := []string{temporary, filepath.Join(s.opts.out, "bin")}
+	if s.opts.reports {
+		dirs = append(dirs, filepath.Join(s.opts.out, "reports"))
+	}
+	for _, dir := range dirs {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
 		}
 	}
-	var err error
-	s.failures, err = openFailureLog(s.opts.out, s.opts.examples)
-	return err
+	return s.archiveStatus()
+}
+
+// archiveStatus renames status.json to status-COMMIT.json.
+// So a new run of the supervisor, or a new commit, starts a new status and keeps the old one.
+func (s *supervisor) archiveStatus() error {
+	path := filepath.Join(s.opts.out, "status.json")
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var old status
+	if err := json.Unmarshal(data, &old); err != nil || old.Commit == "" {
+		old.Commit = "unknown"
+	}
+	return os.Rename(path, filepath.Join(s.opts.out, "status-"+old.Commit+".json"))
 }
 
 // serve runs seeds with the test binary of current until the stop context is done.
@@ -159,6 +174,17 @@ func (s *supervisor) serve(current *build, follow *follower, ticks <-chan time.T
 			s.setBuild(current, err)
 			continue
 		}
+		// The status belongs to one commit: keep the status of the old commit, and start a new one.
+		s.writeStatus()
+		if err := s.archiveStatus(); err != nil {
+			s.logf("keep the status of the old commit: %v", err)
+		}
+		s.mu.Lock()
+		s.counts = counters{Failures: make(map[string]int)}
+		s.start = time.Now()
+		s.shrinks = nil
+		s.mu.Unlock()
+		s.errors.reset()
 		current = next
 		s.setBuild(current, nil)
 		s.pruneBinaries()
@@ -229,7 +255,7 @@ func (s *supervisor) runSeeds(current *build, follow *follower, ticks <-chan tim
 		go func() {
 			defer s.workers.Done()
 			outcome, err := s.execute(current, seed, chosen.Steps)
-			s.handleSeed(current, chosen.Name, outcome, err)
+			s.handleSeed(current, outcome, err)
 		}()
 	}
 }
@@ -299,7 +325,7 @@ func (s *supervisor) stopped(outcome runOutcome) bool {
 }
 
 // handleSeed counts the result of a new seed and records a failure.
-func (s *supervisor) handleSeed(current *build, laneName string, outcome runOutcome, err error) {
+func (s *supervisor) handleSeed(current *build, outcome runOutcome, err error) {
 	if err != nil {
 		s.logf("seed %d: %v", outcome.Seed, err)
 		return
@@ -311,52 +337,32 @@ func (s *supervisor) handleSeed(current *build, laneName string, outcome runOutc
 	s.counts.add(outcome)
 	s.mu.Unlock()
 	if outcome.Kind != kindPass {
-		s.recordFailure(current, laneName, outcome)
+		s.recordFailure(current, outcome)
 	}
 }
 
-// recordFailure writes a failure to the log and returns its signature ID.
-// For a new signature, it queues a shrink and runs the alert command.
-func (s *supervisor) recordFailure(current *build, laneName string, outcome runOutcome) string {
+// recordFailure adds a failed run to the status and returns the text of its error.
+// With -reports, it writes the full report of the run to reports/SEED.txt.
+// For a new error, it queues a shrink and runs the alert command.
+func (s *supervisor) recordFailure(current *build, outcome runOutcome) string {
 	text := signatureText(outcome.Kind, outcome.FirstLine, outcome.Output)
-	entry := failureEntry{
-		Time:          time.Now().UTC().Format(time.RFC3339),
-		Seed:          outcome.Seed,
-		Lane:          laneName,
-		Steps:         outcome.Steps,
-		Kind:          outcome.Kind,
-		FirstLine:     outcome.FirstLine,
-		Signature:     signatureID(text),
-		SignatureText: text,
-		Commit:        current.Commit,
-		Dirty:         current.Dirty,
-		GoVersion:     current.GoVersion,
-		GOOS:          current.GOOS,
-		GOARCH:        current.GOARCH,
-		PageSize:      s.pageSize,
-		Machine:       s.machine,
-		Seconds:       outcome.Elapsed.Seconds(),
-		Exit:          outcome.Exit,
-		Command:       outcome.Command,
-		Replay:        replayCommand(current.Commit, outcome.Seed, outcome.Steps),
-	}
-	if result := outcome.Result; result != nil {
-		entry.GoVersion, entry.GOOS, entry.GOARCH, entry.PageSize = result.GoVersion, result.GOOS, result.GOARCH, result.PageSize
-	}
-	record, isNew, err := s.failures.record(entry, outcome.Report, outcome.RawResult)
-	if err != nil {
-		s.logf("write the failure log: %v", err)
+	isNew := s.errors.add(text, seedFrom(outcome))
+	if s.opts.reports {
+		path := filepath.Join(s.opts.out, "reports", fmt.Sprintf("%d.txt", outcome.Seed))
+		if err := os.WriteFile(path, []byte(outcome.Report), 0o644); err != nil {
+			s.logf("write the report of seed %d: %v", outcome.Seed, err)
+		}
 	}
 	marker := ""
 	if isNew {
-		marker = ", new"
+		marker = " [new error]"
 	}
-	s.logf("seed %d (lane %s, %d steps): %s [signature %s%s]", outcome.Seed, laneName, outcome.Steps, outcome.FirstLine, entry.Signature, marker)
+	s.logf("seed %d (%d steps): %s%s", outcome.Seed, outcome.Steps, outcome.FirstLine, marker)
 	if isNew {
-		s.queueShrink(shrinkJob{build: current, id: entry.Signature, seed: outcome.Seed, steps: outcome.Steps, hint: failedStep(outcome.FirstLine) + 1})
-		s.alert(record)
+		s.queueShrink(shrinkJob{build: current, text: text, seed: outcome.Seed, steps: outcome.Steps, hint: failedStep(outcome.FirstLine) + 1})
+		s.alert(outcome)
 	}
-	return entry.Signature
+	return text
 }
 
 // queueShrink adds a shrink job to the queue.
@@ -407,7 +413,7 @@ func (s *supervisor) nextShrink() (shrinkJob, bool) {
 	}
 }
 
-// shrink searches for the smallest step count that fails with the signature of job.
+// shrink searches for the smallest step count that fails with the error of job.
 // Each try waits for a free worker slot, like a new seed.
 func (s *supervisor) shrink(job shrinkJob) {
 	try := func(ctx context.Context, seed uint64, steps int) (string, error) {
@@ -430,26 +436,24 @@ func (s *supervisor) shrink(job shrinkJob) {
 		if outcome.Kind == kindPass {
 			return "", nil
 		}
-		id := signatureID(signatureText(outcome.Kind, outcome.FirstLine, outcome.Output))
-		if id != job.id {
-			// A different failure is still a failure of the code, so it goes into the log.
-			return s.recordFailure(job.build, shrinkLane, outcome), nil
+		if s.currentBuild() != job.build {
+			// The runner changed to a new commit, and the status of the old commit is closed.
+			return "", errStopped
 		}
-		run := shortestRun{Seed: seed, Steps: steps, Commit: job.build.Commit, Replay: replayCommand(job.build.Commit, seed, steps)}
-		if err := s.failures.shorten(id, run); err != nil {
-			s.logf("write signature %s: %v", id, err)
+		text := signatureText(outcome.Kind, outcome.FirstLine, outcome.Output)
+		if text != job.text {
+			// A different failure is still a failure of the code, so it goes into the status.
+			return s.recordFailure(job.build, outcome), nil
 		}
-		return id, nil
+		s.errors.shorten(text, seedFrom(outcome))
+		return text, nil
 	}
-	steps, err := shrinkSteps(s.stop, try, job.seed, job.steps, job.hint, job.id)
+	steps, err := shrinkSteps(s.stop, try, job.seed, job.steps, job.hint, job.text)
 	if err != nil {
-		s.logf("shrink of signature %s stopped at %d steps: %v", job.id, steps, err)
+		s.logf("shrink of seed %d stopped at %d steps: %v", job.seed, steps, err)
 		return
 	}
-	if err := s.failures.markShrunk(job.id); err != nil {
-		s.logf("write signature %s: %v", job.id, err)
-	}
-	s.logf("shrank signature %s from %d to %d steps: %s", job.id, job.steps, steps, replayCommand(job.build.Commit, job.seed, steps))
+	s.logf("shrank seed %d from %d to %d steps: %s", job.seed, job.steps, steps, job.text)
 }
 
 // pruneBinaries removes the test binaries that neither the current build nor a shrink uses.
@@ -477,8 +481,8 @@ func (s *supervisor) pruneBinaries() {
 	}
 }
 
-// alert runs the alert command for a new signature and does not wait for it.
-func (s *supervisor) alert(record signatureRecord) {
+// alert runs the alert command for a new error, with the seed and the first line of its report, and does not wait for it.
+func (s *supervisor) alert(outcome runOutcome) {
 	if s.opts.alertCommand == "" {
 		return
 	}
@@ -487,10 +491,9 @@ func (s *supervisor) alert(record signatureRecord) {
 		defer s.background.Done()
 		ctx, cancel := context.WithTimeout(context.Background(), alertTimeout)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, s.opts.alertCommand, record.ID, record.FirstLine)
-		cmd.Env = append(os.Environ(), "BLACKOUT_SIGNATURE_DIR="+s.failures.signatureDir(record.ID))
+		cmd := exec.CommandContext(ctx, s.opts.alertCommand, strconv.FormatUint(outcome.Seed, 10), outcome.FirstLine)
 		if output, err := cmd.CombinedOutput(); err != nil {
-			s.logf("alert command for signature %s: %v: %s", record.ID, err, strings.TrimSpace(string(output)))
+			s.logf("alert command for seed %d: %v: %s", outcome.Seed, err, strings.TrimSpace(string(output)))
 		}
 	}()
 }
@@ -508,12 +511,20 @@ func (s *supervisor) setBuild(current *build, err error) {
 
 // status returns the current status.
 func (s *supervisor) status() status {
-	records := s.failures.snapshot()
+	errors := s.errors.snapshot()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	current := newStatus(s.current, s.counts, records, s.start, time.Now())
+	platform := fmt.Sprintf("%s/%s, %d-byte operating-system pages", s.current.GOOS, s.current.GOARCH, s.pageSize)
+	current := newStatus(s.current, platform, s.counts, errors, s.start, time.Now())
 	current.BuildError = s.buildError
 	return current
+}
+
+// currentBuild returns the test binary of the current commit.
+func (s *supervisor) currentBuild() *build {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.current
 }
 
 // writeStatus writes status.json.

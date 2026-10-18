@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -70,11 +69,8 @@ type runOutcome struct {
 	Report    string        // full report of a failed check, or the captured output
 	Output    string        // captured output of the worker
 	Result    *workerResult // nil when the worker wrote no JSON result
-	RawResult []byte        // JSON result as the worker wrote it
 	Exit      string        // exit status of the process
 	Signaled  bool          // a signal that the supervisor did not send stopped the process
-	Elapsed   time.Duration
-	Command   string // command line of the run
 }
 
 // workerArgs returns the arguments of the test binary for one run.
@@ -110,7 +106,6 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 	}
 	args := workerArgs(spec.Seed, spec.Steps, resultPath)
 	env := append(workerEnv(spec.MemoryLimit, dir), spec.Env...)
-	outcome.Command = commandLine(env[:3], spec.Binary, args)
 
 	cmd := exec.Command(spec.Binary, args...)
 	cmd.Dir = dir
@@ -118,7 +113,6 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 	cmd.Stdout = outputFile
 	cmd.Stderr = outputFile
 	setProcessGroup(cmd)
-	start := time.Now()
 	if err := cmd.Start(); err != nil {
 		outputFile.Close()
 		return outcome, fmt.Errorf("start the worker: %w", err)
@@ -139,14 +133,13 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 		killProcess(cmd)
 		waitErr = <-done
 	}
-	outcome.Elapsed = time.Since(start)
 	outputFile.Close()
 	if canceled {
 		outcome.Kind = kindCanceled
 		return outcome, nil
 	}
 	outcome.Output = readCapped(outputPath)
-	outcome.RawResult, outcome.Result = readResult(resultPath)
+	outcome.Result = readResult(resultPath)
 	if cmd.ProcessState != nil {
 		outcome.Exit = cmd.ProcessState.String()
 		outcome.Signaled = !timedOut && cmd.ProcessState.ExitCode() == -1
@@ -222,32 +215,14 @@ func readCapped(path string) string {
 }
 
 // readResult reads the JSON result of a worker, or returns nil when there is no valid result.
-func readResult(path string) ([]byte, *workerResult) {
+func readResult(path string) *workerResult {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, nil
+		return nil
 	}
 	var result workerResult
 	if err := json.Unmarshal(data, &result); err != nil {
-		return nil, nil
+		return nil
 	}
-	return data, &result
-}
-
-// commandLine formats a run as a shell command.
-func commandLine(env []string, binary string, args []string) string {
-	parts := append([]string{}, env...)
-	parts = append(parts, shellQuote(binary))
-	for _, arg := range args {
-		parts = append(parts, shellQuote(arg))
-	}
-	return strings.Join(parts, " ")
-}
-
-// shellQuote quotes text for a POSIX shell when it has characters that the shell changes.
-func shellQuote(text string) string {
-	if text != "" && !strings.ContainsAny(text, " \t\n'\"\\$`^*?[]{}()<>|&;#~!") {
-		return text
-	}
-	return "'" + strings.ReplaceAll(text, "'", `'\''`) + "'"
+	return &result
 }
