@@ -8,12 +8,16 @@ package kvlite_test
 
 import (
 	"flag"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Issaminu/kvlite"
 	"github.com/Issaminu/kvlite/internal/blackout"
 	"github.com/Issaminu/kvlite/internal/blackout/disk"
+	"github.com/Issaminu/kvlite/internal/fileio"
 )
 
 var (
@@ -23,6 +27,7 @@ var (
 	blackoutSteps       = flag.Int("blackout.steps", blackout.DefaultSteps, "safety-phase steps per Blackout run")
 	blackoutTrace       = flag.Int("blackout.trace", 0, "with -blackout.seed, print this many of the last steps and storage events on failure")
 	blackoutMaxFailures = flag.Int("blackout.max-failures", 3, "stop the seed range after this many failed seeds")
+	blackoutDeepCheck   = flag.Bool("blackout.deep-check", false, "run the slow checks after every step: the process-crash image and the memory database")
 )
 
 // target connects the Blackout engine to the internals that export_test.go exports.
@@ -30,6 +35,7 @@ var target = blackout.Target{
 	Open:            kvlite.BlackoutOpen,
 	Checkpoint:      kvlite.BlackoutCheckpoint,
 	CheckPages:      kvlite.BlackoutCheckPages,
+	BucketNames:     kvlite.BlackoutBucketNames,
 	CheckpointCount: kvlite.BlackoutCheckpointCount,
 	Abandon:         kvlite.BlackoutAbandon,
 	Quiesce:         kvlite.BlackoutQuiesce,
@@ -49,6 +55,7 @@ func TestBlackout(t *testing.T) {
 			Steps:      *blackoutSteps,
 			KeepTrace:  *blackoutTrace > 0,
 			TraceLines: *blackoutTrace,
+			DeepCheck:  *blackoutDeepCheck,
 		})
 		t.Logf("seed %d config: %s\n%s", result.Seed, result.Config, result.Stats)
 		if result.Err != nil {
@@ -63,7 +70,7 @@ func TestBlackout(t *testing.T) {
 	var total blackout.Stats
 	failures := 0
 	for index := range seeds {
-		result := blackout.Run(target, *blackoutStart+uint64(index), blackout.Settings{Steps: *blackoutSteps})
+		result := blackout.Run(target, *blackoutStart+uint64(index), blackout.Settings{Steps: *blackoutSteps, DeepCheck: *blackoutDeepCheck})
 		total.Add(result.Stats)
 		if result.Err != nil {
 			t.Error(result.Err)
@@ -97,6 +104,47 @@ func TestBlackoutIsDeterministic(t *testing.T) {
 		}
 		if first.TraceHash != second.TraceHash {
 			t.Errorf("seed %d: trace hashes differ", seed)
+		}
+	}
+}
+
+// TestBlackoutCoverage runs seeds and requires that they reach every important case: each operation, change, scan, contract, outcome, fault, and option combination.
+// A change to Blackout that makes a case unreachable fails this test, even when every seed passes.
+// The test ignores failed seeds: TestBlackout reports them.
+// It is a test of Blackout itself.
+func TestBlackoutCoverage(t *testing.T) {
+	if testing.Short() {
+		t.Skip("the coverage test runs many seeds")
+	}
+	const seeds = 96
+	results := make([]blackout.Result, 0, seeds)
+	for seed := uint64(1); seed <= seeds; seed++ {
+		results = append(results, blackout.Run(target, seed, blackout.Settings{Steps: 150}))
+	}
+	for _, missing := range blackout.MissingCoverage(results) {
+		t.Errorf("%d seeds did not reach: %s", seeds, missing)
+	}
+}
+
+// TestBlackoutWatchdogStopsAHang runs a step that never ends in a child process.
+// The watchdog must print the goroutine stacks and stop the process, so a hang is a failure, not a test that never ends.
+// It is a test of Blackout itself.
+func TestBlackoutWatchdogStopsAHang(t *testing.T) {
+	if os.Getenv("BLACKOUT_WATCHDOG_CHILD") == "1" {
+		hang := target
+		hang.Open = func(string, *kvlite.Options, fileio.FS) (*kvlite.DB, error) { select {} }
+		blackout.Run(hang, 1, blackout.Settings{StepTimeout: 100 * time.Millisecond})
+		return
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestBlackoutWatchdogStopsAHang$")
+	command.Env = append(os.Environ(), "BLACKOUT_WATCHDOG_CHILD=1")
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("the hung run exited cleanly:\n%s", output)
+	}
+	for _, want := range []string{"did not finish in 100ms", "goroutine stacks:", "TestBlackoutWatchdogStopsAHang"} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("the watchdog output lacks %q:\n%s", want, output)
 		}
 	}
 }

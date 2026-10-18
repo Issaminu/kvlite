@@ -194,6 +194,22 @@ func New(seed uint64, config Config) *FS {
 
 var _ fileio.FS = (*FS)(nil)
 
+// CloneCache returns a new FS whose files and names are the cache view of fsys, all durable.
+// It is the storage that a process crash would leave now.
+// The clone has no injected errors, so a check can open a second database on it without a change to fsys.
+func (fsys *FS) CloneCache(seed uint64) *FS {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	clone := New(seed, Config{SectorSize: fsys.config.SectorSize})
+	for name, node := range fsys.names {
+		clone.nextInodeID++
+		copied := &inode{id: clone.nextInodeID, perm: node.perm, data: slices.Clone(node.data), durable: slices.Clone(node.data)}
+		clone.names[name] = copied
+		clone.durableNames[name] = copied
+	}
+	return clone
+}
+
 // SetFaults enables or disables the injected errors of the Config.
 // Crashes do not depend on it.
 // With faults disabled, no call uses the random source for an error decision, so checks with faults disabled do not change later decisions.

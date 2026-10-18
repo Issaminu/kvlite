@@ -414,3 +414,25 @@ func TestInjectedErrorsNeedEnabledFaults(t *testing.T) {
 		t.Fatalf("InjectedFaults = %d, want 2", got)
 	}
 }
+
+func TestCloneCacheHoldsTheCacheViewAsDurable(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, []byte("synced"), 0)
+	mustSync(t, file)
+	// Unsynced, and the name is not durable either.
+	mustWrite(t, file, []byte("cached"), 6)
+
+	clone := fsys.CloneCache(2)
+	clone.Crash()
+	clone.Restart(true)
+	if got := content(clone, testName); string(got) != "syncedcached" {
+		t.Fatalf("clone after a power failure: got %q, want %q", got, "syncedcached")
+	}
+	// The clone is independent: a write to it does not change fsys.
+	cloneFile := openRW(t, clone, testName)
+	mustWrite(t, cloneFile, []byte("X"), 0)
+	if got := content(fsys, testName); string(got) != "syncedcached" {
+		t.Fatalf("original after a write to the clone: got %q", got)
+	}
+}

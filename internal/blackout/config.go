@@ -75,8 +75,11 @@ type Config struct {
 	Disk disk.Config
 }
 
+// syncNames are the short names of the sync modes in reports.
+var syncNames = map[kvlite.Sync]string{kvlite.SyncFull: "full", kvlite.SyncNormal: "normal", kvlite.SyncNone: "none"}
+
 func (config Config) String() string {
-	syncName := map[kvlite.Sync]string{kvlite.SyncFull: "full", kvlite.SyncNormal: "normal", kvlite.SyncNone: "none"}[config.Sync]
+	syncName := syncNames[config.Sync]
 	var operations []string
 	for op, weight := range config.OperationWeights {
 		if weight > 0 {
@@ -105,6 +108,7 @@ const (
 	streamWorkload
 	streamCrash
 	streamDisk
+	streamCheck // decides which steps run the slow checks; the checks change nothing else
 )
 
 // swarmWeights enables a random non-empty subset of n choices with random weights.

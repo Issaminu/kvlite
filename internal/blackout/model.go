@@ -44,10 +44,27 @@ const (
 	mutationGet
 	mutationDeleteBatch
 	mutationScan
+	mutationChecksums // SetDataPageChecksums; the workload never picks it as a change inside a callback
 	mutationKindCount
 )
 
-var mutationNames = [mutationKindCount]string{"put", "delete", "create-bucket", "delete-bucket", "get", "delete-batch", "scan"}
+var mutationNames = [mutationKindCount]string{"put", "delete", "create-bucket", "delete-bucket", "get", "delete-batch", "scan", "checksums"}
+
+// metaPath is the path of a pseudo-bucket for database settings that commits change.
+// The settings are model state, so the floor and branch rules cover them like data.
+// Generated bucket names never start with a zero byte.
+const metaPath = "\x00meta"
+
+// checksumsKey is the entry of metaPath that holds the data-page checksum mode.
+const checksumsKey = "data-page-checksums"
+
+// checksumsValue returns the metaPath value of a checksum mode.
+func checksumsValue(enabled bool) []byte {
+	if enabled {
+		return []byte{1}
+	}
+	return []byte{0}
+}
 
 // txMutation is one call inside a write transaction.
 // A get or a scan changes nothing.
@@ -107,8 +124,28 @@ type stateModel struct {
 	past []uint64
 }
 
-func newStateModel() *stateModel {
-	return &stateModel{state: dbState{}, past: []uint64{0}}
+// newStateModel returns a model whose state 0 is a new database with the given checksum mode.
+func newStateModel(checksums bool) *stateModel {
+	state := dbState{metaPath: {checksumsKey: checksumsValue(checksums)}}
+	hash := stateHash(state)
+	return &stateModel{state: state, hash: hash, floorHash: hash, past: []uint64{hash}}
+}
+
+// bucketPaths returns the path of every bucket in key order.
+func (model *stateModel) bucketPaths() []string {
+	paths := make([]string, 0, len(model.state))
+	for path := range model.state {
+		if path != metaPath {
+			paths = append(paths, path)
+		}
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+// checksums reports the data-page checksum mode of the latest state.
+func (model *stateModel) checksums() bool {
+	return bytes.Equal(model.state[metaPath][checksumsKey], checksumsValue(true))
 }
 
 const (
@@ -216,6 +253,14 @@ func applyChange(state dbState, mutation txMutation) (undoRecord, uint64, bool) 
 			return undoRecord{}, 0, false
 		}
 		return undoRecord{buckets: map[string]map[string][]byte{mutation.path: saved}}, hash, true
+	case mutationChecksums:
+		old := content[mutation.key]
+		if bytes.Equal(old, mutation.value) {
+			return undoRecord{}, 0, false
+		}
+		content[mutation.key] = mutation.value
+		undo := undoRecord{path: mutation.path, key: mutation.key, existed: true, value: old}
+		return undo, valueHash(mutation.path, mutation.key, old) ^ valueHash(mutation.path, mutation.key, mutation.value), true
 	case mutationCreateBucket:
 		parent, name := parentPath(mutation.path)
 		state[mutation.path] = map[string][]byte{}
@@ -398,38 +443,25 @@ func (model *stateModel) resolve(recovered dbState, lowest int, allowBranches bo
 		return "", false, fmt.Errorf("model has %d uncommitted changes during recovery", len(model.journal))
 	}
 	hash := stateHash(recovered)
-	for index := model.latest; index >= lowest; index-- {
-		if model.hashAt(index) != hash || !statesEqual(model.stateAt(index), recovered) {
-			continue
-		}
+	index, branch, found := model.find(recovered, lowest, allowBranches)
+	switch {
+	case found && branch == nil:
 		lost := model.latest - index
 		model.reset(index)
 		if lost == 0 {
 			return "latest state", false, nil
 		}
 		return fmt.Sprintf("state %d, without %d unsynced commits", index, lost), false, nil
-	}
-	if allowBranches {
-		for _, branch := range model.branches {
-			if branch.parent < lowest || branch.hash != hash {
-				continue
-			}
-			expected := model.stateAt(branch.parent)
-			for _, mutation := range branch.mutations {
-				applyChange(expected, mutation)
-			}
-			if !statesEqual(expected, recovered) {
-				continue
-			}
-			model.reset(branch.parent)
-			mark := model.mark()
-			for _, mutation := range branch.mutations {
-				model.apply(mutation)
-			}
-			model.commit(mark)
-			model.branches = slices.DeleteFunc(model.branches, func(other branchRecord) bool { return other.parent >= branch.parent })
-			return fmt.Sprintf("state %d plus the commit whose result was unknown", branch.parent), true, nil
+	case found:
+		parent, mutations := branch.parent, branch.mutations
+		model.reset(parent)
+		mark := model.mark()
+		for _, mutation := range mutations {
+			model.apply(mutation)
 		}
+		model.commit(mark)
+		model.branches = slices.DeleteFunc(model.branches, func(other branchRecord) bool { return other.parent >= parent })
+		return fmt.Sprintf("state %d plus the commit whose result was unknown", parent), true, nil
 	}
 	report := fmt.Sprintf("recovered state matches no allowed state %d..%d (branches allowed: %t, %d branches)",
 		lowest, model.latest, allowBranches, len(model.branches))
@@ -453,6 +485,34 @@ func (model *stateModel) resolve(recovered dbState, lowest int, allowBranches bo
 		}
 	}
 	return "", false, errors.New(report)
+}
+
+// find returns the state that equals recovered: the index of an acknowledged state from lowest to latest, or a branch.
+// It does not change the model.
+func (model *stateModel) find(recovered dbState, lowest int, allowBranches bool) (int, *branchRecord, bool) {
+	hash := stateHash(recovered)
+	for index := model.latest; index >= lowest; index-- {
+		if model.hashAt(index) == hash && statesEqual(model.stateAt(index), recovered) {
+			return index, nil, true
+		}
+	}
+	if !allowBranches {
+		return 0, nil, false
+	}
+	for index := range model.branches {
+		branch := &model.branches[index]
+		if branch.parent < lowest || branch.hash != hash {
+			continue
+		}
+		expected := model.stateAt(branch.parent)
+		for _, mutation := range branch.mutations {
+			applyChange(expected, mutation)
+		}
+		if statesEqual(expected, recovered) {
+			return 0, branch, true
+		}
+	}
+	return 0, nil, false
 }
 
 func statesEqual(left, right dbState) bool {
@@ -482,7 +542,13 @@ func stateDiff(want, got dbState) string {
 			lines = append(lines, fmt.Sprintf(format, args...))
 		}
 	}
+	if wantMode, gotMode := want[metaPath][checksumsKey], got[metaPath][checksumsKey]; !bytes.Equal(wantMode, gotMode) {
+		add("  data-page checksum mode: got %v, want %v", gotMode, wantMode)
+	}
 	for _, path := range slices.Sorted(maps.Keys(want)) {
+		if path == metaPath {
+			continue
+		}
 		gotContent, ok := got[path]
 		if !ok {
 			add("  bucket %q: missing (want %d entries)", path, len(want[path]))

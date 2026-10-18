@@ -19,6 +19,11 @@ import (
 // validatePageOwnership walks every tree page to test the bitmap against the tree.
 // Normal Open checks only bitmap pages, so this test helper can find an incorrect bit on a child page.
 func (db *DB) validatePageOwnership() error {
+	return db.validatePageOwnershipWith(db.readNode)
+}
+
+// validatePageOwnershipWith is validatePageOwnership with its own page reader.
+func (db *DB) validatePageOwnershipWith(readNode func(page.ID) (*btree.Node, error)) error {
 	if db.allocation == nil || db.meta == nil {
 		return ErrInvalid
 	}
@@ -37,7 +42,7 @@ func (db *DB) validatePageOwnership() error {
 		}
 		visited[pageID] = struct{}{}
 
-		node, err := db.readNode(pageID)
+		node, err := readNode(pageID)
 		if err != nil {
 			return err
 		}

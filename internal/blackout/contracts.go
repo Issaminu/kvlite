@@ -32,6 +32,7 @@ var errStopScan = errors.New("blackout scan callback stops the scan")
 // The checks change no committed data, so the model does not change.
 func (runner *runner) contracts() {
 	check := contract(runner.work.rand.IntN(int(contractCount)))
+	runner.stats.Contracts[check]++
 	runner.event("contract: %s", contractNames[check])
 	switch check {
 	case contractWriteInView:
@@ -55,7 +56,7 @@ func (runner *runner) contracts() {
 
 // existingBucket returns an existing bucket path, or false when the database has no bucket.
 func (runner *runner) existingBucket() (string, bool) {
-	if len(runner.model.state) == 0 {
+	if len(runner.model.bucketPaths()) == 0 {
 		return "", false
 	}
 	path := runner.work.pickBucket(runner.model)

@@ -2,9 +2,7 @@ package blackout
 
 import (
 	"fmt"
-	"maps"
 	"math/bits"
-	"slices"
 
 	"github.com/Issaminu/kvlite"
 	"github.com/Issaminu/kvlite/internal/blackout/disk"
@@ -85,7 +83,7 @@ func (work *workload) newTransaction(model *stateModel) ([]txMutation, bool) {
 
 func (work *workload) newMutation(model *stateModel) txMutation {
 	kind := mutationKind(work.rand.Weighted(work.config.MutationWeights))
-	if len(model.state) == 0 && !work.rand.Chance(disk.OneIn(10)) {
+	if len(model.bucketPaths()) == 0 && !work.rand.Chance(disk.OneIn(10)) {
 		kind = mutationCreateBucket
 	}
 	mutation := txMutation{kind: kind}
@@ -118,7 +116,7 @@ func (work *workload) newMutation(model *stateModel) txMutation {
 // newBucketPath returns the path of a bucket to create.
 // It can be a top-level bucket, a nested bucket, or a name that already exists.
 func (work *workload) newBucketPath(model *stateModel) string {
-	if work.config.NestedBuckets && len(model.state) > 0 && work.rand.Bool() {
+	if work.config.NestedBuckets && len(model.bucketPaths()) > 0 && work.rand.Bool() {
 		parent := work.pickBucket(model)
 		if pathDepth(parent) < maxBucketDepth {
 			name := nestedNames[work.rand.IntN(len(nestedNames))]
@@ -131,7 +129,7 @@ func (work *workload) newBucketPath(model *stateModel) string {
 // pickBucket usually returns an existing bucket path.
 // Sometimes it returns a top-level name, which can be missing.
 func (work *workload) pickBucket(model *stateModel) string {
-	existing := slices.Sorted(maps.Keys(model.state))
+	existing := model.bucketPaths()
 	if len(existing) > 0 && !work.rand.Chance(disk.OneIn(10)) {
 		return existing[work.rand.IntN(len(existing))]
 	}

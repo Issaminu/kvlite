@@ -31,12 +31,15 @@ type runner struct {
 	db              *kvlite.DB
 	model           *stateModel
 	step            int
-	faults          bool   // injected errors are enabled outside the checks
-	stopped         bool   // the handle returned ErrWALWriteFailed
-	powerLost       bool   // a power failure happened since the last verified open
-	uncertainOpen   bool   // a commit result is unknown, and no open has resolved it yet
-	checkpointCount uint64 // checkpoints of the current handle
-	droppedCaches   int    // disk.Stats.DroppedCaches at the last verified open
+	faults          bool          // injected errors are enabled outside the checks
+	stopped         bool          // the handle returned ErrWALWriteFailed
+	powerLost       bool          // a power failure happened since the last verified open
+	uncertainOpen   bool          // a commit result is unknown, and no open has resolved it yet
+	checkpointCount uint64        // checkpoints of the current handle
+	checkRand       *disk.Rand    // picks the steps of the slow checks
+	memory          *kvlite.DB    // the memory database of the differential check
+	lastStats       *kvlite.Stats // the last DB.Stats of the current handle
+	droppedCaches   int           // disk.Stats.DroppedCaches at the last verified open
 	failure         error
 	events          []string
 	trace           []string // every step and storage event, when the settings ask for it
@@ -50,7 +53,7 @@ func newRunner(target Target, seed uint64, config Config, settings Settings) *ru
 		seed:      seed,
 		config:    config,
 		settings:  settings,
-		model:     newStateModel(),
+		model:     newStateModel(config.Checksums),
 		traceHash: 14695981039346656037,
 		stats:     Stats{CrashesInCalls: make(map[string]int)},
 	}
@@ -62,6 +65,7 @@ func newRunner(target Target, seed uint64, config Config, settings Settings) *ru
 	}
 	runner.work = newWorkload(seed, &runner.config, osPageSize)
 	runner.crash = newCrasher(seed, &runner.config)
+	runner.checkRand = disk.NewRand(streamSeed(seed, streamCheck))
 	runner.fsys = disk.New(streamSeed(seed, streamDisk), runner.config.Disk)
 	return runner
 }
@@ -95,7 +99,7 @@ func (runner *runner) report() error {
 	var text strings.Builder
 	fmt.Fprintf(&text, "blackout seed %d failed at step %d: %v\n", runner.seed, runner.step, runner.failure)
 	fmt.Fprintf(&text, "config: %s\n", runner.config)
-	fmt.Fprintf(&text, "model: latest=%d floor=%d branches=%d buckets=%d\n", runner.model.latest, runner.model.floor, len(runner.model.branches), len(runner.model.state))
+	fmt.Fprintf(&text, "model: latest=%d floor=%d branches=%d buckets=%d\n", runner.model.latest, runner.model.floor, len(runner.model.branches), len(runner.model.bucketPaths()))
 	if runner.trace != nil && runner.settings.TraceLines > 0 {
 		text.WriteString("trace:\n")
 		for _, event := range runner.trace[max(0, len(runner.trace)-runner.settings.TraceLines):] {
@@ -133,19 +137,22 @@ func (runner *runner) run() (err error) {
 			runner.target.Abandon(runner.db)
 			runner.db = nil
 		}
+		if runner.memory != nil {
+			_ = runner.memory.Close()
+		}
 		runner.stats.Disk = runner.fsys.Stats()
 		if runner.failure != nil {
 			err = runner.report()
 		}
 	}()
 	runner.event("config %s", runner.config)
-	runner.openAndVerify(false)
+	runner.guard(func() { runner.openAndVerify(false) })
 	runner.faults = runner.config.IOFaults
 	runner.fsys.SetFaults(runner.faults)
 	for step := 0; step < runner.settings.Steps && runner.failure == nil; step++ {
 		runner.step = step
 		runner.event("step %d", step)
-		runner.safetyStep()
+		runner.guard(runner.safetyStep)
 	}
 	if runner.failure == nil {
 		runner.livenessPhase()
@@ -206,6 +213,7 @@ func (runner *runner) afterStep() {
 		return
 	}
 	runner.updateFloor()
+	runner.checkAfterStep()
 }
 
 // recoverStopped follows the documented procedure after ErrWALWriteFailed: check that the handle stopped, then close it and open the file again.
@@ -335,7 +343,11 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 	// Recovery can checkpoint inside Open.
 	// Only a later checkpoint makes later commits durable.
 	runner.checkpointCount = runner.target.CheckpointCount(runner.db)
+	runner.lastStats = nil
 	runner.verify(afterCrash)
+	if runner.failure == nil {
+		runner.resetMemory()
+	}
 }
 
 // livenessPhase turns every fault off and requires progress: every operation succeeds, and Close and Open keep the latest state.
@@ -354,14 +366,18 @@ func (runner *runner) livenessPhase() {
 	weights := slices.Clone(runner.config.OperationWeights)
 	weights[opReopen] = 0
 	for step := 0; step < LivenessSteps && runner.failure == nil; step++ {
-		runner.runOperation(runner.work.nextOperation(weights))
-		if crashed, _ := runner.fsys.Crashed(); crashed {
-			runner.fail("the process crashed in the liveness phase")
-		}
-		if runner.stopped && runner.failure == nil {
-			runner.fail("a WAL write failed in the liveness phase, without injected faults")
-		}
-		runner.updateFloor()
+		runner.step = runner.settings.Steps + step
+		runner.guard(func() {
+			runner.runOperation(runner.work.nextOperation(weights))
+			if crashed, _ := runner.fsys.Crashed(); crashed {
+				runner.fail("the process crashed in the liveness phase")
+			}
+			if runner.stopped && runner.failure == nil {
+				runner.fail("a WAL write failed in the liveness phase, without injected faults")
+			}
+			runner.updateFloor()
+			runner.checkAfterStep()
+		})
 	}
 	if runner.failure != nil {
 		return

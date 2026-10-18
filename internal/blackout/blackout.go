@@ -21,6 +21,7 @@ package blackout
 
 import (
 	"os"
+	"time"
 
 	"github.com/Issaminu/kvlite"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -34,7 +35,10 @@ type Target struct {
 	// Checkpoint copies the committed WAL pages into the main file now.
 	Checkpoint func(db *kvlite.DB) error
 	// CheckPages walks every tree page and requires that each reachable page is allocated once and that each allocated page is reachable.
+	// It reads without the node cache, so it does not change what later operations read.
 	CheckPages func(db *kvlite.DB) error
+	// BucketNames returns the names of all top-level buckets in key order, read without the node cache.
+	BucketNames func(db *kvlite.DB) ([]string, error)
 	// CheckpointCount returns the number of checkpoints that this handle completed.
 	CheckpointCount func(db *kvlite.DB) uint64
 	// Abandon drops a handle without Close, as a crashed process does, and stops its write worker.
@@ -67,6 +71,13 @@ type Settings struct {
 	// Change, when not nil, changes the configuration that the seed selected.
 	// Tests of the checker use it, for example to make the storage lie about syncs.
 	Change func(*Config)
+	// DeepCheck runs the slow checks after every step: the process-crash image and the memory database.
+	// Without it, they run after some steps.
+	// The checks never change the run, so a failure replays with and without DeepCheck.
+	DeepCheck bool
+	// StepTimeout is the time limit of one step. Zero means [DefaultStepTimeout].
+	// A step over the limit, such as a deadlock, prints every goroutine stack and stops the process.
+	StepTimeout time.Duration
 }
 
 const (
@@ -74,6 +85,8 @@ const (
 	DefaultSteps = 300
 	// LivenessSteps is the number of liveness-phase steps.
 	LivenessSteps = 40
+	// DefaultStepTimeout is the default time limit of one step.
+	DefaultStepTimeout = 2 * time.Minute
 )
 
 // Result describes one run.
@@ -94,6 +107,9 @@ type Result struct {
 func Run(target Target, seed uint64, settings Settings) Result {
 	if settings.Steps <= 0 {
 		settings.Steps = DefaultSteps
+	}
+	if settings.StepTimeout <= 0 {
+		settings.StepTimeout = DefaultStepTimeout
 	}
 	config := newConfig(seed)
 	if settings.Change != nil {

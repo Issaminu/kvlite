@@ -1,7 +1,11 @@
 package kvlite
 
 import (
+	"slices"
+
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 // This file exports internals to the Blackout simulation test in blackout_test.go.
@@ -20,10 +24,52 @@ func BlackoutCheckpoint(db *DB) error {
 }
 
 // BlackoutCheckPages walks every tree page and compares the walk with the allocation bitmap.
+// It reads without the node cache, so it can run after every step and not change what later operations read.
 func BlackoutCheckPages(db *DB) error {
 	db.operationMu.Lock()
 	defer db.operationMu.Unlock()
-	return db.validatePageOwnership()
+	return db.validatePageOwnershipWith(db.blackoutReadNode)
+}
+
+// BlackoutBucketNames returns the names of the top-level buckets in key order.
+// It reads without the node cache.
+func BlackoutBucketNames(db *DB) ([]string, error) {
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	var names []string
+	pending := []page.ID{db.meta.Root()}
+	for len(pending) > 0 {
+		pageID := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		node, err := db.blackoutReadNode(pageID)
+		if err != nil {
+			return nil, err
+		}
+		if !node.IsLeaf() {
+			pending = append(pending, node.Children...)
+			continue
+		}
+		for index := range node.EntryCount() {
+			names = append(names, string(node.EntryAt(index).Key()))
+		}
+	}
+	slices.Sort(names)
+	return names, nil
+}
+
+// blackoutReadNode reads a tree page like readNode, but without the node cache.
+func (db *DB) blackoutReadNode(pageID page.ID) (*btree.Node, error) {
+	if db.memoryNodes != nil {
+		return db.readNode(pageID)
+	}
+	if record, ok := db.wal.Lookup(pageID); ok {
+		return db.wal.CommittedPageToNode(&record)
+	}
+	data, err := db.readMainNodePage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	return btree.DecodeNode(slices.Clone(data), pageID, db.meta.PageSize(), db.readMainNodePage, db.meta.DataPageChecksums())
 }
 
 // BlackoutCheckpointCount returns the number of checkpoints that db completed.

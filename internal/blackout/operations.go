@@ -76,6 +76,7 @@ func (runner *runner) keyError(path, key string) error {
 // runMutation runs one change in a write callback.
 // It applies the change to the model only after KVLite accepts it.
 func (runner *runner) runMutation(tx *kvlite.Tx, mutation txMutation, applied *[]txMutation) error {
+	runner.stats.Mutations[mutation.kind]++
 	switch mutation.kind {
 	case mutationCreateBucket, mutationDeleteBucket:
 		return runner.runBucketChange(tx, mutation, applied)
@@ -224,6 +225,7 @@ func (runner *runner) finishCommit(op string, mark int, err error, mutations []t
 	case err == nil:
 		if runner.model.commit(mark) {
 			runner.stats.Commits++
+			runner.mirrorCommit(mutations)
 		}
 		runner.event("%s committed %d changes: latest=%d", op, len(mutations), runner.model.latest)
 	case errors.Is(err, kvlite.ErrWALWriteFailed):
@@ -488,6 +490,7 @@ func (runner *runner) scan(bucket *kvlite.Bucket, path string, content map[strin
 		return nil
 	}
 	kind, start, end := runner.work.newScan()
+	runner.stats.Scans[kind]++
 	want := keys
 	op := scanNames[kind]
 	var err error
@@ -562,16 +565,28 @@ func (runner *runner) checkpoint() {
 }
 
 // toggleChecksums turns data-page checksums on or off.
+// The mode is model state: SetDataPageChecksums commits it through the WAL like data.
 func (runner *runner) toggleChecksums() {
-	enabled := !runner.target.DataPageChecksums(runner.db)
-	err := runner.db.SetDataPageChecksums(enabled)
-	runner.event("SetDataPageChecksums(%t): %v", enabled, err)
-	if errors.Is(err, kvlite.ErrWALWriteFailed) {
-		runner.stats.StoppedHandles++
-		runner.stopped = true
+	current := runner.target.DataPageChecksums(runner.db)
+	if current != runner.model.checksums() {
+		runner.fail("data-page checksum mode is %t, want %t", current, runner.model.checksums())
 		return
 	}
-	_ = runner.checkCallError("SetDataPageChecksums", err)
+	enabled := !current
+	mark := runner.model.mark()
+	err := runner.db.SetDataPageChecksums(enabled)
+	runner.event("SetDataPageChecksums(%t): %v", enabled, err)
+	// SetDataPageChecksums checkpoints before it commits the new mode.
+	// So in SyncNormal, a checkpoint inside the call makes only the earlier state durable.
+	runner.updateFloor()
+	var applied []txMutation
+	if err == nil || errors.Is(err, kvlite.ErrWALWriteFailed) {
+		mutation := txMutation{kind: mutationChecksums, path: metaPath, key: checksumsKey, value: checksumsValue(enabled)}
+		if runner.model.apply(mutation) {
+			applied = append(applied, mutation)
+		}
+	}
+	runner.finishCommit("SetDataPageChecksums", mark, err, applied)
 }
 
 // reopen closes the handle cleanly and opens the file again.

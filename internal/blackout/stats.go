@@ -26,6 +26,13 @@ type Stats struct {
 	FailedCloses        int
 	StoppedHandles      int // handles that ErrWALWriteFailed stopped
 	Recoveries          int // opens whose state the checks compared with the model
+	Mutations           [mutationKindCount]int
+	Scans               [scanKindCount]int
+	Contracts           [contractCount]int
+	PageChecks          int // page walks
+	StatsChecks         int // DB.Stats checks
+	ImageChecks         int // opens of the process-crash image
+	MemoryChecks        int // comparisons of the memory database
 	Disk                disk.Stats
 }
 
@@ -34,6 +41,19 @@ func (stats *Stats) Add(other Stats) {
 	for op := range stats.Steps {
 		stats.Steps[op] += other.Steps[op]
 	}
+	for kind := range stats.Mutations {
+		stats.Mutations[kind] += other.Mutations[kind]
+	}
+	for kind := range stats.Scans {
+		stats.Scans[kind] += other.Scans[kind]
+	}
+	for kind := range stats.Contracts {
+		stats.Contracts[kind] += other.Contracts[kind]
+	}
+	stats.PageChecks += other.PageChecks
+	stats.StatsChecks += other.StatsChecks
+	stats.ImageChecks += other.ImageChecks
+	stats.MemoryChecks += other.MemoryChecks
 	stats.Commits += other.Commits
 	stats.Aborts += other.Aborts
 	stats.Uncertain += other.Uncertain
@@ -69,11 +89,22 @@ func (stats Stats) String() string {
 	for op, count := range stats.Steps {
 		steps = append(steps, fmt.Sprintf("%s=%d", operationNames[op], count))
 	}
+	var mutations, scans, contracts []string
+	for kind, count := range stats.Mutations {
+		mutations = append(mutations, fmt.Sprintf("%s=%d", mutationNames[kind], count))
+	}
+	for kind, count := range stats.Scans {
+		scans = append(scans, fmt.Sprintf("%q=%d", scanNames[kind], count))
+	}
+	for kind, count := range stats.Contracts {
+		contracts = append(contracts, fmt.Sprintf("%q=%d", contractNames[kind], count))
+	}
 	var crashes []string
 	for _, kind := range slices.Sorted(maps.Keys(stats.CrashesInCalls)) {
 		crashes = append(crashes, fmt.Sprintf("%s=%d", kind, stats.CrashesInCalls[kind]))
 	}
-	return fmt.Sprintf("steps: %s\ncommits=%d aborts=%d uncertain=%d (kept %d, lost %d) lost-unsynced=%d recoveries=%d stopped=%d failed-opens=%d failed-closes=%d crashes-now=%d crashes-in-open=%d\ncrashes inside calls: %s\ndisk: %+v",
-		strings.Join(steps, " "), stats.Commits, stats.Aborts, stats.Uncertain, stats.UncertainKept, stats.UncertainLost, stats.LostUnsyncedCommits,
+	return fmt.Sprintf("steps: %s\nchanges: %s\nscans: %s\ncontracts: %s\nchecks: pages=%d stats=%d image=%d memory=%d\ncommits=%d aborts=%d uncertain=%d (kept %d, lost %d) lost-unsynced=%d recoveries=%d stopped=%d failed-opens=%d failed-closes=%d crashes-now=%d crashes-in-open=%d\ncrashes inside calls: %s\ndisk: %+v",
+		strings.Join(steps, " "), strings.Join(mutations, " "), strings.Join(scans, " "), strings.Join(contracts, " "),
+		stats.PageChecks, stats.StatsChecks, stats.ImageChecks, stats.MemoryChecks, stats.Commits, stats.Aborts, stats.Uncertain, stats.UncertainKept, stats.UncertainLost, stats.LostUnsyncedCommits,
 		stats.Recoveries, stats.StoppedHandles, stats.FailedOpens, stats.FailedCloses, stats.CrashesNow, stats.CrashesInOpen, strings.Join(crashes, " "), stats.Disk)
 }

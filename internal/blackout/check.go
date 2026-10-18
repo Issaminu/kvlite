@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/Issaminu/kvlite"
 	"github.com/Issaminu/kvlite/internal/blackout/disk"
@@ -61,26 +62,65 @@ func (runner *runner) checkValue(op, bucket, key string, value []byte, err error
 	return nil
 }
 
-// readState reads every bucket of the name universe, and every nested bucket below it, in one read transaction.
-// It checks that keys are in strictly increasing order.
-func readState(db *kvlite.DB, bucketNames []string) (dbState, error) {
+// readState reads the whole database: every top-level bucket that the catalog lists, every nested bucket, and the checksum mode.
+// The catalog read finds buckets that the model does not know.
+func (runner *runner) readState(db *kvlite.DB) (dbState, error) {
+	names, err := runner.target.BucketNames(db)
+	if err != nil {
+		return nil, fmt.Errorf("read the bucket catalog: %w", err)
+	}
+	state, err := readBuckets(db, names)
+	if err != nil {
+		return nil, err
+	}
+	state[metaPath] = map[string][]byte{checksumsKey: checksumsValue(runner.target.DataPageChecksums(db))}
+	return state, nil
+}
+
+// readBuckets reads the named top-level buckets, and every nested bucket below them, in one read transaction.
+// It checks that keys are in strictly increasing order, and that [kvlite.Bucket.Stats] counts what the read found.
+func readBuckets(db *kvlite.DB, names []string) (dbState, error) {
 	state := dbState{}
 	err := db.View(func(tx *kvlite.Tx) error {
-		for _, name := range bucketNames {
+		for _, name := range names {
 			bucket, err := tx.Bucket([]byte(name))
-			if errors.Is(err, kvlite.ErrBucketNotFound) {
-				continue
-			}
 			if err != nil {
-				return fmt.Errorf("open bucket %q: %w", name, err)
+				return fmt.Errorf("open bucket %q from the catalog: %w", name, err)
 			}
 			if err := readBucket(bucket, name, state); err != nil {
+				return err
+			}
+			if err := checkBucketStats(bucket, name, state); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
 	return state, err
+}
+
+// checkBucketStats compares the entry and bucket counts of Bucket.Stats with the read of the same transaction.
+func checkBucketStats(bucket *kvlite.Bucket, path string, state dbState) error {
+	stats, err := bucket.Stats()
+	if err != nil {
+		return fmt.Errorf("stats of bucket %q: %w", path, err)
+	}
+	keys, buckets := 0, 0
+	for other, content := range state {
+		if other != path && !strings.HasPrefix(other, path+"/") {
+			continue
+		}
+		buckets++
+		for _, value := range content {
+			if value != nil {
+				keys++
+			}
+		}
+	}
+	if stats.KeyN != keys || stats.BucketN != buckets {
+		return fmt.Errorf("stats of bucket %q: KeyN=%d BucketN=%d, but the read found %d entries in %d buckets", path, stats.KeyN, stats.BucketN, keys, buckets)
+	}
+	return nil
 }
 
 // readBucket reads the bucket at path into state, and each nested bucket below it.
@@ -123,6 +163,7 @@ func readBucket(bucket *kvlite.Bucket, path string, state dbState) error {
 func (runner *runner) checkPages(when string) {
 	runner.fsys.SetFaults(false)
 	defer runner.fsys.SetFaults(runner.faults)
+	runner.stats.PageChecks++
 	if err := runner.target.CheckPages(runner.db); err != nil {
 		runner.fail("page ownership %s: %v", when, err)
 	}
@@ -136,7 +177,7 @@ func (runner *runner) verify(afterCrash bool) {
 	runner.fsys.SetFaults(false)
 	defer runner.fsys.SetFaults(runner.faults)
 	runner.stats.Recoveries++
-	recovered, err := readState(runner.db, runner.work.bucketNames)
+	recovered, err := runner.readState(runner.db)
 	if err != nil {
 		runner.fail("read the recovered database: %v", err)
 		return
@@ -171,6 +212,9 @@ func (runner *runner) verify(afterCrash bool) {
 		}
 	}
 	runner.event("verified open: %s (state hash %x)", result, runner.model.hash)
+	// A writable recovery syncs and clears the WAL, so it decides each unknown result for good.
+	// A lost branch that appears in a later recovery is a revived commit, not a valid answer.
+	runner.model.branches = nil
 	runner.powerLost = false
 	if runner.config.Sync != kvlite.SyncNone {
 		// Writable recovery syncs the WAL and the main file before it clears the WAL.
