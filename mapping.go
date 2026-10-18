@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -12,8 +13,13 @@ import (
 
 // mapMainFile maps the current main-file length for read-only access.
 // File reads remain available if mapping fails.
+// A file of a simulated test FS has no descriptor, so its reads always use ReadAt.
 func (db *DB) mapMainFile() error {
-	info, err := db.file.Stat()
+	osFile, ok := db.file.(*os.File)
+	if !ok {
+		return nil
+	}
+	info, err := osFile.Stat()
 	if err != nil {
 		return err
 	}
@@ -21,7 +27,7 @@ func (db *DB) mapMainFile() error {
 		return nil
 	}
 
-	data, err := systemMapMainFile(db.file, int(info.Size()))
+	data, err := systemMapMainFile(osFile, int(info.Size()))
 	if err != nil {
 		return nil
 	}

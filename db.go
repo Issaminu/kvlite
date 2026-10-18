@@ -32,7 +32,7 @@ type writeNodeCacheEntry struct {
 // DB is an open handle to a KVLite database in a file or in memory. Create it with [Open] or [OpenMemory]. Its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
 type DB struct {
 	path              string
-	file              *os.File
+	file              fileio.File
 	meta              *page.Meta
 	rootNode          *btree.Node
 	memoryNodes       map[page.ID]*btree.Node          // A non-nil map owns all committed nodes of a memory database. It never evicts a live node.
@@ -109,10 +109,12 @@ func (db *DB) walWriteFailure() error {
 // The caller must call [DB.Close] when the database is no longer needed and must check its error.
 // Use [OpenMemory] to create a database with no file operations.
 func Open(path string, mode os.FileMode, options *Options) (*DB, error) {
-	return open(path, mode, options, fileio.Sync)
+	return open(path, mode, options, fileio.OSFS{})
 }
 
-func open(path string, mode os.FileMode, options *Options, syncDirectory func(*os.File) error) (*DB, error) {
+// open opens the database files through fsys.
+// Tests use a simulated FS to inject storage faults and power failures.
+func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB, error) {
 	if path == "" {
 		return nil, ErrPathRequired
 	}
@@ -126,12 +128,12 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 		return nil, fmt.Errorf("resolve database path: %w", err)
 	}
 
-	var dbFile *os.File
+	var dbFile fileio.File
 
 	if resolvedOptions.ReadOnly {
-		dbFile, err = os.OpenFile(filePath, os.O_RDONLY, mode)
+		dbFile, err = fsys.OpenFile(filePath, os.O_RDONLY, mode)
 	} else {
-		dbFile, err = os.OpenFile(filePath, os.O_RDWR|os.O_CREATE, mode)
+		dbFile, err = fsys.OpenFile(filePath, os.O_RDWR|os.O_CREATE, mode)
 	}
 
 	if err != nil {
@@ -145,10 +147,13 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 		writeNodes: make(map[page.ID]*writeNodeCacheEntry),
 	}
 	// The main file descriptor owns the process lock. failOpen and Close release the lock when they close this file.
-	if err := lockDatabaseFile(db.file, db.options.ReadOnly, db.options.LockTimeout); err != nil {
-		return db.failOpen(err)
+	// A file of a simulated test FS has no descriptor and no lock.
+	if osFile, ok := db.file.(*os.File); ok {
+		if err := lockDatabaseFile(osFile, db.options.ReadOnly, db.options.LockTimeout); err != nil {
+			return db.failOpen(err)
+		}
 	}
-	filePath, err = filepath.EvalSymlinks(filePath)
+	filePath, err = fsys.EvalSymlinks(filePath)
 	if err != nil {
 		return db.failOpen(fmt.Errorf("resolve database links: %w", err))
 	}
@@ -178,17 +183,13 @@ func open(path string, mode os.FileMode, options *Options, syncDirectory func(*o
 		// Close removes the WAL, so a writable Open can create its name again. A file sync does not persist a new file name.
 		// The first WAL sync calls this function, so both names reach storage before a commit or a checkpoint depends on them.
 		syncWALDirectory = func() error {
-			parent, err := os.Open(filepath.Dir(filePath))
-			if err != nil {
-				return fmt.Errorf("open database directory: %w", err)
-			}
-			if err := errors.Join(syncDirectory(parent), parent.Close()); err != nil {
+			if err := fsys.SyncDir(filepath.Dir(filePath)); err != nil {
 				return fmt.Errorf("sync database directory: %w", err)
 			}
 			return nil
 		}
 	}
-	wal, records, err := db.readOrCreateWal(filePath, walPageSize, syncWALDirectory)
+	wal, records, err := db.readOrCreateWal(fsys, filePath, walPageSize, syncWALDirectory)
 	if err != nil {
 		return db.failOpen(err)
 	}

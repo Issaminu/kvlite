@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"math/rand/v2"
-	"os"
 	"slices"
 	"sync"
 
@@ -45,7 +44,8 @@ const (
 
 type WAL struct {
 	path                     string
-	file                     *os.File
+	file                     fileio.File
+	fs                       fileio.FS
 	pageSize                 int64
 	syncOnCommit             bool
 	syncOnCheckpoint         bool
@@ -602,7 +602,7 @@ func (wal *WAL) Delete() error {
 		return err
 	}
 	// delete the file from the disk
-	err = os.Remove(wal.path)
+	err = wal.fs.Remove(wal.path)
 	return err
 }
 

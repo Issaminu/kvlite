@@ -3,7 +3,6 @@ package wal
 import (
 	"io"
 	"maps"
-	"os"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -27,7 +26,8 @@ type checkpointBuffers struct {
 
 type Config struct {
 	Path                     string
-	File                     *os.File
+	File                     fileio.File
+	FS                       fileio.FS // FS removes the WAL file in [WAL.Delete]. Nil uses [fileio.OSFS].
 	PageSize                 int64
 	SyncOnCommit             bool
 	SyncOnCheckpoint         bool
@@ -46,9 +46,14 @@ type CommittedPage struct {
 }
 
 func New(config Config) *WAL {
+	fs := config.FS
+	if fs == nil {
+		fs = fileio.OSFS{}
+	}
 	return &WAL{
 		path:                     config.Path,
 		file:                     config.File,
+		fs:                       fs,
 		pageSize:                 config.PageSize,
 		syncOnCommit:             config.SyncOnCommit,
 		syncOnCheckpoint:         config.SyncOnCheckpoint,
@@ -67,7 +72,7 @@ func New(config Config) *WAL {
 // When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
 // A main-file write, truncate, or required sync failure leaves the overlay and WAL available for a later retry.
 // A WAL truncate failure returns an error and keeps the overlay for cleanup retry.
-func (wal *WAL) Checkpoint(mainFile *os.File, targetSize int64, dataPageChecksums bool) error {
+func (wal *WAL) Checkpoint(mainFile fileio.File, targetSize int64, dataPageChecksums bool) error {
 	if len(wal.overlay) == 0 {
 		return nil
 	}
@@ -310,13 +315,13 @@ func (wal *WAL) SetSyncFileForTesting(syncFile func() error) {
 
 // FileForTesting exposes the WAL file for tests that inject file-operation failures.
 // Production code must use WAL methods instead.
-func (wal *WAL) FileForTesting() *os.File {
+func (wal *WAL) FileForTesting() fileio.File {
 	return wal.file
 }
 
 // ReplaceFileForTesting replaces the WAL file for tests that inject file-operation failures.
 // Production code should not use it.
-func (wal *WAL) ReplaceFileForTesting(file *os.File) {
+func (wal *WAL) ReplaceFileForTesting(file fileio.File) {
 	wal.file = file
 }
 

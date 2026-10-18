@@ -2278,7 +2278,7 @@ func TestOpen_SyncsParentDirectoryAtFirstWALSync(t *testing.T) {
 			// Reopen after Close removes the WAL. Its new name also needs a sync.
 			for attempt := range 2 {
 				var parent *os.File
-				db, err := open(path, 0600, test.options, func(dir *os.File) error {
+				db, err := open(path, 0600, test.options, fileio.OSFS{SyncDirectory: func(dir *os.File) error {
 					if parent != nil {
 						t.Error("directory synced more than once")
 					}
@@ -2293,7 +2293,7 @@ func TestOpen_SyncsParentDirectoryAtFirstWALSync(t *testing.T) {
 						}
 					}
 					return fileio.Sync(dir)
-				})
+				}})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -2334,10 +2334,10 @@ func TestOpen_DirectorySyncFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	syncErr := errors.New("directory sync failed")
 	var parent *os.File
-	db, err := open(path, 0600, nil, func(dir *os.File) error {
+	db, err := open(path, 0600, nil, fileio.OSFS{SyncDirectory: func(dir *os.File) error {
 		parent = dir
 		return syncErr
-	})
+	}})
 	if err != nil {
 		t.Fatalf("Open synced the directory before a write: %v", err)
 	}
@@ -3444,13 +3444,13 @@ func TestReadNode_DoesNotChangeMainFileOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	const offset int64 = 7
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.readNode(db.meta.Root()); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.file.Seek(0, io.SeekCurrent)
+	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3468,13 +3468,13 @@ func TestReadValidMainMeta_DoesNotChangeMainFileOffset(t *testing.T) {
 	defer db.Close()
 
 	const offset int64 = 7
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := db.readValidMainMeta(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.file.Seek(0, io.SeekCurrent)
+	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3492,13 +3492,13 @@ func TestPersistNode_DoesNotChangeMainFileOffset(t *testing.T) {
 	defer db.Close()
 
 	const offset int64 = 7
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.persistNode(db.rootNode); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.file.Seek(0, io.SeekCurrent)
+	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3516,13 +3516,13 @@ func TestPersistMeta_DoesNotChangeMainFileOffset(t *testing.T) {
 	defer db.Close()
 
 	const offset int64 = 7
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.persistMeta(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.file.Seek(0, io.SeekCurrent)
+	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3543,13 +3543,13 @@ func TestCheckpoint_DoesNotChangeMainFileOffset(t *testing.T) {
 		t.Fatal(err)
 	}
 	const offset int64 = 7
-	if _, err := db.file.Seek(offset, io.SeekStart); err != nil {
+	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
-	got, err := db.file.Seek(0, io.SeekCurrent)
+	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -7856,7 +7856,7 @@ func TestAudit_RecoveryFailureKeepsCommittedWAL(t *testing.T) {
 	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.wal.FileForTesting().Seek(0, io.SeekStart); err != nil {
+	if _, err := db.wal.FileForTesting().(*os.File).Seek(0, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
 	records, err := db.wal.ReadRecords()

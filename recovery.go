@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
@@ -41,20 +42,20 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 }
 
 // syncDirectory is nil when the handle must not sync the database directory.
-func (db *DB) readOrCreateWal(path string, pageSize int64, syncDirectory func() error) (*wal.WAL, []wal.WALRecord, error) {
+func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncDirectory func() error) (*wal.WAL, []wal.WALRecord, error) {
 	// Open supplies the resolved absolute path so symbolic links share one log.
 	walPath := path + "-wal"
-	var walFile *os.File
+	var walFile fileio.File
 	var err error
 
 	if db.options.ReadOnly {
-		walFile, err = os.OpenFile(walPath, os.O_RDONLY, 0)
+		walFile, err = fsys.OpenFile(walPath, os.O_RDONLY, 0)
 	} else {
 		info, statErr := db.file.Stat()
 		if statErr != nil {
 			return nil, nil, statErr
 		}
-		walFile, err = os.OpenFile(walPath, os.O_RDWR|os.O_CREATE, info.Mode().Perm())
+		walFile, err = fsys.OpenFile(walPath, os.O_RDWR|os.O_CREATE, info.Mode().Perm())
 	}
 
 	if err != nil {
@@ -68,6 +69,7 @@ func (db *DB) readOrCreateWal(path string, pageSize int64, syncDirectory func() 
 	log := wal.New(wal.Config{
 		Path:                     walPath,
 		File:                     walFile,
+		FS:                       fsys,
 		PageSize:                 pageSize,
 		SyncOnCommit:             db.options.Synchronous == SyncFull,
 		SyncOnCheckpoint:         db.options.Synchronous != SyncNone,

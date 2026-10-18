@@ -2,9 +2,7 @@
 
 package fileio
 
-import "os"
-
 // SyncData writes file data to stable storage.
-func SyncData(file *os.File) error {
+func SyncData(file File) error {
 	return file.Sync()
 }
