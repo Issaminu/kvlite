@@ -23,10 +23,11 @@ const (
 	opContracts            // one check of an API promise, such as an error for misuse
 	opBackup               // DB.Backup, then a check of the backup file
 	opReadOnly             // a clean Close, a read-only handle, and then a writable handle again
+	opReaders              // several read transactions at once, in turns
 	operationCount
 )
 
-var operationNames = [operationCount]string{"update", "batch", "get", "view", "checkpoint", "reopen", "checksums", "contracts", "backup", "read-only"}
+var operationNames = [operationCount]string{"update", "batch", "get", "view", "checkpoint", "reopen", "checksums", "contracts", "backup", "read-only", "readers"}
 
 const (
 	pathAbsolute = iota // Open gets the absolute path of the main file
@@ -261,6 +262,12 @@ func newConfig(seed uint64) Config {
 	if config.PowerFailures && config.fixedChecksums() {
 		// Without data-page checksums, a misdirected write can hide wrong data.
 		config.Disk.Misdirect = sometimes(rand, 1, 4)
+		if config.Disk.Misdirect != disk.Never {
+			// A misdirect needs a power failure while the main file has unsynced writes: inside a checkpoint, between its writes and its sync.
+			// So these runs checkpoint after every commit and crash inside calls often.
+			config.CheckpointBytes = 1
+			config.ScheduleCrash = disk.OneIn(uint64(rand.Range(2, 6)))
+		}
 	}
 
 	config.PathMode = rand.Weighted([]uint64{2, 1, 1})

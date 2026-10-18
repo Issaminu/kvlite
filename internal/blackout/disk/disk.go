@@ -202,6 +202,7 @@ type FS struct {
 	crashed      bool
 	crashEvent   Event
 	faults       bool   // enables the injected errors of Config
+	noSyncFaults bool   // turns off the injected sync errors of Config, also while faults are enabled
 	fullUntil    uint64 // a disk-full episode lasts until this mutation
 	damage       []damage
 	stats        Stats
@@ -294,6 +295,14 @@ func (fsys *FS) SetFaults(enabled bool) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	fsys.faults = enabled
+}
+
+// SetSyncFaults enables or disables the injected sync errors of the Config, while the other injected errors keep their state.
+// A failed sync can drop unsynced changes for good, so a caller turns sync errors off while it cannot predict that loss.
+func (fsys *FS) SetSyncFaults(enabled bool) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	fsys.noSyncFaults = !enabled
 }
 
 // ScheduleCrash makes the n-th next mutating call crash the process, for n >= 1.
@@ -1421,7 +1430,7 @@ func (f *file) Sync() error {
 		fsys.record(fsys.crashEvent)
 		return crashedError("sync", f.name)
 	}
-	if fsys.inject(fsys.config.SyncFault) {
+	if !fsys.noSyncFaults && fsys.inject(fsys.config.SyncFault) {
 		// Like Linux after a writeback error: some changes reach storage, the kernel marks the others clean, and a later sync does not write them.
 		for _, pending := range node.pending {
 			if fsys.rand.Bool() {

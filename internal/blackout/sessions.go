@@ -16,7 +16,8 @@ import (
 //
 // SyncNone promises nothing after a power failure: "a system failure can lose committed updates or corrupt the database".
 // So a SyncNone session taints the storage.
-// While the storage is tainted, no power failure happens and the floor does not move.
+// While the storage is tainted, no power failure happens, the floor does not move, and no sync fails.
+// A failed sync is a storage failure too: it can drop the unsynced pages of the SyncNone session, even from the cache of the running process.
 // The taint ends when a syncing session has made everything durable, which the disk reports ([disk.FS.Durable]).
 
 // optionsForm is how a session gives its options to Open.
@@ -113,6 +114,7 @@ func (runner *runner) startSession() {
 	}
 	if runner.session.sync == kvlite.SyncNone {
 		runner.tainted = true
+		runner.fsys.SetSyncFaults(false)
 	}
 	runner.event("options: %s", runner.session)
 }
@@ -163,6 +165,7 @@ func (runner *runner) clearTaint() {
 		return
 	}
 	runner.tainted = false
+	runner.fsys.SetSyncFaults(true)
 	runner.stats.TaintsCleared++
 	runner.model.setFloor()
 	runner.event("a syncing session made the storage of the SyncNone session durable")

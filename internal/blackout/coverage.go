@@ -126,6 +126,8 @@ func MissingCoverage(results []Result) []string {
 		{"Open that refused invalid options", total.InvalidOpens},
 		{"a session without an automatic checkpoint (a large WAL)", total.LargeWALSessions},
 		{"a session with MaxWriteBatchSize 1", total.BatchSizeOneSessions},
+		{"a returned slice checked at the end of its transaction", total.HeldChecks},
+		{"a turn of one of several readers at once", total.ReaderTurns},
 		{"process crash", total.Disk.ProcessCrashes},
 		{"power failure", total.Disk.PowerFailures},
 		{"crash inside a call", total.Disk.ScheduledCrashes},

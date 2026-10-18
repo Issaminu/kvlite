@@ -221,6 +221,8 @@ func (runner *runner) runOperation(op operation) {
 		runner.backup()
 	case opReadOnly:
 		runner.readOnly()
+	case opReaders:
+		runner.readers()
 	}
 }
 

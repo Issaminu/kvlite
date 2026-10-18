@@ -128,7 +128,7 @@ func (runner *runner) runMutation(tx *kvlite.Tx, mutation txMutation, applied *[
 		}
 		return runner.checkValue("Bucket.Get in Update", mutation.path, mutation.key, value, getErr)
 	case mutationScan:
-		return runner.scan(bucket, mutation.path, runner.model.state[mutation.path])
+		return runner.scan(bucket, mutation.path, runner.model.state[mutation.path], nil)
 	}
 	if err != nil {
 		return err
@@ -449,6 +449,7 @@ func (runner *runner) view() {
 		if tx.Writable() {
 			runner.fail("Tx.Writable is true inside View")
 		}
+		var held []heldRead
 		for range runner.work.rand.Range(0, 3) {
 			path, key := runner.work.pickBucket(runner.model), runner.work.pickKey()
 			bucket, err := runner.openBucketPath(tx, path)
@@ -468,13 +469,17 @@ func (runner *runner) view() {
 			if err := runner.checkValue("View Bucket.Get", path, key, value, err); err != nil {
 				return err
 			}
+			held = append(held, heldRead{op: "View Bucket.Get", path: path, wantKey: key, value: value, want: runner.model.state[path][key]})
 		}
 		path := runner.work.pickBucket(runner.model)
 		bucket, err := runner.openBucketPath(tx, path)
 		if bucket == nil {
 			return err
 		}
-		return runner.scan(bucket, path, runner.model.state[path])
+		if err := runner.scan(bucket, path, runner.model.state[path], &held); err != nil {
+			return err
+		}
+		return runner.checkHeld(held)
 	})
 	if err != nil && runner.failure == nil && !runner.explained(err) {
 		runner.fail("View: unexpected error: %v", err)
@@ -483,15 +488,17 @@ func (runner *runner) view() {
 
 // scan runs one scan and compares its keys and values with the model.
 // A nested bucket appears with a nil value.
-func (runner *runner) scan(bucket *kvlite.Bucket, path string, content map[string][]byte) error {
+// When held is not nil, scan adds the slices that the scan returned, without a copy, for checkHeld.
+func (runner *runner) scan(bucket *kvlite.Bucket, path string, content map[string][]byte, held *[]heldRead) error {
 	keys := slices.Sorted(maps.Keys(content))
-	var got [][2][]byte
+	var got, originals [][2][]byte
 	collect := func(key, value []byte) error {
 		var copied []byte
 		if value != nil {
 			copied = bytes.Clone(value)
 		}
 		got = append(got, [2][]byte{bytes.Clone(key), copied})
+		originals = append(originals, [2][]byte{key, value})
 		return nil
 	}
 	kind, start, end := runner.work.newScan()
@@ -559,7 +566,37 @@ func (runner *runner) scan(bucket *kvlite.Bucket, path string, content map[strin
 			runner.fail("%s in bucket %q: entry %d is key %s with %d bytes, want key %s with %d bytes", op, path, index, shortKey(string(entry[0])), len(entry[1]), shortKey(want[index]), len(wantValue))
 			return errCheckFailed
 		}
+		if held != nil {
+			*held = append(*held, heldRead{op: op, path: path, key: originals[index][0], wantKey: want[index], value: originals[index][1], want: wantValue})
+		}
 	}
+	return nil
+}
+
+// heldRead is a key and a value that a read returned without a copy, and what they must hold.
+type heldRead struct {
+	op      string
+	path    string
+	key     []byte // the returned key, or nil for a point read
+	wantKey string
+	value   []byte
+	want    []byte // nil names a nested bucket
+}
+
+// checkHeld requires that every slice that a read returned still holds its bytes.
+// KVLite documents that returned keys and values stay valid until the transaction callback returns, so the caller calls checkHeld at the end of the callback.
+func (runner *runner) checkHeld(held []heldRead) error {
+	for _, read := range held {
+		if read.key != nil && string(read.key) != read.wantKey {
+			runner.fail("%s in bucket %q: a returned key changed to %s before the transaction ended, want %s", read.op, read.path, shortKey(string(read.key)), shortKey(read.wantKey))
+			return errCheckFailed
+		}
+		if (read.value == nil) != (read.want == nil) || !bytes.Equal(read.value, read.want) {
+			runner.fail("%s in bucket %q key %s: the returned %d-byte value changed before the transaction ended", read.op, read.path, shortKey(read.wantKey), len(read.value))
+			return errCheckFailed
+		}
+	}
+	runner.stats.HeldChecks += len(held)
 	return nil
 }
 

@@ -43,6 +43,9 @@ type Stats struct {
 	InvalidOpens         int            // checks that Open refuses invalid options
 	LargeWALSessions     int            // sessions without an automatic checkpoint
 	BatchSizeOneSessions int            // SyncFull or other sessions with MaxWriteBatchSize 1
+	HeldChecks           int            // returned slices that were still valid at the end of their transaction
+	ReaderGroups         int            // steps with several read transactions at once
+	ReaderTurns          int            // turns of those readers
 	Disk                 disk.Stats
 }
 
@@ -76,6 +79,9 @@ func (stats *Stats) Add(other Stats) {
 	stats.InvalidOpens += other.InvalidOpens
 	stats.LargeWALSessions += other.LargeWALSessions
 	stats.BatchSizeOneSessions += other.BatchSizeOneSessions
+	stats.HeldChecks += other.HeldChecks
+	stats.ReaderGroups += other.ReaderGroups
+	stats.ReaderTurns += other.ReaderTurns
 	stats.Commits += other.Commits
 	stats.Aborts += other.Aborts
 	stats.Uncertain += other.Uncertain

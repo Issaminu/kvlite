@@ -28,6 +28,9 @@ var (
 	blackoutTrace       = flag.Int("blackout.trace", 0, "with -blackout.seed, print this many of the last steps and storage events on failure")
 	blackoutMaxFailures = flag.Int("blackout.max-failures", 3, "stop the seed range after this many failed seeds")
 	blackoutDeepCheck   = flag.Bool("blackout.deep-check", false, "run the slow checks after every step: the process-crash image and the memory database")
+	blackoutStressSeeds = flag.Int("blackout.stress-seeds", 4, "number of seeds of TestBlackoutStress")
+	blackoutStressSize  = flag.Int("blackout.stress-operations", 0, "operations of each stress client (zero means the default)")
+	blackoutStressCount = flag.Int("blackout.stress-clients", 0, "goroutines of each stress run (zero means the default)")
 )
 
 // target connects the Blackout engine to the internals that export_test.go exports.
@@ -146,6 +149,25 @@ func TestBlackoutWatchdogStopsAHang(t *testing.T) {
 		if !strings.Contains(string(output), want) {
 			t.Errorf("the watchdog output lacks %q:\n%s", want, output)
 		}
+	}
+}
+
+// TestBlackoutStress runs real goroutines against one database at the same time (see [blackout.Stress]).
+// The goroutine schedule does not repeat, so a failure may not replay. Run it with the race detector too:
+//
+//	go test -race -run TestBlackoutStress .
+func TestBlackoutStress(t *testing.T) {
+	seeds := uint64(*blackoutStressSeeds)
+	if testing.Short() {
+		seeds = 1
+	}
+	for seed := uint64(1); seed <= seeds; seed++ {
+		result, err := blackout.Stress(target, seed, blackout.StressSettings{Clients: *blackoutStressCount, Operations: *blackoutStressSize})
+		if err != nil {
+			t.Error(err)
+			continue
+		}
+		t.Log(result)
 	}
 }
 
