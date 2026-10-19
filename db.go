@@ -91,7 +91,9 @@ func (db *DB) walWriteFailure() error {
 
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
-// A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions. A read-only Open requires an existing database and does not create either file.
+// A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions.
+// Open commits the pages of a new database to the write-ahead log and then checkpoints them, so a crash during the creation leaves an empty file or a database that the next Open recovers.
+// A read-only Open requires an existing database and does not create either file. An empty file returns an error that matches [os.ErrNotExist].
 // With [SyncFull] or [SyncNormal], the first write-ahead log sync of a writable handle also syncs the parent directory.
 // That sync runs before a commit or a checkpoint depends on the file names, so a handle that does not write does not sync the directory.
 // The file system must support directory sync.
@@ -214,7 +216,14 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 		db.meta = committedMeta
 	}
 
-	if isNew {
+	// A power failure can lose the name of a new main file and keep its WAL.
+	// Then the WAL holds the state, and recovery copies its pages into the new main file.
+	// An empty database written first would give the handle a second, empty root.
+	if isNew && len(committed) == 0 {
+		if db.options.ReadOnly {
+			// A crash while Open creates the database can leave an empty file. It holds no commit, and a read-only handle cannot create the database.
+			return db.failOpen(fmt.Errorf("database file is empty: %w", os.ErrNotExist))
+		}
 		if err := db.initializeNewDatabase(); err != nil {
 			return db.failOpen(err)
 		}
@@ -253,23 +262,25 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	return db, nil
 }
 
+// initializeNewDatabase commits the pages of an empty database to the WAL, and then checkpoints them into the main file.
+// The commit marker makes the creation atomic.
+// A crash before it leaves an empty main file, and the next Open creates the database again.
+// A crash after it leaves a committed WAL, and recovery copies its pages into the main file again.
 func (db *DB) initializeNewDatabase() error {
-	if err := db.persistMeta(); err != nil {
-		return fmt.Errorf("init meta: %w", err)
-	}
 	allocation := newAllocationBitmap(db.meta.PageSize())
-	pageID := allocation.segmentPageID(0)
-	if err := fileio.WriteFullAt(db.file, allocation.encodeSegment(0), int64(pageID)*db.meta.PageSize()); err != nil {
-		return fmt.Errorf("init allocation page %d: %w", pageID, err)
-	}
 	db.rootNode = btree.NewLeafNode(db.meta.Root())
-	if err := db.persistNode(db.rootNode); err != nil {
-		return fmt.Errorf("init root node: %w", err)
+	db.meta.RefreshChecksum()
+	nodes := []wal.NodeRecord{{Final: db.rootNode}}
+	pages := []wal.AllocationRecord{{PageID: allocation.segmentPageID(0), Payload: allocation.encodeSegment(0)}}
+	if _, err := db.wal.Commit(nodes, pages, page.EncodeMeta(db.meta), nil); err != nil {
+		return fmt.Errorf("commit new database: %w", err)
 	}
-	if db.options.Synchronous != SyncNone {
-		if err := fileio.SyncData(db.file); err != nil {
-			return fmt.Errorf("sync new database: %w", err)
-		}
+	size, err := db.logicalFileSize()
+	if err != nil {
+		return err
+	}
+	if err := db.wal.Checkpoint(db.file, size, db.meta.DataPageChecksums()); err != nil {
+		return fmt.Errorf("checkpoint new database: %w", err)
 	}
 	return nil
 }
@@ -487,15 +498,6 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 	return slices.Clone(value), nil
 }
 
-func (db *DB) persistNode(node *btree.Node) error {
-	offset := int64(node.PageID()) * db.meta.PageSize()
-	writer := io.NewOffsetWriter(db.file, offset)
-	if err := btree.WriteNode(writer, node, db.meta.PageSize(), true, db.meta.DataPageChecksums()); err != nil {
-		return fmt.Errorf("write node: %w", err)
-	}
-	return nil
-}
-
 // hasMeta reports whether the main file holds data.
 // A Stat error is not an empty file: Open would then write a new database over the old one.
 func (db *DB) hasMeta() (bool, error) {
@@ -709,11 +711,19 @@ func (db *DB) findCommittedEntry(pageID page.ID, key []byte) (btree.Entry, bool,
 	}
 }
 
+// errMetaRead marks a failed read of a metadata page.
+// The read says nothing about the page, so Open fails instead of selecting the other copy, and the caller can try again.
+var errMetaRead = errors.New("read metadata page")
+
 func (db *DB) readMetaAt(offset int64) (*page.Meta, error) {
 	data := make([]byte, page.MetaSize)
 	reader := io.NewSectionReader(db.file, offset, page.MetaSize)
 	if err := fileio.ReadFull(reader, data); err != nil {
-		return nil, errors.Join(page.ErrInvalid, err)
+		// A short file has no metadata page at offset.
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, errors.Join(page.ErrInvalid, err)
+		}
+		return nil, fmt.Errorf("%w at offset %d: %w", errMetaRead, offset, err)
 	}
 	return page.DecodeMeta(data)
 }
@@ -740,6 +750,9 @@ func validateMeta(meta *page.Meta) error {
 func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err error) {
 	// Metadata page 0 starts at byte zero. Open can read it before it knows the database page size.
 	meta0, meta0Err := db.readMetaAt(0)
+	if errors.Is(meta0Err, errMetaRead) {
+		return nil, 0, meta0Err
+	}
 	if meta0Err == nil {
 		meta0Err = validateMeta(meta0)
 	}
@@ -758,6 +771,9 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 	meta1Err := error(page.ErrInvalid)
 	for _, pageSize := range pageSizes {
 		candidate, readErr := db.readMetaAt(pageSize)
+		if errors.Is(readErr, errMetaRead) {
+			return nil, 0, readErr
+		}
 		if readErr != nil {
 			meta1Err = errors.Join(meta1Err, readErr)
 			continue
@@ -802,18 +818,4 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 		fmt.Errorf("metadata page %d: %w", page.Meta0ID, meta0Err),
 		fmt.Errorf("metadata page %d: %w", page.Meta1ID, meta1Err),
 	)
-}
-
-// persistMeta initializes both metadata pages with the same checksummed values. Checkpoints update both copies through WAL metadata records.
-func (db *DB) persistMeta() error {
-	db.meta.RefreshChecksum()
-	encoded := page.EncodeMeta(db.meta)
-	for _, pageID := range [...]page.ID{page.Meta0ID, page.Meta1ID} {
-		offset := int64(pageID) * db.meta.PageSize()
-		writer := io.NewOffsetWriter(db.file, offset)
-		if err := fileio.WriteFull(writer, encoded); err != nil {
-			return fmt.Errorf("write meta page %d: %w", pageID, err)
-		}
-	}
-	return nil
 }

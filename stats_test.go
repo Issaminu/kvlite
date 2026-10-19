@@ -13,9 +13,19 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
+// openStatsDB opens an existing database, so the counters of the handle start at zero.
+// The handle that creates a database counts the WAL commit and the checkpoint of the creation.
 func openStatsDB(t *testing.T, options *Options) *DB {
 	t.Helper()
-	db, err := Open(filepath.Join(t.TempDir(), "stats.db"), 0600, options)
+	path := filepath.Join(t.TempDir(), "stats.db")
+	db, err := Open(path, 0600, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, options)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1398,11 +1398,14 @@ func (file *appliedTruncateFailureFile) Truncate(size int64) error {
 func TestCheckpoint_WALTruncateFailureKeepsLaterCommits(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	truncateErr := errors.New("truncate failed")
-	db, err := open(path, 0600, &Options{CheckpointThresholdBytes: 1 << 40}, &appliedTruncateFailureFS{err: truncateErr})
+	// The checkpoint of the new database in Open must not fail.
+	fsys := &appliedTruncateFailureFS{err: truncateErr, failed: true}
+	db, err := open(path, 0600, &Options{CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	fsys.failed = false
 	if err := db.Update(func(tx *Tx) error {
 		bucket, err := tx.CreateBucket(testBucketName)
 		if err != nil {
@@ -2350,14 +2353,14 @@ func TestOpen_SyncsParentDirectoryAtFirstWALSync(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if test.options != nil && test.options.ReadOnly {
-				db, err := Open(path, 0600, nil)
-				if err != nil {
-					t.Fatal(err)
-				}
-				if err := db.Close(); err != nil {
-					t.Fatal(err)
-				}
+			// Open creates a database with a WAL commit, so that Open syncs the directory too.
+			// Each open below finds an existing database.
+			db, err := Open(path, 0600, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
 			}
 			// Reopen after Close removes the WAL. Its new name also needs a sync.
 			for attempt := range 2 {
@@ -2416,9 +2419,16 @@ func TestOpen_SyncsParentDirectoryAtFirstWALSync(t *testing.T) {
 
 func TestOpen_DirectorySyncFailure(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
 	syncErr := errors.New("directory sync failed")
 	var parent *os.File
-	db, err := open(path, 0600, nil, fileio.OSFS{SyncDirectory: func(dir *os.File) error {
+	db, err = open(path, 0600, nil, fileio.OSFS{SyncDirectory: func(dir *os.File) error {
 		parent = dir
 		return syncErr
 	}})
@@ -2513,6 +2523,56 @@ func TestOpen_StatFailureDoesNotReinitializeDatabase(t *testing.T) {
 	}
 }
 
+// failFirstMetaReadFS fails the first read of the main file at offset zero, where metadata page 0 starts.
+type failFirstMetaReadFS struct {
+	fileio.OSFS
+	err    error
+	failed bool
+}
+
+func (fsys *failFirstMetaReadFS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
+	file, err := fsys.OSFS.OpenFile(name, flag, perm)
+	if err != nil || strings.HasSuffix(name, "-wal") {
+		return file, err
+	}
+	return &failFirstMetaReadFile{File: file, fsys: fsys}, nil
+}
+
+type failFirstMetaReadFile struct {
+	fileio.File
+	fsys *failFirstMetaReadFS
+}
+
+func (file *failFirstMetaReadFile) ReadAt(p []byte, offset int64) (int, error) {
+	if offset == 0 && !file.fsys.failed {
+		file.fsys.failed = true
+		return 0, file.fsys.err
+	}
+	return file.File.ReadAt(p, offset)
+}
+
+// A failed read says nothing about a metadata page, so Open must fail and let the caller try again.
+// Blackout found this: Open took an I/O error on page 0 for a damaged copy, looked for page 1 at the operating-system page size, and gave the WAL a wrong page size.
+func TestOpen_MetadataReadFailureFailsOpen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	readErr := errors.New("read failed")
+	db, err = open(path, 0600, nil, &failFirstMetaReadFS{err: readErr})
+	if err == nil {
+		closeErr := db.Close()
+		t.Fatalf("Open succeeded after the read of metadata page 0 failed (close: %v)", closeErr)
+	}
+	if !errors.Is(err, readErr) {
+		t.Fatalf("Open error: got %v, want %v", err, readErr)
+	}
+}
+
 func TestOpen_RelaxedSyncModesDoNotSyncEachCommit(t *testing.T) {
 	tests := []struct {
 		name string
@@ -2581,8 +2641,9 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 	if stats.WALBytesWritten == 0 {
 		t.Fatal("WAL bytes written is zero after committed updates")
 	}
-	if stats.CheckpointCount != 2 {
-		t.Fatalf("checkpoint count: got %d, want 2", stats.CheckpointCount)
+	// Open checkpoints the new database, and each of the two commits starts a checkpoint.
+	if stats.CheckpointCount != 3 {
+		t.Fatalf("checkpoint count: got %d, want 3", stats.CheckpointCount)
 	}
 }
 
@@ -3654,54 +3715,6 @@ func TestReadValidMainMeta_DoesNotChangeMainFileOffset(t *testing.T) {
 	}
 	if got != offset {
 		t.Fatalf("main file offset after metadata read: got %d, want %d", got, offset)
-	}
-}
-
-func TestPersistNode_DoesNotChangeMainFileOffset(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "database")
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	const offset int64 = 7
-	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.persistNode(db.rootNode); err != nil {
-		t.Fatal(err)
-	}
-	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != offset {
-		t.Fatalf("main file offset after node write: got %d, want %d", got, offset)
-	}
-}
-
-func TestPersistMeta_DoesNotChangeMainFileOffset(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "database")
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	const offset int64 = 7
-	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.persistMeta(); err != nil {
-		t.Fatal(err)
-	}
-	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != offset {
-		t.Fatalf("main file offset after metadata write: got %d, want %d", got, offset)
 	}
 }
 

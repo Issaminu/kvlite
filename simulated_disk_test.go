@@ -381,3 +381,93 @@ func TestSimulatedDisk_NewHandleCannotReviveOldRecords(t *testing.T) {
 		}
 	}
 }
+
+// A power failure can lose the name of a new main file and keep its WAL.
+// Open then creates a new main file next to the old WAL.
+// Every read of the handle, and of a later handle, must then show one state.
+// Blackout found this: View showed no bucket, but DB.Get found it, and a clean reopen showed the bucket.
+func TestSimulatedDisk_NewMainFileWithOldWALShowsOneState(t *testing.T) {
+	fsys := disk.New(1, disk.Config{})
+	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	simulatedPut(t, db, "key", "value")
+	simulatedCrash(fsys, db)
+	fsys.Restart(false)
+	// The main file name is lost. The WAL stays.
+	if err := fsys.Remove(simulatedPath); err != nil {
+		t.Fatal(err)
+	}
+
+	read := func() (viewErr, getErr error) {
+		db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal}, fsys)
+		if err != nil {
+			t.Fatalf("Open with the old WAL: %v", err)
+		}
+		defer db.Close()
+		viewErr = db.View(func(tx *Tx) error {
+			bucket, err := tx.Bucket(testBucketName)
+			if err != nil {
+				return err
+			}
+			_, err = bucket.Get([]byte("key"))
+			return err
+		})
+		_, getErr = db.Get(testBucketName, []byte("key"))
+		return viewErr, getErr
+	}
+	viewErr, getErr := read()
+	if !errors.Is(viewErr, getErr) && !errors.Is(getErr, viewErr) {
+		t.Errorf("one handle shows two states: View returned %v, DB.Get returned %v", viewErr, getErr)
+	}
+	if againView, _ := read(); !errors.Is(againView, viewErr) && !errors.Is(viewErr, againView) {
+		t.Errorf("a clean reopen changed the state: View returned %v, then %v", viewErr, againView)
+	}
+}
+
+// A crash at any file change of the first Open happens before any commit.
+// So the next Open must give a usable empty database, after a process crash and after a power failure.
+// Blackout found this: the next Open failed with "metadata last page N exceeds main-file and WAL page IDs".
+func TestSimulatedDisk_CrashWhileOpenCreatesTheFile(t *testing.T) {
+	for _, powerFailure := range []bool{false, true} {
+		for crashAt := 1; crashAt <= 12; crashAt++ {
+			fsys := disk.New(uint64(crashAt), disk.Config{})
+			fsys.ScheduleCrash(crashAt)
+			db, err := open(simulatedPath, 0o600, nil, fsys)
+			if crashed, _ := fsys.Crashed(); !crashed {
+				// Open made fewer changes than crashAt.
+				if err != nil {
+					t.Fatalf("crash point %d: Open without a crash: %v", crashAt, err)
+				}
+				fsys.CancelCrash()
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				continue
+			}
+			if err == nil {
+				simulatedCrash(fsys, db)
+			}
+			_, event := fsys.Crashed()
+			fsys.Restart(powerFailure)
+			// A read-only handle cannot create the database, so an empty file is an error.
+			if readOnly, err := open(simulatedPath, 0o600, &Options{ReadOnly: true}, fsys); err == nil {
+				if err := readOnly.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				t.Errorf("power failure %t, crash point %d (%s): read-only Open after the crash: %v", powerFailure, crashAt, event, err)
+			}
+			db, err = open(simulatedPath, 0o600, nil, fsys)
+			if err != nil {
+				t.Errorf("power failure %t, crash point %d (%s): Open after the crash: %v", powerFailure, crashAt, event, err)
+				continue
+			}
+			simulatedPut(t, db, "key", "value")
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
