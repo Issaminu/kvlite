@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/checksum"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -55,7 +56,9 @@ func TestWALCommit_WritesDatabaseFormatHeader(t *testing.T) {
 	}
 }
 
-func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
+// A header with a valid checksum but another magic number or format version is an error.
+// A header that fails its checksum is torn or zero, and a crash tears a header only before its generation has a durable commit, so the WAL holds nothing.
+func TestWALReadRecords_ChecksFileHeader(t *testing.T) {
 	testCases := []struct {
 		name    string
 		change  func([]byte)
@@ -65,6 +68,7 @@ func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
 			name: "magic",
 			change: func(header []byte) {
 				header[0] ^= 0xff
+				binary.LittleEndian.PutUint32(header[16:20], checksum.Sum32(header[:16]))
 			},
 			wantErr: page.ErrInvalid,
 		},
@@ -72,16 +76,15 @@ func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
 			name: "version",
 			change: func(header []byte) {
 				binary.LittleEndian.PutUint32(header[4:8], page.FormatVersion+1)
+				binary.LittleEndian.PutUint32(header[16:20], checksum.Sum32(header[:16]))
 			},
 			wantErr: page.ErrVersionMismatch,
 		},
 		{
-			// Every record depends on the salt, so damage must not silently drop the generation.
-			name: "salt",
+			name: "torn",
 			change: func(header []byte) {
-				header[8] ^= 1
+				clear(header[17:])
 			},
-			wantErr: page.ErrChecksum,
 		},
 	}
 
@@ -100,8 +103,8 @@ func TestWALReadRecords_RejectsInvalidFileHeader(t *testing.T) {
 			}
 
 			log := New(Config{File: walFile, PageSize: 64})
-			if _, err := log.ReadRecords(); !errors.Is(err, testCase.wantErr) {
-				t.Fatalf("ReadRecords error: got %v, want %v", err, testCase.wantErr)
+			if records, err := log.ReadRecords(); !errors.Is(err, testCase.wantErr) || len(records) != 0 {
+				t.Fatalf("ReadRecords: %d records, error %v, want error %v", len(records), err, testCase.wantErr)
 			}
 		})
 	}
@@ -417,13 +420,14 @@ func TestWALTruncate_ResetsAppendOffset(t *testing.T) {
 	}
 }
 
-func TestWALTruncate_FailureKeepsAppendOffset(t *testing.T) {
+// A failed truncate can still change the size, so the next commit must not append at the old offset.
+// It starts a new generation at offset zero and syncs the header first.
+func TestWALTruncate_FailureStartsANewGeneration(t *testing.T) {
 	walFile, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
 	}
-	const appendOffset = int64(73)
-	log := &WAL{file: walFile, appendOffset: appendOffset}
+	log := &WAL{file: walFile, appendOffset: 73}
 	if err := walFile.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -431,9 +435,49 @@ func TestWALTruncate_FailureKeepsAppendOffset(t *testing.T) {
 	if err := log.Truncate(); err == nil {
 		t.Fatal("truncate on closed WAL succeeded")
 	}
-	if log.appendOffset != appendOffset {
-		t.Fatalf("append offset after failed truncate: got %d, want %d", log.appendOffset, appendOffset)
+	if log.appendOffset != 0 || log.fileKnownEmpty || !log.headerSyncNeeded {
+		t.Fatalf("after a failed truncate: append offset %d, file known empty %t, header sync needed %t", log.appendOffset, log.fileKnownEmpty, log.headerSyncNeeded)
 	}
+}
+
+// A new generation syncs its header only when storage can still hold records of an earlier generation.
+// That is true for the first generation of a handle and after a truncate without a sync.
+func TestWALCommit_SyncsHeaderOnlyAfterAnUnsyncedTruncate(t *testing.T) {
+	walFile, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+	log := New(Config{File: walFile, PageSize: 64, SyncOnCommit: true, SyncOnCheckpoint: true, CheckpointThresholdBytes: 1 << 20})
+	syncs := 0
+	log.SetSyncFileForTesting(func() error { syncs++; return nil })
+	expectSyncs := func(step string, want int, run func() error) {
+		t.Helper()
+		syncs = 0
+		if err := run(); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+		if syncs != want {
+			t.Fatalf("%s: got %d syncs, want %d", step, syncs, want)
+		}
+	}
+	commit := func() error {
+		_, err := log.Commit(nil, nil, []byte("value"), nil)
+		return err
+	}
+
+	expectSyncs("first commit of the handle", 2, commit)
+	expectSyncs("next commit", 1, commit)
+	expectSyncs("sync without a truncate", 0, log.SyncTruncate)
+	if err := log.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	expectSyncs("first commit after an unsynced truncate", 2, commit)
+	if err := log.Truncate(); err != nil {
+		t.Fatal(err)
+	}
+	expectSyncs("sync of the truncate", 1, log.SyncTruncate)
+	expectSyncs("first commit after a synced truncate", 1, commit)
 }
 
 // Open truncates the WAL of every writable handle.

@@ -61,6 +61,8 @@ func New(config Config) *WAL {
 		syncDirectory:            config.SyncDirectory,
 		overlay:                  make(map[page.ID]CommittedPage),
 		nextTxid:                 1,
+		// A new handle does not know what an earlier process left in storage.
+		headerSyncNeeded: true,
 	}
 }
 
@@ -71,7 +73,7 @@ func New(config Config) *WAL {
 // Checkpoint removes a free suffix before it syncs mainFile and clears the WAL.
 // When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
 // A main-file write, truncate, or required sync failure leaves the overlay and WAL available for a later retry.
-// A WAL truncate failure returns an error and keeps the overlay for cleanup retry.
+// A WAL truncate failure returns an error, but the main file then holds every committed page, so the overlay goes away (see [WAL.Truncate]).
 func (wal *WAL) Checkpoint(mainFile fileio.File, targetSize int64, dataPageChecksums bool) error {
 	if len(wal.overlay) == 0 {
 		return nil
@@ -104,12 +106,12 @@ func (wal *WAL) Checkpoint(mainFile fileio.File, targetSize int64, dataPageCheck
 			return err
 		}
 	}
-	if err := wal.Truncate(); err != nil {
-		// Keep the overlay so WAL cleanup can be retried.
-		return err
-	}
+	err = wal.Truncate()
 	clear(wal.overlay)
 	wal.bytesSinceCheckpoint = 0
+	if err != nil {
+		return err
+	}
 	wal.checkpointCount++
 	return nil
 }

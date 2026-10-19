@@ -146,7 +146,10 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	if needsCheckpoint {
 		// The WAL is already durable. A checkpoint failure must not turn this
 		// committed transaction into a reported failure.
-		_ = db.checkpointWAL()
+		// The sync of the WAL truncate saves the header sync of the next commit.
+		if db.checkpointWAL() == nil {
+			_ = db.wal.SyncTruncate()
+		}
 	}
 
 	return nil

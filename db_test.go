@@ -1335,7 +1335,8 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stats.CheckpointFailureCount != 1 || stats.LastCheckpointError == nil || stats.WALPageCount == 0 {
+	// The main file holds every committed page, so the WAL pages leave memory although the truncate failed.
+	if stats.CheckpointFailureCount != 1 || stats.LastCheckpointError == nil || stats.WALPageCount != 0 {
 		t.Fatalf("checkpoint failure state: %+v", stats)
 	}
 	walAfter, err := os.ReadFile(path + "-wal")
@@ -1358,6 +1359,89 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	db.wal.ReplaceFileForTesting(writableWAL)
 	if err := db.Close(); err != nil {
 		t.Fatalf("retry close after WAL cleanup failure: %v", err)
+	}
+}
+
+// appliedTruncateFailureFS gives WAL files a Truncate that changes the size and then returns an error once, as an ftruncate that fails after its size change does.
+type appliedTruncateFailureFS struct {
+	fileio.OSFS
+	err    error
+	failed bool
+}
+
+func (fsys *appliedTruncateFailureFS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
+	file, err := fsys.OSFS.OpenFile(name, flag, perm)
+	if err != nil || !strings.HasSuffix(name, "-wal") {
+		return file, err
+	}
+	return &appliedTruncateFailureFile{File: file, fsys: fsys}, nil
+}
+
+type appliedTruncateFailureFile struct {
+	fileio.File
+	fsys *appliedTruncateFailureFS
+}
+
+func (file *appliedTruncateFailureFile) Truncate(size int64) error {
+	if err := file.File.Truncate(size); err != nil {
+		return err
+	}
+	if !file.fsys.failed {
+		file.fsys.failed = true
+		return file.fsys.err
+	}
+	return nil
+}
+
+// A process crash must keep a commit after a checkpoint whose WAL truncate failed but changed the size.
+// Blackout found this: the commit went to the old WAL offset without a header, and recovery found no WAL.
+func TestCheckpoint_WALTruncateFailureKeepsLaterCommits(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	truncateErr := errors.New("truncate failed")
+	db, err := open(path, 0600, &Options{CheckpointThresholdBytes: 1 << 40}, &appliedTruncateFailureFS{err: truncateErr})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("before-checkpoint"), []byte("value"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.operationMu.Lock()
+	err = db.checkpointWAL()
+	db.operationMu.Unlock()
+	if !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint: got %v, want %v", err, truncateErr)
+	}
+	if err := db.Put(testBucketName, []byte("after-checkpoint"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Copy the files as a process crash leaves them, and recover the copy.
+	crashPath := filepath.Join(t.TempDir(), "database")
+	for _, suffix := range []string{"", "-wal"} {
+		data, err := os.ReadFile(path + suffix)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(crashPath+suffix, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recovered, err := Open(crashPath, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer recovered.Close()
+	for _, key := range []string{"before-checkpoint", "after-checkpoint"} {
+		if value, err := recovered.Get(testBucketName, []byte(key)); err != nil || string(value) != "value" {
+			t.Errorf("Get %q after the crash: %q, %v", key, value, err)
+		}
 	}
 }
 
@@ -2499,6 +2583,31 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 	}
 	if stats.CheckpointCount != 2 {
 		t.Fatalf("checkpoint count: got %d, want 2", stats.CheckpointCount)
+	}
+}
+
+// An automatic checkpoint syncs its WAL truncate, so the first commit of the next WAL generation need not sync its header.
+// SyncFull checkpoints in the write batcher, and SyncNormal checkpoints in Update.
+func TestUpdate_AutomaticCheckpointSyncsTheWALTruncate(t *testing.T) {
+	for name, mode := range map[string]Sync{"full": SyncFull, "normal": SyncNormal} {
+		t.Run(name, func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			// The write batcher returns the results before its checkpoint, but it holds this lock until the checkpoint ends.
+			db.operationMu.Lock()
+			syncs := 0
+			db.wal.SetSyncFileForTesting(func() error { syncs++; return nil })
+			err = db.wal.SyncTruncate()
+			db.wal.SetSyncFileForTesting(nil)
+			db.operationMu.Unlock()
+			if err != nil || syncs != 0 {
+				t.Fatalf("the truncate of the automatic checkpoint still waits for a sync: %v, %d syncs", err, syncs)
+			}
+		})
 	}
 }
 
@@ -6634,8 +6743,9 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 			commitMarkers++
 		}
 	}
-	if got, want := len(transactionIDs), int(syncCalls.Load()); got != want {
-		t.Fatalf("WAL transactions: got %d, want one for each of %d syncs", got, want)
+	// This checkpoint does not sync its WAL truncate, so the first commit after it also syncs the header of the new WAL generation.
+	if got, want := len(transactionIDs), int(syncCalls.Load())-1; got != want {
+		t.Fatalf("WAL transactions: got %d, want one for each of %d syncs after the header sync", got, want)
 	}
 	if commitMarkers != len(transactionIDs) {
 		t.Fatalf("WAL commit markers: got %d, want %d", commitMarkers, len(transactionIDs))
@@ -7376,7 +7486,8 @@ func TestAudit_AutomaticCheckpointUsesSelectedSyncMode(t *testing.T) {
 		mode      Sync
 		syncCalls int
 	}{
-		{name: "normal", mode: SyncNormal, syncCalls: 1},
+		// SyncNormal syncs the WAL before the checkpoint copies it, and it syncs the WAL truncate after the checkpoint.
+		{name: "normal", mode: SyncNormal, syncCalls: 2},
 		{name: "none", mode: SyncNone, syncCalls: 0},
 	}
 	for _, test := range tests {
@@ -8549,7 +8660,8 @@ func TestPut_ContinuedWriteBatch(t *testing.T) {
 	db.executeWriteBatch(requests)
 	db.operationMu.Unlock()
 	db.wal.SetSyncFileForTesting(nil)
-	if syncs != 1 {
+	// The first commit of a WAL generation also syncs its header, unless a sync followed the truncate before it.
+	if syncs != 2 {
 		t.Fatalf("batch sync count: %d", syncs)
 	}
 	for i, request := range requests {

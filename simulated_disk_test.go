@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"strings"
@@ -256,5 +257,127 @@ func TestSimulatedDisk_CorruptedReadDoesNotMakeADamagedBackup(t *testing.T) {
 	defer backup.Close()
 	if value, err := backup.Get(testBucketName, []byte("key")); err != nil || string(value) != "value" {
 		t.Fatalf("Backup returned nil, but the backup is damaged: got %q, %v", value, err)
+	}
+}
+
+// A checkpoint makes T1 and T2 durable in the main file, and its WAL truncate is not synced.
+// The next commit starts a new WAL generation over the old records.
+// A power failure can then keep some sectors of the new generation and lose its header and the truncate.
+// The old header then validates a prefix of the old records, which is older than the main file, and recovery must not apply it.
+// Blackout found this: recovery rolled back checkpointed data, or Open failed with "allocation high page does not match metadata page".
+func TestSimulatedDisk_NewWALGenerationCannotReviveOldRecords(t *testing.T) {
+	for seed := range uint64(300) {
+		fsys := disk.New(seed, disk.Config{})
+		db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkpoint := func() {
+			t.Helper()
+			if err := BlackoutCheckpoint(db); err != nil {
+				t.Fatal(err)
+			}
+		}
+		simulatedPut(t, db, "filler", "")
+		checkpoint()
+		// The old generation: a small T1 in the first WAL sector, then a T2 that covers many sectors.
+		simulatedPut(t, db, "key", "T1")
+		if err := db.Update(func(tx *Tx) error {
+			bucket, err := tx.Bucket(testBucketName)
+			if err != nil {
+				return err
+			}
+			if err := bucket.Put([]byte("filler"), bytes.Repeat([]byte("2"), 8000)); err != nil {
+				return err
+			}
+			return bucket.Put([]byte("key"), []byte("T2"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		checkpoint()
+		// SyncNormal does not sync this commit.
+		simulatedPut(t, db, "filler", strings.Repeat("3", 12000))
+		simulatedCrash(fsys, db)
+		fsys.Restart(true)
+		if value, err := simulatedGet(t, fsys, SyncNormal, "key"); err != nil || value != "T2" {
+			t.Fatalf("seed %d: the checkpointed key after a power failure: got %q, %v, want %q", seed, value, err, "T2")
+		}
+	}
+}
+
+// A sector need not be atomic, so a power failure can keep only part of the WAL header.
+// A generation syncs its header before a commit can depend on it, so a torn header holds no durable commit.
+// Open must then succeed without that WAL, as SQLite ignores a WAL with a bad header.
+// Blackout found this with torn sectors: the header kept 17 of its 20 bytes, and Open failed for good.
+func TestSimulatedDisk_TornWALHeaderOpensWithoutTheWAL(t *testing.T) {
+	fsys := disk.New(1, disk.Config{})
+	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	simulatedPut(t, db, "key", "unsynced")
+	simulatedCrash(fsys, db)
+	fsys.Restart(false)
+	// The torn first sector kept 17 header bytes; the last 3 bytes are zero.
+	wal, err := fsys.OpenFile(simulatedPath+"-wal", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wal.WriteAt([]byte{0, 0, 0}, 17); err != nil {
+		t.Fatal(err)
+	}
+	if err := wal.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := simulatedGet(t, fsys, SyncNormal, "key"); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("the commit of the torn generation: got %v, want ErrBucketNotFound", err)
+	}
+}
+
+// A process can truncate the WAL without a sync and then crash.
+// The next handle sees an empty WAL, but storage can still hold the old records.
+// So every new WAL generation must sync its header first, not only one that this handle truncated.
+// Blackout found this: a damage probe truncated the WAL in its recovery, the next handle wrote a new generation, and a power failure revived part of the old one.
+func TestSimulatedDisk_NewHandleCannotReviveOldRecords(t *testing.T) {
+	for seed := range uint64(300) {
+		fsys := disk.New(seed, disk.Config{})
+		options := &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}
+		db, err := open(simulatedPath, 0o600, options, fsys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		simulatedPut(t, db, "filler", "")
+		if err := BlackoutCheckpoint(db); err != nil {
+			t.Fatal(err)
+		}
+		simulatedPut(t, db, "key", "T1")
+		if err := db.Update(func(tx *Tx) error {
+			bucket, err := tx.Bucket(testBucketName)
+			if err != nil {
+				return err
+			}
+			if err := bucket.Put([]byte("filler"), bytes.Repeat([]byte("2"), 8000)); err != nil {
+				return err
+			}
+			return bucket.Put([]byte("key"), []byte("T2"))
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := BlackoutCheckpoint(db); err != nil {
+			t.Fatal(err)
+		}
+		// The process crashes after the unsynced truncate, so the next handle finds an empty WAL.
+		simulatedCrash(fsys, db)
+		fsys.Restart(false)
+		db, err = open(simulatedPath, 0o600, options, fsys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		simulatedPut(t, db, "filler", strings.Repeat("3", 12000))
+		simulatedCrash(fsys, db)
+		fsys.Restart(true)
+		if value, err := simulatedGet(t, fsys, SyncNormal, "key"); err != nil || value != "T2" {
+			t.Fatalf("seed %d: the checkpointed key after a power failure: got %q, %v, want %q", seed, value, err, "T2")
+		}
 	}
 }

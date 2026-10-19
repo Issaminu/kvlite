@@ -384,7 +384,9 @@ func TestSetDataPageChecksums_InterruptedBatchRecovery(t *testing.T) {
 	syncs := 0
 	db.wal.SetSyncFileForTesting(func() error {
 		syncs++
-		if syncs == 2 {
+		// Each batch syncs the header of a new WAL generation, and then the WAL at its checkpoint.
+		// So sync 4 is the checkpoint of the second batch.
+		if syncs == 4 {
 			return injected
 		}
 		return db.wal.FileForTesting().Sync()
@@ -507,7 +509,10 @@ func TestSetDataPageChecksums_FinalCommitFailure(t *testing.T) {
 	syncs := 0
 	db.wal.SetSyncFileForTesting(func() error {
 		syncs++
-		if syncs == 2 {
+		// The checkpoints of SetDataPageChecksums do not sync their WAL truncate.
+		// So each commit that starts a WAL generation syncs its header and then its records.
+		// So sync 4 is the final commit, after the conversion commit.
+		if syncs == 4 {
 			return injected
 		}
 		return db.wal.FileForTesting().Sync()

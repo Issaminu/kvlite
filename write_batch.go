@@ -234,7 +234,10 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	}
 	if needsCheckpoint && commitErr == nil {
 		// The WAL commit is complete. Callers do not need to wait for main-file maintenance.
-		_ = db.checkpointWAL()
+		// The sync of the WAL truncate is maintenance too: it saves the header sync of the next commit.
+		if db.checkpointWAL() == nil {
+			_ = db.wal.SyncTruncate()
+		}
 	}
 }
 

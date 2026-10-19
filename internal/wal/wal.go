@@ -42,6 +42,8 @@ const (
 // Every record checksum covers that salt.
 // A crash can keep new records but lose the truncate that cleared the WAL.
 // Then the earlier records after them fail their checksums, and recovery stops before them.
+// A power failure can also lose the new header.
+// So a new generation syncs its header before its first record, unless the truncate before it is already synced (see [WAL.SyncTruncate]).
 
 type WAL struct {
 	path                     string
@@ -71,6 +73,7 @@ type WAL struct {
 	syncDirectory            func() error              // set until the first successful Sync syncs the database directory
 	fileKnownEmpty           bool                      // true while the file is known to hold no bytes, so Truncate makes no system call
 	closed                   bool                      // Close succeeded; a retry of Delete after a failed remove must not close the file again
+	headerSyncNeeded         bool                      // storage can still hold records of an earlier generation, so a new generation syncs its header before its records
 }
 
 // Commit appends one transaction and publishes each changed page to the committed overlay.
@@ -494,8 +497,8 @@ func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUns
 }
 
 // ReadRecords validates the WAL header and reads the valid record prefix.
-// It returns nil, nil when no WAL file is configured, the file is empty, or a crash left the header incomplete or zero-filled.
-// Such a header holds no finished commit, because a generation writes its header with its first commit.
+// It returns nil, nil when no WAL file is configured, the file is empty, or the header is incomplete or fails its checksum.
+// Such a header holds no durable commit (see parseFileHeader).
 // It stops at the first invalid record, including a record from an earlier generation.
 // File I/O failures still return an error.
 // After header validation it sets [WAL.appendOffset] to the file size.
@@ -576,7 +579,20 @@ func (wal *WAL) Sync() error {
 		wal.syncDirectory = nil
 	}
 	wal.hasUnsyncedWrites = false
+	// A sync stores every earlier change of the file, a truncate too.
+	wal.headerSyncNeeded = false
 	return nil
+}
+
+// SyncTruncate makes an earlier truncate durable, so the first commit of the next generation need not sync its header.
+// The database calls it after an automatic checkpoint, which already does maintenance syncs.
+// It makes no system call when no truncate waits for a sync, or when the WAL does not sync.
+func (wal *WAL) SyncTruncate() error {
+	if !wal.headerSyncNeeded || !wal.syncOnCheckpoint {
+		return nil
+	}
+	wal.hasUnsyncedWrites = true
+	return wal.Sync()
 }
 
 // Truncate clears the WAL file and resets [WAL.appendOffset].
@@ -584,15 +600,20 @@ func (wal *WAL) Sync() error {
 //
 // Only truncate after the WAL contents have been ingested into the database.
 // Truncate makes no system call when the file is known to be empty, for example after Open finds an empty WAL.
+//
+// The next commit starts a new generation at offset zero even when the truncate fails, because a failed truncate can still change the size.
+// The salt of the new generation makes every old record after it invalid.
+// A sync of the truncate (see [WAL.SyncTruncate]) or the header sync of the next generation makes that durable.
+// So the old records need not go away.
 func (wal *WAL) Truncate() error {
+	wal.appendOffset = 0
 	if wal.fileKnownEmpty {
-		wal.appendOffset = 0
 		return nil
 	}
+	wal.headerSyncNeeded = true
 	if err := wal.file.Truncate(0); err != nil {
 		return err
 	}
-	wal.appendOffset = 0
 	wal.fileKnownEmpty = true
 	return nil
 }
@@ -632,6 +653,16 @@ func (wal *WAL) appendTransaction(transaction []byte) (bool, error) {
 		header := encodeWALFileHeader(wal.salt)
 		if err := fileio.WriteFullAt(wal.file, header[:], 0); err != nil {
 			return false, fmt.Errorf("persist WAL header: %w", err)
+		}
+		// A checkpoint does not sync its WAL truncate, and an earlier process can have truncated this file without a sync, so storage can still hold old records.
+		// Without this sync, a power failure can keep records of the new generation but lose the truncate and the new header.
+		// The old header then validates a prefix of the old records, and recovery applies a state older than the main file.
+		// SQLite syncs a new WAL header for the same reason (ticket ff5be73dee).
+		if wal.headerSyncNeeded && wal.syncOnCheckpoint {
+			wal.hasUnsyncedWrites = true
+			if err := wal.Sync(); err != nil {
+				return false, err
+			}
 		}
 		writeOffset = walFileHeaderSize
 		bytesWritten += walFileHeaderSize
@@ -684,10 +715,12 @@ func encodeWALFileHeader(salt uint64) [walFileHeaderSize]byte {
 }
 
 // parseFileHeader returns the salt from the header at the start of WAL file data.
-// It reports false when data is shorter than a header or zero-filled.
-// A generation writes its header with its first commit, so such a WAL holds no finished commit.
+// It reports false when data is shorter than a header or fails its checksum, as zeros or a torn header do.
+// A crash can tear a header only before the first sync of its generation, so such a WAL holds no durable commit.
+// SQLite also ignores a WAL whose header checksum fails.
+// A header with a valid checksum but another magic number or format version is an error.
 func parseFileHeader(data []byte) (salt uint64, complete bool, err error) {
-	if len(data) < walFileHeaderSize || allZero(data) {
+	if len(data) < walFileHeaderSize || checksum.Sum32(data[:16]) != binary.LittleEndian.Uint32(data[16:20]) {
 		return 0, false, nil
 	}
 	if binary.LittleEndian.Uint32(data[0:4]) != walFileMagic {
@@ -696,20 +729,7 @@ func parseFileHeader(data []byte) (salt uint64, complete bool, err error) {
 	if version := binary.LittleEndian.Uint32(data[4:8]); version != page.FormatVersion {
 		return 0, false, fmt.Errorf("read WAL format version %d: %w", version, page.ErrVersionMismatch)
 	}
-	// A header holds the salt for every record after it. Report damage instead of ignoring the generation.
-	if checksum.Sum32(data[:16]) != binary.LittleEndian.Uint32(data[16:20]) {
-		return 0, false, fmt.Errorf("read WAL header checksum: %w", page.ErrChecksum)
-	}
 	return binary.LittleEndian.Uint64(data[8:16]), true, nil
-}
-
-func allZero(data []byte) bool {
-	for _, value := range data {
-		if value != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 // RecordChecksumSeed returns the record checksum seed of the WAL file that starts with data.
