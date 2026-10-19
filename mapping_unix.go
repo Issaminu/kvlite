@@ -16,6 +16,5 @@ func systemUnmapMainFile(data []byte) error {
 	return unix.Munmap(data)
 }
 
-func systemMainFileMappingIsCurrent(mappedSize, fileSize int64) bool {
-	return mappedSize == fileSize
-}
+// A Unix mapping of a file shows later writes to that file.
+const systemMappingFollowsWrites = true

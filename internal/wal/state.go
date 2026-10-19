@@ -331,12 +331,15 @@ func (wal *WAL) ClearCommittedRecordsForTesting() {
 	clear(wal.overlay)
 }
 
+// Close closes the WAL file.
+// A second call does nothing, so [WAL.Delete] can retry the removal after a failure.
 func (wal *WAL) Close() error {
-	if wal.file == nil {
+	if wal.file == nil || wal.closed {
 		return nil
 	}
 	err := wal.file.Close()
 	if err == nil {
+		wal.closed = true
 		wal.checkpointBuffers = checkpointBuffers{}
 	}
 	return err

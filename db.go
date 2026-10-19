@@ -159,7 +159,11 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	if err != nil {
 		return db.failOpen(fmt.Errorf("resolve database links: %w", err))
 	}
-	isNew := !db.hasMeta()
+	hasMeta, err := db.hasMeta()
+	if err != nil {
+		return db.failOpen(fmt.Errorf("read database file size: %w", err))
+	}
+	isNew := !hasMeta
 	var mainMetaErr error
 	var walPageSize int64
 	if isNew {
@@ -492,12 +496,14 @@ func (db *DB) persistNode(node *btree.Node) error {
 	return nil
 }
 
-func (db *DB) hasMeta() bool {
+// hasMeta reports whether the main file holds data.
+// A Stat error is not an empty file: Open would then write a new database over the old one.
+func (db *DB) hasMeta() (bool, error) {
 	fi, err := db.file.Stat()
 	if err != nil {
-		return false
+		return false, err
 	}
-	return fi.Size() > 0
+	return fi.Size() > 0, nil
 }
 
 // readNode returns one committed node. A file database gives the WAL image priority over the main-file image.

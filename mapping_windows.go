@@ -72,6 +72,4 @@ func systemUnmapMainFile(data []byte) error {
 }
 
 // Windows does not guarantee that file writes update an existing mapped view.
-func systemMainFileMappingIsCurrent(int64, int64) bool {
-	return false
-}
+const systemMappingFollowsWrites = false

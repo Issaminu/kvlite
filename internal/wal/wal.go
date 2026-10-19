@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"math/rand/v2"
 	"slices"
 	"sync"
@@ -69,6 +70,7 @@ type WAL struct {
 	syncFile                 func() error              // syncFile is a test hook for sync failures and call counts.
 	syncDirectory            func() error              // set until the first successful Sync syncs the database directory
 	fileKnownEmpty           bool                      // true while the file is known to hold no bytes, so Truncate makes no system call
+	closed                   bool                      // Close succeeded; a retry of Delete after a failed remove must not close the file again
 }
 
 // Commit appends one transaction and publishes each changed page to the committed overlay.
@@ -83,6 +85,7 @@ type WAL struct {
 // allocationPages contains complete allocation segments. A later change to a segment can also use a byte patch.
 // encodedMeta contains metadata when it changed. It can be nil or empty when metadata did not change.
 // Commit writes changed metadata to both metadata pages.
+// When every page equals its image in the WAL, Commit writes nothing.
 // retired identifies old pages that leave the in-memory WAL view after the append succeeds.
 // The caller must not change committed nodes, allocationPages, or encodedMeta before the next checkpoint.
 //
@@ -113,6 +116,10 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 		return false, err
 	}
 	defer wal.releaseEncodingBuffer()
+	if len(transaction) == 0 {
+		// Every page equals its image in the WAL, so the WAL already holds this state.
+		return false, nil
+	}
 	startOffset := wal.appendOffset
 	bytesBefore := wal.bytesSinceCheckpoint
 	unsyncedBefore := wal.hasUnsyncedWrites
@@ -165,7 +172,8 @@ func (wal *WAL) newEncodingBuffer(size int) []byte {
 	return make([]byte, 0, size)
 }
 
-// encodeTransaction encodes changed nodes, allocation pages, optional metadata, and one commit marker.
+// encodeTransaction encodes changed nodes, allocation pages, optional metadata, and a commit marker after them.
+// When every page equals its image in the WAL, there is no record, and it encodes nothing: recovery stops at a commit marker without records.
 // It also fills wal.pending with the committed state of each page, in record order, and Commit publishes it only after a successful append.
 // The payload of a continued page borrows the returned transaction, or a new image when byte patches describe the node.
 func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, txid TxID) ([]byte, error) {
@@ -260,7 +268,9 @@ func (wal *WAL) encodeTransaction(nodes []NodeRecord, allocationPages []Allocati
 			wal.pending = append(wal.pending, CommittedPage{Header: header, Payload: encodedMeta})
 		}
 	}
-	transaction = appendEncodedPayloadRecord(transaction, RecordHeader{Type: RecordTypeCommit, TxID: txid}, nil, wal.checksumSeed)
+	if len(transaction) != 0 {
+		transaction = appendEncodedPayloadRecord(transaction, RecordHeader{Type: RecordTypeCommit, TxID: txid}, nil, wal.checksumSeed)
+	}
 	if continuedPageCount == 0 {
 		wal.encodingBuffer = transaction[:0]
 	}
@@ -603,6 +613,11 @@ func (wal *WAL) Delete() error {
 	}
 	// delete the file from the disk
 	err = wal.fs.Remove(wal.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		// A failed earlier remove can still remove the name.
+		// The goal of a retry is a missing file, so this is success.
+		return nil
+	}
 	return err
 }
 

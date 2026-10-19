@@ -430,6 +430,58 @@ func TestTreeDeleteEntryDoesNotDirtyUnchangedParent(t *testing.T) {
 	}
 }
 
+// TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace builds the exact path:
+// delete the first key of a first child that stays large enough, so the first-key change moves up to the committed parent P.
+// P is under-full, so the repair merges it with its sibling Q. The merge must change a private copy of P, not the committed P.
+func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
+	leaf := func(pageID page.ID, keys ...string) *Node {
+		node := NewLeafNode(pageID)
+		for _, key := range keys {
+			if err := node.InsertEntry(NewEntry(0, []byte(key), bytes.Repeat([]byte("v"), 16))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return node
+	}
+	branch := func(pageID page.ID, separators []string, children ...page.ID) *Node {
+		node := &Node{header: newNodeHeader(NodeTypeBranch, pageID), Children: children}
+		for _, separator := range separators {
+			node.entries = append(node.entries, Entry{key: []byte(separator)})
+		}
+		return node
+	}
+	nodes := []*Node{
+		leaf(10, "a", "b", "c", "d"), leaf(11, "e", "f", "g", "h"),
+		leaf(12, "i", "j", "k", "l"), leaf(13, "m", "n", "o", "p"), leaf(14, "q", "r", "s", "t"),
+		branch(4, []string{"e"}, 10, 11),
+		branch(5, []string{"m", "q"}, 12, 13, 14),
+		branch(2, []string{"i"}, 4, 5),
+	}
+	store := &memoryTreeStore{pageSize: 256, nextID: 20, nodes: make(map[page.ID]*Node)}
+	committed := make(map[*Node][]byte)
+	for _, node := range nodes {
+		store.nodes[node.PageID()] = node
+		committed[node] = EncodeNode(node, testNodePageSize)
+	}
+	parent := store.nodes[4]
+	if size := int64(parent.EncodedSize()); size >= store.pageSize/4 {
+		t.Fatalf("test setup: parent uses %d bytes, want an under-full parent below %d bytes", size, store.pageSize/4)
+	}
+
+	root, found, err := NewTree(store).DeleteEntry(store.nodes[2], []byte("a"))
+	if err != nil || !found {
+		t.Fatalf("delete: found %t, error %v", found, err)
+	}
+	for node, before := range committed {
+		if !bytes.Equal(EncodeNode(node, testNodePageSize), before) {
+			t.Errorf("delete changed committed node %d in place", node.PageID())
+		}
+	}
+	if _, dirty := store.dirty[4]; !dirty && len(store.freed) == 0 {
+		t.Fatalf("test setup: the delete did not repair the under-full parent (root %d)", root.PageID())
+	}
+}
+
 func TestTreeDeleteEntryMergesAndCollapsesRoot(t *testing.T) {
 	store := &memoryTreeStore{pageSize: 128, nextID: 3, nodes: make(map[page.ID]*Node)}
 	tree := NewTree(store)

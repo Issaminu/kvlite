@@ -63,15 +63,20 @@ func (db *DB) unmapMainFile() error {
 
 // refreshMainFileMapping replaces a mapping that cannot represent the current main file.
 func (db *DB) refreshMainFileMapping() error {
+	followsWrites := systemMappingFollowsWrites
+	if mapper, ok := db.file.(fileio.Mapper); ok {
+		followsWrites = mapper.MappingFollowsWrites()
+	}
 	info, err := db.file.Stat()
 	if err != nil {
+		// A mapping that does not show later writes can hold pages that a checkpoint replaced.
+		// Remove it, so reads use the file until the next refresh.
+		if !followsWrites {
+			err = errors.Join(err, db.unmapMainFile())
+		}
 		return err
 	}
-	current := systemMainFileMappingIsCurrent(int64(len(db.mappedFile)), info.Size())
-	if mapper, ok := db.file.(fileio.Mapper); ok {
-		current = mapper.MappingFollowsWrites() && int64(len(db.mappedFile)) == info.Size()
-	}
-	if current {
+	if followsWrites && int64(len(db.mappedFile)) == info.Size() {
 		return nil
 	}
 	if err := db.unmapMainFile(); err != nil {

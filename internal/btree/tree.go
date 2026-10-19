@@ -498,6 +498,9 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			// first key, so no earlier parent needs a new key.
 			minimumChanged = false
 		} else if right != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex, node, right) <= pageSize) {
+			// node can be a committed parent that a first-key change reached without a copy.
+			// This merge changes node.
+			node = tree.store.WritableNode(node)
 			mergeChildren(parent, step.childIndex, node, right)
 			if minimumChanged && step.childIndex > 0 {
 				// The delete may have emptied node. Before the merge, it had
@@ -532,6 +535,9 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				// the smaller page and stop.
 				return root, nil
 			}
+			// node can be a committed parent that a first-key change reached without a copy.
+			// Redistribution changes both pages.
+			node = tree.store.WritableNode(node)
 			if !useLeft {
 				right = tree.store.WritableNode(right)
 				if !redistributeChildren(parent, step.childIndex, node, right, pageSize, minimumSize) {

@@ -6,8 +6,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 
+	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
+	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
@@ -23,6 +26,7 @@ import (
 // Backup retains the committed WAL page images from its start until it returns.
 // Close waits for Backup to finish. Do not call Backup inside a transaction callback.
 // Backup completes the copy, file cleanup, and checkpoint release before it returns success.
+// It reads the copied allocation pages again and checks them, and the copied tree pages too with data-page checksums, so a damaged read fails the backup.
 // It does not start a checkpoint on the source database.
 //
 // With [SyncFull] or [SyncNormal], Backup syncs the new file before it makes path visible.
@@ -82,6 +86,8 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	pageSize := db.meta.PageSize()
 	dataPageChecksums := db.meta.DataPageChecksums()
 	pages := db.wal.CommittedRecords()
+	// A commit replaces changed segments with private copies, so a copy of the list keeps this state.
+	allocation := &allocationBitmap{pageSize: pageSize, segments: slices.Clone(db.allocation.segments)}
 	if db.activeBackups == 0 {
 		db.backupsDone = make(chan struct{})
 	}
@@ -129,6 +135,9 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	if err := temp.Truncate(size); err != nil {
 		return err
 	}
+	if err := checkBackupPages(temp, allocation, pages, size, dataPageChecksums); err != nil {
+		return err
+	}
 	if db.options.Synchronous != SyncNone {
 		if err := syncBackupFile(temp); err != nil {
 			return err
@@ -151,6 +160,36 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 		return nil
 	}
 	return fsys.SyncDir(dir)
+}
+
+// checkBackupPages reads again the backup pages that came from the main file, and checks each page that has a checksum.
+// A read can return wrong bytes, and the backup must hold one committed state.
+// Allocation pages always have a checksum. Tree pages have one only with data-page checksums.
+// The WAL images in pages come from memory, so they need no check.
+func checkBackupPages(file io.ReaderAt, allocation *allocationBitmap, pages map[page.ID]wal.CommittedPage, size int64, dataPageChecksums bool) error {
+	data := make([]byte, allocation.pageSize)
+	for id := page.Meta1ID + 1; int64(id)*allocation.pageSize < size; id++ {
+		if _, inWAL := pages[id]; inWAL || !allocation.allocated(id) {
+			continue
+		}
+		segment := allocation.isSegmentPage(id)
+		if !segment && !dataPageChecksums {
+			continue
+		}
+		if _, err := file.ReadAt(data, int64(id)*allocation.pageSize); err != nil {
+			return err
+		}
+		var err error
+		if segment {
+			err = verifyAllocationPage(data, allocation.pageSize, id)
+		} else {
+			err = btree.CheckNodeChecksum(data, id)
+		}
+		if err != nil {
+			return fmt.Errorf("check backup page %d: %w", id, err)
+		}
+	}
+	return nil
 }
 
 func backupPathAvailable(fsys fileio.FS, path string) error {

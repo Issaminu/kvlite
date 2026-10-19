@@ -2364,6 +2364,71 @@ func TestOpen_DirectorySyncFailure(t *testing.T) {
 	}
 }
 
+// failFirstMainStatFS fails the first Stat of a main database file.
+type failFirstMainStatFS struct {
+	fileio.OSFS
+	err    error
+	failed bool
+}
+
+func (fsys *failFirstMainStatFS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
+	file, err := fsys.OSFS.OpenFile(name, flag, perm)
+	if err != nil || strings.HasSuffix(name, "-wal") {
+		return file, err
+	}
+	return &failFirstStatFile{File: file, fsys: fsys}, nil
+}
+
+type failFirstStatFile struct {
+	fileio.File
+	fsys *failFirstMainStatFS
+}
+
+func (file *failFirstStatFile) Stat() (os.FileInfo, error) {
+	if !file.fsys.failed {
+		file.fsys.failed = true
+		return nil, file.fsys.err
+	}
+	return file.File.Stat()
+}
+
+// A failed Stat says nothing about the file size.
+// Open must fail, not write a new database over the old one.
+// Blackout found this: Open read the failure as an empty file.
+func TestOpen_StatFailureDoesNotReinitializeDatabase(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	statErr := errors.New("stat failed")
+	db, err = open(path, 0600, nil, &failFirstMainStatFS{err: statErr})
+	if err == nil {
+		closeErr := db.Close()
+		t.Fatalf("Open succeeded after the size check failed (close: %v)", closeErr)
+	}
+	if !errors.Is(err, statErr) {
+		t.Fatalf("Open error: got %v, want %v", err, statErr)
+	}
+
+	db, err = Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	value, err := db.Get(testBucketName, []byte("key"))
+	if err != nil || string(value) != "value" {
+		t.Fatalf("Get after the failed Open: %q, %v", value, err)
+	}
+}
+
 func TestOpen_RelaxedSyncModesDoNotSyncEachCommit(t *testing.T) {
 	tests := []struct {
 		name string
@@ -7033,6 +7098,69 @@ func TestWriteBatch_WALFailureKeepsResultsWithoutPendingDependency(t *testing.T)
 	}
 	if result := <-requests[2].result; !result.panicked || result.panicValue != "callback panic" || result.err != nil {
 		t.Fatalf("panic after pending write: got %+v, want the unchanged panic", result)
+	}
+}
+
+// failFirstRemoveFS fails the first Remove.
+// With removeAnyway, that Remove also removes the name, as an unlink that fails after its directory change does.
+type failFirstRemoveFS struct {
+	fileio.OSFS
+	err          error
+	removeAnyway bool
+	failed       bool
+}
+
+func (fsys *failFirstRemoveFS) Remove(name string) error {
+	if !fsys.failed {
+		fsys.failed = true
+		if fsys.removeAnyway {
+			if err := fsys.OSFS.Remove(name); err != nil {
+				return err
+			}
+		}
+		return fsys.err
+	}
+	return fsys.OSFS.Remove(name)
+}
+
+// Close documents that the caller can retry after an error.
+// Blackout found that after a failed WAL remove, every retry failed with "file already closed".
+func TestClose_RetryAfterWALRemoveFailure(t *testing.T) {
+	for _, removeAnyway := range []bool{false, true} {
+		t.Run(fmt.Sprintf("removed=%t", removeAnyway), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			removeErr := errors.New("remove failed")
+			db, err := open(path, 0600, nil, &failFirstRemoveFS{err: removeErr, removeAnyway: removeAnyway})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				return bucket.Put([]byte("key"), []byte("value"))
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); !errors.Is(err, removeErr) {
+				t.Fatalf("first Close: got %v, want %v", err, removeErr)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatalf("Close retry: %v", err)
+			}
+			if _, err := os.Stat(path + "-wal"); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("WAL after Close retry: %v", err)
+			}
+			db, err = Open(path, 0600, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if value, err := db.Get(testBucketName, []byte("key")); err != nil || string(value) != "value" {
+				t.Fatalf("Get after reopen: %q, %v", value, err)
+			}
+		})
 	}
 }
 

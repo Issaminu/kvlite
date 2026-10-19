@@ -16,6 +16,4 @@ func systemUnmapMainFile([]byte) error {
 	return nil
 }
 
-func systemMainFileMappingIsCurrent(int64, int64) bool {
-	return false
-}
+const systemMappingFollowsWrites = false
