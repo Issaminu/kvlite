@@ -335,14 +335,14 @@ func TestStatsCheckpointSyncFailure(t *testing.T) {
 	if !errors.Is(failed.LastCheckpointError, failure) || failed.CheckpointFailureCount != 1 || failed.CheckpointCount != before.CheckpointCount || failed.WALPageCount == 0 {
 		t.Fatalf("sync failure state: %+v", failed)
 	}
-	db.wal.SetSyncFileForTesting(nil)
-	db.wal.SetCheckpointThresholdBytes(1)
-	if err := db.Put([]byte("data"), []byte("next"), []byte("value")); err != nil {
-		t.Fatal(err)
+	// After a failed WAL sync, the WAL can lose unsynced records, so the handle stops as after a failed commit.
+	if err := db.Put([]byte("data"), []byte("next"), []byte("value")); !errors.Is(err, ErrWALWriteFailed) {
+		t.Fatalf("Put after a failed checkpoint sync: got %v, want ErrWALWriteFailed", err)
 	}
-	retried := readStats(t, db)
-	if retried.LastCheckpointError != nil || retried.CheckpointFailureCount != 1 || retried.CheckpointCount != before.CheckpointCount+1 || retried.WALPageCount != 0 {
-		t.Fatalf("automatic retry state: %+v", retried)
+	reopened := reopenAfterWALWriteFailure(t, db, db.Path(), &Options{Synchronous: SyncNormal})
+	defer reopened.Close()
+	if value, err := reopened.Get([]byte("data"), []byte("key")); err != nil || string(value) != "value" {
+		t.Fatalf("committed write after the reopen: got %q, %v", value, err)
 	}
 }
 

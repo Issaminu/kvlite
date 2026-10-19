@@ -467,6 +467,9 @@ func TestSetDataPageChecksums_InterruptedBatchRecovery(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// The failed WAL sync stopped the handle, so the conversion continues after a reopen.
+	db = reopenAfterWALWriteFailure(t, db, path, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
+	defer db.Close()
 	if err := db.SetDataPageChecksums(true); err != nil {
 		t.Fatal(err)
 	}

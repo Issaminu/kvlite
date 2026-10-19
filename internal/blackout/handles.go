@@ -130,6 +130,12 @@ func (runner *runner) readOnly() {
 		return
 	}
 	runner.checkClosed(writable)
+	if runner.closeStopped {
+		// The handle stopped, so the files can hold any state from the floor to the latest state.
+		runner.event("read-only open skipped: the closed handle had stopped")
+		runner.openAndVerify(false)
+		return
+	}
 	db, err := runner.openDB(runner.fsys, true)
 	if err != nil {
 		if !runner.explained(err) {

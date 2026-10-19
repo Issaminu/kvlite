@@ -33,6 +33,7 @@ type runner struct {
 	step            int
 	faults          bool          // injected errors are enabled outside the checks
 	stopped         bool          // the handle returned ErrWALWriteFailed
+	closeStopped    bool          // the last Close found a handle that ErrWALWriteFailed stopped
 	powerLost       bool          // a power failure happened since the last verified open
 	uncertainOpen   bool          // a commit result is unknown, and no open has resolved it yet
 	checkpointCount uint64        // checkpoints of the current handle
@@ -235,12 +236,28 @@ func (runner *runner) afterStep() {
 		runner.recoverCrash()
 		return
 	}
-	if runner.stopped {
+	if runner.stopped || runner.checkpointStopped() {
 		runner.recoverStopped()
 		return
 	}
 	runner.updateFloor()
 	runner.checkAfterStep()
+}
+
+// checkpointStopped reports whether a failed WAL sync in a checkpoint stopped the handle.
+// The commit before an automatic checkpoint succeeded, so no commit result is unknown, but every later call fails with ErrWALWriteFailed.
+// It probes with View, as the documentation of ErrWALWriteFailed says: View does no I/O, so an injected fault cannot hide the stop.
+func (runner *runner) checkpointStopped() bool {
+	if runner.db == nil {
+		return false
+	}
+	err := runner.db.View(func(*kvlite.Tx) error { return nil })
+	if !errors.Is(err, kvlite.ErrWALWriteFailed) {
+		return false
+	}
+	runner.stats.StoppedHandles++
+	runner.event("a checkpoint stopped the handle: %v", err)
+	return true
 }
 
 // recoverStopped follows the documented procedure after ErrWALWriteFailed: check that the handle stopped, then close it and open the file again.
@@ -286,6 +303,8 @@ func (runner *runner) updateFloor() {
 // It retries after injected errors and finally turns faults off, because Close must succeed once the storage works.
 // It reports false when a crash interrupted Close.
 func (runner *runner) closeDB() bool {
+	// Close of a stopped handle keeps the WAL without a sync, so it does not make the latest state durable.
+	stopped := errors.Is(runner.db.View(func(*kvlite.Tx) error { return nil }), kvlite.ErrWALWriteFailed)
 	for attempt := 0; ; attempt++ {
 		if attempt == closeTries {
 			runner.fsys.SetFaults(false)
@@ -295,16 +314,25 @@ func (runner *runner) closeDB() bool {
 		runner.event("close: %v", err)
 		if err == nil {
 			runner.db = nil
-			if runner.syncing() {
+			runner.closeStopped = stopped
+			switch {
+			case stopped:
+				// The commits after the floor can be saved or lost, so the floor stays.
+			case runner.syncing():
 				// Close checkpoints with syncs, so the latest state is durable.
 				runner.model.setFloor()
-			} else {
+			default:
 				runner.clearTaint()
 			}
 			return true
 		}
 		if crashed, _ := runner.fsys.Crashed(); crashed {
 			return false
+		}
+		if errors.Is(err, kvlite.ErrWALWriteFailed) {
+			// A failed WAL sync in the checkpoint of Close stops the handle, and the next Close keeps the WAL.
+			stopped = true
+			runner.stats.StoppedHandles++
 		}
 		runner.stats.FailedCloses++
 		if !runner.explained(err) || attempt >= closeTries {

@@ -424,10 +424,16 @@ func TestRecovery_UsesSyncMode(t *testing.T) {
 						t.Fatalf("failed WAL sync changed %s: %v", name, err)
 					}
 				}
+				// A failed WAL sync stops this WAL, so a new Open recovers again.
 				db.wal.SetSyncFileForTesting(nil)
-				if err := db.ingestWalRecords(committed); err != nil {
-					t.Fatalf("retry recovery: %v", err)
+				if err := db.closeFiles(); err != nil {
+					t.Fatal(err)
 				}
+				reopened, err := Open(path, 0600, &Options{Synchronous: mode})
+				if err != nil {
+					t.Fatalf("retry recovery in a new Open: %v", err)
+				}
+				defer reopened.Close()
 			}
 			if info, err := os.Stat(path + "-wal"); err != nil || info.Size() != 0 {
 				t.Fatalf("successful recovery did not clear the WAL: %v", err)

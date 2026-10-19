@@ -63,5 +63,6 @@ func (runner *runner) allowedStates(afterCrash bool) (int, bool) {
 	if afterCrash && runner.powerLost || droppedCache {
 		lowest = runner.model.floor
 	}
-	return lowest, afterCrash || droppedCache
+	// After ErrWALWriteFailed, Close keeps the WAL, so the commit whose result is unknown can come back without a crash.
+	return lowest, afterCrash || droppedCache || runner.uncertainOpen
 }

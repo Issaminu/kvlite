@@ -97,7 +97,7 @@ type WAL struct {
 // An error before the append starts, such as an oversized payload, changes nothing.
 // A write or sync failure returns an error that matches [ErrWriteFailed].
 // Commit then truncates the failed append and restores the pre-append byte and synchronization state without updating the overlay.
-// The truncate is not synchronized, so the failed transaction can still reach storage.
+// With syncs, it also syncs the truncate (see rollbackAppend). Without syncs, or when that sync fails, the failed transaction can still reach storage.
 // Every later Commit on this WAL returns the same error, because a new transaction must not build on that unknown file state.
 func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte, retired map[page.ID]struct{}) (bool, error) {
 	if wal.appendFailure != nil {
@@ -485,7 +485,9 @@ func appendBranchBytePatch(patch *[]byte, base, target *btree.Node) (int, bool) 
 }
 
 // rollbackAppend removes bytes from a failed commit and restores the counters that describe the retained WAL prefix.
-// Without a crash, a later open of this WAL then does not recover the failed transaction.
+// A later open of this WAL then does not recover the failed transaction.
+// A sync can store the transaction before the commit fails, for example when the directory sync fails after the file sync.
+// So with syncs, rollbackAppend syncs the truncate: the caller must reopen, and a later power failure must not bring back a transaction that the reopen did not show.
 func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUnsyncedWrites bool) error {
 	if err := wal.file.Truncate(offset); err != nil {
 		return fmt.Errorf("truncate failed WAL transaction: %w", err)
@@ -493,6 +495,11 @@ func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUns
 	wal.bytesSinceCheckpoint = bytesSinceCheckpoint
 	wal.hasUnsyncedWrites = hasUnsyncedWrites
 	wal.appendOffset = offset
+	if wal.syncOnCheckpoint {
+		if err := wal.syncData(); err != nil {
+			return fmt.Errorf("sync truncate of failed WAL transaction: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -585,14 +592,7 @@ func (wal *WAL) Sync() error {
 		return nil
 	}
 
-	var err error
-	if wal.syncFile != nil {
-		err = wal.syncFile()
-	} else {
-		// Production leaves syncFile nil and syncs the WAL data directly.
-		err = fileio.SyncData(wal.file)
-	}
-	if err != nil {
+	if err := wal.syncData(); err != nil {
 		return err
 	}
 	if wal.syncDirectory != nil {
@@ -606,6 +606,15 @@ func (wal *WAL) Sync() error {
 	// A sync stores every earlier change of the file, a truncate too.
 	wal.headerSyncNeeded = false
 	return nil
+}
+
+// syncData syncs the WAL file data.
+func (wal *WAL) syncData() error {
+	if wal.syncFile != nil {
+		return wal.syncFile()
+	}
+	// Production leaves syncFile nil and syncs the WAL data directly.
+	return fileio.SyncData(wal.file)
 }
 
 // SyncTruncate makes an earlier truncate durable, so the first commit of the next generation need not sync its header.

@@ -1,6 +1,7 @@
 package wal
 
 import (
+	"fmt"
 	"io"
 	"maps"
 	"slices"
@@ -72,18 +73,25 @@ func New(config Config) *WAL {
 // targetSize is the byte length through the last allocated database page.
 // Checkpoint removes a free suffix before it syncs mainFile and clears the WAL.
 // When [Config.SyncOnCheckpoint] is true, Checkpoint syncs the WAL before the copy and syncs mainFile before cleanup. When it is false, Checkpoint does not issue these sync calls.
-// A main-file write, truncate, or required sync failure leaves the overlay and WAL available for a later retry.
+// A main-file write, truncate, or sync failure leaves the overlay and WAL available for a later retry.
+// A WAL sync failure stops the WAL like a failed append (see [WAL.Commit]), and every later Checkpoint returns that error and writes nothing.
 // A WAL truncate failure returns an error, but the main file then holds every committed page, so the overlay goes away (see [WAL.Truncate]).
 func (wal *WAL) Checkpoint(mainFile fileio.File, targetSize int64, dataPageChecksums bool) error {
 	if len(wal.overlay) == 0 {
 		return nil
+	}
+	if wal.appendFailure != nil {
+		return wal.appendFailure
 	}
 	if wal.pageSize <= 0 || targetSize < 0 || targetSize%wal.pageSize != 0 {
 		return page.ErrInvalid
 	}
 	if wal.syncOnCheckpoint {
 		if err := wal.Sync(); err != nil {
-			return err
+			// After a failed sync, the file can lose unsynced records for good, as Linux can after a writeback error.
+			// Then no WAL can repair a torn main-file write, so stop this WAL like a failed append.
+			wal.appendFailure = fmt.Errorf("%w: %w", ErrWriteFailed, err)
+			return wal.appendFailure
 		}
 	}
 	if err := wal.checkpointBuffers.writeCommittedPages(mainFile, wal.overlay, wal.pageSize, dataPageChecksums); err != nil {

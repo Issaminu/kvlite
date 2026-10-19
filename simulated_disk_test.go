@@ -536,3 +536,76 @@ func TestSimulatedDisk_RecoveryStoresTheWALItReads(t *testing.T) {
 		t.Fatal("no seed dropped a WAL write, so this test does not reach the case")
 	}
 }
+
+// After ErrWALWriteFailed, the documented step is to close, open again, and check the data.
+// The answer of that open must be final: a commit that it does not show must not come back after a later power failure.
+// Blackout found this: the WAL sync of a commit succeeded and the directory sync failed, so the commit failed and its rollback truncated the WAL without a sync.
+// A power failure then lost the truncate, and the commit came back.
+func TestSimulatedDisk_FailedCommitStaysLostAfterPowerFailure(t *testing.T) {
+	// Keep almost no unsynced change at the power failure.
+	fsys := disk.New(1, disk.Config{SyncDirFault: disk.Always, KeepChange: disk.Ratio{Num: 1, Den: 1 << 30}})
+	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The first commit of a new WAL syncs the directory, and that sync fails.
+	fsys.SetFaults(true)
+	err = db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.Put([]byte("key"), []byte("failed"))
+	})
+	fsys.SetFaults(false)
+	if !errors.Is(err, ErrWALWriteFailed) {
+		t.Fatalf("commit with a failed directory sync: %v, want ErrWALWriteFailed", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := simulatedGet(t, fsys, SyncFull, "key"); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("the failed commit after the reopen: %v, want ErrBucketNotFound", err)
+	}
+	fsys.Crash()
+	fsys.Restart(true)
+	if _, err := simulatedGet(t, fsys, SyncFull, "key"); !errors.Is(err, ErrBucketNotFound) {
+		t.Fatalf("the failed commit after a power failure: %v, want ErrBucketNotFound; the reopen said it was lost", err)
+	}
+}
+
+// After a failed sync, the WAL file content is unknown: Linux can drop the unsynced pages after a writeback error.
+// A checkpoint that then writes the main file has no WAL that can repair a torn write.
+// So a failed WAL sync in a checkpoint must stop the handle like a failed commit, and Close must keep the WAL for the next Open.
+// Blackout found this: a checkpoint retry after a failed WAL sync wrote main pages, a power failure tore them, and the recovered database was invalid.
+func TestSimulatedDisk_FailedWALSyncInCheckpointStopsTheHandle(t *testing.T) {
+	fsys := disk.New(1, disk.Config{SyncFault: disk.Always, DropCache: disk.Always})
+	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	simulatedPut(t, db, "key", "value")
+	fsys.SetFaults(true)
+	err = BlackoutCheckpoint(db)
+	fsys.SetFaults(false)
+	if err == nil {
+		t.Fatal("the checkpoint with a failed WAL sync succeeded")
+	}
+	if err := db.Put(testBucketName, []byte("later"), []byte("value")); !errors.Is(err, ErrWALWriteFailed) {
+		t.Fatalf("Put after a failed WAL sync in a checkpoint: %v, want ErrWALWriteFailed", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close after a failed WAL sync in a checkpoint: %v", err)
+	}
+	// The dropped cache can keep or lose the commit, but the state must be one of the two.
+	if value, err := simulatedGet(t, fsys, SyncNormal, "key"); !errors.Is(err, ErrBucketNotFound) && (err != nil || value != "value") {
+		t.Fatalf("after the reopen: got %q, %v", value, err)
+	}
+}

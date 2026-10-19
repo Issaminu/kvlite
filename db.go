@@ -334,7 +334,7 @@ func (db *DB) failOpen(err error) (*DB, error) {
 	return nil, err
 }
 
-// Close releases the database resources. For a writable file database, it first checkpoints committed data into the database file and removes the write-ahead log. A read-only file database only closes its files. A memory database discards all data without file operations.
+// Close releases the database resources. For a writable file database, it first checkpoints committed data into the database file and removes the write-ahead log. A read-only file database only closes its files, and so does a database that returned [ErrWALWriteFailed]: the next Open recovers its write-ahead log. A memory database discards all data without file operations.
 //
 // Close prevents new data operations and waits for active operations to finish. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, the database remains open so the caller can retry, but some cleanup can remain incomplete.
 func (db *DB) Close() error {
@@ -372,7 +372,10 @@ func (db *DB) close() error {
 		db.allocation = nil
 		return nil
 	}
-	if db.options.ReadOnly {
+	// A read-only handle only closes its files.
+	// After a failed WAL write or sync, the WAL file content is unknown, so a checkpoint could write main pages that no WAL can repair.
+	// Then Close keeps the WAL, and the next Open recovers what storage holds.
+	if db.options.ReadOnly || db.walWriteFailure() != nil {
 		if err := db.unmapMainFile(); err != nil {
 			return err
 		}

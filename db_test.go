@@ -7665,7 +7665,7 @@ func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
 	syncCalls := 0
 	db.wal.SetSyncFileForTesting(func() error {
 		syncCalls++
-		// The first hooked sync belongs to the failed commit. Any later call is redundant.
+		// The first hooked sync belongs to the failed commit, and the second to its rollback. Any later call is redundant.
 		if syncCalls == 1 {
 			return syncErr
 		}
@@ -7678,8 +7678,8 @@ func TestAudit_FailedSyncRestoresPriorWALSyncState(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if syncCalls != 1 {
-		t.Fatalf("failed commit and close WAL sync calls: got %d, want 1", syncCalls)
+	if syncCalls != 2 {
+		t.Fatalf("failed commit, rollback, and close WAL sync calls: got %d, want 2", syncCalls)
 	}
 }
 
@@ -7722,8 +7722,9 @@ func TestAudit_WALSyncFailureRollsBackBeforePublication(t *testing.T) {
 	if !errors.Is(err, syncErr) {
 		t.Fatalf("Put error: got %v, want %v", err, syncErr)
 	}
-	if syncCalls != 1 {
-		t.Fatalf("WAL sync calls: got %d, want 1", syncCalls)
+	// The failed commit syncs, and its rollback syncs the truncate.
+	if syncCalls != 2 {
+		t.Fatalf("WAL sync calls: got %d, want 2", syncCalls)
 	}
 	if publishedBeforeSync {
 		t.Fatal("transaction was published to the overlay before WAL sync succeeded")
