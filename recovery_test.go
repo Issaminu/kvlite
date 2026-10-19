@@ -42,6 +42,60 @@ func TestRecovery_ZeroFilledWALHeaderOpens(t *testing.T) {
 	}
 }
 
+// An empty main file holds no database, so Open ignores a WAL next to it, as SQLite does.
+// A person can delete a database file and keep its WAL.
+// Open then copied the pages of that WAL into the new file, and every later Open failed with "read allocation page 2: EOF".
+func TestRecovery_EmptyMainFileIgnoresTheWAL(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 1 << 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	for index := range 200 {
+		if err := db.Put(testBucketName, []byte{byte(index), 'k'}, make([]byte, 300)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The checkpoint moves most pages into the main file, so the WAL alone is not a database.
+	if err := db.checkpointWAL(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("old"), []byte("value")); err != nil {
+		t.Fatal(err)
+	}
+	staleWAL, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", staleWAL, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A read-only handle cannot create the database.
+	if _, err := Open(path, 0600, &Options{ReadOnly: true}); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read-only Open of an empty file next to a WAL: got %v, want os.ErrNotExist", err)
+	}
+	for attempt := range 2 {
+		db, err := Open(path, 0600, &Options{Synchronous: SyncFull})
+		if err != nil {
+			t.Fatalf("Open %d of an empty file next to a WAL: %v", attempt, err)
+		}
+		if _, err := db.Get(testBucketName, []byte("old")); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("Open %d shows data of the WAL: got %v, want ErrBucketNotFound", attempt, err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestRecovery_PartialCheckpoint(t *testing.T) {
 	for _, test := range []struct {
 		name      string

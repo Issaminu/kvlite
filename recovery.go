@@ -41,8 +41,10 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 	return db.ingestWalRecords(committed)
 }
 
+// readOrCreateWal opens the WAL of path and reads its committed prefix.
+// With discard, it clears the WAL instead, because the empty main file holds no database (see open).
 // syncDirectory is nil when the handle must not sync the database directory.
-func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncDirectory func() error) (*wal.WAL, []wal.WALRecord, error) {
+func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncDirectory func() error, discard bool) (*wal.WAL, []wal.WALRecord, error) {
 	// Open supplies the resolved absolute path so symbolic links share one log.
 	walPath := path + "-wal"
 	var walFile fileio.File
@@ -77,6 +79,14 @@ func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncD
 		SyncDirectory:            syncDirectory,
 	})
 
+	if discard {
+		// The first commit of a handle syncs the WAL header before its records, and that sync also makes this truncate durable.
+		// So no record of this WAL can come back after a power failure.
+		if err := log.Truncate(); err != nil {
+			return nil, nil, errors.Join(err, log.Close())
+		}
+		return log, nil, nil
+	}
 	records, err := log.ReadRecords()
 	if err != nil {
 		return nil, nil, errors.Join(err, log.Close())

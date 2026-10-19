@@ -384,7 +384,7 @@ func TestSimulatedDisk_NewHandleCannotReviveOldRecords(t *testing.T) {
 
 // A power failure can lose the name of a new main file and keep its WAL.
 // Open then creates a new main file next to the old WAL.
-// Every read of the handle, and of a later handle, must then show one state.
+// The empty main file holds no database, so Open ignores the WAL, and every read of the handle, and of a later handle, shows the empty database.
 // Blackout found this: View showed no bucket, but DB.Get found it, and a clean reopen showed the bucket.
 func TestSimulatedDisk_NewMainFileWithOldWALShowsOneState(t *testing.T) {
 	fsys := disk.New(1, disk.Config{})
@@ -418,8 +418,8 @@ func TestSimulatedDisk_NewMainFileWithOldWALShowsOneState(t *testing.T) {
 		return viewErr, getErr
 	}
 	viewErr, getErr := read()
-	if !errors.Is(viewErr, getErr) && !errors.Is(getErr, viewErr) {
-		t.Errorf("one handle shows two states: View returned %v, DB.Get returned %v", viewErr, getErr)
+	if !errors.Is(viewErr, ErrBucketNotFound) || !errors.Is(getErr, ErrBucketNotFound) {
+		t.Errorf("the handle does not show the empty database: View returned %v, DB.Get returned %v", viewErr, getErr)
 	}
 	if againView, _ := read(); !errors.Is(againView, viewErr) && !errors.Is(viewErr, againView) {
 		t.Errorf("a clean reopen changed the state: View returned %v, then %v", viewErr, againView)

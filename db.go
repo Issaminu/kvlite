@@ -166,6 +166,13 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 		return db.failOpen(fmt.Errorf("read database file size: %w", err))
 	}
 	isNew := !hasMeta
+	// An empty main file holds no database, so a WAL next to it comes from a deleted database or from a creation that did not finish.
+	// The creating Open checkpoints and syncs the main file before it returns, so that WAL holds no acknowledged commit.
+	// So Open ignores that WAL, as SQLite deletes the WAL of an empty database file (pagerOpenWalIfPresent).
+	if isNew && db.options.ReadOnly {
+		// A crash while Open creates the database can leave an empty file, and a read-only handle cannot create the database.
+		return db.failOpen(fmt.Errorf("database file is empty: %w", os.ErrNotExist))
+	}
 	var mainMetaErr error
 	var walPageSize int64
 	if isNew {
@@ -197,7 +204,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 			return nil
 		}
 	}
-	wal, records, err := db.readOrCreateWal(fsys, filePath, walPageSize, syncWALDirectory)
+	wal, records, err := db.readOrCreateWal(fsys, filePath, walPageSize, syncWALDirectory, isNew)
 	if err != nil {
 		return db.failOpen(err)
 	}
@@ -216,14 +223,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 		db.meta = committedMeta
 	}
 
-	// A power failure can lose the name of a new main file and keep its WAL.
-	// Then the WAL holds the state, and recovery copies its pages into the new main file.
-	// An empty database written first would give the handle a second, empty root.
-	if isNew && len(committed) == 0 {
-		if db.options.ReadOnly {
-			// A crash while Open creates the database can leave an empty file. It holds no commit, and a read-only handle cannot create the database.
-			return db.failOpen(fmt.Errorf("database file is empty: %w", os.ErrNotExist))
-		}
+	if isNew {
 		if err := db.initializeNewDatabase(); err != nil {
 			return db.failOpen(err)
 		}
