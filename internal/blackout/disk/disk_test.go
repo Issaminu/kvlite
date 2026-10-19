@@ -597,22 +597,24 @@ func TestDiskFullEpisodeFailsGrowth(t *testing.T) {
 }
 
 func TestReadCorruptionLeavesStoredBytes(t *testing.T) {
-	fsys := New(1, Config{ReadCorruption: Always})
-	wal := openRW(t, fsys, testName+"-wal")
-	mustWrite(t, wal, []byte("record"), 0)
-	main := openRW(t, fsys, testName)
-	mustWrite(t, main, []byte("record"), 0)
-	fsys.SetFaults(true)
-	buffer := make([]byte, 6)
-	if _, err := wal.ReadAt(buffer, 0); err != nil || string(buffer) == "record" {
-		t.Fatalf("WAL read with ReadCorruption: %q, %v, want one flipped bit", buffer, err)
-	}
-	if _, err := main.ReadAt(buffer, 0); err != nil || string(buffer) != "record" {
-		t.Fatalf("main-file read without CorruptMainReads: %q, %v", buffer, err)
-	}
-	fsys.SetFaults(false)
-	if got := content(fsys, testName+"-wal"); string(got) != "record" {
-		t.Fatalf("stored WAL bytes after a corrupted read: %q", got)
+	for _, corruptMainReads := range []bool{false, true} {
+		fsys := New(1, Config{ReadCorruption: Always, CorruptMainReads: corruptMainReads})
+		wal := openRW(t, fsys, testName+"-wal")
+		mustWrite(t, wal, []byte("record"), 0)
+		main := openRW(t, fsys, testName)
+		mustWrite(t, main, []byte("record"), 0)
+		fsys.SetFaults(true)
+		buffer := make([]byte, 6)
+		if _, err := wal.ReadAt(buffer, 0); err != nil || string(buffer) != "record" {
+			t.Fatalf("WAL read with CorruptMainReads %t: %q, %v, want no flipped bit", corruptMainReads, buffer, err)
+		}
+		if _, err := main.ReadAt(buffer, 0); err != nil || (string(buffer) == "record") == corruptMainReads {
+			t.Fatalf("main-file read with CorruptMainReads %t: %q, %v", corruptMainReads, buffer, err)
+		}
+		fsys.SetFaults(false)
+		if got := content(fsys, testName); string(got) != "record" {
+			t.Fatalf("stored main-file bytes after a corrupted read: %q", got)
+		}
 	}
 }
 

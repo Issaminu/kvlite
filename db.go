@@ -234,6 +234,13 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 		return db.failOpen(err)
 	}
 
+	// A failed sync of an earlier process can drop WAL writes from storage while the cache keeps them.
+	// Write the records again, so the sync before the checkpoint stores them, and the WAL can repair a torn main-file write of recovery.
+	if !db.options.ReadOnly && db.options.Synchronous != SyncNone && len(committed) > 0 {
+		if err := db.wal.RewriteRecords(records); err != nil {
+			return db.failOpen(err)
+		}
+	}
 	// A remaining WAL can contain committed data from an unclean close, an interrupted checkpoint, or failed cleanup. Writable recovery copies committed records to the main file. Read-only recovery keeps them in the WAL overlay.
 	if err := db.replayWAL(committed); err != nil {
 		return db.failOpen(err)

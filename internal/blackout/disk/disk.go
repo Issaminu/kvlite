@@ -110,7 +110,8 @@ type Config struct {
 	FullFault Ratio
 
 	// ReadCorruption is the probability that a read returns one flipped bit, while the stored bytes stay correct.
-	// It applies to WAL files, and to other files only with CorruptMainReads.
+	// It applies only with CorruptMainReads, and never to a WAL file.
+	// A real read of a WAL comes from the page cache, so a second read returns the same bytes, and a wrong WAL byte is then bit rot, which Blackout does not inject (see damage.go).
 	ReadCorruption   Ratio
 	CorruptMainReads bool
 
@@ -1207,7 +1208,7 @@ func (f *file) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, io.EOF
 	}
 	n := copy(p, f.node.data[offset:])
-	if n > 0 && (fsys.config.CorruptMainReads || strings.HasSuffix(f.name, "-wal")) && fsys.faults && fsys.rand.Chance(fsys.config.ReadCorruption) {
+	if n > 0 && fsys.config.CorruptMainReads && !strings.HasSuffix(f.name, "-wal") && fsys.faults && fsys.rand.Chance(fsys.config.ReadCorruption) {
 		bit := fsys.rand.IntN(n * 8)
 		p[bit/8] ^= 1 << (bit % 8)
 		fsys.stats.ReadCorruptions++

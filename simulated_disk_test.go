@@ -471,3 +471,68 @@ func TestSimulatedDisk_CrashWhileOpenCreatesTheFile(t *testing.T) {
 		}
 	}
 }
+
+// A failed sync can drop a WAL write from storage for good while the cache keeps it, and a later sync does not write it.
+// After a process crash, recovery reads that write from the cache, and its WAL sync does not store it.
+// If a power failure then tears the main-file writes of recovery, the durable WAL must still repair them.
+// Blackout found this: the recovered tree had keys out of order.
+func TestSimulatedDisk_RecoveryStoresTheWALItReads(t *testing.T) {
+	dropped := 0
+	for seed := range uint64(40) {
+		for crashAt := 1; crashAt <= 12; crashAt++ {
+			fsys := disk.New(seed, disk.Config{SyncFault: disk.Always})
+			db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			simulatedPut(t, db, "base", "v0")
+			if err := BlackoutCheckpoint(db); err != nil {
+				t.Fatal(err)
+			}
+			simulatedPut(t, db, "key", strings.Repeat("v", 3*os.Getpagesize()))
+			fsys.SetFaults(true)
+			_ = BlackoutCheckpoint(db)
+			fsys.SetFaults(false)
+			if cache, durable, _ := fsys.FileData(simulatedPath + "-wal"); bytes.Equal(cache, durable) {
+				// The failed sync stored every WAL write.
+				simulatedCrash(fsys, db)
+				break
+			}
+			dropped++
+			simulatedCrash(fsys, db)
+			fsys.Restart(false)
+			fsys.ScheduleCrash(crashAt)
+			if db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal}, fsys); err == nil {
+				fsys.CancelCrash()
+				if crashed, _ := fsys.Crashed(); !crashed {
+					// Recovery made fewer changes than crashAt.
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					break
+				}
+				BlackoutAbandon(db)
+			}
+			fsys.Restart(true)
+			db, err = open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal}, fsys)
+			if err != nil {
+				t.Fatalf("seed %d, crash point %d: Open after a power failure in recovery: %v", seed, crashAt, err)
+			}
+			if err := BlackoutCheckPages(db); err != nil {
+				t.Fatalf("seed %d, crash point %d: pages after a power failure in recovery: %v", seed, crashAt, err)
+			}
+			if value, err := db.Get(testBucketName, []byte("base")); err != nil || value == nil {
+				t.Fatalf("seed %d, crash point %d: checkpointed key: %v", seed, crashAt, err)
+			}
+			if _, err := db.Get(testBucketName, []byte("key")); err != nil && !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("seed %d, crash point %d: unsynced key: %v", seed, crashAt, err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if dropped == 0 {
+		t.Fatal("no seed dropped a WAL write, so this test does not reach the case")
+	}
+}

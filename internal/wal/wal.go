@@ -556,6 +556,30 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 	return records, nil
 }
 
+// RewriteRecords writes records again at their offsets, with the header of their generation.
+// records must be the records that ReadRecords returned, in the same order.
+// A failed sync of an earlier process can drop WAL writes from storage for good while the cache keeps them, as Linux can after a writeback error, and a later sync does not write them.
+// ext4 and XFS keep the new content of such pages in the cache and mark the pages clean (Rebello et al., "Can Applications Recover from fsync Failures?", USENIX ATC 2020).
+// Recovery reads such records from the cache, so it writes them again: the pages become dirty, and the next sync stores them.
+// Btrfs puts the content on storage back into the cache instead, so there the rewrite writes the bytes on storage again.
+// The bytes are the same, so a crash during the rewrite changes nothing that a reader sees.
+func (wal *WAL) RewriteRecords(records []WALRecord) error {
+	size := walFileHeaderSize
+	for index := range records {
+		size += HeaderSize + len(records[index].Payload) + ChecksumSize
+	}
+	header := encodeWALFileHeader(wal.salt)
+	data := append(make([]byte, 0, size), header[:]...)
+	for index := range records {
+		data = appendEncodedPayloadRecord(data, records[index].Header, records[index].Payload, wal.checksumSeed)
+	}
+	if err := fileio.WriteFullAt(wal.file, data, 0); err != nil {
+		return fmt.Errorf("rewrite WAL records: %w", err)
+	}
+	wal.hasUnsyncedWrites = true
+	return nil
+}
+
 func (wal *WAL) Sync() error {
 	if !wal.hasUnsyncedWrites {
 		return nil
