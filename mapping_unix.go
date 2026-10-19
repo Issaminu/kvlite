@@ -1,4 +1,4 @@
-//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || solaris
 
 package kvlite
 
@@ -16,5 +16,5 @@ func systemUnmapMainFile(data []byte) error {
 	return unix.Munmap(data)
 }
 
-// A Unix mapping of a file shows later writes to that file.
+// These systems have a unified buffer cache, so a shared mapping of a file shows later writes to that file.
 const systemMappingFollowsWrites = true
