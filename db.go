@@ -220,6 +220,11 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 		return db.failOpen(fmt.Errorf("read committed meta from WAL: %w", committedMetaErr))
 	}
 	if committedMeta != nil {
+		// The WAL decoded its records with walPageSize, and its checkpoint places pages with it.
+		// walPageSize can come from a metadata copy that failed its checksum, so validated metadata must confirm it before recovery writes.
+		if committedMeta.PageSize() != walPageSize {
+			return db.failOpen(fmt.Errorf("WAL metadata page size %d does not match the page size %d that Open used for the WAL: %w", committedMeta.PageSize(), walPageSize, page.ErrInvalid))
+		}
 		db.meta = committedMeta
 	}
 

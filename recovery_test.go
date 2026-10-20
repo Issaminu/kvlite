@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
@@ -444,6 +445,83 @@ func TestRecovery_UsesSyncMode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Open must not place WAL pages with the page size of a metadata copy that fails its checksum.
+// Blackout found this (issue 4): one changed bit in the page-size field of metadata page 0 made 16384 into 49152.
+// Metadata page 1 was not at the operating-system page size, so Open read the WAL with 49152 and took the 16384 metadata from the WAL.
+// The recovery checkpoint then wrote each page at 3 times its offset and cleared the WAL, and every later Open failed.
+func TestRecovery_DamagedMetadataPageSizeKeepsCommittedData(t *testing.T) {
+	const databasePageSize, hostPageSize = 16384, 4096
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := open(path, 0o600, &Options{CheckpointThresholdBytes: 1 << 40, pageSize: databasePageSize}, fileio.OSFS{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	value := bytes.Repeat([]byte{'v'}, 3000)
+	// The checkpoint writes only when the damaged page size divides the file size, so the file gets a multiple of 3 pages.
+	keys := 0
+	for keys == 0 || (db.meta.LastPage()+1)%3 != 0 {
+		if err := db.Put(testBucketName, []byte(fmt.Sprintf("key-%03d", keys)), value); err != nil {
+			t.Fatal(err)
+		}
+		keys++
+	}
+	// Keep the files of a process that stopped after its last commit, so the commits are only in the WAL.
+	main, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	log, err := os.ReadFile(path + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pageSizeByte := main[9]
+	// Bit 79 is in the page-size field of metadata page 0.
+	main[9] ^= 0x80
+	if err := os.WriteFile(path, main, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", log, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	checkKeys := func(db *DB, when string) {
+		t.Helper()
+		for index := range keys {
+			got, err := db.Get(testBucketName, []byte(fmt.Sprintf("key-%03d", index)))
+			if err != nil || !bytes.Equal(got, value) {
+				t.Fatalf("%s: key %d: got %d bytes, error %v", when, index, len(got), err)
+			}
+		}
+	}
+
+	// On a host with 4 KiB pages, Open finds no valid metadata copy in the main file.
+	// It can fail, but it must not damage the database.
+	if damaged, err := open(path, 0o600, &Options{pageSize: hostPageSize}, fileio.OSFS{}); err == nil {
+		checkKeys(damaged, "Open with damaged metadata")
+		if err := damaged.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The next read of page 0 is correct, as after a read error that does not stay.
+	main, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	main[9] = pageSizeByte
+	if err := os.WriteFile(path, main, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := open(path, 0o600, &Options{pageSize: hostPageSize}, fileio.OSFS{})
+	if err != nil {
+		t.Fatalf("Open after the damage is gone: %v", err)
+	}
+	defer reopened.Close()
+	checkKeys(reopened, "Open after the damage is gone")
 }
 
 func TestCommittedWALRecords_StopsAtInvalidTransaction(t *testing.T) {
