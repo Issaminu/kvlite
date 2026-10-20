@@ -1,6 +1,9 @@
 package kvlite_test
 
 // This file runs Blackout, KVLite's deterministic simulation test (package internal/blackout).
+// A plain go test runs no Blackout tests. Set BLACKOUT=1 to run them:
+//
+//	BLACKOUT=1 go test -run '^TestBlackout' .
 //
 // Replay a failure with its printed seed:
 //
@@ -108,7 +111,17 @@ var target = blackout.Target{
 	DataPageChecksums: kvlite.BlackoutDataPageChecksums,
 }
 
+// skipUnlessBlackout skips a Blackout test unless BLACKOUT=1 or a nonzero -blackout.seed asks for Blackout.
+// A seed names one simulation run, so the printed replay commands and the supervisor need no other setting.
+func skipUnlessBlackout(t *testing.T) {
+	t.Helper()
+	if os.Getenv("BLACKOUT") != "1" && *blackoutSeed == 0 {
+		t.Skip("set BLACKOUT=1 to run the Blackout tests")
+	}
+}
+
 func TestBlackout(t *testing.T) {
+	skipUnlessBlackout(t)
 	if *blackoutSeed != 0 {
 		result := blackout.Run(target, *blackoutSeed, blackout.Settings{
 			Steps:      *blackoutSteps,
@@ -153,6 +166,7 @@ func TestBlackout(t *testing.T) {
 // TestBlackoutIsDeterministic runs seeds twice and requires the same trace, so that a printed seed replays a failure.
 // It is a test of Blackout itself.
 func TestBlackoutIsDeterministic(t *testing.T) {
+	skipUnlessBlackout(t)
 	for seed := uint64(1); seed <= 4; seed++ {
 		settings := blackout.Settings{Steps: 120, KeepTrace: true}
 		first := blackout.Run(target, seed, settings)
@@ -181,6 +195,7 @@ func TestBlackoutIsDeterministic(t *testing.T) {
 // The test ignores failed seeds: TestBlackout reports them.
 // It is a test of Blackout itself.
 func TestBlackoutCoverage(t *testing.T) {
+	skipUnlessBlackout(t)
 	if testing.Short() {
 		t.Skip("the coverage test runs many seeds")
 	}
@@ -211,6 +226,7 @@ func TestBlackoutWatchdogStopsAHang(t *testing.T) {
 		blackout.Run(hang, 1, blackout.Settings{StepTimeout: 100 * time.Millisecond})
 		return
 	}
+	skipUnlessBlackout(t)
 	command := exec.Command(os.Args[0], "-test.run=^TestBlackoutWatchdogStopsAHang$")
 	command.Env = append(os.Environ(), "BLACKOUT_WATCHDOG_CHILD=1")
 	output, err := command.CombinedOutput()
@@ -227,8 +243,9 @@ func TestBlackoutWatchdogStopsAHang(t *testing.T) {
 // TestBlackoutStress runs real goroutines against one database at the same time (see [blackout.Stress]).
 // The goroutine schedule does not repeat, so a failure may not replay. Run it with the race detector too:
 //
-//	go test -race -run TestBlackoutStress .
+//	BLACKOUT=1 go test -race -run TestBlackoutStress .
 func TestBlackoutStress(t *testing.T) {
+	skipUnlessBlackout(t)
 	seeds := uint64(*blackoutStressSeeds)
 	if testing.Short() {
 		seeds = 1
@@ -245,6 +262,7 @@ func TestBlackoutStress(t *testing.T) {
 // A seed counts only when the same seed passes without the lie, so an open KVLite bug cannot stand in for the lie.
 // It is a test of Blackout itself.
 func TestBlackoutDetectsDurabilityDefects(t *testing.T) {
+	skipUnlessBlackout(t)
 	for _, test := range []struct {
 		name string
 		lie  disk.SyncLie

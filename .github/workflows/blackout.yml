@@ -11,6 +11,9 @@ jobs:
   blackout:
     name: Blackout simulation
     runs-on: ubuntu-latest
+    # A plain go test runs no Blackout tests. BLACKOUT=1 runs them.
+    env:
+      BLACKOUT: "1"
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -24,6 +27,9 @@ jobs:
           start=$((16#${GITHUB_SHA:0:15}))
           echo "Blackout seeds $start to $((start + 199)) of commit $GITHUB_SHA"
           go test -timeout=20m -run 'TestBlackout$' -blackout.start="$start" -blackout.seeds=200 .
+
+      - name: Run the fixed Blackout seeds and the other Blackout tests of KVLite
+        run: go test -timeout=20m -run '^Test(Blackout|SimulatedDisk_)' .
 
       - name: Test the Blackout packages
         run: go test ./internal/blackout/...

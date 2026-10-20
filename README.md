@@ -486,6 +486,12 @@ go test -race ./... -count=1
 go vet ./...
 ```
 
+These commands skip the Blackout tests: the simulation in `blackout_test.go`, the simulated-disk tests, and the `internal/blackout` packages. Set `BLACKOUT=1` to run them too:
+
+```sh
+BLACKOUT=1 go test ./... -count=1
+```
+
 
 
 ## License

@@ -43,7 +43,7 @@ const (
 //
 // A seed selects the options and the operation mix of each client.
 // The schedule of the goroutines does not repeat, so a failure may not replay.
-// Run it with the race detector too: go test -race -run TestBlackoutStress .
+// Run it with the race detector too: BLACKOUT=1 go test -race -run TestBlackoutStress .
 // It returns the first failure.
 func Stress(target Target, seed uint64, settings StressSettings) error {
 	if settings.Clients <= 0 {

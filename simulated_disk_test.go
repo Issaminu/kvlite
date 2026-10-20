@@ -13,8 +13,17 @@ import (
 
 // These tests run KVLite on the simulated disk of package internal/blackout/disk.
 // KVLite reaches every file through fileio.FS, so the disk can crash the process and cut the power under it.
+// They are Blackout tests, so a plain go test skips them. Set BLACKOUT=1 to run them.
 
 const simulatedPath = "/sim/database"
+
+// skipUnlessBlackout skips a simulated-disk test unless BLACKOUT=1.
+func skipUnlessBlackout(t *testing.T) {
+	t.Helper()
+	if os.Getenv("BLACKOUT") != "1" {
+		t.Skip("set BLACKOUT=1 to run the Blackout tests")
+	}
+}
 
 // simulatedPut commits key and value to the test bucket, and creates the bucket first when it is missing.
 func simulatedPut(t *testing.T, db *DB, key, value string) {
@@ -57,6 +66,7 @@ func simulatedGet(t *testing.T, fsys *disk.FS, sync Sync, key string) (string, e
 // A SyncFull commit is durable when Update returns. A SyncNormal commit is durable after Close.
 // Each seed makes other power-failure decisions about the unsynced changes.
 func TestSimulatedDisk_DurableCommitSurvivesPowerFailure(t *testing.T) {
+	skipUnlessBlackout(t)
 	for _, sync := range []Sync{SyncFull, SyncNormal} {
 		for seed := range uint64(50) {
 			fsys := disk.New(seed, disk.Config{})
@@ -80,6 +90,7 @@ func TestSimulatedDisk_DurableCommitSurvivesPowerFailure(t *testing.T) {
 
 // A process crash keeps the operating-system cache, so it keeps a SyncNormal commit that no sync made durable.
 func TestSimulatedDisk_ProcessCrashKeepsUnsyncedCommit(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := disk.New(1, disk.Config{})
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {
@@ -96,6 +107,7 @@ func TestSimulatedDisk_ProcessCrashKeepsUnsyncedCommit(t *testing.T) {
 // When file syncs do nothing, a power failure can lose a SyncFull commit.
 // The durability test above must be able to fail, so some seed must lose the commit here.
 func TestSimulatedDisk_SyncLieLosesCommit(t *testing.T) {
+	skipUnlessBlackout(t)
 	for seed := range uint64(50) {
 		fsys := disk.New(seed, disk.Config{SyncLie: disk.SyncLieAllFiles})
 		db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
@@ -123,6 +135,7 @@ func TestSimulatedDisk_SyncLieLosesCommit(t *testing.T) {
 // Recovery must replay the commits after it.
 // Blackout found this: a SyncFull Put of an unchanged value with continuation pages, and then recovery dropped two synced commits.
 func TestSimulatedDisk_EmptyWALTransactionKeepsLaterCommits(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := disk.New(1, disk.Config{})
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {
@@ -177,6 +190,7 @@ func (file *statFailFile) Stat() (os.FileInfo, error) {
 // If that fails after the checkpoint cleared the WAL, reads must not use the old mapping.
 // Blackout found this: a Stat error in refreshMainFileMapping kept the old mapping, and the page walk read old pages.
 func TestSimulatedDisk_FailedRemapDropsStaleMapping(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := &statFailFS{FS: disk.New(1, disk.Config{StaleMappings: true})}
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {
@@ -235,6 +249,7 @@ func (file *corruptOneMainReadFile) ReadAt(p []byte, offset int64) (int, error) 
 // With data-page checksums, a read that returns a flipped bit must fail the backup, not make a damaged backup that Backup reports as complete.
 // Blackout found this: a flipped bit in the copy of the main file went into the backup, and Backup returned nil.
 func TestSimulatedDisk_CorruptedReadDoesNotMakeADamagedBackup(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := &corruptOneMainReadFS{FS: disk.New(1, disk.Config{DisableMap: true}), name: simulatedPath}
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncFull, DataPageChecksums: true, CheckpointThresholdBytes: 1}, fsys)
 	if err != nil {
@@ -266,6 +281,7 @@ func TestSimulatedDisk_CorruptedReadDoesNotMakeADamagedBackup(t *testing.T) {
 // The old header then validates a prefix of the old records, which is older than the main file, and recovery must not apply it.
 // Blackout found this: recovery rolled back checkpointed data, or Open failed with "allocation high page does not match metadata page".
 func TestSimulatedDisk_NewWALGenerationCannotReviveOldRecords(t *testing.T) {
+	skipUnlessBlackout(t)
 	for seed := range uint64(300) {
 		fsys := disk.New(seed, disk.Config{})
 		db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
@@ -310,6 +326,7 @@ func TestSimulatedDisk_NewWALGenerationCannotReviveOldRecords(t *testing.T) {
 // Open must then succeed without that WAL, as SQLite ignores a WAL with a bad header.
 // Blackout found this with torn sectors: the header kept 17 of its 20 bytes, and Open failed for good.
 func TestSimulatedDisk_TornWALHeaderOpensWithoutTheWAL(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := disk.New(1, disk.Config{})
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {
@@ -339,6 +356,7 @@ func TestSimulatedDisk_TornWALHeaderOpensWithoutTheWAL(t *testing.T) {
 // So every new WAL generation must sync its header first, not only one that this handle truncated.
 // Blackout found this: a damage probe truncated the WAL in its recovery, the next handle wrote a new generation, and a power failure revived part of the old one.
 func TestSimulatedDisk_NewHandleCannotReviveOldRecords(t *testing.T) {
+	skipUnlessBlackout(t)
 	for seed := range uint64(300) {
 		fsys := disk.New(seed, disk.Config{})
 		options := &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}
@@ -387,6 +405,7 @@ func TestSimulatedDisk_NewHandleCannotReviveOldRecords(t *testing.T) {
 // The empty main file holds no database, so Open ignores the WAL, and every read of the handle, and of a later handle, shows the empty database.
 // Blackout found this: View showed no bucket, but DB.Get found it, and a clean reopen showed the bucket.
 func TestSimulatedDisk_NewMainFileWithOldWALShowsOneState(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := disk.New(1, disk.Config{})
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {
@@ -430,6 +449,7 @@ func TestSimulatedDisk_NewMainFileWithOldWALShowsOneState(t *testing.T) {
 // So the next Open must give a usable empty database, after a process crash and after a power failure.
 // Blackout found this: the next Open failed with "metadata last page N exceeds main-file and WAL page IDs".
 func TestSimulatedDisk_CrashWhileOpenCreatesTheFile(t *testing.T) {
+	skipUnlessBlackout(t)
 	for _, powerFailure := range []bool{false, true} {
 		for crashAt := 1; crashAt <= 12; crashAt++ {
 			fsys := disk.New(uint64(crashAt), disk.Config{})
@@ -477,6 +497,7 @@ func TestSimulatedDisk_CrashWhileOpenCreatesTheFile(t *testing.T) {
 // If a power failure then tears the main-file writes of recovery, the durable WAL must still repair them.
 // Blackout found this: the recovered tree had keys out of order.
 func TestSimulatedDisk_RecoveryStoresTheWALItReads(t *testing.T) {
+	skipUnlessBlackout(t)
 	dropped := 0
 	for seed := range uint64(40) {
 		for crashAt := 1; crashAt <= 12; crashAt++ {
@@ -542,6 +563,7 @@ func TestSimulatedDisk_RecoveryStoresTheWALItReads(t *testing.T) {
 // Blackout found this: the WAL sync of a commit succeeded and the directory sync failed, so the commit failed and its rollback truncated the WAL without a sync.
 // A power failure then lost the truncate, and the commit came back.
 func TestSimulatedDisk_FailedCommitStaysLostAfterPowerFailure(t *testing.T) {
+	skipUnlessBlackout(t)
 	// Keep almost no unsynced change at the power failure.
 	fsys := disk.New(1, disk.Config{SyncDirFault: disk.Always, KeepChange: disk.Ratio{Num: 1, Den: 1 << 30}})
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
@@ -586,6 +608,7 @@ func TestSimulatedDisk_FailedCommitStaysLostAfterPowerFailure(t *testing.T) {
 // So a failed WAL sync in a checkpoint must stop the handle like a failed commit, and Close must keep the WAL for the next Open.
 // Blackout found this: a checkpoint retry after a failed WAL sync wrote main pages, a power failure tore them, and the recovered database was invalid.
 func TestSimulatedDisk_FailedWALSyncInCheckpointStopsTheHandle(t *testing.T) {
+	skipUnlessBlackout(t)
 	fsys := disk.New(1, disk.Config{SyncFault: disk.Always, DropCache: disk.Always})
 	db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 40}, fsys)
 	if err != nil {

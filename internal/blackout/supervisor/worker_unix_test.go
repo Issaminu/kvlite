@@ -21,9 +21,14 @@ import (
 const helperEnv = "BLACKOUT_SUPERVISOR_HELPER"
 
 // TestMain lets the test binary play a worker: the standard helper-process pattern.
+// Otherwise it runs the tests only when BLACKOUT=1, so a plain go test runs no Blackout tests.
 func TestMain(m *testing.M) {
 	if mode := os.Getenv(helperEnv); mode != "" {
 		helperMain(mode)
+		os.Exit(0)
+	}
+	if os.Getenv("BLACKOUT") != "1" {
+		fmt.Println("skip: set BLACKOUT=1 to run the Blackout tests")
 		os.Exit(0)
 	}
 	os.Exit(m.Run())
