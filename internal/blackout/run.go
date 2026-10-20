@@ -48,6 +48,7 @@ type runner struct {
 	lastBackup      *backupRecord // the last complete backup, which must survive a power failure
 	crashedBackup   *backupRecord // a backup that a crash stopped; if its file exists, it must be complete
 	readOnlyState   dbState       // the state that a read-only recovery showed, which the writable recovery must match
+	readOnlyDrops   int           // disk.Stats.DroppedCaches at the read-only recovery
 	memory          *kvlite.DB    // the memory database of the differential check
 	lastStats       *kvlite.Stats // the last DB.Stats of the current handle
 	droppedCaches   int           // disk.Stats.DroppedCaches at the last verified open

@@ -639,6 +639,60 @@ func TestHealUndoesBitRotAndKeepsLaterWrites(t *testing.T) {
 	}
 }
 
+// FileSize gives the size of the cache view without a copy, for the checks after every step.
+func TestFileSizeReportsTheCacheView(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, bytes.Repeat([]byte{'a'}, 64), 0)
+	if size, exists := fsys.FileSize(testName); !exists || size != 64 {
+		t.Fatalf("FileSize: %d, %t, want 64, true", size, exists)
+	}
+	if _, exists := fsys.FileSize(testDir + "/missing"); exists {
+		t.Fatal("FileSize found a missing file")
+	}
+}
+
+// Two damages can change the same bytes, for example bit rot in a block that a misdirected write changed.
+// Heal must undo the newer damage first, or it brings back bytes of the older damage.
+func TestHealUndoesOverlappingDamageNewestFirst(t *testing.T) {
+	fsys := New(1, Config{})
+	file := openRW(t, fsys, testName)
+	original := bytes.Repeat([]byte{'a'}, 8)
+	mustWrite(t, file, original, 0)
+	mustSync(t, file)
+	for range 2 {
+		if !fsys.Corrupt(testName, 0, 8, 32) {
+			t.Fatal("Corrupt did not change the file")
+		}
+	}
+	fsys.Heal()
+	if got := content(fsys, testName); !bytes.Equal(got, original) {
+		t.Fatalf("after Heal: %q, want %q", got, original)
+	}
+}
+
+// A writeback error marks data pages clean, but the journal keeps a size change.
+// Blackout found that a dropped truncate left main-file pages past the logical end, which no real file system does.
+func TestFailedSyncKeepsTruncates(t *testing.T) {
+	for seed := range uint64(20) {
+		fsys := New(seed, Config{SyncFault: Always})
+		file := openRW(t, fsys, testName)
+		mustWrite(t, file, bytes.Repeat([]byte{'a'}, 64), 0)
+		mustSync(t, file)
+		if err := file.Truncate(16); err != nil {
+			t.Fatal(err)
+		}
+		fsys.SetFaults(true)
+		if err := file.Sync(); err == nil {
+			t.Fatal("the sync did not fail")
+		}
+		fsys.SetFaults(false)
+		if _, durable, _ := fsys.FileData(testName); len(durable) != 16 {
+			t.Fatalf("seed %d: durable size after a failed sync: %d, want 16", seed, len(durable))
+		}
+	}
+}
+
 func TestMisdirectedWriteMovesDataAndHealRestoresIt(t *testing.T) {
 	moved := false
 	for seed := range uint64(200) {

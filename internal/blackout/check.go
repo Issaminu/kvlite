@@ -207,7 +207,8 @@ func (runner *runner) verify(afterCrash bool) {
 		runner.stats.LostUnsyncedCommits += before - runner.model.latest
 	}
 	if runner.readOnlyState != nil {
-		if !statesEqual(runner.readOnlyState, recovered) {
+		// A failed sync that dropped the cache after the read-only recovery changed what reads see, as a power failure does.
+		if runner.fsys.Stats().DroppedCaches == runner.readOnlyDrops && !statesEqual(runner.readOnlyState, recovered) {
 			runner.fail("the read-only recovery showed another state than the writable recovery:\n%s", stateDiff(runner.readOnlyState, recovered))
 		}
 		runner.readOnlyState = nil

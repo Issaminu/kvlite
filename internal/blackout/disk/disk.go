@@ -594,10 +594,11 @@ func (fsys *FS) Damaged() bool {
 }
 
 // Heal restores the correct bytes of each damage run that no later write or truncate replaced.
+// It undoes the newest damage first, because two damages can change the same bytes.
 func (fsys *FS) Heal() {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
-	for _, damaged := range fsys.damage {
+	for _, damaged := range slices.Backward(fsys.damage) {
 		node := damaged.node
 		for _, run := range damaged.runs {
 			for _, data := range [][]byte{node.data, node.durable} {
@@ -775,6 +776,18 @@ func (fsys *FS) FileData(name string) (cache, durable []byte, ok bool) {
 		return nil, nil, false
 	}
 	return slices.Clone(node.data), slices.Clone(node.durable), true
+}
+
+// FileSize returns the size of the cache view of the file at name, and whether the file exists.
+// It copies nothing, so the checks after every step can use it on large files.
+func (fsys *FS) FileSize(name string) (int64, bool) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	node, ok := fsys.names[fsys.follow(name)]
+	if !ok {
+		return 0, false
+	}
+	return int64(len(node.data)), true
 }
 
 func (fsys *FS) record(event Event) {
@@ -1432,9 +1445,10 @@ func (f *file) Sync() error {
 		return crashedError("sync", f.name)
 	}
 	if !fsys.noSyncFaults && fsys.inject(fsys.config.SyncFault) {
-		// Like Linux after a writeback error: some changes reach storage, the kernel marks the others clean, and a later sync does not write them.
+		// Like Linux after a writeback error: some writes reach storage, the kernel marks the others clean, and a later sync does not write them.
+		// A truncate changes metadata, and the file-system journal keeps it, so it reaches storage.
 		for _, pending := range node.pending {
-			if fsys.rand.Bool() {
+			if pending.truncate || fsys.rand.Bool() {
 				node.durable = applyChange(node.durable, pending)
 			}
 		}

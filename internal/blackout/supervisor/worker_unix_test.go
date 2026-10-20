@@ -114,7 +114,7 @@ func runHelper(t *testing.T, ctx context.Context, mode string, timeout time.Dura
 		Seed:        42,
 		Steps:       10,
 		Timeout:     timeout,
-		KillGrace:   200 * time.Millisecond,
+		KillGrace:   2 * time.Second, // under full CPU load, the runtime needs time to print every stack after SIGQUIT
 		MemoryLimit: "256MiB",
 		TempDir:     temporary,
 		Env:         []string{helperEnv + "=" + mode},
@@ -159,7 +159,8 @@ func TestRunWorkerClassifiesHelperProcesses(t *testing.T) {
 	})
 	t.Run("timeout", func(t *testing.T) {
 		t.Parallel()
-		outcome := runHelper(t, context.Background(), "hang", 500*time.Millisecond)
+		// A short timeout can send SIGQUIT before the runtime of the helper starts, and then nothing prints the stacks.
+		outcome := runHelper(t, context.Background(), "hang", 3*time.Second)
 		if outcome.Kind != kindTimeout || !strings.Contains(outcome.Output, "SIGQUIT") {
 			t.Fatalf("outcome: kind %s, output %q", outcome.Kind, truncate(outcome.Output, 300))
 		}

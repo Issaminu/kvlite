@@ -37,7 +37,7 @@ func (runner *runner) backup() {
 		runner.crashedBackup = record
 		return
 	}
-	_, _, exists := runner.fsys.FileData(path)
+	_, exists := runner.fsys.FileSize(path)
 	if err == nil && !exists {
 		runner.fail("Backup returned nil, but %s does not exist", path)
 		return
@@ -100,7 +100,7 @@ func (runner *runner) checkBackupAfterCrash() {
 	}
 	if record := runner.crashedBackup; record != nil {
 		runner.crashedBackup = nil
-		if _, _, exists := runner.fsys.FileData(record.path); exists {
+		if _, exists := runner.fsys.FileSize(record.path); exists {
 			// Backup publishes the file with a hard link only after the copy is complete and synced.
 			runner.checkBackup(record)
 			runner.fsys.SetFaults(false)
@@ -111,7 +111,7 @@ func (runner *runner) checkBackupAfterCrash() {
 	if runner.lastBackup == nil || runner.failure != nil {
 		return
 	}
-	if _, _, exists := runner.fsys.FileData(runner.lastBackup.path); !exists {
+	if _, exists := runner.fsys.FileSize(runner.lastBackup.path); !exists {
 		runner.fail("the complete backup %s did not survive the crash", runner.lastBackup.path)
 		return
 	}
@@ -236,5 +236,6 @@ func (runner *runner) readOnlyRecovery() {
 	}
 	runner.stats.ReadOnlyRecoveries++
 	runner.readOnlyState = state
+	runner.readOnlyDrops = runner.fsys.Stats().DroppedCaches
 	runner.event("read-only recovery: an allowed state (state hash %x)", stateHash(state))
 }

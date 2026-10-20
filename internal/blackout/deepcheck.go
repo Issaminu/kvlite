@@ -51,7 +51,7 @@ func (runner *runner) checkFiles() {
 		}
 	}
 	if runner.config.PathMode == pathSymlink {
-		if _, _, exists := runner.fsys.FileData(simDir + "/link-wal"); exists {
+		if _, exists := runner.fsys.FileSize(simDir + "/link-wal"); exists {
 			runner.fail("a WAL exists next to the symbolic link, not next to the main file")
 		}
 	}
@@ -74,15 +74,15 @@ func (runner *runner) checkStats() {
 		return
 	}
 	runner.stats.StatsChecks++
-	mainFile, _, _ := runner.fsys.FileData(runner.realPath)
-	walFile, _, _ := runner.fsys.FileData(runner.realPath + "-wal")
+	mainSize, _ := runner.fsys.FileSize(runner.realPath)
+	walSize, _ := runner.fsys.FileSize(runner.realPath + "-wal")
 	switch {
 	case stats.PageSize != runner.work.pageSize:
 		runner.fail("DB.Stats: PageSize is %d, want %d", stats.PageSize, runner.work.pageSize)
-	case stats.FileSize != int64(len(mainFile)):
-		runner.fail("DB.Stats: FileSize is %d, but the main file has %d bytes", stats.FileSize, len(mainFile))
-	case stats.WALSize != int64(len(walFile)):
-		runner.fail("DB.Stats: WALSize is %d, but the WAL file has %d bytes", stats.WALSize, len(walFile))
+	case stats.FileSize != mainSize:
+		runner.fail("DB.Stats: FileSize is %d, but the main file has %d bytes", stats.FileSize, mainSize)
+	case stats.WALSize != walSize:
+		runner.fail("DB.Stats: WALSize is %d, but the WAL file has %d bytes", stats.WALSize, walSize)
 	case stats.CheckpointCount != runner.target.CheckpointCount(runner.db):
 		runner.fail("DB.Stats: CheckpointCount is %d, but the WAL counts %d", stats.CheckpointCount, runner.target.CheckpointCount(runner.db))
 	case stats.CheckpointThresholdBytes != runner.checkpointThreshold():
