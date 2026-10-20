@@ -619,6 +619,7 @@ func (wal *WAL) syncData() error {
 
 // SyncTruncate makes an earlier truncate durable, so the first commit of the next generation need not sync its header.
 // The database calls it after an automatic checkpoint, which already does maintenance syncs.
+// A writable Open that finds a WAL of an earlier process also calls it, so that storage holds the WAL state that recovery read.
 // It makes no system call when no truncate waits for a sync, or when the WAL does not sync.
 func (wal *WAL) SyncTruncate() error {
 	if !wal.headerSyncNeeded || !wal.syncOnCheckpoint {

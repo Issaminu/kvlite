@@ -622,6 +622,67 @@ func TestSimulatedDisk_FailedCommitStaysLostAfterPowerFailure(t *testing.T) {
 	}
 }
 
+// A process can crash inside the rollback truncate of a failed commit, after the truncate changed the file and before its sync.
+// When the failed transaction is the first of its WAL generation, the next Open then finds an empty WAL in the cache, while storage can still hold the synced header and the records.
+// The answer of that Open must be final too: the failed commit must not come back after a later power failure.
+// Blackout found this (issue 5): the Open showed the state before the failed commit, and after a power failure, recovery applied the failed commit.
+func TestSimulatedDisk_CrashInRollbackKeepsTheFailedCommitLost(t *testing.T) {
+	skipUnlessBlackout(t)
+	reached := 0
+	for seed := range uint64(200) {
+		// A power failure keeps an ordered prefix of the unsynced changes, so it can keep the record write and lose the truncate after it.
+		fsys := disk.New(seed, disk.Config{WriteFault: disk.Ratio{Num: 1, Den: 2}, InOrder: disk.Always})
+		db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		simulatedPut(t, db, "base", "v0")
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		db, err = open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// The commit writes the WAL header, syncs the WAL and the directory, and writes its records.
+		// When the record write fails, the fifth mutating call is the rollback truncate, and the crash stops the process in it.
+		fsys.ScheduleCrash(5)
+		fsys.SetFaults(true)
+		_ = db.Update(func(tx *Tx) error {
+			bucket, err := tx.Bucket(testBucketName)
+			if err != nil {
+				return err
+			}
+			return bucket.Put([]byte("key"), []byte("failed"))
+		})
+		fsys.SetFaults(false)
+		crashed, event := fsys.Crashed()
+		cache, durable, _ := fsys.FileData(simulatedPath + "-wal")
+		simulatedCrash(fsys, db)
+		if !crashed || event.Op != "truncate" || len(cache) != 0 || len(durable) == 0 {
+			// The crash was not in the rollback truncate, or the truncate did not change the cache.
+			continue
+		}
+		reached++
+		fsys.Restart(false)
+		db, err = open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
+		if err != nil {
+			t.Fatalf("seed %d: Open after the crash: %v", seed, err)
+		}
+		if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("seed %d: the failed commit after the crash: %v, want ErrKeyNotFound", seed, err)
+		}
+		simulatedCrash(fsys, db)
+		fsys.Restart(true)
+		if value, err := simulatedGet(t, fsys, SyncFull, "key"); !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("seed %d: the failed commit after a power failure: %q, %v, want ErrKeyNotFound; the Open after the crash said it was lost", seed, value, err)
+		}
+	}
+	if reached == 0 {
+		t.Fatal("no seed crashed in a rollback truncate that cleared the WAL, so this test does not reach the case")
+	}
+}
+
 // After a failed sync, the WAL file content is unknown: Linux can drop the unsynced pages after a writeback error.
 // A checkpoint that then writes the main file has no WAL that can repair a torn write.
 // So a failed WAL sync in a checkpoint must stop the handle like a failed commit, and Close must keep the WAL for the next Open.

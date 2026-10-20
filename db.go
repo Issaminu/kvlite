@@ -205,7 +205,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 			return nil
 		}
 	}
-	wal, records, err := db.readOrCreateWal(fsys, filePath, walPageSize, syncWALDirectory, isNew)
+	wal, records, walFound, err := db.readOrCreateWal(fsys, filePath, walPageSize, syncWALDirectory, isNew)
 	if err != nil {
 		return db.failOpen(err)
 	}
@@ -268,6 +268,16 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	if !db.options.ReadOnly {
 		if err := db.wal.Truncate(); err != nil {
 			return db.failOpen(err)
+		}
+		// Close removes the WAL, so a WAL that Open finds comes from a process that did not close the database.
+		// That process can have changed the WAL in the cache only, for example with the rollback truncate of a failed commit before the process crashed.
+		// Storage can then still hold records that this Open did not apply, and a power failure can bring them back after readers saw the state without them.
+		// So Open syncs the cleared WAL before it returns, and its answer about a commit with an unknown result is final.
+		// PostgreSQL syncs the data directory after a crash for the same reason (SyncDataDirectory in StartupXLOG).
+		if walFound {
+			if err := db.wal.SyncTruncate(); err != nil {
+				return db.failOpen(err)
+			}
 		}
 	}
 	db.startWriteBatcher()

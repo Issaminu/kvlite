@@ -42,9 +42,10 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 }
 
 // readOrCreateWal opens the WAL of path and reads its committed prefix.
+// It also reports whether the WAL file existed before this call.
 // With discard, it clears the WAL instead, because the empty main file holds no database (see open).
 // syncDirectory is nil when the handle must not sync the database directory.
-func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncDirectory func() error, discard bool) (*wal.WAL, []wal.WALRecord, error) {
+func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncDirectory func() error, discard bool) (*wal.WAL, []wal.WALRecord, bool, error) {
 	// Open supplies the resolved absolute path so symbolic links share one log.
 	walPath := path + "-wal"
 	var walFile fileio.File
@@ -53,9 +54,13 @@ func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncD
 	if db.options.ReadOnly {
 		walFile, err = fsys.OpenFile(walPath, os.O_RDONLY, 0)
 	} else {
+		walFile, err = fsys.OpenFile(walPath, os.O_RDWR, 0)
+	}
+	found := err == nil
+	if !db.options.ReadOnly && errors.Is(err, os.ErrNotExist) {
 		info, statErr := db.file.Stat()
 		if statErr != nil {
-			return nil, nil, statErr
+			return nil, nil, false, statErr
 		}
 		walFile, err = fsys.OpenFile(walPath, os.O_RDWR|os.O_CREATE, info.Mode().Perm())
 	}
@@ -64,7 +69,7 @@ func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncD
 		if errors.Is(err, os.ErrNotExist) {
 			walFile = nil
 		} else {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
@@ -83,16 +88,16 @@ func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncD
 		// The first commit of a handle syncs the WAL header before its records, and that sync also makes this truncate durable.
 		// So no record of this WAL can come back after a power failure.
 		if err := log.Truncate(); err != nil {
-			return nil, nil, errors.Join(err, log.Close())
+			return nil, nil, false, errors.Join(err, log.Close())
 		}
-		return log, nil, nil
+		return log, nil, found, nil
 	}
 	records, err := log.ReadRecords()
 	if err != nil {
-		return nil, nil, errors.Join(err, log.Close())
+		return nil, nil, false, errors.Join(err, log.Close())
 	}
 
-	return log, records, nil
+	return log, records, found, nil
 }
 
 func (db *DB) ingestWalRecords(committed []wal.WALRecord) error {
