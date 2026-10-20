@@ -229,8 +229,6 @@ func (runner *runner) finishCommit(op string, mark int, err error, mutations []t
 		}
 		runner.event("%s committed %d changes: latest=%d", op, len(mutations), runner.model.latest)
 	case errors.Is(err, kvlite.ErrWALWriteFailed):
-		runner.stats.Uncertain++
-		runner.stats.StoppedHandles++
 		runner.stopped = true
 		runner.uncertainOpen = true
 		runner.model.uncertain(mark, mutations)

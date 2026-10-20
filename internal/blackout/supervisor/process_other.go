@@ -31,11 +31,6 @@ func lowPriority(name string, args ...string) (string, []string) {
 	return name, args
 }
 
-// checkTools reports nil, because the supervisor needs no extra command on this system.
-func checkTools() error {
-	return nil
-}
-
 // residentBytes fails, because the supervisor cannot read the RSS of a process on this system.
 // Use -max-rss off.
 func residentBytes(pid int) (int64, error) {

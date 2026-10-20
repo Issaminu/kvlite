@@ -73,7 +73,6 @@ func (runner *runner) checkStats() {
 		runner.fail("DB.Stats: %v", err)
 		return
 	}
-	runner.stats.StatsChecks++
 	mainSize, _ := runner.fsys.FileSize(runner.realPath)
 	walSize, _ := runner.fsys.FileSize(runner.realPath + "-wal")
 	switch {

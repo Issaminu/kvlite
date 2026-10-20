@@ -116,8 +116,8 @@ func (config Config) String() string {
 			operations = append(operations, fmt.Sprintf("%s=%d", operationNames[op], weight))
 		}
 	}
-	return fmt.Sprintf("option-changes=%t path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v main=%t rot=%v misdirect=%v page=%d map=%s sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t revert-sync=%t sector=%d keep=%v in-order=%v ops=[%s]",
-		config.OptionChanges, pathModeNames[config.PathMode], config.FileMode, config.Disk.TornSectors, config.Disk.Garbage, config.Disk.FullFault, config.Disk.ReadCorruption, config.Disk.CorruptMainReads, config.CorruptAtRest, config.Disk.Misdirect,
+	return fmt.Sprintf("option-changes=%t path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v rot=%v misdirect=%v page=%d map=%s sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t revert-sync=%t sector=%d keep=%v in-order=%v ops=[%s]",
+		config.OptionChanges, pathModeNames[config.PathMode], config.FileMode, config.Disk.TornSectors, config.Disk.Garbage, config.Disk.FullFault, config.Disk.ReadCorruption, config.CorruptAtRest, config.Disk.Misdirect,
 		config.PageSize, config.mappingName(), syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
 		config.ValueWeights, config.MutationWeights, config.MaxMutations, config.Abort, config.CrashNow, config.ScheduleCrash,
 		config.PowerFailures, config.IOFaults, config.Disk.RevertFailedSync, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
@@ -256,7 +256,11 @@ func newConfig(seed uint64) Config {
 	if config.IOFaults {
 		config.Disk.FullFault = sometimes(rand, 20, 200)
 		config.Disk.ReadCorruption = sometimes(rand, 20, 300)
-		config.Disk.CorruptMainReads = config.fixedChecksums()
+		if !config.fixedChecksums() {
+			// Without data-page checksums, KVLite cannot find a flipped bit in a read.
+			// The draw above still happens, so the later draws of a seed do not change.
+			config.Disk.ReadCorruption = disk.Never
+		}
 		config.CorruptAtRest = sometimes(rand, 2, 12)
 	}
 	if config.PowerFailures && config.fixedChecksums() {

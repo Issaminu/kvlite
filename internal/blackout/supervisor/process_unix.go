@@ -42,20 +42,6 @@ func lowPriority(name string, args ...string) (string, []string) {
 	return "nice", append([]string{"-n", "19", name}, args...)
 }
 
-// checkTools reports an error when a command that the supervisor needs is missing.
-func checkTools() error {
-	tools := []string{"nice"}
-	if runtime.GOOS != "linux" {
-		tools = append(tools, "ps")
-	}
-	for _, tool := range tools {
-		if _, err := exec.LookPath(tool); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // residentBytes returns the memory of the process pid, in bytes.
 // On Linux, it reads the resident set size (RSS) and the swapped memory from /proc, so it starts no process.
 // On other systems, it runs ps and returns the RSS.

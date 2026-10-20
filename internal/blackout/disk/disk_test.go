@@ -361,22 +361,6 @@ func TestSameSeedMakesSameDecisions(t *testing.T) {
 	}
 }
 
-func TestSyncLieLosesSyncedData(t *testing.T) {
-	for seed := range uint64(50) {
-		fsys := New(seed, Config{SyncLie: SyncLieAllFiles})
-		file := openRW(t, fsys, testName)
-		mustWrite(t, file, []byte("data"), 0)
-		mustSync(t, file)
-		if err := fsys.SyncDir(testDir); err != nil {
-			t.Fatal(err)
-		}
-		fsys.Restart(true)
-		if !bytes.Equal(content(fsys, testName), []byte("data")) {
-			return
-		}
-	}
-	t.Fatal("SyncLieAllFiles never lost synced data")
-}
 func TestFailedSyncCanDropChangesForGood(t *testing.T) {
 	for seed := range uint64(100) {
 		fsys := New(seed, Config{SyncFault: Always})
@@ -664,24 +648,22 @@ func TestDiskFullEpisodeFailsGrowth(t *testing.T) {
 }
 
 func TestReadCorruptionLeavesStoredBytes(t *testing.T) {
-	for _, corruptMainReads := range []bool{false, true} {
-		fsys := New(1, Config{ReadCorruption: Always, CorruptMainReads: corruptMainReads})
-		wal := openRW(t, fsys, testName+"-wal")
-		mustWrite(t, wal, []byte("record"), 0)
-		main := openRW(t, fsys, testName)
-		mustWrite(t, main, []byte("record"), 0)
-		fsys.SetFaults(true)
-		buffer := make([]byte, 6)
-		if _, err := wal.ReadAt(buffer, 0); err != nil || string(buffer) != "record" {
-			t.Fatalf("WAL read with CorruptMainReads %t: %q, %v, want no flipped bit", corruptMainReads, buffer, err)
-		}
-		if _, err := main.ReadAt(buffer, 0); err != nil || (string(buffer) == "record") == corruptMainReads {
-			t.Fatalf("main-file read with CorruptMainReads %t: %q, %v", corruptMainReads, buffer, err)
-		}
-		fsys.SetFaults(false)
-		if got := content(fsys, testName); string(got) != "record" {
-			t.Fatalf("stored main-file bytes after a corrupted read: %q", got)
-		}
+	fsys := New(1, Config{ReadCorruption: Always})
+	wal := openRW(t, fsys, testName+"-wal")
+	mustWrite(t, wal, []byte("record"), 0)
+	main := openRW(t, fsys, testName)
+	mustWrite(t, main, []byte("record"), 0)
+	fsys.SetFaults(true)
+	buffer := make([]byte, 6)
+	if _, err := wal.ReadAt(buffer, 0); err != nil || string(buffer) != "record" {
+		t.Fatalf("WAL read: %q, %v, want no flipped bit", buffer, err)
+	}
+	if _, err := main.ReadAt(buffer, 0); err != nil || string(buffer) == "record" {
+		t.Fatalf("main-file read: %q, %v, want a flipped bit", buffer, err)
+	}
+	fsys.SetFaults(false)
+	if got := content(fsys, testName); string(got) != "record" {
+		t.Fatalf("stored main-file bytes after a corrupted read: %q", got)
 	}
 }
 

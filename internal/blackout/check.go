@@ -168,7 +168,6 @@ func readBucket(bucket *kvlite.Bucket, path string, state dbState) error {
 func (runner *runner) checkPages(when string) {
 	runner.fsys.SetFaults(false)
 	defer runner.fsys.SetFaults(runner.faults)
-	runner.stats.PageChecks++
 	if err := runner.target.CheckPages(runner.db); err != nil {
 		runner.fail("page ownership %s: %v", when, err)
 	}

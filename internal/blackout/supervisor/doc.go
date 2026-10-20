@@ -10,7 +10,7 @@
 //
 // This command runs 2 workers for 30 seconds with short runs:
 //
-//	go run ./internal/blackout/supervisor -workers 2 -duration 30s -lanes default=1:steps=50 -out /tmp/blackout
+//	go run ./internal/blackout/supervisor -workers 2 -duration 30s -steps 50 -out /tmp/blackout
 //
 // # Workers
 //
@@ -34,23 +34,23 @@
 // # Resources
 //
 // The supervisor can run for good on a small computer that other programs share.
-// By default, all workers together get half of the memory and half of the CPUs:
-//   - The memory is the RAM, or the smallest cgroup memory limit of the supervisor and its ancestor cgroups when that is smaller, for example the MemoryMax of a systemd unit or of its slice.
+// By default, all workers together get half of the memory, and they can use all CPUs at the lowest priority:
+//   - The memory is the RAM, or the cgroup memory limit of the supervisor when that is smaller, for example the MemoryMax of its systemd unit or the limit of a container.
 //     The supervisor reads it with "sysctl" on macOS and from /proc and /sys/fs/cgroup on Linux.
 //     -memory changes the budget.
-//   - The CPUs are the CPUs of the computer, or the smallest cgroup CPU limit (cpu.max) of the supervisor and its ancestor cgroups when it is smaller, also a fraction such as 0.5.
-//     -cpus changes the budget, also to less than one CPU.
+//   - The CPUs are GOMAXPROCS of the supervisor.
+//     On Linux, the Go runtime sets GOMAXPROCS from the cgroup CPU limit (cpu.max), and the kernel enforces that limit.
 //
 // From the budgets, the supervisor chooses the number of workers and the hard memory limit of each worker, -max-rss:
 //   - Each worker gets 4 GiB when the memory budget allows it.
 //     A 3000-step seed reached 3.44 GiB of RSS on an Apple M4 Max.
 //   - With a smaller budget, one worker gets the whole budget.
 //     Most seeds need less than 400 MiB, but some long seeds need several GiB, and the limit kills them.
-//   - There are at most as many workers as CPUs in the budget, and at least one.
+//   - There are at most as many workers as CPUs, and at least one.
 //   - GOMEMLIMIT is half of -max-rss.
 //
 // For example, a computer with 14 cores and 36 GiB of RAM gets 4 workers with 4 GiB each.
-// A computer with 1 CPU and 1 GiB of RAM gets 1 worker with 512 MiB, and the worker waits after each run as long as the run took, so it uses half a CPU on average.
+// A computer with 1 CPU and 1 GiB of RAM gets 1 worker with 512 MiB.
 //
 // The supervisor protects the other programs in these ways:
 //   - It reads the memory of each worker every 250 ms on Linux (from /proc, which costs little) and every second on other systems (with ps).
@@ -58,10 +58,13 @@
 //     When it cannot read the memory 3 times in a row, it also stops the worker, because the limit then does not work.
 //   - It starts a worker only when the system has the memory limit of the worker available, and a tenth of the memory more for the other programs.
 //     Otherwise, the new runs wait and the log says so.
-//   - On Linux, it asks the out-of-memory killer to kill the supervisor and its workers first.
-//     The supervisor counts a SIGKILL that it did not send as a memory kill.
+//   - It counts a SIGKILL that it did not send as a memory kill, because the out-of-memory killers of Linux and macOS send SIGKILL.
+//     The systemd unit makes the kernel kill a worker first (OOMScoreAdjust=1000).
 //   - The workers and the compile run at the lowest CPU priority, nice 19.
-//     The compile runs no more programs at the same time than the CPU budget allows.
+//     So they use only the CPU time that other programs do not need.
+//     For quiet nights on a Mac, put "taskpolicy -c background" in front of the supervisor command.
+//     The workers and the compile inherit that policy, so they run only on the efficiency cores, and the fans stay quiet.
+//     The runs are then about 6 times slower.
 //   - The log of errors keeps at most 100 errors with 100 seeds each, so its memory stays small.
 //
 // A memory kill is not a failure of KVLite: status.json counts it in memory_kills, the log names the seed, and the supervisor makes no error and no shrink of it.
@@ -73,12 +76,11 @@
 // For a hard limit of the kernel, run the supervisor in a systemd unit with MemoryMax, as blackout.service in this directory does.
 // On Windows, the supervisor cannot read the RSS, so it refuses to start until -max-rss is off.
 //
-// # Lanes
+// # Steps
 //
-// A lane is a class of runs with a weight and settings.
-// The -lanes flag has the form name=weight:key=value, with a comma between two lanes.
-// The only key is steps, the number of safety-phase steps.
-// Each new seed picks a lane at random, in proportion to the weights.
+// 80% of the new seeds have 300 safety-phase steps, and 20% have 3000 steps.
+// Short runs test many configurations fast, and long runs make the large databases that some bugs need.
+// -steps gives every seed the same step count, for example for a quick check.
 //
 // # Errors
 //
@@ -94,9 +96,6 @@
 // The search accepts only a step count that gives the same error, and it finds a local minimum only.
 // The shorter run then becomes the first seed of the error.
 // At most one shrink runs at a time, and its runs use the same worker slots as the new seeds.
-//
-// When a new error appears, the supervisor runs -alert-command with the seed and the first line of the report as arguments.
-// The supervisor does not wait for the command.
 //
 // # Output
 //
@@ -136,23 +135,7 @@
 // Linux on x86-64 has 4 KiB pages, and macOS on Apple silicon has 16 KiB pages.
 // So a seed replays exactly only on a platform with the same operating-system page size, and the log records that size.
 //
-// To run the supervisor on a server:
-//  1. Make a checkout that only the runner uses, for example /var/lib/blackout/kvlite.
-//  2. Give the server a deploy key with read-only access.
-//     The runner fetches and never pushes.
-//  3. Compile the supervisor with "go build -o /var/lib/blackout/bin/blackout-supervisor ./internal/blackout/supervisor".
-//  4. Copy blackout.service from this directory to /etc/systemd/system and change its paths.
-//  5. Start the service with "systemctl enable --now blackout".
-//
-// The unit restarts the supervisor when it stops.
-// It uses KillMode=mixed, so that a stop sends SIGTERM to the supervisor only and the running workers can finish.
-// It also sets limits that the kernel enforces at once, for the supervisor, its workers, and the compile together:
-//   - MemoryMax=50% and MemorySwapMax=0: the service never uses more than half of the RAM, and no swap.
-//     The supervisor plans its workers in half of MemoryMax, so the kernel limit is a second wall that a fast-growing worker can reach before a sample sees it.
-//   - CPUSchedulingPolicy=idle, Nice=19, and IOSchedulingClass=idle: the service runs only when the other programs do not need the CPU or the disk.
-//   - OOMScoreAdjust=1000: when the computer has no memory left, the kernel kills a worker first.
-//
-// The supervisor already uses half of the CPUs on average.
-// For a hard CPU limit of the kernel, also set CPUQuota, where 100% is one CPU.
-// For example, CPUQuota=100% on a server with 2 CPUs.
+// To run the supervisor on a server, use the systemd unit blackout.service in this directory.
+// Its comments give the setup steps and the limits that the kernel enforces for the supervisor, its workers, and the compile together.
+// The most important limit is MemoryMax=50%, a second wall behind the RSS limit: the kernel stops a fast-growing worker before a sample sees it.
 package main

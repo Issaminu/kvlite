@@ -20,14 +20,14 @@ type StressSettings struct {
 	Clients int
 	// Operations is the number of operations of each client. Zero means 300.
 	Operations int
-	// Timeout is the time limit of the run. Zero means 5 minutes.
-	// A run over the limit, such as a deadlock, prints every goroutine stack and stops the process.
-	Timeout time.Duration
 }
 
 const (
 	stressPath = "/sim/stress"
 	stressKeys = 6 // keys in the bucket of each client
+	// stressTimeout is the time limit of one stress run.
+	// A run over the limit, such as a deadlock, prints every goroutine stack and stops the process.
+	stressTimeout = 5 * time.Minute
 )
 
 // Stress runs real goroutines against one database at the same time, and checks the history that they see.
@@ -44,16 +44,13 @@ const (
 // A seed selects the options and the operation mix of each client.
 // The schedule of the goroutines does not repeat, so a failure may not replay.
 // Run it with the race detector too: go test -race -run TestBlackoutStress .
-// It returns what the run did, for the test log, and the first failure.
-func Stress(target Target, seed uint64, settings StressSettings) (StressResult, error) {
+// It returns the first failure.
+func Stress(target Target, seed uint64, settings StressSettings) error {
 	if settings.Clients <= 0 {
 		settings.Clients = 6
 	}
 	if settings.Operations <= 0 {
 		settings.Operations = 300
-	}
-	if settings.Timeout <= 0 {
-		settings.Timeout = 5 * time.Minute
 	}
 	rand := disk.NewRand(streamSeed(seed, streamConfig))
 	run := &stressRun{
@@ -76,20 +73,20 @@ func Stress(target Target, seed uint64, settings StressSettings) (StressResult, 
 		seed, settings.Clients, settings.Operations, syncNames[run.options.Synchronous], run.options.MaxWriteBatchSize,
 		run.options.CheckpointThresholdBytes, run.options.DataPageChecksums, run.pageSize, staleMappings)
 
-	timer := time.AfterFunc(settings.Timeout, func() {
+	timer := time.AfterFunc(stressTimeout, func() {
 		stacks := make([]byte, 16<<20)
 		stacks = stacks[:runtime.Stack(stacks, true)]
-		fmt.Fprintf(os.Stderr, "%s did not finish in %s; goroutine stacks:\n%s\n", run.name, settings.Timeout, stacks)
-		panic(fmt.Sprintf("%s did not finish in %s (a deadlock or a hang)", run.name, settings.Timeout))
+		fmt.Fprintf(os.Stderr, "%s did not finish in %s; goroutine stacks:\n%s\n", run.name, stressTimeout, stacks)
+		panic(fmt.Sprintf("%s did not finish in %s (a deadlock or a hang)", run.name, stressTimeout))
 	})
 	defer timer.Stop()
 
 	if err := run.setup(); err != nil {
-		return run.result(), fmt.Errorf("%s: %w", run.name, err)
+		return fmt.Errorf("%s: %w", run.name, err)
 	}
 	run.parallel(func(client int) { run.client(client, settings.Operations) })
 	if err := run.err(); err != nil {
-		return run.result(), err
+		return err
 	}
 	run.closeDuringWork()
 	if run.err() == nil {
@@ -100,48 +97,23 @@ func Stress(target Target, seed uint64, settings StressSettings) (StressResult, 
 		run.fsys.Restart(true)
 		run.verifyFinal("after a power failure")
 	}
-	return run.result(), run.err()
-}
-
-// StressResult counts what one stress run did.
-type StressResult struct {
-	Name        string
-	Commits     int64 // completed commits of all clients
-	Reads       int64
-	Backups     int64
-	Checkpoints int64
-}
-
-func (result StressResult) String() string {
-	return fmt.Sprintf("%s: %d commits, %d reads, %d backups, %d checkpoints", result.Name, result.Commits, result.Reads, result.Backups, result.Checkpoints)
-}
-
-// result returns what the run did so far.
-func (run *stressRun) result() StressResult {
-	result := StressResult{Name: run.name, Reads: run.reads.Load(), Backups: run.backups.Load(), Checkpoints: run.checkpoints.Load()}
-	for client := range run.clients {
-		result.Commits += run.completed[client].Load()
-	}
-	return result
+	return run.err()
 }
 
 // stressRun is one stress run.
 type stressRun struct {
-	target      Target
-	seed        uint64
-	name        string
-	clients     int
-	options     *kvlite.Options
-	pageSize    int
-	fsys        *disk.FS
-	db          *kvlite.DB
-	started     []atomic.Int64 // commits that each client started
-	completed   []atomic.Int64 // commits that returned success
-	reads       atomic.Int64
-	backups     atomic.Int64
-	checkpoints atomic.Int64
-	mu          sync.Mutex
-	failure     error
+	target    Target
+	seed      uint64
+	name      string
+	clients   int
+	options   *kvlite.Options
+	pageSize  int
+	fsys      *disk.FS
+	db        *kvlite.DB
+	started   []atomic.Int64 // commits that each client started
+	completed []atomic.Int64 // commits that returned success
+	mu        sync.Mutex
+	failure   error
 }
 
 // fail records the first failure. Every goroutine stops soon after it.
@@ -252,7 +224,6 @@ func (run *stressRun) client(client, operations int) {
 				run.fail("client %d: DB.Stats: %v", client, err)
 			}
 		case 5:
-			run.checkpoints.Add(1)
 			if err := run.target.Checkpoint(run.db); err != nil {
 				run.fail("client %d: checkpoint: %v", client, err)
 			}
@@ -289,7 +260,6 @@ func (run *stressRun) write(client int) error {
 
 // readOwn reads the bucket of client: the only writer of that bucket must see its last commit.
 func (run *stressRun) readOwn(client int) {
-	run.reads.Add(1)
 	want := run.completed[client].Load()
 	err := run.db.View(func(tx *kvlite.Tx) error {
 		bucket, err := tx.Bucket(stressBucket(client))
@@ -318,7 +288,6 @@ func (run *stressRun) readOwn(client int) {
 
 // readBucket scans the bucket of other in one View: every key must show one commit, inside the bounds of the history.
 func (run *stressRun) readBucket(client, other int, lastSeen []int64) {
-	run.reads.Add(1)
 	low := run.completed[other].Load()
 	seen := int64(-1)
 	err := run.db.View(func(tx *kvlite.Tx) error {
@@ -363,7 +332,6 @@ func (run *stressRun) readBucket(client, other int, lastSeen []int64) {
 
 // get reads one key of other with DB.Get.
 func (run *stressRun) get(client, other, key int, lastSeen []int64) {
-	run.reads.Add(1)
 	low := run.completed[other].Load()
 	value, err := run.db.Get(stressBucket(other), stressKey(key))
 	high := run.started[other].Load()
@@ -414,7 +382,6 @@ func (run *stressRun) backup(client, operation int) {
 		run.fail("Backup: %v", err)
 		return
 	}
-	run.backups.Add(1)
 	defer run.fsys.Remove(path)
 	backup, err := run.target.Open(path, 0o600, &kvlite.Options{ReadOnly: true, Synchronous: run.options.Synchronous}, run.fsys, run.pageSize)
 	if err != nil {

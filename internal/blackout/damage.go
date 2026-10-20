@@ -25,7 +25,6 @@ func (runner *runner) corruptAtRest() {
 // probeDamage opens the damaged storage once and requires an error or an allowed state, never wrong data.
 // It then heals the damage.
 func (runner *runner) probeDamage(afterCrash bool) {
-	runner.stats.DamageProbes++
 	runner.fsys.SetFaults(false)
 	defer runner.fsys.SetFaults(runner.faults)
 	runner.fsys.CancelCrash()

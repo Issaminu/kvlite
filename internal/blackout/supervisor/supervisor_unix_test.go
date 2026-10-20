@@ -21,30 +21,23 @@ func (writer testWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-// TestSupervisorRecordsShrinksAndAlerts runs the loop of the supervisor with the test binary as the worker.
-// Every run of 5 or more steps fails at step 4, so the status must list each failed seed, the shrink must make one seed 5 steps long, and the alert must run once.
-func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
+// TestSupervisorRecordsAndShrinks runs the loop of the supervisor with the test binary as the worker.
+// Every run of 5 or more steps fails at step 4, so the status must list each failed seed, and the shrink must make one seed 5 steps long.
+func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	out := t.TempDir()
-	alerts := filepath.Join(t.TempDir(), "alerts.txt")
 	t.Setenv(helperEnv, "fail-from-5")
-	t.Setenv(alertFileEnv, alerts)
 	opts := options{
-		out:          out,
-		workers:      2,
-		timeout:      30 * time.Second,
-		memoryLimit:  "256MiB",
-		lanes:        "default=1:steps=20",
-		reports:      true,
-		alertCommand: executable,
+		out:         out,
+		workers:     2,
+		timeout:     30 * time.Second,
+		memoryLimit: "256MiB",
+		reports:     true,
 	}
-	lanes, err := parseLanes(opts.lanes)
-	if err != nil {
-		t.Fatal(err)
-	}
+	lanes := []lane{{"default", 1, 20}}
 	// A status of an earlier supervisor must be kept, not overwritten.
 	if err := os.WriteFile(filepath.Join(out, "status.json"), []byte(`{"commit": "old1234"}`), 0o644); err != nil {
 		t.Fatal(err)
@@ -62,7 +55,7 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		s.serve(&build{Commit: "test123", Binary: executable, GoVersion: "go-test", GOOS: "testos", GOARCH: "testarch"}, nil, nil)
+		s.serve(&build{Commit: "test123", Binary: executable, GOOS: "testos", GOARCH: "testarch"}, nil, nil)
 	}()
 
 	deadline := time.Now().Add(20 * time.Second)
@@ -103,15 +96,6 @@ func TestSupervisorRecordsShrinksAndAlerts(t *testing.T) {
 	reports, err := filepath.Glob(filepath.Join(out, "reports", "*.txt"))
 	if err != nil || len(reports) != current.Runs {
 		t.Fatalf("reports: %d files for %d failed runs, %v", len(reports), current.Runs, err)
-	}
-
-	alerted, err := os.ReadFile(alerts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	lines := strings.Split(strings.TrimSpace(string(alerted)), "\n")
-	if len(lines) != 1 || !strings.Contains(lines[0], " | blackout seed ") {
-		t.Fatalf("alerts: %q", lines)
 	}
 	if left, _ := os.ReadDir(filepath.Join(out, "tmp")); len(left) != 0 {
 		t.Fatalf("the runs left %d working directories", len(left))

@@ -110,10 +110,9 @@ type Config struct {
 	FullFault Ratio
 
 	// ReadCorruption is the probability that a read returns one flipped bit, while the stored bytes stay correct.
-	// It applies only with CorruptMainReads, and never to a WAL file.
+	// It never applies to a WAL file.
 	// A real read of a WAL comes from the page cache, so a second read returns the same bytes, and a wrong WAL byte is then bit rot, which Blackout does not inject (see damage.go).
-	ReadCorruption   Ratio
-	CorruptMainReads bool
+	ReadCorruption Ratio
 
 	// TornSectors lets a power failure keep part of a sector, so a sector is not atomic.
 	TornSectors bool
@@ -203,9 +202,8 @@ type FS struct {
 	durableNames map[string]*inode // durable view of the directory entries
 	links        map[string]string // symbolic links, from absolute name to target; they are always durable
 	generation   uint64            // a restart increments it, so earlier handles fail
-	nextInodeID  uint64
-	mutations    uint64 // mutating calls so far; a scheduled crash counts them
-	crashAt      uint64 // mutation that crashes; zero means none
+	mutations    uint64            // mutating calls so far; a scheduled crash counts them
+	crashAt      uint64            // mutation that crashes; zero means none
 	crashed      bool
 	crashEvent   Event
 	faults       bool   // enables the injected errors of Config
@@ -221,7 +219,6 @@ type FS struct {
 // inode is the content of one file.
 // Several names share one inode after a hard link.
 type inode struct {
-	id       uint64
 	perm     os.FileMode
 	data     []byte     // cache view
 	durable  []byte     // durable view
@@ -288,8 +285,7 @@ func (fsys *FS) CloneCache(seed uint64) *FS {
 		node := fsys.names[name]
 		copied, ok := copies[node]
 		if !ok {
-			clone.nextInodeID++
-			copied = &inode{id: clone.nextInodeID, perm: node.perm, data: slices.Clone(node.data)}
+			copied = &inode{perm: node.perm, data: slices.Clone(node.data)}
 			copies[node] = copied
 		}
 		clone.names[name] = copied
@@ -906,8 +902,7 @@ func (fsys *FS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, 
 }
 
 func (fsys *FS) create(name string, perm os.FileMode) *inode {
-	fsys.nextInodeID++
-	node := &inode{id: fsys.nextInodeID, perm: perm.Perm()}
+	node := &inode{perm: perm.Perm()}
 	fsys.names[name] = node
 	return node
 }
@@ -920,11 +915,6 @@ func (fsys *FS) Remove(name string) error {
 	name = fsys.abs(name)
 	if fsys.crashed {
 		return crashedError("remove", name)
-	}
-	if _, ok := fsys.links[name]; ok {
-		delete(fsys.links, name)
-		fsys.record(Event{Mutation: fsys.mutations, Op: "remove", Name: name, Result: "ok, a symbolic link"})
-		return nil
 	}
 	if _, ok := fsys.names[name]; !ok {
 		return &fs.PathError{Op: "remove", Path: name, Err: fs.ErrNotExist}
@@ -1010,6 +1000,7 @@ func (fsys *FS) Abs(name string) (string, error) {
 
 // Symlink makes name a symbolic link to target, like os.Symlink.
 // Symbolic links are always durable; Blackout makes them only before a run.
+// Remove and Link do not check for symbolic links, because no caller removes one or makes a hard link at its name.
 func (fsys *FS) Symlink(target, name string) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
@@ -1086,9 +1077,7 @@ func (fsys *FS) Link(oldname, newname string) error {
 	if !ok {
 		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: fs.ErrNotExist}
 	}
-	_, nameExists := fsys.names[newname]
-	_, linkExists := fsys.links[newname]
-	if nameExists || linkExists {
+	if _, ok := fsys.names[newname]; ok {
 		return &os.LinkError{Op: "link", Old: oldname, New: newname, Err: fs.ErrExist}
 	}
 	if fsys.mutate("link", newname, 0, 0) {
@@ -1251,7 +1240,7 @@ func (f *file) ReadAt(p []byte, offset int64) (int, error) {
 		return 0, io.EOF
 	}
 	n := copy(p, f.node.data[offset:])
-	if n > 0 && fsys.config.CorruptMainReads && !strings.HasSuffix(f.name, "-wal") && fsys.faults && fsys.rand.Chance(fsys.config.ReadCorruption) {
+	if n > 0 && !strings.HasSuffix(f.name, "-wal") && fsys.faults && fsys.rand.Chance(fsys.config.ReadCorruption) {
 		bit := fsys.rand.IntN(n * 8)
 		p[bit/8] ^= 1 << (bit % 8)
 		fsys.stats.ReadCorruptions++
@@ -1493,7 +1482,8 @@ func (f *file) Sync() error {
 				fsys.stats.RevertedSyncs++
 				fsys.stats.DroppedCaches++
 				result = "injected, reverted"
-				node.data = slices.Clone(node.durable)
+				// No other slice holds the array of the cache view, so the copy can reuse it.
+				node.data = append(node.data[:0], node.durable...)
 				refreshMappings(node)
 			}
 			fsys.record(Event{Mutation: fsys.mutations, Op: "sync", Name: f.name, Result: result})
@@ -1516,7 +1506,8 @@ func (f *file) Sync() error {
 				fsys.stats.DroppedCaches++
 				result = "injected, cache dropped"
 			}
-			node.data = slices.Clone(node.durable)
+			// No other slice holds the array of the cache view, so the copy can reuse it.
+			node.data = append(node.data[:0], node.durable...)
 			refreshMappings(node)
 		}
 		fsys.record(Event{Mutation: fsys.mutations, Op: "sync", Name: f.name, Result: result})

@@ -31,24 +31,12 @@ const (
 // A panic and its stacks come first, so the start of the output is the important part.
 const maxOutput = 8 << 20
 
-// workerResult is the JSON that the test binary writes with -blackout.json.
-// It mirrors blackoutResult in the root package's blackout_test.go.
+// workerResult holds the fields of the JSON that the test binary writes with -blackout.json, as far as the supervisor reads them.
+// The full JSON is blackoutResult in the root package's blackout_test.go.
 type workerResult struct {
-	Seed          uint64 `json:"seed"`
-	Steps         int    `json:"steps"`
-	Passed        bool   `json:"passed"`
-	Failure       string `json:"failure"`
-	Report        string `json:"report"`
-	Config        string `json:"config"`
-	TraceHash     string `json:"trace_hash"`
-	GoVersion     string `json:"go_version"`
-	GOOS          string `json:"goos"`
-	GOARCH        string `json:"goarch"`
-	PageSize      int    `json:"page_size"`
-	Commits       int    `json:"commits"`
-	Recoveries    int    `json:"recoveries"`
-	Crashes       int    `json:"crashes"`
-	PowerFailures int    `json:"power_failures"`
+	Passed  bool   `json:"passed"`
+	Failure string `json:"failure"`
+	Report  string `json:"report"`
 }
 
 // runSpec describes one run of one seed.

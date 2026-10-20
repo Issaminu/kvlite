@@ -7,7 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 )
 
@@ -17,7 +17,6 @@ type build struct {
 	FullCommit string // full hash of HEAD
 	Dirty      bool   // the checkout had changes
 	Binary     string // path of the test binary
-	GoVersion  string // version of the Go toolchain that compiled the binary
 	GOOS       string
 	GOARCH     string
 }
@@ -48,19 +47,15 @@ func commandGit(repo string) gitRunner {
 }
 
 // sourceState returns the short and full hash of HEAD and whether the checkout has changes.
-// exclude is a path in the checkout that does not count as a change, such as the output directory, or "".
-func sourceState(ctx context.Context, git gitRunner, exclude string) (short, full string, dirty bool, err error) {
+// A file that .gitignore lists is no change, for example in the default output directory.
+func sourceState(ctx context.Context, git gitRunner) (short, full string, dirty bool, err error) {
 	if full, err = git(ctx, "rev-parse", "HEAD"); err != nil {
 		return "", "", false, err
 	}
 	if short, err = git(ctx, "rev-parse", "--short", "HEAD"); err != nil {
 		return "", "", false, err
 	}
-	args := []string{"status", "--porcelain", "--", "."}
-	if exclude != "" {
-		args = append(args, ":(exclude)"+exclude)
-	}
-	status, err := git(ctx, args...)
+	status, err := git(ctx, "status", "--porcelain", "--", ".")
 	if err != nil {
 		return "", "", false, err
 	}
@@ -68,18 +63,18 @@ func sourceState(ctx context.Context, git gitRunner, exclude string) (short, ful
 }
 
 // compileWorker compiles the test binary of the root package in repo into binDir.
-// exclude is passed to sourceState.
-// The compile runs at the lowest CPU priority, with at most parallel programs at the same time.
-func compileWorker(ctx context.Context, goTool, repo, binDir, exclude string, parallel int) (*build, error) {
+// The compile runs at the lowest CPU priority.
+// The workers run on this computer, so the binary is for the operating system and architecture of the supervisor.
+func compileWorker(ctx context.Context, goTool, repo, binDir string) (*build, error) {
 	git := commandGit(repo)
-	short, full, dirty, err := sourceState(ctx, git, exclude)
+	short, full, dirty, err := sourceState(ctx, git)
 	if err != nil {
 		return nil, err
 	}
-	result := &build{Commit: short, FullCommit: full, Dirty: dirty}
+	result := &build{Commit: short, FullCommit: full, Dirty: dirty, GOOS: runtime.GOOS, GOARCH: runtime.GOARCH}
 	result.Binary = filepath.Join(binDir, "blackout-"+result.label()+".test")
 	temporary := result.Binary + ".tmp"
-	name, args := lowPriority(goTool, "test", "-c", "-p", strconv.Itoa(parallel), "-o", temporary, ".")
+	name, args := lowPriority(goTool, "test", "-c", "-o", temporary, ".")
 	compile := exec.CommandContext(ctx, name, args...)
 	compile.Dir = repo
 	if output, err := compile.CombinedOutput(); err != nil {
@@ -90,24 +85,5 @@ func compileWorker(ctx context.Context, goTool, repo, binDir, exclude string, pa
 	if err := os.Rename(temporary, result.Binary); err != nil {
 		return nil, err
 	}
-	environment := exec.CommandContext(ctx, goTool, "env", "GOVERSION", "GOOS", "GOARCH")
-	environment.Dir = repo
-	output, err := environment.Output()
-	if err != nil {
-		return nil, fmt.Errorf("go env: %w", err)
-	}
-	if fields := strings.Fields(string(output)); len(fields) == 3 {
-		result.GoVersion, result.GOOS, result.GOARCH = fields[0], fields[1], fields[2]
-	}
 	return result, nil
-}
-
-// excludedPath returns out relative to repo when out is inside repo, or "" when it is not.
-// The output directory inside the checkout must not make the checkout dirty.
-func excludedPath(repo, out string) string {
-	relative, err := filepath.Rel(repo, out)
-	if err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return ""
-	}
-	return filepath.ToSlash(relative)
 }

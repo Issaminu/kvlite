@@ -115,7 +115,7 @@ func TestBlackout(t *testing.T) {
 			TraceLines: *blackoutTrace,
 			DeepCheck:  *blackoutDeepCheck,
 		})
-		t.Logf("seed %d config: %s\n%s", result.Seed, result.Config, result.Stats)
+		t.Logf("seed %d config: %s", result.Seed, result.Config)
 		if *blackoutJSON != "" {
 			if err := writeBlackoutResult(*blackoutJSON, result, *blackoutSteps); err != nil {
 				t.Fatalf("write the JSON result: %v", err)
@@ -130,11 +130,9 @@ func TestBlackout(t *testing.T) {
 	if testing.Short() {
 		seeds = min(seeds, 8)
 	}
-	var total blackout.Stats
 	failures := 0
 	for index := range seeds {
 		result := blackout.Run(target, *blackoutStart+uint64(index), blackout.Settings{Steps: *blackoutSteps, DeepCheck: *blackoutDeepCheck})
-		total.Add(result.Stats)
 		if result.Err != nil {
 			t.Error(result.Err)
 			if failures++; failures == *blackoutMaxFailures {
@@ -142,7 +140,6 @@ func TestBlackout(t *testing.T) {
 			}
 		}
 	}
-	t.Logf("%d seeds of %d steps:\n%s", seeds, *blackoutSteps, total)
 }
 
 // TestBlackoutIsDeterministic runs seeds twice and requires the same trace, so that a printed seed replays a failure.
@@ -222,12 +219,9 @@ func TestBlackoutStress(t *testing.T) {
 		seeds = 1
 	}
 	for seed := uint64(1); seed <= seeds; seed++ {
-		result, err := blackout.Stress(target, seed, blackout.StressSettings{Clients: *blackoutStressCount, Operations: *blackoutStressSize})
-		if err != nil {
+		if err := blackout.Stress(target, seed, blackout.StressSettings{Clients: *blackoutStressCount, Operations: *blackoutStressSize}); err != nil {
 			t.Error(err)
-			continue
 		}
-		t.Log(result)
 	}
 }
 

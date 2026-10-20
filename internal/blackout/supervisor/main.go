@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"syscall"
 	"time"
@@ -24,13 +25,11 @@ type options struct {
 	workers        int
 	timeout        time.Duration
 	memoryLimit    string
-	maxRSS         int64   // zero means no limit
-	memoryBudget   int64   // memory of all workers together; zero means unknown
-	cpus           float64 // CPUs of all workers together, on average
-	lanes          string
+	maxRSS         int64 // zero means no limit
+	memoryBudget   int64 // memory of all workers together; zero means unknown
+	steps          int   // safety-phase steps of every seed; zero means defaultLanes
 	duration       time.Duration
 	reports        bool
-	alertCommand   string
 	follow         bool
 	followInterval time.Duration
 	remote         string
@@ -43,7 +42,7 @@ var memoryLimitPattern = regexp.MustCompile(`^(off|[0-9]+(B|KiB|MiB|GiB|TiB)?)$`
 // errUsage is the error of a flag that the flag package already reported.
 var errUsage = errors.New("usage error")
 
-// parseOptions parses the command-line flags and the lanes.
+// parseOptions parses the command-line flags and returns the lanes of the new seeds.
 func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	var opts options
 	flags := flag.NewFlagSet("supervisor", flag.ContinueOnError)
@@ -57,16 +56,14 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	flags.StringVar(&opts.repo, "repo", ".", "KVLite `checkout` to compile; follow mode changes it, so give the runner its own checkout")
 	flags.StringVar(&opts.out, "out", "blackout-results", "output `directory` for the status and the reports")
 	flags.StringVar(&opts.goTool, "go", "go", "Go `command` that compiles the test binary")
-	flags.IntVar(&opts.workers, "workers", 0, "number of worker processes that run at the same time (default: from -memory and -cpus)")
-	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "time limit of one worker")
+	flags.IntVar(&opts.workers, "workers", 0, "number of worker processes that run at the same time (default: one for each CPU that the Go runtime uses, as -memory allows)")
+	flags.DurationVar(&opts.timeout, "timeout", 2*time.Hour, "time limit of one worker; slow CPUs make long seeds slow, so the limit finds only runs that make no progress")
 	flags.StringVar(&opts.memoryLimit, "memlimit", "", "soft memory `limit` of one worker (GOMEMLIMIT) (default: half of -max-rss)")
-	maxRSS := flags.String("max-rss", "", "hard memory `limit` of one worker: the supervisor kills a worker whose RSS is larger; off removes the limit (default: from -memory and -cpus, at most 4GiB)")
+	maxRSS := flags.String("max-rss", "", "hard memory `limit` of one worker: the supervisor kills a worker whose RSS is larger; off removes the limit (default: from -memory and the workers, at most 4GiB)")
 	memory := flags.String("memory", "", "memory `budget` of all workers together (default: half of the RAM, or of the cgroup memory limit when it is smaller)")
-	flags.Float64Var(&opts.cpus, "cpus", cpuCount()/2, "CPU `budget` of all workers together (default: half of the CPUs, or of the cgroup CPU limit when it is smaller); a worker uses one CPU, and with fewer CPUs than workers, each worker waits after a run")
-	flags.StringVar(&opts.lanes, "lanes", "default=80:steps=300,long=20:steps=3000", "lanes as name=weight:steps=N, with a comma between two lanes")
+	flags.IntVar(&opts.steps, "steps", 0, "safety-phase steps of every seed, for example for a quick check (default: 80% of the seeds with 300 steps and 20% with 3000 steps)")
 	flags.DurationVar(&opts.duration, "duration", 0, "stop after this time; zero runs until a signal")
 	flags.BoolVar(&opts.reports, "reports", false, "write the full report of each failed seed to reports/SEED.txt; a replay of the seed gives the same report")
-	flags.StringVar(&opts.alertCommand, "alert-command", "", "`command` to run for a new error, with the seed and the first line of the report as arguments")
 	flags.BoolVar(&opts.follow, "follow", false, "fetch the remote and check out each new commit of the branch in -repo")
 	flags.DurationVar(&opts.followInterval, "follow-interval", 5*time.Minute, "time between two fetches in follow mode")
 	flags.StringVar(&opts.remote, "remote", "origin", "git remote for follow mode")
@@ -99,7 +96,8 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	if set["workers"] && opts.workers <= 0 {
 		return opts, nil, errors.New("-workers must be positive")
 	}
-	opts.workers, opts.maxRSS = plan(opts.memoryBudget, opts.cpus, opts.workers, opts.maxRSS)
+	// GOMAXPROCS follows the cgroup CPU limit, and the kernel enforces that limit, so the supervisor reads no CPU limit itself.
+	opts.workers, opts.maxRSS = plan(opts.memoryBudget, runtime.GOMAXPROCS(0), opts.workers, opts.maxRSS)
 	if !set["memlimit"] {
 		perWorker := opts.maxRSS
 		if perWorker == 0 {
@@ -110,8 +108,8 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	switch {
 	case flags.NArg() > 0:
 		return opts, nil, fmt.Errorf("unexpected arguments: %q", flags.Args())
-	case !(opts.cpus > 0):
-		return opts, nil, errors.New("-cpus must be positive")
+	case opts.steps < 0:
+		return opts, nil, errors.New("-steps must not be negative")
 	case opts.timeout <= 0:
 		return opts, nil, errors.New("-timeout must be positive")
 	case opts.followInterval <= 0:
@@ -119,9 +117,9 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	case !memoryLimitPattern.MatchString(opts.memoryLimit):
 		return opts, nil, fmt.Errorf("-memlimit %q is not a GOMEMLIMIT value, such as 2GiB", opts.memoryLimit)
 	}
-	lanes, err := parseLanes(opts.lanes)
-	if err != nil {
-		return opts, nil, err
+	lanes := defaultLanes
+	if opts.steps > 0 {
+		lanes = []lane{{"steps", 1, opts.steps}}
 	}
 	if opts.repo, err = filepath.Abs(opts.repo); err != nil {
 		return opts, nil, err
@@ -159,9 +157,6 @@ func main() {
 	case err != nil:
 		fmt.Fprintln(os.Stderr, "supervisor:", err)
 		os.Exit(2)
-	}
-	if err := preferAsOOMVictim(); err != nil {
-		fmt.Fprintln(os.Stderr, "supervisor: the out-of-memory killer of Linux does not prefer the workers:", err)
 	}
 	stop, stopCancel, hard := stopContexts(log.New(os.Stderr, "blackout ", log.LstdFlags))
 	if err := newSupervisor(opts, lanes, stop, stopCancel, hard).run(); err != nil {

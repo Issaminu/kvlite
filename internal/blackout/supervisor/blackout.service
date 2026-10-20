@@ -37,7 +37,7 @@ CPUSchedulingPolicy=idle
 IOSchedulingClass=idle
 
 # A stop sends SIGTERM to the supervisor only.
-# The supervisor then lets the running workers finish, up to -timeout (5 minutes).
+# The supervisor then lets the running workers finish, and systemd kills them after TimeoutStopSec.
 KillMode=mixed
 TimeoutStopSec=6min
 
@@ -47,7 +47,8 @@ MemoryMax=50%
 MemorySwapMax=0
 # When the server has no memory left, the kernel kills a worker first, so the other programs survive.
 OOMScoreAdjust=1000
-# The supervisor uses half of the CPUs on average.
+# The workers use all CPUs, but at the lowest priority, so they get only the CPU time that other programs do not need.
+# Some VPS plans do not allow full CPU use for a long time.
 # For a hard CPU limit, set CPUQuota, where 100% is one CPU, for example CPUQuota=100% on 2 CPUs.
 #CPUQuota=100%
 

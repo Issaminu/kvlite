@@ -10,10 +10,7 @@ import (
 	"log"
 	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 )
@@ -23,8 +20,6 @@ const (
 	killGrace = 10 * time.Second
 	// gitTimeout is the time limit of the git commands of follow mode.
 	gitTimeout = 2 * time.Minute
-	// alertTimeout is the time limit of the alert command.
-	alertTimeout = time.Minute
 )
 
 // errStopped is the error of a shrink run that the supervisor stopped.
@@ -44,14 +39,13 @@ type supervisor struct {
 	hard       context.Context    // done when the running workers must die
 	shrinkWake chan struct{}      // gets a value when a shrink job is queued
 	workers    sync.WaitGroup     // runs of new seeds
-	background sync.WaitGroup     // the shrinker and the alert commands
+	background sync.WaitGroup     // the shrinker
 	// memory returns the memory of the system and the available part, as systemMemory does; tests replace it.
 	memory func() (total, available int64)
 
 	mu         sync.Mutex
 	current    *build
 	counts     counters
-	running    int
 	shrinks    []shrinkJob
 	shrinking  *shrinkJob // the running shrink, or nil
 	buildError string
@@ -107,9 +101,6 @@ func (s *supervisor) run() error {
 
 // prepare checks that the supervisor can read the RSS of a process, makes the output directories, and keeps the status of an earlier supervisor.
 func (s *supervisor) prepare() error {
-	if err := checkTools(); err != nil {
-		return err
-	}
 	if s.opts.maxRSS > 0 {
 		if _, err := residentBytes(os.Getpid()); err != nil {
 			return fmt.Errorf("-max-rss needs the RSS of the workers, but the supervisor cannot read it: %w", err)
@@ -160,7 +151,7 @@ func (s *supervisor) serve(current *build, follow *follower, ticks <-chan time.T
 	if s.opts.maxRSS > 0 {
 		limit = fmt.Sprintf("a memory limit of %d MiB of RSS for each worker", s.opts.maxRSS>>20)
 	}
-	s.logf("compiled %s with %s; %d workers with %s; budget %d MiB and %g CPUs; lanes %s", current.Binary, current.GoVersion, s.opts.workers, limit, s.opts.memoryBudget>>20, s.opts.cpus, s.opts.lanes)
+	s.logf("compiled %s; %d workers with %s; budget %d MiB; lanes %+v", current.Binary, s.opts.workers, limit, s.opts.memoryBudget>>20, s.lanes)
 	if s.opts.memoryBudget > 0 && (s.opts.maxRSS == 0 || int64(s.opts.workers)*s.opts.maxRSS > s.opts.memoryBudget) {
 		s.logf("warning: the memory limits of the workers together are more than the memory budget")
 	}
@@ -245,9 +236,8 @@ func (s *supervisor) firstBuild(follow *follower, ticks <-chan time.Time) (*buil
 }
 
 // compile compiles the test binary of the current checkout.
-// The compile runs while no worker runs, so it uses the CPU budget of the workers.
 func (s *supervisor) compile(ctx context.Context) (*build, error) {
-	return compileWorker(ctx, s.opts.goTool, s.opts.repo, filepath.Join(s.opts.out, "bin"), excludedPath(s.opts.repo, s.opts.out), max(1, int(s.opts.cpus)))
+	return compileWorker(ctx, s.opts.goTool, s.opts.repo, filepath.Join(s.opts.out, "bin"))
 }
 
 // runSeeds starts new seeds until the stop context is done or follow mode checks out a new commit.
@@ -310,28 +300,12 @@ func newSeed() uint64 {
 }
 
 // execute runs one seed in a worker slot that the caller holds, and then frees the slot.
-// It starts the worker only when the system has the memory for it, and after the run, the slot rests as long as the CPU budget needs.
+// It starts the worker only when the system has the memory for it.
 func (s *supervisor) execute(current *build, seed uint64, steps int) (runOutcome, error) {
-	s.mu.Lock()
-	s.running++
-	s.mu.Unlock()
-	start := time.Now()
-	defer func() {
-		s.mu.Lock()
-		s.running--
-		s.mu.Unlock()
-		if rest := restAfter(time.Since(start), s.opts.workers, s.opts.cpus); rest > 0 {
-			select {
-			case <-time.After(rest):
-			case <-s.stop.Done():
-			}
-		}
-		<-s.slots
-	}()
+	defer func() { <-s.slots }()
 	if !s.waitForMemory() {
 		return runOutcome{Kind: kindCanceled, Seed: seed, Steps: steps}, nil
 	}
-	start = time.Now()
 	outcome, err := runWorker(s.hard, runSpec{
 		Binary:      current.Binary,
 		Seed:        seed,
@@ -401,7 +375,7 @@ func (s *supervisor) handleSeed(current *build, outcome runOutcome, err error) {
 
 // recordFailure adds a failed run to the status and returns the text of its error.
 // With -reports, it writes the full report of the run to reports/SEED.txt.
-// For a new error, it queues a shrink and runs the alert command.
+// For a new error, it queues a shrink.
 func (s *supervisor) recordFailure(current *build, outcome runOutcome) string {
 	text := signatureText(outcome.Kind, outcome.FirstLine, outcome.Output)
 	isNew := s.errors.add(text, seedFrom(outcome))
@@ -418,7 +392,6 @@ func (s *supervisor) recordFailure(current *build, outcome runOutcome) string {
 	s.logf("seed %d (%d steps): %s%s", outcome.Seed, outcome.Steps, outcome.FirstLine, marker)
 	if isNew {
 		s.queueShrink(shrinkJob{build: current, text: text, seed: outcome.Seed, steps: outcome.Steps, hint: failedStep(outcome.FirstLine) + 1})
-		s.alert(outcome)
 	}
 	return text
 }
@@ -541,23 +514,6 @@ func (s *supervisor) pruneBinaries() {
 			}
 		}
 	}
-}
-
-// alert runs the alert command for a new error, with the seed and the first line of its report, and does not wait for it.
-func (s *supervisor) alert(outcome runOutcome) {
-	if s.opts.alertCommand == "" {
-		return
-	}
-	s.background.Add(1)
-	go func() {
-		defer s.background.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), alertTimeout)
-		defer cancel()
-		cmd := exec.CommandContext(ctx, s.opts.alertCommand, strconv.FormatUint(outcome.Seed, 10), outcome.FirstLine)
-		if output, err := cmd.CombinedOutput(); err != nil {
-			s.logf("alert command for seed %d: %v: %s", outcome.Seed, err, strings.TrimSpace(string(output)))
-		}
-	}()
 }
 
 // setBuild changes the current test binary and the last compile error.

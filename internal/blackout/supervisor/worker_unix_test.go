@@ -17,26 +17,11 @@ import (
 	"time"
 )
 
-const (
-	// helperEnv selects the behavior of the test binary when it plays a worker.
-	helperEnv = "BLACKOUT_SUPERVISOR_HELPER"
-	// alertFileEnv names the file to which the test binary writes its arguments when it plays the alert command.
-	alertFileEnv = "BLACKOUT_SUPERVISOR_ALERT_FILE"
-)
+// helperEnv selects the behavior of the test binary when it plays a worker.
+const helperEnv = "BLACKOUT_SUPERVISOR_HELPER"
 
-// TestMain lets the test binary play a worker or the alert command: the standard helper-process pattern.
+// TestMain lets the test binary play a worker: the standard helper-process pattern.
 func TestMain(m *testing.M) {
-	// The alert command gets a seed and a line, and no test flag.
-	if os.Getenv(alertFileEnv) != "" && len(os.Args) == 3 && !strings.HasPrefix(os.Args[1], "-") {
-		line := strings.Join(os.Args[1:], " | ") + "\n"
-		file, err := os.OpenFile(os.Getenv(alertFileEnv), os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
-		if err != nil {
-			os.Exit(1)
-		}
-		file.WriteString(line)
-		file.Close()
-		os.Exit(0)
-	}
 	if mode := os.Getenv(helperEnv); mode != "" {
 		helperMain(mode)
 		os.Exit(0)
@@ -64,21 +49,21 @@ func helperMain(mode string) {
 	}
 	switch mode {
 	case "pass":
-		writeResult(workerResult{Seed: seed, Steps: steps, Passed: true, Recoveries: 3, Crashes: 2})
+		writeResult(workerResult{Passed: true})
 		fmt.Println("PASS")
 	case "fail":
 		failure := fmt.Sprintf("blackout seed %d failed at step %d: Open: page %d is bad", seed, steps-1, steps*2)
-		writeResult(workerResult{Seed: seed, Steps: steps, Failure: failure, Report: failure + "\nconfig: test"})
+		writeResult(workerResult{Failure: failure, Report: failure + "\nconfig: test"})
 		fmt.Println("--- FAIL: TestBlackout")
 		os.Exit(1)
 	case "fail-from-5":
 		// Runs of 5 or more steps fail at step 4, like a failure in the safety phase.
 		if steps < 5 {
-			writeResult(workerResult{Seed: seed, Steps: steps, Passed: true, Recoveries: 1, Crashes: 1})
+			writeResult(workerResult{Passed: true})
 			return
 		}
 		failure := fmt.Sprintf("blackout seed %d failed at step 4: Open: page %d is bad", seed, seed%1000)
-		writeResult(workerResult{Seed: seed, Steps: steps, Failure: failure, Report: failure + "\nconfig: test"})
+		writeResult(workerResult{Failure: failure, Report: failure + "\nconfig: test"})
 		os.Exit(1)
 	case "panic":
 		go helperPanic()
@@ -105,7 +90,7 @@ func helperMain(mode string) {
 		}
 		time.Sleep(3 * time.Second)
 		runtime.KeepAlive(chunks)
-		writeResult(workerResult{Seed: seed, Steps: steps, Passed: true})
+		writeResult(workerResult{Passed: true})
 	case "self-kill":
 		// The helper plays a worker that the out-of-memory killer of the system stops.
 		syscall.Kill(os.Getpid(), syscall.SIGKILL)
@@ -118,7 +103,7 @@ func helperMain(mode string) {
 			priority = 20 - priority
 		}
 		failure := fmt.Sprintf("blackout seed %d failed at step 0: nice %d, %v", seed, priority, err)
-		writeResult(workerResult{Seed: seed, Steps: steps, Failure: failure})
+		writeResult(workerResult{Failure: failure})
 		os.Exit(1)
 	}
 }
@@ -169,7 +154,7 @@ func TestRunWorkerClassifiesHelperProcesses(t *testing.T) {
 	t.Run("pass", func(t *testing.T) {
 		t.Parallel()
 		outcome := runHelper(t, context.Background(), "pass", 30*time.Second)
-		if outcome.Kind != kindPass || outcome.Result == nil || outcome.Result.Recoveries != 3 || outcome.FirstLine != "" {
+		if outcome.Kind != kindPass || outcome.Result == nil || outcome.FirstLine != "" {
 			t.Fatalf("outcome: %+v", outcome)
 		}
 	})

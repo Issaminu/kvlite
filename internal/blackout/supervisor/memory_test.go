@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"testing"
 	"time"
 )
@@ -17,44 +16,26 @@ func TestPlan(t *testing.T) {
 	for _, test := range []struct {
 		name        string
 		budget      int64
-		cpus        float64
+		cpus        int
 		workers     int
 		maxRSS      int64
 		wantWorkers int
 		wantMaxRSS  int64
 	}{
-		{"the laptop of 2026-10-19", 18 * gib, 7, 0, -1, 4, 4 * gib},
+		{"the laptop of 2026-10-19", 18 * gib, 14, 0, -1, 4, 4 * gib},
 		{"CPUs are the limit", 128 * gib, 4, 0, -1, 4, 4 * gib},
 		{"memory is the limit", 8 * gib, 32, 0, -1, 2, 4 * gib},
-		{"a VPS with 2 GiB and 1 CPU", 1 * gib, 0.5, 0, -1, 1, 1 * gib},
-		{"a VPS with 512 MiB", 256 << 20, 0.5, 0, -1, 1, 256 << 20},
+		{"a VPS with 2 GiB and 1 CPU", 1 * gib, 1, 0, -1, 1, 1 * gib},
+		{"a VPS with 512 MiB", 256 << 20, 1, 0, -1, 1, 256 << 20},
 		{"unknown memory", 0, 7, 0, -1, 7, 4 * gib},
 		{"the user chose the workers", 18 * gib, 7, 6, -1, 6, 3 * gib},
 		{"the user chose the limit", 18 * gib, 7, 0, 1 * gib, 7, 1 * gib},
 		{"the user chose no limit", 18 * gib, 7, 0, 0, 4, 0},
-		{"the user chose both", 1 * gib, 0.5, 3, 2 * gib, 3, 2 * gib},
+		{"the user chose both", 1 * gib, 1, 3, 2 * gib, 3, 2 * gib},
 	} {
 		workers, maxRSS := plan(test.budget, test.cpus, test.workers, test.maxRSS)
 		if workers != test.wantWorkers || maxRSS != test.wantMaxRSS {
 			t.Errorf("%s: got %d workers with %d bytes, want %d workers with %d bytes", test.name, workers, maxRSS, test.wantWorkers, test.wantMaxRSS)
-		}
-	}
-}
-
-func TestRestAfterKeepsTheCPUBudget(t *testing.T) {
-	for _, test := range []struct {
-		workers int
-		cpus    float64
-		want    time.Duration
-	}{
-		{4, 7, 0},
-		{1, 1, 0},
-		{1, 0.5, time.Minute},
-		{2, 0.5, 3 * time.Minute},
-		{4, 1, 3 * time.Minute},
-	} {
-		if got := restAfter(time.Minute, test.workers, test.cpus); got != test.want {
-			t.Errorf("%d workers and %g CPUs: rest %v, want %v", test.workers, test.cpus, got, test.want)
 		}
 	}
 }
@@ -108,51 +89,28 @@ func TestCgroupAndMeminfoParsing(t *testing.T) {
 	if got := meminfoValue(meminfo, "MemAvailable:"); got != 905312<<10 {
 		t.Errorf("MemAvailable: %d", got)
 	}
-	if limit, ok := cgroupCPULimit([]byte("50000 100000\n")); !ok || limit != 0.5 {
-		t.Errorf("cpu.max with half a CPU: %g, %v", limit, ok)
-	}
-	if _, ok := cgroupCPULimit([]byte("max 100000\n")); ok {
-		t.Error("cpu.max without a limit gave a limit")
-	}
 }
 
-// A limit of an ancestor cgroup also applies, for example MemoryMax on a systemd slice.
-func TestCgroupLimitsOfAncestors(t *testing.T) {
-	root := t.TempDir()
-	unit := filepath.Join(root, "blackout.slice", "blackout.service")
-	if err := os.MkdirAll(unit, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	for name, text := range map[string]string{
-		"blackout.slice/memory.max":                      "1073741824\n",
-		"blackout.slice/memory.current":                  "805306368\n",
-		"blackout.slice/cpu.max":                         "50000 100000\n",
-		"blackout.slice/blackout.service/memory.max":     "max\n",
-		"blackout.slice/blackout.service/memory.current": "104857600\n",
-		"blackout.slice/blackout.service/cpu.max":        "max 100000\n",
+func TestCgroupMemory(t *testing.T) {
+	limited, unlimited := t.TempDir(), t.TempDir()
+	for path, text := range map[string]string{
+		filepath.Join(limited, "memory.max"):       "1073741824\n",
+		filepath.Join(limited, "memory.current"):   "805306368\n",
+		filepath.Join(unlimited, "memory.max"):     "max\n",
+		filepath.Join(unlimited, "memory.current"): "104857600\n",
 	} {
-		if err := os.WriteFile(filepath.Join(root, name), []byte(text), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
 			t.Fatal(err)
 		}
 	}
-	dirs := cgroupAncestors(unit, root)
-	if len(dirs) == 0 || dirs[0] != unit || dirs[len(dirs)-1] != root {
-		t.Fatalf("cgroupAncestors: %q, want %q first and %q last", dirs, unit, root)
-	}
-	// The slice allows 1 GiB and uses 768 MiB, so 256 MiB is available.
-	if limit, available := cgroupMemory(dirs); limit != 1<<30 || available != 256<<20 {
+	// The cgroup allows 1 GiB and uses 768 MiB, so 256 MiB is available.
+	if limit, available := cgroupMemory(limited); limit != 1<<30 || available != 256<<20 {
 		t.Errorf("cgroupMemory: limit %d, available %d, want %d and %d", limit, available, 1<<30, 256<<20)
 	}
-	if limit, ok := cgroupCPULimitOf(dirs); !ok || limit != 0.5 {
-		t.Errorf("cgroupCPULimitOf: %g, %v, want 0.5", limit, ok)
-	}
-}
-
-func TestCPUCount(t *testing.T) {
-	count := cpuCount()
-	t.Logf("%g CPUs", count)
-	if count <= 0 || count > float64(runtime.NumCPU()) {
-		t.Fatalf("cpuCount() = %g", count)
+	for _, dir := range []string{unlimited, ""} {
+		if limit, available := cgroupMemory(dir); limit != 0 || available != 0 {
+			t.Errorf("cgroupMemory(%q): limit %d, available %d, want no limit", dir, limit, available)
+		}
 	}
 }
 
@@ -165,17 +123,5 @@ func TestSystemMemory(t *testing.T) {
 	t.Logf("memory %d MiB, available %d MiB", total>>20, available>>20)
 	if total < 256<<20 || total > 64<<40 || available <= 0 || available > total {
 		t.Fatalf("systemMemory() = %d, %d", total, available)
-	}
-}
-
-func TestPreferAsOOMVictim(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("only Linux has oom_score_adj")
-	}
-	if err := preferAsOOMVictim(); err != nil {
-		t.Fatal(err)
-	}
-	if data, err := os.ReadFile("/proc/self/oom_score_adj"); err != nil || strings.TrimSpace(string(data)) != "1000" {
-		t.Fatalf("oom_score_adj: %q, %v", data, err)
 	}
 }

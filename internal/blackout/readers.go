@@ -17,7 +17,6 @@ import (
 // At the end of its View, every kept slice must still hold its bytes: KVLite documents that they stay valid until the callback returns.
 func (runner *runner) readers() {
 	count := runner.work.rand.Range(2, 4)
-	runner.stats.ReaderGroups++
 	runner.event("%d readers at once", count)
 	type reader struct {
 		id   int

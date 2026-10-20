@@ -113,17 +113,3 @@ func TestFollowerErrors(t *testing.T) {
 		t.Fatalf("after a failed checkout: got %q, %v; want no second try of the same commit", commit, err)
 	}
 }
-
-func TestExcludedPath(t *testing.T) {
-	for _, test := range []struct{ repo, out, want string }{
-		{"/r", "/r/blackout-results", "blackout-results"},
-		{"/r", "/r/a/b", "a/b"},
-		{"/r", "/tmp/out", ""},
-		{"/r", "/r", ""},
-		{"/r", "/r2/out", ""},
-	} {
-		if got := excludedPath(test.repo, test.out); got != test.want {
-			t.Errorf("excludedPath(%q, %q) = %q, want %q", test.repo, test.out, got, test.want)
-		}
-	}
-}

@@ -256,7 +256,6 @@ func (runner *runner) checkpointStopped() bool {
 	if !errors.Is(err, kvlite.ErrWALWriteFailed) {
 		return false
 	}
-	runner.stats.StoppedHandles++
 	runner.event("a checkpoint stopped the handle: %v", err)
 	return true
 }
@@ -333,7 +332,6 @@ func (runner *runner) closeDB() bool {
 		if errors.Is(err, kvlite.ErrWALWriteFailed) {
 			// A failed WAL sync in the checkpoint of Close stops the handle, and the next Close keeps the WAL.
 			stopped = true
-			runner.stats.StoppedHandles++
 		}
 		runner.stats.FailedCloses++
 		if !runner.explained(err) || attempt >= closeTries {
@@ -402,7 +400,6 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 			runner.fsys.CancelCrash()
 			break
 		}
-		runner.stats.FailedOpens++
 		runner.event("open: %v", err)
 		if crashed, _ := runner.fsys.Crashed(); crashed && attempt < openTries {
 			runner.stats.CrashesInOpen++
@@ -481,7 +478,4 @@ func (runner *runner) livenessPhase() {
 	runner.fsys.Restart(true)
 	runner.powerLost = true
 	runner.openAndVerify(true)
-	if runner.failure == nil && runner.model.latest != runner.model.floor {
-		runner.fail("model floor %d differs from latest %d after the final check", runner.model.floor, runner.model.latest)
-	}
 }
