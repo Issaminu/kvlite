@@ -50,17 +50,16 @@ func (runner *runner) backup() {
 }
 
 // keepBackup returns the backup to keep for the power-failure check: the new one when it is complete and durable, else the old one.
-// It removes the backup that it does not keep, so the simulated storage stays small.
+// It discards the backup that it does not keep, so the simulated storage stays small.
 func (runner *runner) keepBackup(old, record *backupRecord, complete bool) *backupRecord {
+	kept, dropped := record, old
 	if !complete || runner.session.sync == kvlite.SyncNone {
-		return old
+		kept, dropped = old, record
 	}
-	if old != nil {
-		runner.fsys.SetFaults(false)
-		_ = runner.fsys.Remove(old.path)
-		runner.fsys.SetFaults(runner.faults)
+	if dropped != nil {
+		runner.fsys.Discard(dropped.path)
 	}
-	return record
+	return kept
 }
 
 // checkBackup opens a backup read-only and requires its state.
@@ -93,9 +92,7 @@ func (runner *runner) checkBackup(record *backupRecord) {
 func (runner *runner) checkBackupAfterCrash() {
 	for _, name := range runner.fsys.Names() {
 		if strings.HasPrefix(filepath.Base(name), ".kvlite-backup-") {
-			runner.fsys.SetFaults(false)
-			_ = runner.fsys.Remove(name)
-			runner.fsys.SetFaults(runner.faults)
+			runner.fsys.Discard(name)
 		}
 	}
 	if record := runner.crashedBackup; record != nil {
@@ -103,9 +100,7 @@ func (runner *runner) checkBackupAfterCrash() {
 		if _, exists := runner.fsys.FileSize(record.path); exists {
 			// Backup publishes the file with a hard link only after the copy is complete and synced.
 			runner.checkBackup(record)
-			runner.fsys.SetFaults(false)
-			_ = runner.fsys.Remove(record.path)
-			runner.fsys.SetFaults(runner.faults)
+			runner.fsys.Discard(record.path)
 		}
 	}
 	if runner.lastBackup == nil || runner.failure != nil {

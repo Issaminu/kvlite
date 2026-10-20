@@ -258,6 +258,29 @@ func TestRemovedNameCanReturnWithDurableData(t *testing.T) {
 	t.Fatal("a removed name never returned after a power failure")
 }
 
+// TestDiscardRemovesANameForGood requires that a discarded name never returns, and that Discard changes nothing that the run depends on.
+func TestDiscardRemovesANameForGood(t *testing.T) {
+	for seed := range uint64(50) {
+		fsys := New(seed, Config{})
+		file := openRW(t, fsys, testName)
+		mustWrite(t, file, []byte("durable"), 0)
+		mustSync(t, file)
+		if err := fsys.SyncDir(testDir); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, file, []byte("DURABLE"), 0)
+		mutations, hash := fsys.Mutations(), fsys.TraceHash()
+		fsys.Discard(testName)
+		if fsys.Mutations() != mutations || fsys.TraceHash() != hash {
+			t.Fatalf("seed %d: Discard counted a mutation or recorded an event", seed)
+		}
+		fsys.Restart(true)
+		if got := content(fsys, testName); got != nil {
+			t.Fatalf("seed %d: a discarded name returned after a power failure with %q", seed, got)
+		}
+	}
+}
+
 func TestScheduledCrashStopsTheCall(t *testing.T) {
 	fsys := New(3, Config{})
 	file := openRW(t, fsys, testName)

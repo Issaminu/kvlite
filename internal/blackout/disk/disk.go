@@ -942,6 +942,17 @@ func (fsys *FS) Remove(name string) error {
 	return nil
 }
 
+// Discard removes name from the cache view and from the durable view, so no crash or power failure can bring it back.
+// It is not a call of the simulated process: it counts no mutation, records no event, and takes no random decision.
+// The checks use it for their own files, such as backups that they do not need any more.
+func (fsys *FS) Discard(name string) {
+	fsys.mu.Lock()
+	defer fsys.mu.Unlock()
+	name = fsys.abs(name)
+	delete(fsys.names, name)
+	delete(fsys.durableNames, name)
+}
+
 // EvalSymlinks returns the absolute name of the file that name names after it follows symbolic links.
 // The file must exist.
 func (fsys *FS) EvalSymlinks(name string) (string, error) {
