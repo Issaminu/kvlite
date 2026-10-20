@@ -50,6 +50,8 @@ type supervisor struct {
 	shrinks    []shrinkJob
 	shrinking  *shrinkJob // the running shrink, or nil
 	buildError string
+	totals     *totals   // all testing in -out over every restart; nil before prepare
+	lastTick   time.Time // the last time that the totals counted the run time of the supervisor
 }
 
 // shrinkJob is a request to shrink the first seed of a new error.
@@ -125,6 +127,13 @@ func (s *supervisor) prepare() error {
 			return err
 		}
 	}
+	loaded, err := loadTotals(s.opts.out, time.Now())
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.totals, s.lastTick = loaded, time.Now()
+	s.mu.Unlock()
 	return s.archiveStatus()
 }
 
@@ -311,6 +320,7 @@ func (s *supervisor) execute(current *build, seed uint64, steps int) (runOutcome
 	if !s.waitForMemory() {
 		return runOutcome{Kind: kindCanceled, Seed: seed, Steps: steps}, nil
 	}
+	started := time.Now()
 	outcome, err := runWorker(s.hard, runSpec{
 		Binary:      current.Binary,
 		Seed:        seed,
@@ -325,8 +335,23 @@ func (s *supervisor) execute(current *build, seed uint64, steps int) (runOutcome
 		// The supervisor cannot start a worker, for example because the disk is full.
 		// A pause with the slot held keeps the loop from spinning.
 		time.Sleep(time.Second)
+		return outcome, err
 	}
-	return outcome, err
+	s.countRun(outcome, time.Since(started))
+	return outcome, nil
+}
+
+// countRun adds a run to the totals.
+// A run that the supervisor stopped adds only its worker time.
+func (s *supervisor) countRun(outcome runOutcome, duration time.Duration) {
+	if s.stopped(outcome) {
+		outcome.Kind = kindCanceled
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.totals != nil {
+		s.totals.add(outcome, duration)
+	}
 }
 
 // waitForMemory waits until the system has the memory for one more worker, as memoryAllowsWorker says.
@@ -561,6 +586,10 @@ func (s *supervisor) status() status {
 	defer s.mu.Unlock()
 	current := newStatus(s.current, s.platform(s.current), s.counts, errors, s.start, time.Now())
 	current.BuildError = s.buildError
+	if s.totals != nil {
+		copied := *s.totals
+		current.Totals = &copied
+	}
 	return current
 }
 
@@ -577,8 +606,23 @@ func (s *supervisor) currentBuild() *build {
 	return s.current
 }
 
-// writeStatus writes status.json.
+// writeStatus adds the run time of the supervisor to the totals, and writes totals.json and status.json.
 func (s *supervisor) writeStatus() {
+	s.mu.Lock()
+	var snapshot *totals
+	if s.totals != nil {
+		now := time.Now()
+		s.totals.addWall(now.Sub(s.lastTick))
+		s.lastTick = now
+		copied := *s.totals
+		snapshot = &copied
+	}
+	s.mu.Unlock()
+	if snapshot != nil {
+		if err := snapshot.save(s.opts.out); err != nil {
+			s.logf("write the totals: %v", err)
+		}
+	}
 	if err := writeJSONFile(filepath.Join(s.opts.out, "status.json"), s.status()); err != nil {
 		s.logf("write the status: %v", err)
 	}

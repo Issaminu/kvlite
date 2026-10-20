@@ -104,6 +104,12 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	if err != nil || len(reports) != current.Runs {
 		t.Fatalf("reports: %d files for %d failed runs, %v", len(reports), current.Runs, err)
 	}
+	if current.Totals == nil || current.Totals.Runs < int64(current.Runs) || current.Totals.Failures < int64(current.Runs) || !(current.Totals.WorkerHours > 0) || !(current.Totals.WallHours > 0) {
+		t.Fatalf("totals: %+v for %d runs", current.Totals, current.Runs)
+	}
+	if saved, err := loadTotals(out, time.Now()); err != nil || *saved != *current.Totals {
+		t.Fatalf("totals.json %+v, %v; status.json has %+v", saved, err, current.Totals)
+	}
 	if len(github.issues) != 1 || !strings.Contains(github.commentsOf(101)[0], "-blackout.steps=5") {
 		t.Fatalf("GitHub: %d issues, comments %q", len(github.issues), github.commentsOf(101))
 	}

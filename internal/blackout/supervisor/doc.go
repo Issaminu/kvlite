@@ -110,6 +110,9 @@
 //
 // # Output
 //
+// totals.json counts all testing in -out over every restart and commit: the hours that a supervisor ran, the worker-hours, the runs, the finished steps, the checked commits, the injected crashes and power failures, the checked recoveries, the failures, and the memory kills.
+// Blackout has no simulated clock, so the hours are real time; 2 workers for 1 hour give 2 worker-hours.
+// status.json has a copy of the totals, and the summary line of the log shows the worker-hours.
 // status.json is the result of the runs of the current commit, rewritten every few seconds.
 // It holds the commit, the platform, the run and failure counts, each error with every seed that failed with it, and the count of memory kills.
 // For each seed, it holds the steps of the run, the step of the failure, and the message.

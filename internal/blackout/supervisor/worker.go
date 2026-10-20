@@ -37,6 +37,11 @@ type workerResult struct {
 	Passed  bool   `json:"passed"`
 	Failure string `json:"failure"`
 	Report  string `json:"report"`
+	// The counters of the run, for totals.json.
+	Commits       int `json:"commits"`
+	Recoveries    int `json:"recoveries"`
+	Crashes       int `json:"crashes"` // power failures included
+	PowerFailures int `json:"power_failures"`
 }
 
 // runSpec describes one run of one seed.

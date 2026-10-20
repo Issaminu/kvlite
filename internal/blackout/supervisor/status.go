@@ -48,6 +48,8 @@ type status struct {
 	// MemoryKills counts the runs that the supervisor killed at -max-rss.
 	// They are not failures of KVLite, and the log names their seeds.
 	MemoryKills int `json:"memory_kills"`
+	// Totals counts all testing in -out over every restart and commit, as totals.json does.
+	Totals *totals `json:"totals,omitempty"`
 }
 
 // newStatus makes a status from the counters and the errors.
@@ -77,5 +79,9 @@ func (current status) summary() string {
 	for _, kind := range []string{kindFail, kindPanic, kindTimeout, kindError} {
 		fmt.Fprintf(&failures, " %s %d", kind, current.Failures[kind])
 	}
-	return fmt.Sprintf("%s up %s: runs %d,%s, memory kills %d, errors %d", current.Commit, current.Uptime, current.Runs, failures.String(), current.MemoryKills, len(current.Errors))
+	line := fmt.Sprintf("%s up %s: runs %d,%s, memory kills %d, errors %d", current.Commit, current.Uptime, current.Runs, failures.String(), current.MemoryKills, len(current.Errors))
+	if current.Totals != nil {
+		line += fmt.Sprintf("; totals since %s: %.1f worker-hours, %d runs, %d crashes", current.Totals.Since, current.Totals.WorkerHours, current.Totals.Runs, current.Totals.Crashes)
+	}
+	return line
 }
