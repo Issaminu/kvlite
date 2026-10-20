@@ -1,18 +1,13 @@
-<p align="center">
-  <img src="assets/logo/kvlite-logo.svg" alt="KVLite logo" width="480">
-</p>
-
+![KVLite logo](assets/logo/kvlite-logo.svg)
 
 A blazingly-fast embedded key/value database for Go.
 
-[![Go Reference](https://pkg.go.dev/badge/github.com/Issaminu/kvlite.svg)](https://pkg.go.dev/github.com/Issaminu/kvlite) [![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go)](go.mod) [![Benchmark results](https://img.shields.io/badge/benchmarks-results-2563EB)](BENCHMARKS.md) [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE) [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/Issaminu/kvlite)
+![Go Reference](https://pkg.go.dev/badge/github.com/Issaminu/kvlite.svg) ![Go 1.26](https://img.shields.io/badge/Go-1.26-00ADD8?logo=go) ![Benchmark results](https://img.shields.io/badge/benchmarks-results-2563EB) ![MIT License](https://img.shields.io/badge/license-MIT-green) ![Ask DeepWiki](https://deepwiki.com/badge.svg)
 
 KVLite uses a paged B+ tree. It supports transactions, nested buckets, key and bucket deletion, page reuse, ordered cursors, prefix scans, range scans, and read-only database handles.
 
 > [!WARNING]
 > KVLite does not have a stable release yet. Its API and file format can change between pre-release versions. For production usage, wait for the 1.0 release.
-
-
 
 ## Install
 
@@ -21,8 +16,6 @@ KVLite requires Go 1.26 or a later compatible release.
 ```sh
 go get github.com/Issaminu/kvlite@latest
 ```
-
-
 
 ## Quick start
 
@@ -130,8 +123,6 @@ if err != nil {
 fmt.Println(string(value))
 ```
 
-
-
 ## Data model
 
 A database contains named top-level buckets. A bucket can contain key/value pairs and nested buckets. A user value always belongs to a bucket.
@@ -172,8 +163,6 @@ if err != nil {
 }
 ```
 
-
-
 ## Transactions
 
 `DB.View` starts a read-only transaction. Each read in its callback sees the same database state.
@@ -202,8 +191,6 @@ if err != nil {
 }
 ```
 
-
-
 ## Ordered reads
 
 A cursor visits values and nested bucket names in key order. A nested bucket has a nil value. A stored empty value has a non-nil value with length zero.
@@ -231,8 +218,6 @@ if err != nil {
 	return err
 }
 ```
-
-
 
 ## Byte-slice ownership
 
@@ -264,20 +249,16 @@ if err != nil {
 fmt.Println(string(saved))
 ```
 
-
-
 ## Durability and recovery
 
 This section applies to file databases opened with `Open`.
 
 For a database at `app.db`, KVLite can use two files:
 
-
 | File         | Purpose                                                                      |
 | ------------ | ---------------------------------------------------------------------------- |
 | `app.db`     | Stores metadata, page allocation data, and fixed-size B+ tree pages.         |
 | `app.db-wal` | Stores committed tree, allocation, and metadata changes until a checkpoint. |
-
 
 A writable open creates the log. A clean writable close removes it. An application or system failure can leave the log beside the main file.
 
@@ -313,13 +294,11 @@ Without data-page checksums, damaged key or value bytes can pass unnoticed. Meta
 
 KVLite records which database pages are in use. A later transaction can reuse a tree page that an earlier transaction freed. When free pages reach the end of the file, a checkpoint can shorten the main file. `DB.Stats` reports allocated pages, reusable pages, retired pages, and reused pages.
 
-
 | Mode         | Behavior                                                                                                                                                  |
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SyncFull`   | Default. A non-empty update returns after KVLite synchronizes its log data to storage. Concurrent updates can share this work.                            |
 | `SyncNormal` | Synchronizes at a checkpoint or clean close. A system failure can lose recent committed updates from the operating-system cache.                          |
 | `SyncNone`   | Writes files without synchronization, including during recovery. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
-
 
 These modes select when operations synchronize committed data to storage.
 
@@ -331,7 +310,61 @@ options := &kvlite.Options{
 }
 ```
 
+## Crash testing with Blackout
 
+Blackout is KVLite's deterministic simulation test. It runs KVLite on simulated storage, crashes the process, cuts the power, and damages the files. After each crash, it opens the database again and compares the result with a model. It is inspired by the designs of [TigerBeetle's VOPR](https://docs.tigerbeetle.com/concepts/safety/).
+
+One 64-bit seed selects the database options, the workload, the time of each crash, and each decision of the simulated storage. The same seed and code give the same run, so each failure has a command that replays it.
+
+#### Faults
+
+| Fault             | What the simulated storage does                                                                                                                                                        |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Process crash     | Stops the process between two operations or inside a file call. Completed writes stay in the simulated operating-system cache.                                                         |
+| Power failure     | Keeps the synced bytes and a random part of the unsynced writes. Each sector of 512 bytes or 4 KiB keeps a prefix of its writes, and sectors have no order. Unsynced truncates, file lengths, and names can stay or go. |
+| Failed call       | A read, write, sync, truncate, open, or remove returns an error. A failed write can still write a prefix, and a failed truncate or remove can still take effect.                        |
+| Failed sync       | Some unsynced changes become durable, and the others are lost for good, as on Linux after a writeback error. Some runs use the ext4 and XFS behavior, and others use the Btrfs behavior. |
+| Full disk         | For a short time, each write that grows a file fails with "no space left on device".                                                                                                  |
+| Read corruption   | A read of the main file returns one flipped bit. The stored bytes stay correct.                                                                                                        |
+| Bit rot           | Bits of the stored main file change between a stop and the next open.                                                                                                                 |
+| Misdirected write | A power failure moves a kept write of a file that is not the WAL 1 to 4 blocks of 4 KiB from its correct offset.                                                                                    |
+
+#### Checks
+
+- A model holds the latest state and each older state that recovery can still return.
+- Each read must match the model.
+- Each recovery must return exactly one state that the model allows. After a power failure, a commit that returned success under `SyncFull` must still be there.
+- After bit rot or a misdirected write, the next open must fail or return an allowed state. It must never return wrong data.
+- A read-only recovery and a writable recovery of the same files must show the same state.
+- At the end of each run, all faults stop. Each operation must then succeed, and a clean close and reopen must keep the latest state.
+
+#### Continues, non-stop chaos simulationa
+
+- Each push to `main` and each pull request runs 200 new seeds, the fixed seeds, and the tests of Blackout itself ([workflow](.github/workflows/blackout.yml)).
+- The Blackout [supervisor](internal/blackout/supervisor/doc.go) runs random seeds without end on a small server with 2 ARM CPUs. It tests each new commit of `main`. It makes a failing seed shorter, and it opens a GitHub issue with the seed, the report, and the replay command. These issues have the label [`blackout`](https://github.com/Issaminu/kvlite/issues?q=label%3Ablackout).
+
+#### Run Blackout
+
+```sh
+# Run seeds 1 to 32.
+BLACKOUT=1 go test -run 'TestBlackout$' .
+
+# Run 200 seeds from seed 1000.
+BLACKOUT=1 go test -run 'TestBlackout$' -blackout.start=1000 -blackout.seeds=200 .
+
+# Replay one seed and print its last 200 steps.
+go test -run 'TestBlackout$' -blackout.seed=SEED -blackout.steps=STEPS -blackout.trace=200 -v .
+
+# Run Blackout supervisor with random seeds without end with 2 workers.
+go run ./internal/blackout/supervisor -workers 2 -out /tmp/blackout
+```
+
+#### Limits
+
+- The faults come from a model of storage. Real hardware can fail in ways that the model does not include.
+- The simulated storage has no file locks and no renames.
+- When the data-page checksums option is disabled, KVLite cannot find a damaged key or value byte. Blackout then puts bit rot only on the metadata pages and the first allocation page, which always have checksums.
+- A seed runs one goroutine at a time, so that it can replay. `TestBlackoutStress` runs goroutines at the same time, but its schedule does not repeat, so its failures may not replay.
 
 ## Statistics
 
@@ -395,12 +428,9 @@ for range 2 {
 }
 ```
 
-
-
 ## Options
 
 `Open` accepts `nil` options. It then uses these defaults:
-
 
 | Option                     | Default                            | Effect                                                             |
 | -------------------------- | ---------------------------------- | ------------------------------------------------------------------ |
@@ -451,9 +481,6 @@ cd benchmarks/kvbench
 ./run-docker.sh
 ```
 
-
-
-
 ## Backup
 
 Use `DB.Backup` to save one committed file database state to a new file. Reads and writes can continue during the copy. Writable and read-only file handles can both create backups. Memory databases return an error that matches `errors.ErrUnsupported` without file operations.
@@ -492,7 +519,7 @@ These commands skip the Blackout tests: the simulation in `blackout_test.go`, th
 BLACKOUT=1 go test ./... -count=1
 ```
 
-
+To run more seeds or replay a failure, see [Crash testing with Blackout](#crash-testing-with-blackout).
 
 ## License
 
