@@ -6708,41 +6708,58 @@ func TestUpdate_GroupsConcurrentDurableWrites(t *testing.T) {
 	}
 
 	var syncCalls atomic.Int64
+	// The first sync waits, as a slow storage sync does, so the other writes wait in the request queue.
+	// A sync without a delay lets the scheduler decide how many writes each batch gets.
+	syncing := make(chan struct{})
+	release := make(chan struct{})
 	db.wal.SetSyncFileForTesting(func() error {
-		syncCalls.Add(1)
+		if syncCalls.Add(1) == 1 {
+			close(syncing)
+			<-release
+		}
 		return nil
 	})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 
 	const writeCount = 32
-	start := make(chan struct{})
 	errorsByWrite := make(chan error, writeCount)
-	var ready sync.WaitGroup
-	var done sync.WaitGroup
-	ready.Add(writeCount)
-	done.Add(writeCount)
-	for index := range writeCount {
-		go func() {
-			defer done.Done()
-			ready.Done()
-			<-start
-			key := fmt.Appendf(nil, "key-%02d", index)
-			errorsByWrite <- db.Put(testBucketName, key, []byte("value"))
-		}()
+	put := func(index int) {
+		key := fmt.Appendf(nil, "key-%02d", index)
+		errorsByWrite <- db.Put(testBucketName, key, []byte("value"))
+	}
+	go put(0)
+	<-syncing
+	for index := 1; index < writeCount; index++ {
+		go put(index)
 	}
 
-	ready.Wait()
-	close(start)
-	done.Wait()
-	close(errorsByWrite)
-	for err := range errorsByWrite {
-		if err != nil {
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for len(db.writeRequests) < writeCount-1 {
+		select {
+		case <-deadline.C:
+			t.Fatalf("request queue during the first sync: got %d writes, want %d", len(db.writeRequests), writeCount-1)
+		default:
+			runtime.Gosched()
+		}
+	}
+	close(release)
+	for range writeCount {
+		if err := <-errorsByWrite; err != nil {
 			t.Fatal(err)
 		}
 	}
 	db.wal.SetSyncFileForTesting(nil)
 
-	if got := syncCalls.Load(); got > 4 {
-		t.Fatalf("WAL sync calls for %d concurrent writes: got %d, want at most 4", writeCount, got)
+	// The first write syncs the header of the new WAL generation and its own commit. The other writes share one sync.
+	if got, want := syncCalls.Load(), int64(3); got != want {
+		t.Fatalf("WAL sync calls for %d concurrent writes: got %d, want %d", writeCount, got, want)
 	}
 	records, err := db.wal.ReadRecords()
 	if err != nil {
