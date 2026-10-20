@@ -199,7 +199,7 @@ func runTable(current *build, platform string, outcome runOutcome) string {
 	if current.Dirty {
 		commit += " (the checkout had changes, so a replay is not exact)"
 	}
-	return fmt.Sprintf("| | |\n|---|---|\n| Kind | %s |\n| Seed | `%d` |\n| Steps | %d |\n| Failed at step | %s |\n| Commit | %s |\n| Platform | %s |\n\nReplay at this commit, on a platform with the same operating-system page size:\n\n```sh\n%s\n```\n",
+	return fmt.Sprintf("| | |\n|---|---|\n| Kind | %s |\n| Seed | `%d` |\n| Steps | %d |\n| Failed at step | %s |\n| Commit | %s |\n| Platform | %s |\n\nReplay at this commit:\n\n```sh\n%s\n```\n",
 		outcome.Kind, outcome.Seed, outcome.Steps, failedAt, commit, platform, replayCommand(outcome.Seed, outcome.Steps))
 }
 

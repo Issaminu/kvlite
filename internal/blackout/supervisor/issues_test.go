@@ -78,7 +78,7 @@ func TestIssueTrackerFilesOneIssueForEachError(t *testing.T) {
 	tracker.api = server.URL
 	ctx := context.Background()
 	first := &build{Commit: "abc1234", FullCommit: "abc1234aaaa", GOOS: "linux", GOARCH: "arm64"}
-	platform := "linux/arm64, 4096-byte operating-system pages"
+	platform := "linux/arm64"
 	text := "fail: recovery: lost commit N"
 	failed := runOutcome{Kind: kindFail, Seed: 42, Steps: 300, FirstLine: "blackout seed 42 failed at step 7: recovery: lost commit 3", Report: "blackout seed 42 failed at step 7: recovery: lost commit 3\nconfig: page=4096"}
 

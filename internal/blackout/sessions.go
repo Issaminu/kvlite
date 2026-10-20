@@ -3,7 +3,6 @@ package blackout
 import (
 	"errors"
 	"fmt"
-	"os"
 	"slices"
 	"time"
 
@@ -50,9 +49,6 @@ func (options session) String() string {
 
 // largeWAL is a checkpoint threshold that no run reaches, so the WAL grows until an explicit checkpoint, a Close, or a recovery.
 const largeWAL = 1 << 40
-
-// defaultCheckpointBytes is the default checkpoint threshold of KVLite: about 1,000 operating-system pages.
-var defaultCheckpointBytes = 1000 * uint64(os.Getpagesize())
 
 // firstSession returns the options that the config generator selected.
 func firstSession(config *Config) session {
@@ -146,9 +142,10 @@ func (runner *runner) readOnlyOptions() *kvlite.Options {
 }
 
 // checkpointThreshold returns the checkpoint threshold that DB.Stats must report in the current session.
+// The default of KVLite is about 1,000 operating-system pages, and the simulated disk gives that page size.
 func (runner *runner) checkpointThreshold() uint64 {
 	if runner.session.checkpointBytes == 0 {
-		return defaultCheckpointBytes
+		return 1000 * uint64(runner.fsys.PageSize())
 	}
 	return runner.session.checkpointBytes
 }

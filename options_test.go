@@ -23,7 +23,7 @@ func TestOptions_MaxWriteBatchSize(t *testing.T) {
 		{name: "custom", input: 256, want: 256},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			resolved, err := resolveOptions(&Options{MaxWriteBatchSize: test.input})
+			resolved, err := resolveOptions(&Options{MaxWriteBatchSize: test.input}, 4096)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -32,7 +32,7 @@ func TestOptions_MaxWriteBatchSize(t *testing.T) {
 			}
 		})
 	}
-	if _, err := resolveOptions(&Options{MaxWriteBatchSize: -1}); !errors.Is(err, ErrInvalid) {
+	if _, err := resolveOptions(&Options{MaxWriteBatchSize: -1}, 4096); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("negative maximum write batch size: got %v, want ErrInvalid", err)
 	}
 }

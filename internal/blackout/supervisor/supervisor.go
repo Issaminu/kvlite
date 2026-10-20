@@ -31,7 +31,6 @@ type supervisor struct {
 	lanes      []lane
 	errors     *errorLog
 	logger     *log.Logger
-	pageSize   int
 	start      time.Time
 	slots      chan struct{}      // one token for each running worker
 	stop       context.Context    // done when no new run may start
@@ -69,7 +68,6 @@ func newSupervisor(opts options, lanes []lane, stop context.Context, stopCancel 
 		lanes:      lanes,
 		errors:     newErrorLog(),
 		logger:     log.New(os.Stderr, "blackout ", log.LstdFlags),
-		pageSize:   os.Getpagesize(),
 		start:      time.Now(),
 		slots:      make(chan struct{}, opts.workers),
 		stop:       stop,
@@ -593,10 +591,9 @@ func (s *supervisor) status() status {
 	return current
 }
 
-// platform returns the platform of a build: the operating system, the architecture, and the operating-system page size.
-// A seed replays exactly only on a platform with the same page size.
+// platform returns the platform of a build: the operating system and the architecture.
 func (s *supervisor) platform(current *build) string {
-	return fmt.Sprintf("%s/%s, %d-byte operating-system pages", current.GOOS, current.GOARCH, s.pageSize)
+	return current.GOOS + "/" + current.GOARCH
 }
 
 // currentBuild returns the test binary of the current commit.

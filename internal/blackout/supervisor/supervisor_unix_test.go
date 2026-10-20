@@ -89,7 +89,7 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	if err := json.Unmarshal(data, &current); err != nil {
 		t.Fatal(err)
 	}
-	if current.Runs == 0 || current.Failures[kindFail] != current.Runs || current.Commit != "test123" || !strings.HasPrefix(current.Platform, "testos/testarch, ") {
+	if current.Runs == 0 || current.Failures[kindFail] != current.Runs || current.Commit != "test123" || current.Platform != "testos/testarch" {
 		t.Fatalf("status: %s", data)
 	}
 	// The shrink runs with the same error do not count, so the error has one seed for each run.

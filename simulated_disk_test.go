@@ -88,6 +88,25 @@ func TestSimulatedDisk_DurableCommitSurvivesPowerFailure(t *testing.T) {
 	}
 }
 
+// The simulated disk has 4 KiB operating-system pages on every host.
+// So nil options give the same page size and checkpoint threshold on every host, and a seed gives the same run on macOS and on Linux.
+// Before, Open read the page size of the host, and the seed of issue 4 failed only on hosts with 4 KiB pages.
+func TestSimulatedDisk_NilOptionsUseTheSimulatedPageSize(t *testing.T) {
+	skipUnlessBlackout(t)
+	const simulatedPageSize = 4096
+	db, err := open(simulatedPath, 0o600, nil, disk.New(1, disk.Config{}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := db.meta.PageSize(); got != simulatedPageSize {
+		t.Errorf("page size of a new file: got %d, want %d", got, simulatedPageSize)
+	}
+	if got := db.options.CheckpointThresholdBytes; got != defaultCheckpointPageCount*simulatedPageSize {
+		t.Errorf("default checkpoint threshold: got %d, want %d", got, defaultCheckpointPageCount*simulatedPageSize)
+	}
+}
+
 // A process crash keeps the operating-system cache, so it keeps a SyncNormal commit that no sync made durable.
 func TestSimulatedDisk_ProcessCrashKeepsUnsyncedCommit(t *testing.T) {
 	skipUnlessBlackout(t)
@@ -142,7 +161,7 @@ func TestSimulatedDisk_EmptyWALTransactionKeepsLaterCommits(t *testing.T) {
 		t.Fatal(err)
 	}
 	// The value needs continuation pages, so the second Put writes no page record.
-	value := strings.Repeat("v", 3*os.Getpagesize())
+	value := strings.Repeat("v", 3*fsys.PageSize())
 	simulatedPut(t, db, "key", value)
 	simulatedPut(t, db, "key", value)
 	simulatedPut(t, db, "later", "commit")
@@ -237,7 +256,7 @@ type corruptOneMainReadFile struct {
 
 func (file *corruptOneMainReadFile) ReadAt(p []byte, offset int64) (int, error) {
 	n, err := file.File.ReadAt(p, offset)
-	pageStart := int64(firstTreePageID) * int64(os.Getpagesize())
+	pageStart := int64(firstTreePageID) * int64(file.fsys.PageSize())
 	if file.fsys.armed && offset <= pageStart && pageStart < offset+int64(n) {
 		file.fsys.armed = false
 		p[pageStart-offset+20] ^= 1
@@ -510,7 +529,7 @@ func TestSimulatedDisk_RecoveryStoresTheWALItReads(t *testing.T) {
 			if err := BlackoutCheckpoint(db); err != nil {
 				t.Fatal(err)
 			}
-			simulatedPut(t, db, "key", strings.Repeat("v", 3*os.Getpagesize()))
+			simulatedPut(t, db, "key", strings.Repeat("v", 3*fsys.PageSize()))
 			fsys.SetFaults(true)
 			_ = BlackoutCheckpoint(db)
 			fsys.SetFaults(false)

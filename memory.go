@@ -23,7 +23,7 @@ import (
 func OpenMemory() *DB {
 	meta := page.NewMeta(int64(os.Getpagesize()))
 	root := btree.NewLeafNode(meta.Root())
-	options := defaultOptions()
+	options := defaultOptions(meta.PageSize())
 	return &DB{
 		meta:        meta,
 		rootNode:    root,

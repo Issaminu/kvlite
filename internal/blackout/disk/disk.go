@@ -998,6 +998,12 @@ func (fsys *FS) Abs(name string) (string, error) {
 	return fsys.abs(name), nil
 }
 
+// PageSize returns the page size of the simulated operating system: the cache page that a crash can split a write at.
+// It does not read the page size of the host, so a seed gives the same run on every host.
+func (fsys *FS) PageSize() int {
+	return cachePageSize
+}
+
 // Symlink makes name a symbolic link to target, like os.Symlink.
 // Symbolic links are always durable; Blackout makes them only before a run.
 // Remove and Link do not check for symbolic links, because no caller removes one or makes a hard link at its name.

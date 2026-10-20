@@ -38,7 +38,7 @@ func (counts *counters) add(outcome runOutcome) {
 // Replay a seed at the commit with: go test -run 'TestBlackout$' -blackout.seed=SEED -blackout.steps=STEPS -blackout.trace=200 -v .
 type status struct {
 	Commit     string         `json:"commit"`   // with "-dirty" when the checkout had changes
-	Platform   string         `json:"platform"` // a replay is exact only with the same operating-system page size
+	Platform   string         `json:"platform"` // the operating system and the architecture of the runs
 	Time       string         `json:"time"`     // the time of this write; an old time means that the runner stopped
 	Uptime     string         `json:"uptime"`   // since the first run of this commit
 	Runs       int            `json:"runs"`     // runs of new seeds; shrink runs are not counted

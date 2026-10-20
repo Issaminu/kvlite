@@ -2203,19 +2203,20 @@ func TestOpen_Reopen(t *testing.T) {
 }
 
 func TestDefaultOptionsAreIndependent(t *testing.T) {
-	first := defaultOptions()
+	const osPageSize = 4096
+	first := defaultOptions(osPageSize)
 	first.ReadOnly = true
 	first.Synchronous = SyncNone
 	first.CheckpointThresholdBytes = 1
 
-	second := defaultOptions()
+	second := defaultOptions(osPageSize)
 	if second.ReadOnly {
 		t.Fatal("changing one default options value changed a later value")
 	}
 	if second.Synchronous != SyncFull {
 		t.Fatalf("default synchronous mode: got %v, want SyncFull", second.Synchronous)
 	}
-	if second.CheckpointThresholdBytes != defaultCheckpointPageCount*uint64(os.Getpagesize()) {
+	if second.CheckpointThresholdBytes != defaultCheckpointPageCount*osPageSize {
 		t.Fatalf("default checkpoint threshold: got %d", second.CheckpointThresholdBytes)
 	}
 }

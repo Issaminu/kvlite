@@ -53,7 +53,6 @@ type blackoutResult struct {
 	GoVersion     string `json:"go_version"`
 	GOOS          string `json:"goos"`
 	GOARCH        string `json:"goarch"`
-	PageSize      int    `json:"page_size"` // the operating-system page size: the default checkpoint threshold depends on it, so a replay needs the same size
 	Commits       int    `json:"commits"`
 	Recoveries    int    `json:"recoveries"`
 	Crashes       int    `json:"crashes"`
@@ -71,7 +70,6 @@ func writeBlackoutResult(path string, result blackout.Result, steps int) error {
 		GoVersion:     runtime.Version(),
 		GOOS:          runtime.GOOS,
 		GOARCH:        runtime.GOARCH,
-		PageSize:      os.Getpagesize(),
 		Commits:       result.Stats.Commits,
 		Recoveries:    result.Stats.Recoveries,
 		Crashes:       result.Stats.Disk.ProcessCrashes + result.Stats.Disk.PowerFailures,

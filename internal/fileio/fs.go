@@ -68,6 +68,10 @@ type FS interface {
 
 	// Chmod changes the permission bits of name, like [os.Chmod].
 	Chmod(name string, mode os.FileMode) error
+
+	// PageSize returns the memory page size of the operating system, like [os.Getpagesize].
+	// A new database uses it, and the default checkpoint threshold counts it.
+	PageSize() int
 }
 
 // OSFS is the [FS] of the operating system.
@@ -101,6 +105,11 @@ func (OSFS) EvalSymlinks(name string) (string, error) {
 // Abs returns an absolute form of name with [filepath.Abs].
 func (OSFS) Abs(name string) (string, error) {
 	return filepath.Abs(name)
+}
+
+// PageSize returns the memory page size of the operating system with [os.Getpagesize].
+func (OSFS) PageSize() int {
+	return os.Getpagesize()
 }
 
 // Lstat returns the file information of name with [os.Lstat].

@@ -2,7 +2,6 @@ package kvlite
 
 import (
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/Issaminu/kvlite/internal/page"
@@ -58,25 +57,21 @@ type Options struct {
 	pageSize int64
 }
 
-// newFilePageSize returns the page size of a new file.
-func (options *Options) newFilePageSize() int64 {
-	if options.pageSize != 0 {
-		return options.pageSize
-	}
-	return int64(os.Getpagesize())
-}
-
-func defaultOptions() Options {
+// defaultOptions returns the defaults on an operating system with osPageSize pages.
+func defaultOptions(osPageSize int64) Options {
 	return Options{
 		ReadOnly:                 false,
 		Synchronous:              SyncFull,
 		MaxWriteBatchSize:        defaultWriteBatchSize,
-		CheckpointThresholdBytes: defaultCheckpointPageCount * uint64(os.Getpagesize()),
+		CheckpointThresholdBytes: defaultCheckpointPageCount * uint64(osPageSize),
+		pageSize:                 osPageSize,
 	}
 }
 
-func resolveOptions(options *Options) (*Options, error) {
-	defaults := defaultOptions()
+// resolveOptions replaces the zero values of options with the defaults on an operating system with osPageSize pages.
+// Open takes osPageSize from its file system, so a simulated disk can select it.
+func resolveOptions(options *Options, osPageSize int64) (*Options, error) {
+	defaults := defaultOptions(osPageSize)
 	resolved := defaults
 	if options != nil {
 		resolved = *options
@@ -88,6 +83,9 @@ func resolveOptions(options *Options) (*Options, error) {
 		}
 		if resolved.CheckpointThresholdBytes == 0 {
 			resolved.CheckpointThresholdBytes = defaults.CheckpointThresholdBytes
+		}
+		if resolved.pageSize == 0 {
+			resolved.pageSize = defaults.pageSize
 		}
 	}
 

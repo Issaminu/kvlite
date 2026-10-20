@@ -145,9 +145,8 @@
 //
 // # Operator notes
 //
-// Each seed selects the page size of its database, but the default checkpoint threshold is about 1,000 operating-system pages.
-// Linux on x86-64 has 4 KiB pages, and macOS on Apple silicon has 16 KiB pages.
-// So a seed replays exactly only on a platform with the same operating-system page size, and the log records that size.
+// Each seed selects the page size of its database, and the simulated disk has 4 KiB operating-system pages on every host.
+// So the page size of the host does not change a run: a seed from Linux replays on macOS with 16 KiB pages too.
 //
 // To run the supervisor on a server, use the systemd unit blackout.service in this directory.
 // Its comments give the setup steps and the limits that the kernel enforces for the supervisor, its workers, and the compile together.

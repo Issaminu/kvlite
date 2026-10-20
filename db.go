@@ -123,7 +123,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 		return nil, ErrPathRequired
 	}
 
-	resolvedOptions, err := resolveOptions(options)
+	resolvedOptions, err := resolveOptions(options, int64(fsys.PageSize()))
 	if err != nil {
 		return nil, err
 	}
@@ -177,7 +177,7 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	var mainMetaErr error
 	var walPageSize int64
 	if isNew {
-		db.meta = page.NewMeta(db.options.newFilePageSize())
+		db.meta = page.NewMeta(db.options.pageSize)
 		db.meta.SetDataPageChecksums(db.options.DataPageChecksums)
 		walPageSize = db.meta.PageSize()
 	} else {
