@@ -5,6 +5,7 @@ import (
 	"math"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -13,12 +14,28 @@ import (
 )
 
 const (
-	// defaultMaxRSS is the default hard memory limit of one worker.
-	// A 3000-step seed reached 3.44 GiB of RSS on macOS, so this limit leaves room for larger seeds.
-	defaultMaxRSS = 4 << 30
-	// rssInterval is the time between two RSS samples of a worker.
-	rssInterval = time.Second
+	// targetMaxRSS is the memory limit of a worker when the memory budget allows it.
+	// A 3000-step seed reached 3.44 GiB of RSS on an Apple M4 Max, so this limit leaves room for most large seeds.
+	targetMaxRSS = 4 << 30
+	// minMaxRSS is the smallest memory limit of a worker.
+	// Most seeds use less than 400 MiB, but a smaller limit than this kills too many runs to be useful.
+	minMaxRSS = 64 << 20
+	// maxFailedSamples is the number of RSS samples in a row that can fail before the supervisor stops the worker.
+	// A sample fails when the worker has just exited, so one failure is normal.
+	maxFailedSamples = 3
+	// memoryPollInterval is the time between two checks of the available memory while new runs wait for memory.
+	memoryPollInterval = 5 * time.Second
 )
+
+// rssInterval returns the time between two RSS samples of a worker.
+// On Linux, a sample reads /proc and costs little.
+// On other systems, each sample starts ps, so the supervisor samples less often.
+func rssInterval() time.Duration {
+	if runtime.GOOS == "linux" {
+		return 250 * time.Millisecond
+	}
+	return time.Second
+}
 
 // sizePattern matches a size in bytes with the units of GOMEMLIMIT.
 var sizePattern = regexp.MustCompile(`^([0-9]+)(B|KiB|MiB|GiB|TiB)?$`)
@@ -44,47 +61,211 @@ func parseBytes(text string) (int64, error) {
 	return value << shift, nil
 }
 
-// physicalMemory returns the size of the RAM in bytes, or zero when the supervisor cannot read it.
-func physicalMemory() int64 {
+// systemMemory returns the memory that the supervisor and its workers can use, and the part of it that is available now, in bytes.
+// The memory is the RAM, or the smallest cgroup memory limit of the supervisor and its ancestors when that is smaller, for example in a systemd unit or slice with MemoryMax, or in a container.
+// A zero value means that the supervisor cannot read it.
+func systemMemory() (total, available int64) {
 	switch runtime.GOOS {
 	case "darwin":
-		output, err := exec.Command("sysctl", "-n", "hw.memsize").Output()
-		if err != nil {
-			return 0
-		}
-		bytes, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
-		if err != nil {
-			return 0
-		}
-		return bytes
+		total = sysctlValue("hw.memsize")
+		// kern.memorystatus_level is the available part of the memory, in percent.
+		available = total * sysctlValue("kern.memorystatus_level") / 100
 	case "linux":
-		data, err := os.ReadFile("/proc/meminfo")
-		if err != nil {
-			return 0
-		}
-		// The line has the form "MemTotal:       16318412 kB".
-		for line := range strings.Lines(string(data)) {
-			if fields := strings.Fields(line); len(fields) == 3 && fields[0] == "MemTotal:" && fields[2] == "kB" {
-				kib, err := strconv.ParseInt(fields[1], 10, 64)
-				if err != nil {
-					return 0
-				}
-				return kib << 10
+		data, _ := os.ReadFile("/proc/meminfo")
+		total, available = meminfoValue(data, "MemTotal:"), meminfoValue(data, "MemAvailable:")
+		if limit, free := cgroupMemory(selfCgroupDirs()); limit > 0 {
+			if total == 0 || limit < total {
+				total = limit
 			}
+			if available == 0 || free < available {
+				available = free
+			}
+		}
+	}
+	return total, available
+}
+
+// sysctlValue returns the integer value of a sysctl variable of macOS, or zero.
+func sysctlValue(name string) int64 {
+	output, err := exec.Command("sysctl", "-n", name).Output()
+	if err != nil {
+		return 0
+	}
+	value, _ := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
+	return value
+}
+
+// meminfoValue returns the value of the line of /proc/meminfo that starts with key, in bytes, or zero.
+// The line has the form "MemTotal:       16318412 kB".
+func meminfoValue(data []byte, key string) int64 {
+	for line := range strings.Lines(string(data)) {
+		if fields := strings.Fields(line); len(fields) == 3 && fields[0] == key && fields[2] == "kB" {
+			kib, _ := strconv.ParseInt(fields[1], 10, 64)
+			return kib << 10
 		}
 	}
 	return 0
 }
 
-// defaultWorkers returns the default number of workers.
-// It uses at most half the cores, so the computer stays usable.
-// It also keeps the memory limits of all workers together at or below half of the RAM.
-// It returns at least 1, also when the RAM is smaller than two memory limits.
-// A zero ram or maxRSS removes the RAM bound.
-func defaultWorkers(cores int, ram, maxRSS int64) int {
-	workers := cores / 2
-	if ram > 0 && maxRSS > 0 {
-		workers = min(workers, int(ram/2/maxRSS))
+// cgroupMemory returns the smallest memory limit (memory.max) of the cgroup v2 directories dirs, and the memory that is available under the limits.
+// The available memory is the smallest memory.max minus memory.current of a directory with a limit.
+// The limit is zero when no directory has a limit or the supervisor cannot read it.
+func cgroupMemory(dirs []string) (limit, available int64) {
+	available = -1
+	for _, dir := range dirs {
+		// The value "max" means no limit, and it parses as zero.
+		dirLimit := cgroupValue(dir, "memory.max")
+		if dirLimit <= 0 {
+			continue
+		}
+		if limit == 0 || dirLimit < limit {
+			limit = dirLimit
+		}
+		if free := max(0, dirLimit-cgroupValue(dir, "memory.current")); available < 0 || free < available {
+			available = free
+		}
 	}
-	return max(1, workers)
+	return limit, max(0, available)
+}
+
+// cgroupValue returns the integer in the file name of the cgroup v2 directory dir, or zero.
+func cgroupValue(dir, name string) int64 {
+	data, _ := os.ReadFile(filepath.Join(dir, name))
+	value, _ := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+	return value
+}
+
+// cpuCount returns the number of CPUs that the supervisor and its workers can use: the CPUs of the computer, or the smallest cgroup v2 CPU limit of the supervisor and its ancestors when it is smaller.
+// The cgroup limit can be a fraction, for example 0.5 for half a CPU.
+// The supervisor does not use GOMAXPROCS for this, because the Go runtime does not set GOMAXPROCS below 2 for a cgroup limit.
+func cpuCount() float64 {
+	count := float64(runtime.NumCPU())
+	if runtime.GOOS != "linux" {
+		return count
+	}
+	if limit, ok := cgroupCPULimitOf(selfCgroupDirs()); ok {
+		count = min(count, limit)
+	}
+	return count
+}
+
+// cgroupCPULimitOf returns the smallest CPU limit (cpu.max) of the cgroup v2 directories dirs, and false when no directory has a limit.
+func cgroupCPULimitOf(dirs []string) (float64, bool) {
+	limit, found := 0.0, false
+	for _, dir := range dirs {
+		data, _ := os.ReadFile(filepath.Join(dir, "cpu.max"))
+		if dirLimit, ok := cgroupCPULimit(data); ok && (!found || dirLimit < limit) {
+			limit, found = dirLimit, true
+		}
+	}
+	return limit, found
+}
+
+// cgroupCPULimit returns the CPU limit in the content of cpu.max, which has the form "QUOTA PERIOD", or "max PERIOD" for no limit.
+func cgroupCPULimit(text []byte) (float64, bool) {
+	fields := strings.Fields(string(text))
+	if len(fields) != 2 {
+		return 0, false
+	}
+	quota, quotaErr := strconv.ParseFloat(fields[0], 64)
+	period, periodErr := strconv.ParseFloat(fields[1], 64)
+	if quotaErr != nil || periodErr != nil || quota <= 0 || period <= 0 {
+		return 0, false
+	}
+	return quota / period, true
+}
+
+// cgroupRoot is the directory of the root of the cgroup v2 hierarchy.
+const cgroupRoot = "/sys/fs/cgroup"
+
+// selfCgroupDirs returns the cgroup v2 directory of the supervisor and the directories of its ancestors, or nil.
+func selfCgroupDirs() []string {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return nil
+	}
+	dir, ok := cgroupDir(data)
+	if !ok {
+		return nil
+	}
+	return cgroupAncestors(dir, cgroupRoot)
+}
+
+// cgroupAncestors returns dir and each parent of dir up to root, dir first.
+// A limit of an ancestor also applies to dir, because cgroup v2 distributes resources top-down (Documentation/admin-guide/cgroup-v2.rst).
+// For example, MemoryMax on a systemd slice limits each unit in the slice.
+func cgroupAncestors(dir, root string) []string {
+	dirs := []string{dir}
+	for dir != root && strings.HasPrefix(dir, root+string(filepath.Separator)) {
+		dir = filepath.Dir(dir)
+		dirs = append(dirs, dir)
+	}
+	return dirs
+}
+
+// cgroupDir returns the directory of the cgroup v2 in the content of /proc/self/cgroup, which has the line "0::/PATH".
+func cgroupDir(data []byte) (string, bool) {
+	for line := range strings.Lines(string(data)) {
+		if path, found := strings.CutPrefix(strings.TrimSpace(line), "0::"); found {
+			return filepath.Join(cgroupRoot, path), true
+		}
+	}
+	return "", false
+}
+
+// plan returns the number of workers and the memory limit of each worker for a memory budget and a CPU budget.
+// A workers value of zero and a negative maxRSS mean that plan chooses them; other values are choices of the user, and plan keeps them.
+// A maxRSS of zero means no limit.
+//
+// Each worker gets targetMaxRSS when the memory budget allows it.
+// With a smaller budget, one worker gets the whole budget: the computer then runs fewer seeds, but it never uses more memory.
+// The number of workers is at most the CPU budget, and at least 1.
+// A zero memory budget means that the budget is not known, and then the memory does not limit the plan.
+func plan(memoryBudget int64, cpuBudget float64, workers int, maxRSS int64) (int, int64) {
+	perWorker := maxRSS // the memory of one worker, for the number of workers
+	if perWorker <= 0 {
+		perWorker = targetMaxRSS
+	}
+	if workers == 0 {
+		workers = max(1, int(cpuBudget))
+		if memoryBudget > 0 {
+			workers = max(1, min(workers, int(memoryBudget/perWorker)))
+		}
+	}
+	if maxRSS < 0 {
+		maxRSS = targetMaxRSS
+		if memoryBudget > 0 {
+			maxRSS = min(targetMaxRSS, memoryBudget/int64(workers))
+		}
+	}
+	return workers, maxRSS
+}
+
+// restAfter returns the time that a worker slot waits after a run, so that the workers use at most cpuBudget CPUs on average.
+// A worker uses one CPU while it runs, so the slots wait only when there are more workers than CPUs in the budget, for example one worker and half a CPU.
+// A zero CPU budget means no budget.
+func restAfter(run time.Duration, workers int, cpuBudget float64) time.Duration {
+	if cpuBudget <= 0 || float64(workers) <= cpuBudget {
+		return 0
+	}
+	return time.Duration(float64(run) * (float64(workers)/cpuBudget - 1))
+}
+
+// memoryAllowsWorker reports whether the system has the memory for one more worker: its memory limit, and a tenth of the total memory for the other processes.
+// It also reports true when the supervisor cannot read the memory.
+func memoryAllowsWorker(total, available, maxRSS int64) bool {
+	if total <= 0 || available <= 0 {
+		return true
+	}
+	return available >= maxRSS+total/10
+}
+
+// preferAsOOMVictim asks Linux to kill the supervisor and its workers first when the system has no memory left.
+// The workers inherit the setting, so the other processes of the computer survive.
+// It does nothing on other systems.
+func preferAsOOMVictim() error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	return os.WriteFile("/proc/self/oom_score_adj", []byte("1000"), 0)
 }

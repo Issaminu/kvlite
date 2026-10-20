@@ -62,6 +62,9 @@ type runSpec struct {
 	MaxRSS      int64         // RSS in bytes above which the supervisor kills the process group; zero means no limit
 	TempDir     string        // parent of the working directory of the run
 	Env         []string      // more environment variables, for tests
+	// ReadRSS reads the memory of the worker; nil means residentBytes.
+	// Tests replace it.
+	ReadRSS func(pid int) (int64, error)
 }
 
 // runOutcome is the result of one run.
@@ -75,7 +78,8 @@ type runOutcome struct {
 	Result    *workerResult // nil when the worker wrote no JSON result
 	Exit      string        // exit status of the process
 	Signaled  bool          // a signal that the supervisor did not send stopped the process
-	RSS       int64         // the RSS sample that passed MaxRSS, for kindMemory
+	// MemoryCause says why the supervisor or the system stopped the worker, for kindMemory.
+	MemoryCause string
 }
 
 // workerArgs returns the arguments of the test binary for one run.
@@ -112,7 +116,8 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 	args := workerArgs(spec.Seed, spec.Steps, resultPath)
 	env := append(workerEnv(spec.MemoryLimit, dir), spec.Env...)
 
-	cmd := exec.Command(spec.Binary, args...)
+	name, args := lowPriority(spec.Binary, args...)
+	cmd := exec.Command(name, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdout = outputFile
@@ -128,12 +133,17 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 	defer timer.Stop()
 	var samples <-chan time.Time // without a limit, it stays nil, and a nil channel is never ready
 	if spec.MaxRSS > 0 {
-		ticker := time.NewTicker(rssInterval)
+		ticker := time.NewTicker(rssInterval())
 		defer ticker.Stop()
 		samples = ticker.C
 	}
+	readRSS := spec.ReadRSS
+	if readRSS == nil {
+		readRSS = residentBytes
+	}
 	var waitErr error
-	stoppedAs := "" // the kind of the stop, when the supervisor stopped the process
+	stoppedAs := ""    // the kind of the stop, when the supervisor stopped the process
+	failedSamples := 0 // RSS samples in a row that failed
 wait:
 	for {
 		select {
@@ -149,16 +159,32 @@ wait:
 			waitErr = <-done
 			break wait
 		case <-samples:
-			// ps fails when the process has exited, and then the next select gets the result.
-			rss, err := residentBytes(cmd.Process.Pid)
-			if err == nil && rss > spec.MaxRSS {
-				// The kill does not wait for stacks, because the memory can grow fast.
-				stoppedAs, outcome.RSS = kindMemory, rss
-				killProcess(cmd)
-				waitErr = <-done
-				break wait
+			rss, err := readRSS(cmd.Process.Pid)
+			switch {
+			case err != nil && failedSamples+1 < maxFailedSamples:
+				// A sample fails when the process has just exited, and then the next select gets the result.
+				failedSamples++
+				continue
+			case err != nil:
+				// Without samples, the limit does not work, so the worker stops.
+				outcome.MemoryCause = fmt.Sprintf("memory: the supervisor could not read the RSS of the worker %d times in a row (%v), so it stopped the worker", maxFailedSamples, err)
+			case rss > spec.MaxRSS:
+				outcome.MemoryCause = fmt.Sprintf("memory: the worker used %d MiB of RSS, more than the limit of %d MiB", rss>>20, spec.MaxRSS>>20)
+			default:
+				failedSamples = 0
+				continue
 			}
+			// The kill does not wait for stacks, because the memory can grow fast.
+			stoppedAs = kindMemory
+			killProcess(cmd)
+			waitErr = <-done
+			break wait
 		}
+	}
+	if stoppedAs == "" && cmd.ProcessState != nil && killedBySystem(cmd.ProcessState) {
+		// The supervisor did not send this SIGKILL, so the out-of-memory killer of the system sent it, for example at the MemoryMax of a systemd unit.
+		stoppedAs = kindMemory
+		outcome.MemoryCause = "memory: the system killed the worker with SIGKILL, as its out-of-memory killer does"
 	}
 	outputFile.Close()
 	if stoppedAs == kindCanceled {
@@ -223,7 +249,7 @@ func describe(outcome runOutcome, spec runSpec) (firstLine, report string) {
 	case kindTimeout:
 		firstLine = fmt.Sprintf("timeout: the run did not stop in %v", spec.Timeout)
 	case kindMemory:
-		firstLine = fmt.Sprintf("memory: the worker used %d MiB of RSS, more than the limit of %d MiB", outcome.RSS>>20, spec.MaxRSS>>20)
+		firstLine = outcome.MemoryCause
 	default:
 		firstLine = outcome.Exit
 		if line := firstLineOf(outcome.Output); line != "" {

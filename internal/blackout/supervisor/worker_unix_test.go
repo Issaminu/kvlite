@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -105,6 +106,20 @@ func helperMain(mode string) {
 		time.Sleep(3 * time.Second)
 		runtime.KeepAlive(chunks)
 		writeResult(workerResult{Seed: seed, Steps: steps, Passed: true})
+	case "self-kill":
+		// The helper plays a worker that the out-of-memory killer of the system stops.
+		syscall.Kill(os.Getpid(), syscall.SIGKILL)
+		time.Sleep(time.Minute)
+	case "priority":
+		// The helper reports its CPU priority as a failure, so the test can read it from the first line.
+		priority, err := syscall.Getpriority(syscall.PRIO_PROCESS, 0)
+		if runtime.GOOS == "linux" {
+			// The system call of Linux returns 20 minus the nice value.
+			priority = 20 - priority
+		}
+		failure := fmt.Sprintf("blackout seed %d failed at step 0: nice %d, %v", seed, priority, err)
+		writeResult(workerResult{Seed: seed, Steps: steps, Failure: failure})
+		os.Exit(1)
 	}
 }
 
@@ -118,14 +133,15 @@ func helperHang() {
 	time.Sleep(time.Minute)
 }
 
-func runHelper(t *testing.T, ctx context.Context, mode string, timeout time.Duration) runOutcome {
+// runHelper runs the test binary as a worker in mode, and change can modify the run first.
+func runHelper(t *testing.T, ctx context.Context, mode string, timeout time.Duration, change ...func(*runSpec)) runOutcome {
 	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
 	temporary := t.TempDir()
-	outcome, err := runWorker(ctx, runSpec{
+	spec := runSpec{
 		Binary:      executable,
 		Seed:        42,
 		Steps:       10,
@@ -135,7 +151,11 @@ func runHelper(t *testing.T, ctx context.Context, mode string, timeout time.Dura
 		MaxRSS:      128 << 20,
 		TempDir:     temporary,
 		Env:         []string{helperEnv + "=" + mode},
-	})
+	}
+	for _, change := range change {
+		change(&spec)
+	}
+	outcome, err := runWorker(ctx, spec)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +230,31 @@ func TestRunWorkerClassifiesHelperProcesses(t *testing.T) {
 		outcome := runHelper(t, context.Background(), "grow", 30*time.Second)
 		if outcome.Kind != kindMemory || outcome.Signaled || !strings.HasPrefix(outcome.FirstLine, "memory: the worker used ") {
 			t.Fatalf("outcome: kind %s, signaled %v, first line %q", outcome.Kind, outcome.Signaled, outcome.FirstLine)
+		}
+	})
+	t.Run("RSS that the supervisor cannot read", func(t *testing.T) {
+		t.Parallel()
+		// Without samples, the limit does not work, so the supervisor must stop the worker and not let it run.
+		failing := func(spec *runSpec) {
+			spec.ReadRSS = func(int) (int64, error) { return 0, errors.New("no sample") }
+		}
+		outcome := runHelper(t, context.Background(), "hang", 30*time.Second, failing)
+		if outcome.Kind != kindMemory || !strings.Contains(outcome.FirstLine, "could not read the RSS") {
+			t.Fatalf("outcome: kind %s, first line %q", outcome.Kind, outcome.FirstLine)
+		}
+	})
+	t.Run("SIGKILL from the system", func(t *testing.T) {
+		t.Parallel()
+		outcome := runHelper(t, context.Background(), "self-kill", 30*time.Second)
+		if outcome.Kind != kindMemory || outcome.Signaled || !strings.Contains(outcome.FirstLine, "SIGKILL") {
+			t.Fatalf("outcome: kind %s, signaled %v, first line %q", outcome.Kind, outcome.Signaled, outcome.FirstLine)
+		}
+	})
+	t.Run("lowest CPU priority", func(t *testing.T) {
+		t.Parallel()
+		outcome := runHelper(t, context.Background(), "priority", 30*time.Second)
+		if !strings.HasSuffix(outcome.FirstLine, "nice 19, <nil>") {
+			t.Fatalf("outcome: kind %s, first line %q", outcome.Kind, outcome.FirstLine)
 		}
 	})
 	t.Run("canceled", func(t *testing.T) {

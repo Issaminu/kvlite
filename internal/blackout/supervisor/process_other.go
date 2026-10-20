@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 )
 
@@ -18,6 +19,21 @@ func interruptProcess(cmd *exec.Cmd) {
 // killProcess kills the worker.
 func killProcess(cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
+}
+
+// killedBySystem reports false, because the supervisor cannot tell on this system who stopped a process.
+func killedBySystem(state *os.ProcessState) bool {
+	return false
+}
+
+// lowPriority returns name and args without a change, because this system has no nice command.
+func lowPriority(name string, args ...string) (string, []string) {
+	return name, args
+}
+
+// checkTools reports nil, because the supervisor needs no extra command on this system.
+func checkTools() error {
+	return nil
 }
 
 // residentBytes fails, because the supervisor cannot read the RSS of a process on this system.

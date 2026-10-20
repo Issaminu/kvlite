@@ -2,8 +2,8 @@ package main
 
 import (
 	"io"
-	"runtime"
 	"slices"
+	"strconv"
 	"testing"
 )
 
@@ -55,16 +55,20 @@ func TestParseOptions(t *testing.T) {
 	if opts.workers != 2 || len(lanes) != 1 || lanes[0].Steps != 50 || opts.memoryLimit != "512MiB" || opts.maxRSS != 1<<30 {
 		t.Fatalf("options: got %+v and lanes %+v", opts, lanes)
 	}
-	// The default number of workers follows the memory limit.
-	opts, _, err = parseOptions([]string{"-max-rss", "off"}, io.Discard)
-	if err != nil || opts.maxRSS != 0 || opts.workers != defaultWorkers(runtime.NumCPU(), physicalMemory(), 0) {
-		t.Fatalf("options without a memory limit: got %+v, %v", opts, err)
-	}
+	// The defaults follow the memory and the CPUs of the computer.
+	total, _ := systemMemory()
+	cpus := cpuCount() / 2
+	workers, maxRSS := plan(total/2, cpus, 0, -1)
 	opts, _, err = parseOptions(nil, io.Discard)
-	if err != nil || opts.maxRSS != defaultMaxRSS || opts.workers != defaultWorkers(runtime.NumCPU(), physicalMemory(), defaultMaxRSS) {
+	if err != nil || opts.workers != workers || opts.maxRSS != maxRSS || opts.memoryBudget != total/2 || opts.cpus != cpus || opts.memoryLimit != strconv.FormatInt(maxRSS/2, 10) {
 		t.Fatalf("default options: got %+v, %v", opts, err)
 	}
-	for _, args := range [][]string{{"-workers", "0"}, {"-memlimit", "2GB"}, {"-max-rss", "3GB"}, {"-max-rss", "-1"}, {"-lanes", "x"}, {"extra"}, {"-no-such-flag"}} {
+	// A small budget gives one worker with the whole budget.
+	opts, _, err = parseOptions([]string{"-memory", "512MiB", "-cpus", "0.5"}, io.Discard)
+	if err != nil || opts.workers != 1 || opts.maxRSS != 512<<20 || opts.memoryLimit != strconv.Itoa(256<<20) {
+		t.Fatalf("options of a small computer: got %+v, %v", opts, err)
+	}
+	for _, args := range [][]string{{"-workers", "0"}, {"-memlimit", "2GB"}, {"-max-rss", "3GB"}, {"-max-rss", "-1"}, {"-max-rss", "1MiB"}, {"-memory", "off"}, {"-cpus", "0"}, {"-lanes", "x"}, {"extra"}, {"-no-such-flag"}} {
 		if _, _, err := parseOptions(args, io.Discard); err == nil {
 			t.Errorf("parseOptions(%q) accepted bad flags", args)
 		}

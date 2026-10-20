@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -68,7 +69,8 @@ func sourceState(ctx context.Context, git gitRunner, exclude string) (short, ful
 
 // compileWorker compiles the test binary of the root package in repo into binDir.
 // exclude is passed to sourceState.
-func compileWorker(ctx context.Context, goTool, repo, binDir, exclude string) (*build, error) {
+// The compile runs at the lowest CPU priority, with at most parallel programs at the same time.
+func compileWorker(ctx context.Context, goTool, repo, binDir, exclude string, parallel int) (*build, error) {
 	git := commandGit(repo)
 	short, full, dirty, err := sourceState(ctx, git, exclude)
 	if err != nil {
@@ -77,7 +79,8 @@ func compileWorker(ctx context.Context, goTool, repo, binDir, exclude string) (*
 	result := &build{Commit: short, FullCommit: full, Dirty: dirty}
 	result.Binary = filepath.Join(binDir, "blackout-"+result.label()+".test")
 	temporary := result.Binary + ".tmp"
-	compile := exec.CommandContext(ctx, goTool, "test", "-c", "-o", temporary, ".")
+	name, args := lowPriority(goTool, "test", "-c", "-p", strconv.Itoa(parallel), "-o", temporary, ".")
+	compile := exec.CommandContext(ctx, name, args...)
 	compile.Dir = repo
 	if output, err := compile.CombinedOutput(); err != nil {
 		os.Remove(temporary)

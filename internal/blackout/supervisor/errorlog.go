@@ -54,17 +54,37 @@ func (log *errorLog) reset() {
 	log.errors = make(map[string]*errorRecord)
 }
 
+const (
+	// maxErrors is the number of errors that the log keeps; more errors go into one record with the text overflowError.
+	maxErrors = 100
+	// maxSeeds is the number of seeds that the log keeps for each error; more seeds only increase the count.
+	maxSeeds = 100
+	// overflowError is the text of the record that collects the errors after the first maxErrors.
+	overflowError = "other: more errors than the log keeps; the log of the supervisor names them"
+)
+
 // add records a failed run with the error text and reports whether the error is new.
+// The log keeps at most maxErrors errors and maxSeeds seeds of each error, so its memory and status.json stay small in a run without end.
 func (log *errorLog) add(text string, seed seedRecord) bool {
 	log.mu.Lock()
 	defer log.mu.Unlock()
 	record, found := log.errors[text]
+	if !found && len(log.errors) >= maxErrors {
+		// The overflow record is not an error with one cause, so it is never new and gets no shrink.
+		text, found = overflowError, true
+		if record = log.errors[text]; record == nil {
+			record = &errorRecord{Error: text}
+			log.errors[text] = record
+		}
+	}
 	if !found {
 		record = &errorRecord{Error: text}
 		log.errors[text] = record
 	}
 	record.Count++
-	record.Seeds = append(record.Seeds, seed)
+	if len(record.Seeds) < maxSeeds {
+		record.Seeds = append(record.Seeds, seed)
+	}
 	return !found
 }
 

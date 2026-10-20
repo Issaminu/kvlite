@@ -45,6 +45,8 @@ type supervisor struct {
 	shrinkWake chan struct{}      // gets a value when a shrink job is queued
 	workers    sync.WaitGroup     // runs of new seeds
 	background sync.WaitGroup     // the shrinker and the alert commands
+	// memory returns the memory of the system and the available part, as systemMemory does; tests replace it.
+	memory func() (total, available int64)
 
 	mu         sync.Mutex
 	current    *build
@@ -77,6 +79,7 @@ func newSupervisor(opts options, lanes []lane, stop context.Context, stopCancel 
 		stopCancel: stopCancel,
 		hard:       hard,
 		shrinkWake: make(chan struct{}, 1),
+		memory:     systemMemory,
 		counts:     counters{Failures: make(map[string]int)},
 	}
 }
@@ -104,6 +107,9 @@ func (s *supervisor) run() error {
 
 // prepare checks that the supervisor can read the RSS of a process, makes the output directories, and keeps the status of an earlier supervisor.
 func (s *supervisor) prepare() error {
+	if err := checkTools(); err != nil {
+		return err
+	}
 	if s.opts.maxRSS > 0 {
 		if _, err := residentBytes(os.Getpid()); err != nil {
 			return fmt.Errorf("-max-rss needs the RSS of the workers, but the supervisor cannot read it: %w", err)
@@ -154,7 +160,10 @@ func (s *supervisor) serve(current *build, follow *follower, ticks <-chan time.T
 	if s.opts.maxRSS > 0 {
 		limit = fmt.Sprintf("a memory limit of %d MiB of RSS for each worker", s.opts.maxRSS>>20)
 	}
-	s.logf("compiled %s with %s; %d workers with %s; lanes %s", current.Binary, current.GoVersion, s.opts.workers, limit, s.opts.lanes)
+	s.logf("compiled %s with %s; %d workers with %s; budget %d MiB and %g CPUs; lanes %s", current.Binary, current.GoVersion, s.opts.workers, limit, s.opts.memoryBudget>>20, s.opts.cpus, s.opts.lanes)
+	if s.opts.memoryBudget > 0 && (s.opts.maxRSS == 0 || int64(s.opts.workers)*s.opts.maxRSS > s.opts.memoryBudget) {
+		s.logf("warning: the memory limits of the workers together are more than the memory budget")
+	}
 	if s.opts.duration > 0 {
 		time.AfterFunc(s.opts.duration, s.stopCancel)
 	}
@@ -236,8 +245,9 @@ func (s *supervisor) firstBuild(follow *follower, ticks <-chan time.Time) (*buil
 }
 
 // compile compiles the test binary of the current checkout.
+// The compile runs while no worker runs, so it uses the CPU budget of the workers.
 func (s *supervisor) compile(ctx context.Context) (*build, error) {
-	return compileWorker(ctx, s.opts.goTool, s.opts.repo, filepath.Join(s.opts.out, "bin"), excludedPath(s.opts.repo, s.opts.out))
+	return compileWorker(ctx, s.opts.goTool, s.opts.repo, filepath.Join(s.opts.out, "bin"), excludedPath(s.opts.repo, s.opts.out), max(1, int(s.opts.cpus)))
 }
 
 // runSeeds starts new seeds until the stop context is done or follow mode checks out a new commit.
@@ -300,16 +310,28 @@ func newSeed() uint64 {
 }
 
 // execute runs one seed in a worker slot that the caller holds, and then frees the slot.
+// It starts the worker only when the system has the memory for it, and after the run, the slot rests as long as the CPU budget needs.
 func (s *supervisor) execute(current *build, seed uint64, steps int) (runOutcome, error) {
 	s.mu.Lock()
 	s.running++
 	s.mu.Unlock()
+	start := time.Now()
 	defer func() {
 		s.mu.Lock()
 		s.running--
 		s.mu.Unlock()
+		if rest := restAfter(time.Since(start), s.opts.workers, s.opts.cpus); rest > 0 {
+			select {
+			case <-time.After(rest):
+			case <-s.stop.Done():
+			}
+		}
 		<-s.slots
 	}()
+	if !s.waitForMemory() {
+		return runOutcome{Kind: kindCanceled, Seed: seed, Steps: steps}, nil
+	}
+	start = time.Now()
 	outcome, err := runWorker(s.hard, runSpec{
 		Binary:      current.Binary,
 		Seed:        seed,
@@ -326,6 +348,28 @@ func (s *supervisor) execute(current *build, seed uint64, steps int) (runOutcome
 		time.Sleep(time.Second)
 	}
 	return outcome, err
+}
+
+// waitForMemory waits until the system has the memory for one more worker, as memoryAllowsWorker says.
+// It reports false when the stop context is done first.
+func (s *supervisor) waitForMemory() bool {
+	for waited := false; ; waited = true {
+		total, available := s.memory()
+		if memoryAllowsWorker(total, available, s.opts.maxRSS) {
+			if waited {
+				s.logf("memory: %d MiB is available again, so a new worker starts", available>>20)
+			}
+			return true
+		}
+		if !waited {
+			s.logf("memory: only %d MiB of %d MiB is available, so a new worker waits until %d MiB is available", available>>20, total>>20, (s.opts.maxRSS+total/10)>>20)
+		}
+		select {
+		case <-time.After(memoryPollInterval):
+		case <-s.stop.Done():
+			return false
+		}
+	}
 }
 
 // stopped reports whether the supervisor caused the result of a run.

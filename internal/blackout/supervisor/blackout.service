@@ -31,9 +31,9 @@ ExecStart=/var/lib/blackout/bin/blackout-supervisor -repo /var/lib/blackout/kvli
 Restart=always
 RestartSec=60s
 
-# Low priority: the runner uses spare CPU time only.
-Nice=10
-CPUSchedulingPolicy=batch
+# Low priority: the runner uses only the CPU time and the disk time that other programs do not need.
+Nice=19
+CPUSchedulingPolicy=idle
 IOSchedulingClass=idle
 
 # A stop sends SIGTERM to the supervisor only.
@@ -41,9 +41,15 @@ IOSchedulingClass=idle
 KillMode=mixed
 TimeoutStopSec=6min
 
-# GOMEMLIMIT is a soft limit for each worker, and -max-rss is a hard limit for each worker.
-# MemoryMax is a hard limit for all processes together.
-#MemoryMax=8G
+# Hard limits of the kernel for the supervisor, its workers, and the compile together.
+# The supervisor plans its workers in half of MemoryMax, and the kernel stops a worker that grows past the plan before a sample sees it.
+MemoryMax=50%
+MemorySwapMax=0
+# When the server has no memory left, the kernel kills a worker first, so the other programs survive.
+OOMScoreAdjust=1000
+# The supervisor uses half of the CPUs on average.
+# For a hard CPU limit, set CPUQuota, where 100% is one CPU, for example CPUQuota=100% on 2 CPUs.
+#CPUQuota=100%
 
 # The service writes only in its own directory.
 NoNewPrivileges=true

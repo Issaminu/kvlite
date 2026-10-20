@@ -19,32 +19,59 @@
 //	blackout-COMMIT.test -test.run '^TestBlackout$' -blackout.seed=N -blackout.steps=S -blackout.json=PATH
 //
 // A separate process isolates the runs: a panic, a deadlock, a leak, or a changed global stops only one run.
-// Each worker gets GOMAXPROCS=1 and the soft memory limit GOMEMLIMIT from -memlimit.
+// Each worker gets GOMAXPROCS=1, so it uses at most one CPU, and the soft memory limit GOMEMLIMIT from -memlimit.
 // A worker that runs longer than -timeout gets SIGQUIT, which makes the Go runtime print the stack of each goroutine.
 // If the worker does not stop, the supervisor kills its process group.
-//
-// GOMEMLIMIT only makes the garbage collector work harder, so the supervisor also has a hard memory limit for each worker, -max-rss.
-// Every second, the supervisor reads the resident set size (RSS) of each worker with ps.
-// When the RSS of a worker is larger than -max-rss, the supervisor kills its process group at once.
-// On macOS, the RSS also counts memory that the Go runtime gave back but the kernel did not take yet, so there the limit kills earlier than necessary.
-// A memory kill is not a failure of KVLite: status.json counts it in memory_kills, the log names the seed, and the supervisor makes no error and no shrink of it.
-// A 3000-step seed reached 3.44 GiB of RSS on an Apple M4 Max, so the default limit is 4 GiB.
-// Some long seeds need much more, and the limit kills them.
-// On Windows, the supervisor cannot read the RSS, so it refuses to start until -max-rss is off.
-//
-// The default of -workers keeps the computer usable.
-// It is half the cores, and at most the number of workers whose limits together are half of the RAM or less.
-// The supervisor reads the size of the RAM with "sysctl hw.memsize" on macOS and from /proc/meminfo on Linux.
-// On other systems, only the cores limit the default.
-// For example, a computer with 14 cores and 36 GiB of RAM gets 4 workers with the default limit of 4 GiB.
 //
 // The supervisor puts the result of each run into one of these kinds:
 //   - pass: the JSON result says that the seed passed.
 //   - fail: the JSON result says that a check failed.
 //   - panic: there is no JSON result, and the output has a "panic:" or "fatal error:" line.
 //   - timeout: the run did not stop in time.
-//   - memory: the RSS of the worker passed -max-rss. This is not a failure of KVLite.
+//   - memory: the RSS of the worker passed -max-rss, the supervisor could not read the RSS, or the system killed the worker with SIGKILL. This is not a failure of KVLite.
 //   - error: all other results, for example a non-zero exit without a JSON result.
+//
+// # Resources
+//
+// The supervisor can run for good on a small computer that other programs share.
+// By default, all workers together get half of the memory and half of the CPUs:
+//   - The memory is the RAM, or the smallest cgroup memory limit of the supervisor and its ancestor cgroups when that is smaller, for example the MemoryMax of a systemd unit or of its slice.
+//     The supervisor reads it with "sysctl" on macOS and from /proc and /sys/fs/cgroup on Linux.
+//     -memory changes the budget.
+//   - The CPUs are the CPUs of the computer, or the smallest cgroup CPU limit (cpu.max) of the supervisor and its ancestor cgroups when it is smaller, also a fraction such as 0.5.
+//     -cpus changes the budget, also to less than one CPU.
+//
+// From the budgets, the supervisor chooses the number of workers and the hard memory limit of each worker, -max-rss:
+//   - Each worker gets 4 GiB when the memory budget allows it.
+//     A 3000-step seed reached 3.44 GiB of RSS on an Apple M4 Max.
+//   - With a smaller budget, one worker gets the whole budget.
+//     Most seeds need less than 400 MiB, but some long seeds need several GiB, and the limit kills them.
+//   - There are at most as many workers as CPUs in the budget, and at least one.
+//   - GOMEMLIMIT is half of -max-rss.
+//
+// For example, a computer with 14 cores and 36 GiB of RAM gets 4 workers with 4 GiB each.
+// A computer with 1 CPU and 1 GiB of RAM gets 1 worker with 512 MiB, and the worker waits after each run as long as the run took, so it uses half a CPU on average.
+//
+// The supervisor protects the other programs in these ways:
+//   - It reads the memory of each worker every 250 ms on Linux (from /proc, which costs little) and every second on other systems (with ps).
+//     When the RSS and the swapped memory of a worker are larger than -max-rss, it kills the process group at once.
+//     When it cannot read the memory 3 times in a row, it also stops the worker, because the limit then does not work.
+//   - It starts a worker only when the system has the memory limit of the worker available, and a tenth of the memory more for the other programs.
+//     Otherwise, the new runs wait and the log says so.
+//   - On Linux, it asks the out-of-memory killer to kill the supervisor and its workers first.
+//     The supervisor counts a SIGKILL that it did not send as a memory kill.
+//   - The workers and the compile run at the lowest CPU priority, nice 19.
+//     The compile runs no more programs at the same time than the CPU budget allows.
+//   - The log of errors keeps at most 100 errors with 100 seeds each, so its memory stays small.
+//
+// A memory kill is not a failure of KVLite: status.json counts it in memory_kills, the log names the seed, and the supervisor makes no error and no shrink of it.
+//
+// The limit of each worker is a sample, not a limit of the kernel.
+// A worker can grow by about 1 GiB in a second, so between two samples it can pass its limit by that much.
+// On macOS, the RSS also counts memory that the Go runtime gave back but the kernel did not take yet, so the limit kills earlier than necessary.
+// But under memory pressure, macOS compresses or swaps pages, which then leave the RSS, so the limit can kill later than necessary.
+// For a hard limit of the kernel, run the supervisor in a systemd unit with MemoryMax, as blackout.service in this directory does.
+// On Windows, the supervisor cannot read the RSS, so it refuses to start until -max-rss is off.
 //
 // # Lanes
 //
@@ -117,8 +144,15 @@
 //  4. Copy blackout.service from this directory to /etc/systemd/system and change its paths.
 //  5. Start the service with "systemctl enable --now blackout".
 //
-// The unit runs the supervisor at a low CPU priority (Nice=10) and restarts it when it stops.
+// The unit restarts the supervisor when it stops.
 // It uses KillMode=mixed, so that a stop sends SIGTERM to the supervisor only and the running workers can finish.
-// GOMEMLIMIT is a soft limit, and -max-rss is a hard limit for each worker.
-// Use MemoryMax in the unit for a hard limit on all processes of the service together.
+// It also sets limits that the kernel enforces at once, for the supervisor, its workers, and the compile together:
+//   - MemoryMax=50% and MemorySwapMax=0: the service never uses more than half of the RAM, and no swap.
+//     The supervisor plans its workers in half of MemoryMax, so the kernel limit is a second wall that a fast-growing worker can reach before a sample sees it.
+//   - CPUSchedulingPolicy=idle, Nice=19, and IOSchedulingClass=idle: the service runs only when the other programs do not need the CPU or the disk.
+//   - OOMScoreAdjust=1000: when the computer has no memory left, the kernel kills a worker first.
+//
+// The supervisor already uses half of the CPUs on average.
+// For a hard CPU limit of the kernel, also set CPUQuota, where 100% is one CPU.
+// For example, CPUQuota=100% on a server with 2 CPUs.
 package main

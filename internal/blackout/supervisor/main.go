@@ -11,7 +11,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
-	"runtime"
+	"strconv"
 	"syscall"
 	"time"
 )
@@ -24,7 +24,9 @@ type options struct {
 	workers        int
 	timeout        time.Duration
 	memoryLimit    string
-	maxRSS         int64 // zero means no limit
+	maxRSS         int64   // zero means no limit
+	memoryBudget   int64   // memory of all workers together; zero means unknown
+	cpus           float64 // CPUs of all workers together, on average
 	lanes          string
 	duration       time.Duration
 	reports        bool
@@ -55,10 +57,12 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	flags.StringVar(&opts.repo, "repo", ".", "KVLite `checkout` to compile; follow mode changes it, so give the runner its own checkout")
 	flags.StringVar(&opts.out, "out", "blackout-results", "output `directory` for the status and the reports")
 	flags.StringVar(&opts.goTool, "go", "go", "Go `command` that compiles the test binary")
-	flags.IntVar(&opts.workers, "workers", 0, "number of worker processes that run at the same time (default: half the cores, and at most half the RAM divided by -max-rss)")
+	flags.IntVar(&opts.workers, "workers", 0, "number of worker processes that run at the same time (default: from -memory and -cpus)")
 	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "time limit of one worker")
-	flags.StringVar(&opts.memoryLimit, "memlimit", "2GiB", "soft memory `limit` of one worker (GOMEMLIMIT)")
-	maxRSS := flags.String("max-rss", fmt.Sprintf("%dGiB", defaultMaxRSS>>30), "hard memory `limit` of one worker: the supervisor kills a worker whose RSS is larger; off removes the limit")
+	flags.StringVar(&opts.memoryLimit, "memlimit", "", "soft memory `limit` of one worker (GOMEMLIMIT) (default: half of -max-rss)")
+	maxRSS := flags.String("max-rss", "", "hard memory `limit` of one worker: the supervisor kills a worker whose RSS is larger; off removes the limit (default: from -memory and -cpus, at most 4GiB)")
+	memory := flags.String("memory", "", "memory `budget` of all workers together (default: half of the RAM, or of the cgroup memory limit when it is smaller)")
+	flags.Float64Var(&opts.cpus, "cpus", cpuCount()/2, "CPU `budget` of all workers together (default: half of the CPUs, or of the cgroup CPU limit when it is smaller); a worker uses one CPU, and with fewer CPUs than workers, each worker waits after a run")
 	flags.StringVar(&opts.lanes, "lanes", "default=80:steps=300,long=20:steps=3000", "lanes as name=weight:steps=N, with a comma between two lanes")
 	flags.DurationVar(&opts.duration, "duration", 0, "stop after this time; zero runs until a signal")
 	flags.BoolVar(&opts.reports, "reports", false, "write the full report of each failed seed to reports/SEED.txt; a replay of the seed gives the same report")
@@ -73,20 +77,41 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 		}
 		return opts, nil, errUsage
 	}
+	set := make(map[string]bool)
+	flags.Visit(func(given *flag.Flag) { set[given.Name] = true })
+	total, _ := systemMemory()
+	opts.memoryBudget = total / 2
 	var err error
-	if opts.maxRSS, err = parseBytes(*maxRSS); err != nil {
-		return opts, nil, fmt.Errorf("-max-rss: %w", err)
+	if set["memory"] {
+		if opts.memoryBudget, err = parseBytes(*memory); err != nil || opts.memoryBudget <= 0 {
+			return opts, nil, fmt.Errorf("-memory %q is not a positive size, such as 1GiB", *memory)
+		}
 	}
-	workersSet := false
-	flags.Visit(func(set *flag.Flag) { workersSet = workersSet || set.Name == "workers" })
-	if !workersSet {
-		opts.workers = defaultWorkers(runtime.NumCPU(), physicalMemory(), opts.maxRSS)
+	opts.maxRSS = -1 // plan chooses it
+	if set["max-rss"] {
+		if opts.maxRSS, err = parseBytes(*maxRSS); err != nil {
+			return opts, nil, fmt.Errorf("-max-rss: %w", err)
+		}
+		if opts.maxRSS != 0 && opts.maxRSS < minMaxRSS {
+			return opts, nil, fmt.Errorf("-max-rss must be off or at least %d MiB", minMaxRSS>>20)
+		}
+	}
+	if set["workers"] && opts.workers <= 0 {
+		return opts, nil, errors.New("-workers must be positive")
+	}
+	opts.workers, opts.maxRSS = plan(opts.memoryBudget, opts.cpus, opts.workers, opts.maxRSS)
+	if !set["memlimit"] {
+		perWorker := opts.maxRSS
+		if perWorker == 0 {
+			perWorker = targetMaxRSS
+		}
+		opts.memoryLimit = strconv.FormatInt(perWorker/2, 10)
 	}
 	switch {
 	case flags.NArg() > 0:
 		return opts, nil, fmt.Errorf("unexpected arguments: %q", flags.Args())
-	case opts.workers <= 0:
-		return opts, nil, errors.New("-workers must be positive")
+	case !(opts.cpus > 0):
+		return opts, nil, errors.New("-cpus must be positive")
 	case opts.timeout <= 0:
 		return opts, nil, errors.New("-timeout must be positive")
 	case opts.followInterval <= 0:
@@ -134,6 +159,9 @@ func main() {
 	case err != nil:
 		fmt.Fprintln(os.Stderr, "supervisor:", err)
 		os.Exit(2)
+	}
+	if err := preferAsOOMVictim(); err != nil {
+		fmt.Fprintln(os.Stderr, "supervisor: the out-of-memory killer of Linux does not prefer the workers:", err)
 	}
 	stop, stopCancel, hard := stopContexts(log.New(os.Stderr, "blackout ", log.LstdFlags))
 	if err := newSupervisor(opts, lanes, stop, stopCancel, hard).run(); err != nil {
