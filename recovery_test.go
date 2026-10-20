@@ -1072,6 +1072,30 @@ func TestMetaFromCommittedRecords_RejectsInvalidPageSize(t *testing.T) {
 	}
 }
 
+// Every page size of KVLite is a power of two, as in SQLite.
+// One changed bit turns a power of two into a value that is not a power of two, so validation finds that damage although the checksum matches.
+func TestValidateMeta_RejectsPageSizeThatIsNotAPowerOfTwo(t *testing.T) {
+	for _, test := range []struct {
+		pageSize int64
+		valid    bool
+	}{
+		{pageSize: 4096, valid: true},
+		{pageSize: 16384, valid: true},
+		{pageSize: 65536, valid: true},
+		{pageSize: 16384 | 1<<15}, // the changed bit of issue 4
+		{pageSize: 16384 | 1<<6},
+		{pageSize: 4096 | 1<<13},
+	} {
+		meta := page.NewMeta(test.pageSize)
+		meta.RefreshChecksum()
+		if err := validateMeta(meta); (err == nil) != test.valid {
+			t.Errorf("page size %d: got error %v, want valid %t", test.pageSize, err, test.valid)
+		} else if err != nil && !errors.Is(err, ErrInvalid) {
+			t.Errorf("page size %d: got error %v, want ErrInvalid", test.pageSize, err)
+		}
+	}
+}
+
 func TestMetaFromCommittedRecords_NoMetadata(t *testing.T) {
 	meta, err := metaFromCommittedRecords([]wal.WALRecord{{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 2, TxID: 1}}})
 	if err != nil || meta != nil {

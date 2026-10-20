@@ -743,8 +743,10 @@ func (db *DB) readMetaAt(offset int64) (*page.Meta, error) {
 	return page.DecodeMeta(data)
 }
 
+// validMetaPageSize reports whether pageSize is a power of two from the metadata size to MaxValueSize.
+// One changed bit turns a power of two into a value that is not a power of two, so this check also finds that damage.
 func validMetaPageSize(pageSize int64) bool {
-	return pageSize >= page.MetaSize && pageSize <= MaxValueSize
+	return pageSize >= page.MetaSize && pageSize <= MaxValueSize && pageSize&(pageSize-1) == 0
 }
 
 // validateMeta checks the file marker, format version, checksum, and supported page size.
