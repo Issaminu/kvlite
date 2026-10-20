@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"syscall"
 	"testing"
@@ -416,7 +417,7 @@ func TestInjectedErrorsNeedEnabledFaults(t *testing.T) {
 	}
 }
 
-func TestCloneCacheHoldsTheCacheViewAsDurable(t *testing.T) {
+func TestCloneCacheHoldsOneCopyOfTheCacheView(t *testing.T) {
 	fsys := New(1, Config{})
 	file := openRW(t, fsys, testName)
 	mustWrite(t, file, []byte("synced"), 0)
@@ -426,15 +427,58 @@ func TestCloneCacheHoldsTheCacheViewAsDurable(t *testing.T) {
 
 	clone := fsys.CloneCache(2)
 	clone.Crash()
-	clone.Restart(true)
+	clone.Restart(false)
 	if got := content(clone, testName); string(got) != "syncedcached" {
-		t.Fatalf("clone after a power failure: got %q, want %q", got, "syncedcached")
+		t.Fatalf("clone after a process crash: got %q, want %q", got, "syncedcached")
 	}
 	// The clone is independent: a write to it does not change fsys.
 	cloneFile := openRW(t, clone, testName)
 	mustWrite(t, cloneFile, []byte("X"), 0)
 	if got := content(fsys, testName); string(got) != "syncedcached" {
 		t.Fatalf("original after a write to the clone: got %q", got)
+	}
+	// The clone keeps no durable view and no unsynced change, so each file costs one copy.
+	if _, durable, _ := clone.FileData(testName); durable != nil || len(clone.names[testName].pending) != 0 {
+		t.Fatalf("clone: durable view %q and %d unsynced changes", durable, len(clone.names[testName].pending))
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a power failure on the clone did not panic")
+		}
+	}()
+	clone.Restart(true)
+}
+
+// allocatedBytes returns the number of bytes that fn allocates.
+func allocatedBytes(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestDamageDoesNotCopyTheFile requires that a power failure with a misdirected write, and bit rot in a small range, reuse the arrays of the file.
+// Long runs grow files to hundreds of MiB, so each full copy costs much memory.
+func TestDamageDoesNotCopyTheFile(t *testing.T) {
+	const size = 4 << 20
+	fsys := New(1, Config{Misdirect: Always})
+	file := openRW(t, fsys, testName)
+	mustWrite(t, file, bytes.Repeat([]byte{'.'}, size), 0)
+	mustSync(t, file)
+	if err := fsys.SyncDir(testDir); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, file, bytes.Repeat([]byte{'w'}, 4096), size/2)
+	fsys.Crash()
+	if allocated := allocatedBytes(func() { fsys.Restart(true) }); allocated > size/4 {
+		t.Errorf("a power failure of a %d-byte file allocated %d bytes", size, allocated)
+	}
+	if got, _ := fsys.FileSize(testName); got != size {
+		t.Fatalf("the file has %d bytes after the power failure, want %d", got, size)
+	}
+	if allocated := allocatedBytes(func() { fsys.Corrupt(testName, 0, 4096, 3) }); allocated > size/4 {
+		t.Errorf("bit rot in 4096 bytes of a %d-byte file allocated %d bytes", size, allocated)
 	}
 }
 
@@ -738,7 +782,7 @@ func TestHealKeepsTheDamagedPartsOutsideALaterWrite(t *testing.T) {
 		node.durable[index] = 'x'
 	}
 	node.data = slices.Clone(node.durable)
-	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, node.durable)})
+	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, node.durable, 0)})
 	fsys.mu.Unlock()
 	// A write replaces the middle of the run.
 	mustWrite(t, file, bytes.Repeat([]byte{'b'}, 8), 28)

@@ -204,6 +204,7 @@ type FS struct {
 	crashEvent   Event
 	faults       bool   // enables the injected errors of Config
 	noSyncFaults bool   // turns off the injected sync errors of Config, also while faults are enabled
+	volatile     bool   // the FS keeps no durable view and no unsynced changes, so a power failure is not possible
 	fullUntil    uint64 // a disk-full episode lasts until this mutation
 	damage       []damage
 	stats        Stats
@@ -266,20 +267,23 @@ func New(seed uint64, config Config) *FS {
 
 var _ fileio.FS = (*FS)(nil)
 
-// CloneCache returns a new FS whose files and names are the cache view of fsys, all durable.
+// CloneCache returns a new FS whose files and names are the cache view of fsys.
 // It is the storage that a process crash would leave now.
 // The clone has no injected errors, so a check can open a second database on it without a change to fsys.
+// The clone keeps no durable view, so it holds one copy of each file.
+// A power failure on the clone panics, and FileData on the clone returns no durable view.
 func (fsys *FS) CloneCache(seed uint64) *FS {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
 	clone := New(seed, Config{SectorSize: fsys.config.SectorSize, WorkingDir: fsys.config.WorkingDir})
+	clone.volatile = true
 	copies := make(map[*inode]*inode)
 	for _, name := range slices.Sorted(maps.Keys(fsys.names)) {
 		node := fsys.names[name]
 		copied, ok := copies[node]
 		if !ok {
 			clone.nextInodeID++
-			copied = &inode{id: clone.nextInodeID, perm: node.perm, data: slices.Clone(node.data), durable: slices.Clone(node.data)}
+			copied = &inode{id: clone.nextInodeID, perm: node.perm, data: slices.Clone(node.data)}
 			copies[node] = copied
 		}
 		clone.names[name] = copied
@@ -351,6 +355,9 @@ func (fsys *FS) Crashed() (bool, Event) {
 func (fsys *FS) Restart(powerFailure bool) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
+	if powerFailure && fsys.volatile {
+		panic("disk: a power failure on a clone of CloneCache, which keeps no durable view")
+	}
 	fsys.generation++
 	fsys.crashed = false
 	fsys.crashAt = 0
@@ -403,8 +410,9 @@ func (fsys *FS) Restart(powerFailure bool) {
 }
 
 // powerFail replaces the content of node with its durable view and a random part of its unsynced changes.
+// The process has ended, so the result reuses the array of the cache view, and the new durable view reuses the array of the old one.
 func (fsys *FS) powerFail(name string, node *inode) {
-	result := slices.Clone(node.durable)
+	result := append(node.data[:0], node.durable...)
 	if len(node.pending) > 0 {
 		if fsys.rand.Chance(fsys.config.InOrder) {
 			cut := fsys.rand.IntN(len(node.pending) + 1)
@@ -431,13 +439,14 @@ func (fsys *FS) powerFail(name string, node *inode) {
 		}
 	}
 	node.data = result
-	node.durable = slices.Clone(result)
+	node.durable = append(node.durable[:0], result...)
 	node.pending = nil
 }
 
 // misdirect moves one unsynced write in the result of a power failure to a wrong offset, like a firmware bug.
 // The intended range gets its durable bytes from before the write, and the wrong range gets the write.
 // It records the damage, so Heal can restore the correct result.
+// It changes result in place and returns it.
 func (fsys *FS) misdirect(name string, node *inode, result []byte) []byte {
 	var candidates []change
 	for _, pending := range node.pending {
@@ -457,21 +466,23 @@ func (fsys *FS) misdirect(name string, node *inode, result []byte) []byte {
 	if target < 0 || target+int64(len(write.data)) > int64(len(result)) {
 		return result
 	}
-	damaged := slices.Clone(result)
 	end := write.offset + int64(len(write.data))
+	// Only the intended range and the wrong range change, so a copy of the bytes from low to high is enough for the damage runs.
+	low, high := min(write.offset, target), max(end, target+int64(len(write.data)))
+	correct := slices.Clone(result[low:high])
 	older := make([]byte, len(write.data))
 	if write.offset < int64(len(node.durable)) {
 		copy(older, node.durable[write.offset:min(end, int64(len(node.durable)))])
 	}
-	copy(damaged[write.offset:end], older)
-	copy(damaged[target:], write.data)
-	if bytes.Equal(damaged, result) {
+	copy(result[write.offset:end], older)
+	copy(result[target:], write.data)
+	if bytes.Equal(correct, result[low:high]) {
 		return result
 	}
-	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(result, damaged)})
+	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, result[low:high], low)})
 	fsys.stats.MisdirectedWrites++
 	fsys.record(Event{Mutation: fsys.mutations, Op: "misdirect-write", Name: name, Offset: write.offset, Length: len(write.data), Result: fmt.Sprintf("landed at %d", target)})
-	return damaged
+	return result
 }
 
 // damage is a change of the stored bytes of a file that is not a correct result: bit rot or a misdirected write.
@@ -488,8 +499,8 @@ type damageRun struct {
 }
 
 // diffRuns returns the ranges where damaged differs from correct, with the correct bytes.
-// Both have one length.
-func diffRuns(correct, damaged []byte) []damageRun {
+// Both have one length, and both start at the file offset base.
+func diffRuns(correct, damaged []byte, base int64) []damageRun {
 	var runs []damageRun
 	for index := 0; index < len(correct); {
 		if correct[index] == damaged[index] {
@@ -500,7 +511,7 @@ func diffRuns(correct, damaged []byte) []damageRun {
 		for index < len(correct) && correct[index] != damaged[index] {
 			index++
 		}
-		runs = append(runs, damageRun{offset: int64(start), correct: slices.Clone(correct[start:index])})
+		runs = append(runs, damageRun{offset: base + int64(start), correct: slices.Clone(correct[start:index])})
 	}
 	return runs
 }
@@ -549,17 +560,19 @@ func (fsys *FS) Corrupt(name string, start, end int64, bits int) bool {
 	if start < 0 || start >= end {
 		return false
 	}
-	correct := slices.Clone(node.durable)
+	// Only the bytes from start to end change, so a copy of them is enough for the damage runs.
+	correct := slices.Clone(node.durable[start:end])
 	for range bits {
 		offset := start + int64(fsys.rand.Uint64N(uint64(end-start)))
 		node.durable[offset] ^= 1 << fsys.rand.IntN(8)
 	}
-	if bytes.Equal(correct, node.durable) {
+	if bytes.Equal(correct, node.durable[start:end]) {
 		return false
 	}
-	node.data = slices.Clone(node.durable)
+	// No other slice holds the array of the cache view, so the copy can reuse it.
+	node.data = append(node.data[:0], node.durable...)
 	refreshMappings(node)
-	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, node.durable)})
+	fsys.damage = append(fsys.damage, damage{node: node, runs: diffRuns(correct, node.durable[start:end], start)})
 	fsys.stats.BitRot++
 	fsys.record(Event{Mutation: fsys.mutations, Op: "bit-rot", Name: name, Offset: start, Length: int(end - start), Result: fmt.Sprintf("%d bits", bits)})
 	return true
@@ -1306,9 +1319,13 @@ func (fsys *FS) write(node *inode, p []byte, offset int64) {
 	if len(p) == 0 {
 		return
 	}
-	pending := change{offset: offset, data: slices.Clone(p)}
-	node.data = applyChange(node.data, pending)
-	node.pending = append(node.pending, pending)
+	if fsys.volatile {
+		node.data = applyChange(node.data, change{offset: offset, data: p})
+	} else {
+		pending := change{offset: offset, data: slices.Clone(p)}
+		node.data = applyChange(node.data, pending)
+		node.pending = append(node.pending, pending)
+	}
 	fsys.forgetDamage(node, offset, len(p))
 	for _, live := range node.mappings {
 		if live.follows && offset < int64(len(live.data)) {
@@ -1321,7 +1338,9 @@ func (fsys *FS) write(node *inode, p []byte, offset int64) {
 // The caller must hold mu.
 func (fsys *FS) truncate(node *inode, size int64) {
 	node.data = resize(node.data, size)
-	node.pending = append(node.pending, change{truncate: true, offset: size})
+	if !fsys.volatile {
+		node.pending = append(node.pending, change{truncate: true, offset: size})
+	}
 	fsys.forgetDamage(node, size, -1)
 	for _, live := range node.mappings {
 		if int64(len(live.data)) > size {

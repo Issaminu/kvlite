@@ -3,7 +3,10 @@
 package main
 
 import (
+	"fmt"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 )
 
@@ -22,4 +25,19 @@ func interruptProcess(cmd *exec.Cmd) {
 // killProcess kills the process group of the worker.
 func killProcess(cmd *exec.Cmd) {
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}
+
+// residentBytes returns the resident set size (RSS) of the process pid, in bytes.
+// It runs ps, which macOS and Linux both have.
+// On macOS, the RSS also counts memory that the Go runtime gave back but the kernel did not take yet, so it can be larger than the memory footprint.
+func residentBytes(pid int) (int64, error) {
+	output, err := exec.Command("ps", "-o", "rss=", "-p", strconv.Itoa(pid)).Output()
+	if err != nil {
+		return 0, fmt.Errorf("ps: %w", err)
+	}
+	kib, err := strconv.ParseInt(strings.TrimSpace(string(output)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("ps: %w", err)
+	}
+	return kib << 10, nil
 }

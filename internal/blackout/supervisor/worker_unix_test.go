@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -89,6 +90,21 @@ func helperMain(mode string) {
 	case "error":
 		fmt.Println("something odd")
 		os.Exit(3)
+	case "grow":
+		// The helper grows to 384 MiB in about 2 seconds, so a sample sees it above the limit of runHelper.
+		// It passes if nothing kills it.
+		var chunks [][]byte
+		for range 192 {
+			chunk := make([]byte, 2<<20)
+			for index := 0; index < len(chunk); index += 4096 {
+				chunk[index] = 1
+			}
+			chunks = append(chunks, chunk)
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(3 * time.Second)
+		runtime.KeepAlive(chunks)
+		writeResult(workerResult{Seed: seed, Steps: steps, Passed: true})
 	}
 }
 
@@ -116,6 +132,7 @@ func runHelper(t *testing.T, ctx context.Context, mode string, timeout time.Dura
 		Timeout:     timeout,
 		KillGrace:   2 * time.Second, // under full CPU load, the runtime needs time to print every stack after SIGQUIT
 		MemoryLimit: "256MiB",
+		MaxRSS:      128 << 20,
 		TempDir:     temporary,
 		Env:         []string{helperEnv + "=" + mode},
 	})
@@ -186,6 +203,13 @@ func TestRunWorkerClassifiesHelperProcesses(t *testing.T) {
 		outcome := runHelper(t, context.Background(), "error", 30*time.Second)
 		if outcome.Kind != kindError || outcome.FirstLine != "exit status 3: something odd" {
 			t.Fatalf("outcome: kind %s, first line %q", outcome.Kind, outcome.FirstLine)
+		}
+	})
+	t.Run("memory limit", func(t *testing.T) {
+		t.Parallel()
+		outcome := runHelper(t, context.Background(), "grow", 30*time.Second)
+		if outcome.Kind != kindMemory || outcome.Signaled || !strings.HasPrefix(outcome.FirstLine, "memory: the worker used ") {
+			t.Fatalf("outcome: kind %s, signaled %v, first line %q", outcome.Kind, outcome.Signaled, outcome.FirstLine)
 		}
 	})
 	t.Run("canceled", func(t *testing.T) {

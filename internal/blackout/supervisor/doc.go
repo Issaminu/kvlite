@@ -23,11 +23,27 @@
 // A worker that runs longer than -timeout gets SIGQUIT, which makes the Go runtime print the stack of each goroutine.
 // If the worker does not stop, the supervisor kills its process group.
 //
+// GOMEMLIMIT only makes the garbage collector work harder, so the supervisor also has a hard memory limit for each worker, -max-rss.
+// Every second, the supervisor reads the resident set size (RSS) of each worker with ps.
+// When the RSS of a worker is larger than -max-rss, the supervisor kills its process group at once.
+// On macOS, the RSS also counts memory that the Go runtime gave back but the kernel did not take yet, so there the limit kills earlier than necessary.
+// A memory kill is not a failure of KVLite: status.json counts it in memory_kills, the log names the seed, and the supervisor makes no error and no shrink of it.
+// A 3000-step seed reached 3.44 GiB of RSS on an Apple M4 Max, so the default limit is 4 GiB.
+// Some long seeds need much more, and the limit kills them.
+// On Windows, the supervisor cannot read the RSS, so it refuses to start until -max-rss is off.
+//
+// The default of -workers keeps the computer usable.
+// It is half the cores, and at most the number of workers whose limits together are half of the RAM or less.
+// The supervisor reads the size of the RAM with "sysctl hw.memsize" on macOS and from /proc/meminfo on Linux.
+// On other systems, only the cores limit the default.
+// For example, a computer with 14 cores and 36 GiB of RAM gets 4 workers with the default limit of 4 GiB.
+//
 // The supervisor puts the result of each run into one of these kinds:
 //   - pass: the JSON result says that the seed passed.
 //   - fail: the JSON result says that a check failed.
 //   - panic: there is no JSON result, and the output has a "panic:" or "fatal error:" line.
 //   - timeout: the run did not stop in time.
+//   - memory: the RSS of the worker passed -max-rss. This is not a failure of KVLite.
 //   - error: all other results, for example a non-zero exit without a JSON result.
 //
 // # Lanes
@@ -58,7 +74,7 @@
 // # Output
 //
 // status.json is the result of the runs of the current commit, rewritten every few seconds.
-// It holds the commit, the platform, the run and failure counts, and each error with every seed that failed with it.
+// It holds the commit, the platform, the run and failure counts, each error with every seed that failed with it, and the count of memory kills.
 // For each seed, it holds the steps of the run, the step of the failure, and the message.
 // Replay a seed at the commit of the status with:
 //
@@ -103,5 +119,6 @@
 //
 // The unit runs the supervisor at a low CPU priority (Nice=10) and restarts it when it stops.
 // It uses KillMode=mixed, so that a stop sends SIGTERM to the supervisor only and the running workers can finish.
-// GOMEMLIMIT is a soft limit; use MemoryMax in the unit for a hard limit on all workers together.
+// GOMEMLIMIT is a soft limit, and -max-rss is a hard limit for each worker.
+// Use MemoryMax in the unit for a hard limit on all processes of the service together.
 package main

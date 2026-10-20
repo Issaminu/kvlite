@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"runtime"
 	"slices"
 	"testing"
 )
@@ -47,14 +48,23 @@ func TestPickLaneFollowsWeights(t *testing.T) {
 }
 
 func TestParseOptions(t *testing.T) {
-	opts, lanes, err := parseOptions([]string{"-workers", "2", "-lanes", "default=1:steps=50", "-memlimit", "512MiB"}, io.Discard)
+	opts, lanes, err := parseOptions([]string{"-workers", "2", "-lanes", "default=1:steps=50", "-memlimit", "512MiB", "-max-rss", "1GiB"}, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opts.workers != 2 || len(lanes) != 1 || lanes[0].Steps != 50 || opts.memoryLimit != "512MiB" {
+	if opts.workers != 2 || len(lanes) != 1 || lanes[0].Steps != 50 || opts.memoryLimit != "512MiB" || opts.maxRSS != 1<<30 {
 		t.Fatalf("options: got %+v and lanes %+v", opts, lanes)
 	}
-	for _, args := range [][]string{{"-workers", "0"}, {"-memlimit", "2GB"}, {"-lanes", "x"}, {"extra"}, {"-no-such-flag"}} {
+	// The default number of workers follows the memory limit.
+	opts, _, err = parseOptions([]string{"-max-rss", "off"}, io.Discard)
+	if err != nil || opts.maxRSS != 0 || opts.workers != defaultWorkers(runtime.NumCPU(), physicalMemory(), 0) {
+		t.Fatalf("options without a memory limit: got %+v, %v", opts, err)
+	}
+	opts, _, err = parseOptions(nil, io.Discard)
+	if err != nil || opts.maxRSS != defaultMaxRSS || opts.workers != defaultWorkers(runtime.NumCPU(), physicalMemory(), defaultMaxRSS) {
+		t.Fatalf("default options: got %+v, %v", opts, err)
+	}
+	for _, args := range [][]string{{"-workers", "0"}, {"-memlimit", "2GB"}, {"-max-rss", "3GB"}, {"-max-rss", "-1"}, {"-lanes", "x"}, {"extra"}, {"-no-such-flag"}} {
 		if _, _, err := parseOptions(args, io.Discard); err == nil {
 			t.Errorf("parseOptions(%q) accepted bad flags", args)
 		}

@@ -19,6 +19,9 @@ const (
 	kindPanic   = "panic"
 	kindTimeout = "timeout"
 	kindError   = "error"
+	// kindMemory is a run that the supervisor killed because its RSS passed -max-rss.
+	// It is not a failure of KVLite: the supervisor counts it apart from the failures and makes no error of it.
+	kindMemory = "memory"
 	// kindCanceled is a run that the supervisor stopped.
 	// It says nothing about the code, so the supervisor does not count it.
 	kindCanceled = "canceled"
@@ -56,6 +59,7 @@ type runSpec struct {
 	Timeout     time.Duration // time limit of the run
 	KillGrace   time.Duration // time between SIGQUIT and the kill of the process group
 	MemoryLimit string        // value of GOMEMLIMIT
+	MaxRSS      int64         // RSS in bytes above which the supervisor kills the process group; zero means no limit
 	TempDir     string        // parent of the working directory of the run
 	Env         []string      // more environment variables, for tests
 }
@@ -71,6 +75,7 @@ type runOutcome struct {
 	Result    *workerResult // nil when the worker wrote no JSON result
 	Exit      string        // exit status of the process
 	Signaled  bool          // a signal that the supervisor did not send stopped the process
+	RSS       int64         // the RSS sample that passed MaxRSS, for kindMemory
 }
 
 // workerArgs returns the arguments of the test binary for one run.
@@ -121,20 +126,42 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 	go func() { done <- cmd.Wait() }()
 	timer := time.NewTimer(spec.Timeout)
 	defer timer.Stop()
+	var samples <-chan time.Time // without a limit, it stays nil, and a nil channel is never ready
+	if spec.MaxRSS > 0 {
+		ticker := time.NewTicker(rssInterval)
+		defer ticker.Stop()
+		samples = ticker.C
+	}
 	var waitErr error
-	timedOut, canceled := false, false
-	select {
-	case waitErr = <-done:
-	case <-timer.C:
-		timedOut = true
-		waitErr = stopProcess(cmd, done, spec.KillGrace)
-	case <-ctx.Done():
-		canceled = true
-		killProcess(cmd)
-		waitErr = <-done
+	stoppedAs := "" // the kind of the stop, when the supervisor stopped the process
+wait:
+	for {
+		select {
+		case waitErr = <-done:
+			break wait
+		case <-timer.C:
+			stoppedAs = kindTimeout
+			waitErr = stopProcess(cmd, done, spec.KillGrace)
+			break wait
+		case <-ctx.Done():
+			stoppedAs = kindCanceled
+			killProcess(cmd)
+			waitErr = <-done
+			break wait
+		case <-samples:
+			// ps fails when the process has exited, and then the next select gets the result.
+			rss, err := residentBytes(cmd.Process.Pid)
+			if err == nil && rss > spec.MaxRSS {
+				// The kill does not wait for stacks, because the memory can grow fast.
+				stoppedAs, outcome.RSS = kindMemory, rss
+				killProcess(cmd)
+				waitErr = <-done
+				break wait
+			}
+		}
 	}
 	outputFile.Close()
-	if canceled {
+	if stoppedAs == kindCanceled {
 		outcome.Kind = kindCanceled
 		return outcome, nil
 	}
@@ -142,10 +169,10 @@ func runWorker(ctx context.Context, spec runSpec) (runOutcome, error) {
 	outcome.Result = readResult(resultPath)
 	if cmd.ProcessState != nil {
 		outcome.Exit = cmd.ProcessState.String()
-		outcome.Signaled = !timedOut && cmd.ProcessState.ExitCode() == -1
+		outcome.Signaled = stoppedAs == "" && cmd.ProcessState.ExitCode() == -1
 	}
-	outcome.Kind = classify(outcome.Result, waitErr, outcome.Output, timedOut)
-	outcome.FirstLine, outcome.Report = describe(outcome, spec.Timeout)
+	outcome.Kind = classify(outcome.Result, waitErr, outcome.Output, stoppedAs)
+	outcome.FirstLine, outcome.Report = describe(outcome, spec)
 	return outcome, nil
 }
 
@@ -164,10 +191,11 @@ func stopProcess(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
 }
 
 // classify returns the kind of a run.
-func classify(result *workerResult, waitErr error, output string, timedOut bool) string {
+// stoppedAs is kindTimeout or kindMemory when the supervisor stopped the process for that cause, and empty otherwise.
+func classify(result *workerResult, waitErr error, output string, stoppedAs string) string {
 	switch {
-	case timedOut:
-		return kindTimeout
+	case stoppedAs != "":
+		return stoppedAs
 	case result != nil && !result.Passed:
 		return kindFail
 	case result != nil && waitErr == nil:
@@ -180,7 +208,7 @@ func classify(result *workerResult, waitErr error, output string, timedOut bool)
 }
 
 // describe returns the first line and the report of a run.
-func describe(outcome runOutcome, timeout time.Duration) (firstLine, report string) {
+func describe(outcome runOutcome, spec runSpec) (firstLine, report string) {
 	switch outcome.Kind {
 	case kindPass:
 		return "", ""
@@ -193,7 +221,9 @@ func describe(outcome runOutcome, timeout time.Duration) (firstLine, report stri
 	case kindPanic:
 		firstLine = crashMessage(outcome.Output)
 	case kindTimeout:
-		firstLine = fmt.Sprintf("timeout: the run did not stop in %v", timeout)
+		firstLine = fmt.Sprintf("timeout: the run did not stop in %v", spec.Timeout)
+	case kindMemory:
+		firstLine = fmt.Sprintf("memory: the worker used %d MiB of RSS, more than the limit of %d MiB", outcome.RSS>>20, spec.MaxRSS>>20)
 	default:
 		firstLine = outcome.Exit
 		if line := firstLineOf(outcome.Output); line != "" {

@@ -18,12 +18,18 @@ const (
 type counters struct {
 	Runs     int
 	Failures map[string]int // failed seeds for each kind
+	// MemoryKills counts the runs that passed -max-rss; they are not failures.
+	MemoryKills int
 }
 
 // add counts one run.
 func (counts *counters) add(outcome runOutcome) {
 	counts.Runs++
-	if outcome.Kind != kindPass {
+	switch outcome.Kind {
+	case kindPass:
+	case kindMemory:
+		counts.MemoryKills++
+	default:
 		counts.Failures[outcome.Kind]++
 	}
 }
@@ -39,6 +45,9 @@ type status struct {
 	Failures   map[string]int `json:"failures"`
 	BuildError string         `json:"build_error,omitempty"`
 	Errors     []errorRecord  `json:"errors"` // the most frequent first; a shrink run that fails with a different error adds a seed here too
+	// MemoryKills counts the runs that the supervisor killed at -max-rss.
+	// They are not failures of KVLite, and the log names their seeds.
+	MemoryKills int `json:"memory_kills"`
 }
 
 // newStatus makes a status from the counters and the errors.
@@ -52,6 +61,7 @@ func newStatus(current *build, platform string, counts counters, errors []errorR
 		Failures: make(map[string]int),
 		Errors:   errors,
 	}
+	result.MemoryKills = counts.MemoryKills
 	if current.Dirty {
 		result.Commit += "-dirty"
 	}
@@ -67,5 +77,5 @@ func (current status) summary() string {
 	for _, kind := range []string{kindFail, kindPanic, kindTimeout, kindError} {
 		fmt.Fprintf(&failures, " %s %d", kind, current.Failures[kind])
 	}
-	return fmt.Sprintf("%s up %s: runs %d,%s, errors %d", current.Commit, current.Uptime, current.Runs, failures.String(), len(current.Errors))
+	return fmt.Sprintf("%s up %s: runs %d,%s, memory kills %d, errors %d", current.Commit, current.Uptime, current.Runs, failures.String(), current.MemoryKills, len(current.Errors))
 }

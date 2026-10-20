@@ -102,8 +102,13 @@ func (s *supervisor) run() error {
 	return nil
 }
 
-// prepare makes the output directories and keeps the status of an earlier supervisor.
+// prepare checks that the supervisor can read the RSS of a process, makes the output directories, and keeps the status of an earlier supervisor.
 func (s *supervisor) prepare() error {
+	if s.opts.maxRSS > 0 {
+		if _, err := residentBytes(os.Getpid()); err != nil {
+			return fmt.Errorf("-max-rss needs the RSS of the workers, but the supervisor cannot read it: %w", err)
+		}
+	}
 	temporary := filepath.Join(s.opts.out, "tmp")
 	// Remove the working directories that an earlier supervisor left when it died.
 	if err := os.RemoveAll(temporary); err != nil {
@@ -145,7 +150,11 @@ func (s *supervisor) archiveStatus() error {
 func (s *supervisor) serve(current *build, follow *follower, ticks <-chan time.Time) {
 	s.setBuild(current, nil)
 	s.pruneBinaries()
-	s.logf("compiled %s with %s; %d workers; lanes %s", current.Binary, current.GoVersion, s.opts.workers, s.opts.lanes)
+	limit := "no memory limit"
+	if s.opts.maxRSS > 0 {
+		limit = fmt.Sprintf("a memory limit of %d MiB of RSS for each worker", s.opts.maxRSS>>20)
+	}
+	s.logf("compiled %s with %s; %d workers with %s; lanes %s", current.Binary, current.GoVersion, s.opts.workers, limit, s.opts.lanes)
 	if s.opts.duration > 0 {
 		time.AfterFunc(s.opts.duration, s.stopCancel)
 	}
@@ -308,6 +317,7 @@ func (s *supervisor) execute(current *build, seed uint64, steps int) (runOutcome
 		Timeout:     s.opts.timeout,
 		KillGrace:   killGrace,
 		MemoryLimit: s.opts.memoryLimit,
+		MaxRSS:      s.opts.maxRSS,
 		TempDir:     filepath.Join(s.opts.out, "tmp"),
 	})
 	if err != nil {
@@ -336,7 +346,11 @@ func (s *supervisor) handleSeed(current *build, outcome runOutcome, err error) {
 	s.mu.Lock()
 	s.counts.add(outcome)
 	s.mu.Unlock()
-	if outcome.Kind != kindPass {
+	switch outcome.Kind {
+	case kindPass:
+	case kindMemory:
+		s.logf("seed %d (%d steps): %s; this is not a KVLite failure", outcome.Seed, outcome.Steps, outcome.FirstLine)
+	default:
 		s.recordFailure(current, outcome)
 	}
 }
@@ -433,8 +447,12 @@ func (s *supervisor) shrink(job shrinkJob) {
 		if s.stopped(outcome) {
 			return "", errStopped
 		}
-		if outcome.Kind == kindPass {
+		switch outcome.Kind {
+		case kindPass:
 			return "", nil
+		case kindMemory:
+			// The result of the run is unknown, so the search stops.
+			return "", errors.New(outcome.FirstLine)
 		}
 		if s.currentBuild() != job.build {
 			// The runner changed to a new commit, and the status of the old commit is closed.

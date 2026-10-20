@@ -24,6 +24,7 @@ type options struct {
 	workers        int
 	timeout        time.Duration
 	memoryLimit    string
+	maxRSS         int64 // zero means no limit
 	lanes          string
 	duration       time.Duration
 	reports        bool
@@ -54,9 +55,10 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	flags.StringVar(&opts.repo, "repo", ".", "KVLite `checkout` to compile; follow mode changes it, so give the runner its own checkout")
 	flags.StringVar(&opts.out, "out", "blackout-results", "output `directory` for the status and the reports")
 	flags.StringVar(&opts.goTool, "go", "go", "Go `command` that compiles the test binary")
-	flags.IntVar(&opts.workers, "workers", runtime.NumCPU(), "number of worker processes that run at the same time")
+	flags.IntVar(&opts.workers, "workers", 0, "number of worker processes that run at the same time (default: half the cores, and at most half the RAM divided by -max-rss)")
 	flags.DurationVar(&opts.timeout, "timeout", 5*time.Minute, "time limit of one worker")
 	flags.StringVar(&opts.memoryLimit, "memlimit", "2GiB", "soft memory `limit` of one worker (GOMEMLIMIT)")
+	maxRSS := flags.String("max-rss", fmt.Sprintf("%dGiB", defaultMaxRSS>>30), "hard memory `limit` of one worker: the supervisor kills a worker whose RSS is larger; off removes the limit")
 	flags.StringVar(&opts.lanes, "lanes", "default=80:steps=300,long=20:steps=3000", "lanes as name=weight:steps=N, with a comma between two lanes")
 	flags.DurationVar(&opts.duration, "duration", 0, "stop after this time; zero runs until a signal")
 	flags.BoolVar(&opts.reports, "reports", false, "write the full report of each failed seed to reports/SEED.txt; a replay of the seed gives the same report")
@@ -70,6 +72,15 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 			return opts, nil, err
 		}
 		return opts, nil, errUsage
+	}
+	var err error
+	if opts.maxRSS, err = parseBytes(*maxRSS); err != nil {
+		return opts, nil, fmt.Errorf("-max-rss: %w", err)
+	}
+	workersSet := false
+	flags.Visit(func(set *flag.Flag) { workersSet = workersSet || set.Name == "workers" })
+	if !workersSet {
+		opts.workers = defaultWorkers(runtime.NumCPU(), physicalMemory(), opts.maxRSS)
 	}
 	switch {
 	case flags.NArg() > 0:

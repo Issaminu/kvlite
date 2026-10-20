@@ -41,7 +41,8 @@ IOSchedulingClass=idle
 KillMode=mixed
 TimeoutStopSec=6min
 
-# GOMEMLIMIT is a soft limit for each worker; MemoryMax is a hard limit for all processes together.
+# GOMEMLIMIT is a soft limit for each worker, and -max-rss is a hard limit for each worker.
+# MemoryMax is a hard limit for all processes together.
 #MemoryMax=8G
 
 # The service writes only in its own directory.
