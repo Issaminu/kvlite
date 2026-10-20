@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -126,19 +127,26 @@ func TestBlackout(t *testing.T) {
 		}
 		return
 	}
+	t.Parallel()
 	seeds := *blackoutSeeds
 	if testing.Short() {
 		seeds = min(seeds, 8)
 	}
-	failures := 0
+	// The seeds share no state, so each seed is a parallel subtest, and -parallel limits the seeds that run at the same time.
+	var failures atomic.Int64
 	for index := range seeds {
-		result := blackout.Run(target, *blackoutStart+uint64(index), blackout.Settings{Steps: *blackoutSteps, DeepCheck: *blackoutDeepCheck})
-		if result.Err != nil {
-			t.Error(result.Err)
-			if failures++; failures == *blackoutMaxFailures {
-				t.Fatalf("stopped after %d failed seeds", failures)
+		seed := *blackoutStart + uint64(index)
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) {
+			t.Parallel()
+			if failures.Load() >= int64(*blackoutMaxFailures) {
+				t.Skipf("stopped after %d failed seeds", *blackoutMaxFailures)
 			}
-		}
+			result := blackout.Run(target, seed, blackout.Settings{Steps: *blackoutSteps, DeepCheck: *blackoutDeepCheck})
+			if result.Err != nil {
+				failures.Add(1)
+				t.Fatal(result.Err)
+			}
+		})
 	}
 }
 
@@ -176,11 +184,18 @@ func TestBlackoutCoverage(t *testing.T) {
 	if testing.Short() {
 		t.Skip("the coverage test runs many seeds")
 	}
+	t.Parallel()
 	const seeds = 96
-	results := make([]blackout.Result, 0, seeds)
-	for seed := uint64(1); seed <= seeds; seed++ {
-		results = append(results, blackout.Run(target, seed, blackout.Settings{Steps: 150}))
-	}
+	results := make([]blackout.Result, seeds)
+	// Run returns after all parallel subtests of the group, so the coverage check below sees every result.
+	t.Run("seeds", func(t *testing.T) {
+		for index := range results {
+			t.Run(fmt.Sprintf("seed=%d", index+1), func(t *testing.T) {
+				t.Parallel()
+				results[index] = blackout.Run(target, uint64(index+1), blackout.Settings{Steps: 150})
+			})
+		}
+	})
 	for _, missing := range blackout.MissingCoverage(results) {
 		t.Errorf("%d seeds did not reach: %s", seeds, missing)
 	}

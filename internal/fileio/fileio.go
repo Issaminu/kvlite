@@ -42,6 +42,13 @@ func WriteFullAt(w io.WriterAt, data []byte, offset int64) error {
 	return nil
 }
 
+// SkipDriveCacheFlushForTesting makes [Sync] and [SyncData] use fsync(2) for an [*os.File] on macOS, and not F_FULLFSYNC.
+// F_FULLFSYNC also flushes the cache of the drive, so the data survives a power failure, but each call takes some milliseconds.
+// fsync(2) on macOS does not flush that cache, so a power failure can lose the synced data.
+// Only a test binary sets it, before it opens a database.
+// Other platforms ignore it.
+var SkipDriveCacheFlushForTesting bool
+
 // Sync flushes file data and metadata to storage.
 // It skips directory sync on Windows.
 func Sync(file *os.File) error {
@@ -53,6 +60,10 @@ func Sync(file *os.File) error {
 		if info.IsDir() {
 			return nil
 		}
+	}
+	if runtime.GOOS == "darwin" && SkipDriveCacheFlushForTesting {
+		// SyncData on macOS uses fsync(2) for this case.
+		return SyncData(file)
 	}
 	return file.Sync()
 }
