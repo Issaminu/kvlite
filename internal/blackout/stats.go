@@ -102,6 +102,7 @@ func (stats *Stats) Add(other Stats) {
 	stats.Disk.InjectedFaults += other.Disk.InjectedFaults
 	stats.Disk.DroppedSyncs += other.Disk.DroppedSyncs
 	stats.Disk.DroppedCaches += other.Disk.DroppedCaches
+	stats.Disk.RevertedSyncs += other.Disk.RevertedSyncs
 	stats.Disk.NoSpaceErrors += other.Disk.NoSpaceErrors
 	stats.Disk.ReadCorruptions += other.Disk.ReadCorruptions
 	stats.Disk.TornSectors += other.Disk.TornSectors

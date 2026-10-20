@@ -129,6 +129,11 @@ type Config struct {
 	// DropCache is the probability that a failed sync also drops the dropped changes from the cache view, so reads return the durable bytes.
 	DropCache Ratio
 
+	// RevertFailedSync makes a failed sync behave as on Btrfs: no unsynced change of the file reaches storage, and the cache view becomes the durable view again.
+	// Without it, a failed sync behaves as on ext4 and XFS: some writes reach storage, every truncate reaches storage, and the cache keeps the new bytes unless DropCache drops them.
+	// Rebello et al., "Can Applications Recover from fsync Failures?" (USENIX ATC 2020), §3.3 and Table 1.
+	RevertFailedSync bool
+
 	// KeepChange is the probability that a power failure keeps one unsynced sector, truncate, file length, or name change.
 	// Zero means one half.
 	KeepChange Ratio
@@ -150,6 +155,7 @@ type Stats struct {
 	InjectedFaults   int // injected errors of all kinds
 	DroppedSyncs     int // failed syncs that dropped unsynced changes for good
 	DroppedCaches    int // failed syncs that also dropped those changes from the cache view, so a running process loses them
+	RevertedSyncs    int // failed syncs that reverted the file to its durable bytes, as Btrfs does
 	ProcessCrashes   int // restarts that kept the cache view
 	PowerFailures    int // restarts that kept only the durable view and a random part of the unsynced changes
 	ScheduledCrashes int // crashes inside a call
@@ -1475,6 +1481,24 @@ func (f *file) Sync() error {
 		return crashedError("sync", f.name)
 	}
 	if !fsys.noSyncFaults && fsys.inject(fsys.config.SyncFault) {
+		if fsys.config.RevertFailedSync {
+			// Like Btrfs after a writeback error: the file goes back to its durable data and metadata, and the cache shows those bytes again.
+			if len(node.pending) > 0 {
+				fsys.stats.DroppedSyncs++
+			}
+			node.pending = nil
+			result := "injected"
+			if !bytes.Equal(node.data, node.durable) {
+				// What reads see changes, as after a dropped cache.
+				fsys.stats.RevertedSyncs++
+				fsys.stats.DroppedCaches++
+				result = "injected, reverted"
+				node.data = slices.Clone(node.durable)
+				refreshMappings(node)
+			}
+			fsys.record(Event{Mutation: fsys.mutations, Op: "sync", Name: f.name, Result: result})
+			return injectedError("sync", f.name)
+		}
 		// Like Linux after a writeback error: some writes reach storage, the kernel marks the others clean, and a later sync does not write them.
 		// A truncate changes metadata, and the file-system journal keeps it, so it reaches storage.
 		for _, pending := range node.pending {

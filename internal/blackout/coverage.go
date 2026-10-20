@@ -110,6 +110,7 @@ func MissingCoverage(results []Result) []string {
 		{"injected I/O error", total.Disk.InjectedFaults},
 		{"failed sync that dropped changes", total.Disk.DroppedSyncs},
 		{"failed sync that dropped the cache view", total.Disk.DroppedCaches},
+		{"failed sync that reverted the file, as on Btrfs", total.Disk.RevertedSyncs},
 		{"disk-full error", total.Disk.NoSpaceErrors},
 		{"read that returned a flipped bit", total.Disk.ReadCorruptions},
 		{"torn sector", total.Disk.TornSectors},

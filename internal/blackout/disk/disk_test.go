@@ -760,6 +760,38 @@ func TestFailedSyncKeepsTruncates(t *testing.T) {
 	}
 }
 
+// On Btrfs, a failed sync reverts the data and the metadata of the file, and the cache shows the old bytes again.
+func TestFailedSyncRevertsLikeBtrfs(t *testing.T) {
+	for seed := range uint64(20) {
+		fsys := New(seed, Config{SyncFault: Always, RevertFailedSync: true})
+		file := openRW(t, fsys, testName)
+		original := bytes.Repeat([]byte{'a'}, 64)
+		mustWrite(t, file, original, 0)
+		mustSync(t, file)
+		if err := file.Truncate(16); err != nil {
+			t.Fatal(err)
+		}
+		mustWrite(t, file, bytes.Repeat([]byte{'b'}, 32), 8)
+		fsys.SetFaults(true)
+		if err := file.Sync(); err == nil {
+			t.Fatal("the sync did not fail")
+		}
+		fsys.SetFaults(false)
+		cache, durable, _ := fsys.FileData(testName)
+		if !bytes.Equal(durable, original) || !bytes.Equal(cache, original) {
+			t.Fatalf("seed %d: after a reverted sync: cache %q, durable %q, want both %q", seed, cache, durable, original)
+		}
+		if stats := fsys.Stats(); stats.RevertedSyncs != 1 || stats.DroppedCaches != 1 {
+			t.Fatalf("seed %d: reverted syncs %d, dropped caches %d, want 1 and 1", seed, stats.RevertedSyncs, stats.DroppedCaches)
+		}
+		// A later sync has nothing to write.
+		mustSync(t, file)
+		if _, durable, _ := fsys.FileData(testName); !bytes.Equal(durable, original) {
+			t.Fatalf("seed %d: durable bytes after a later sync: %q", seed, durable)
+		}
+	}
+}
+
 func TestMisdirectedWriteMovesDataAndHealRestoresIt(t *testing.T) {
 	moved := false
 	for seed := range uint64(200) {
