@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -774,39 +775,53 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 		meta0Err = validateMeta(meta0)
 	}
 
-	// Metadata page 1 starts at the database page size. A supported page-size field from page 0 can locate it after page 0 fails validation. The new-file page size is the second choice because every new database uses that size.
-	pageSizes := make([]int64, 0, 2)
-	if meta0 != nil && validMetaPageSize(meta0.PageSize()) {
+	// Metadata page 1 starts at the database page size, so a valid page 0 gives its offset.
+	// After page 0 fails validation, its page-size field can be damaged too.
+	// So Open then tries the common operating-system page sizes, most common first: 4 KiB (Linux and Windows), 16 KiB (macOS on Apple silicon), and 64 KiB (some Linux on ARM and POWER).
+	// Then it tries every other supported page size in increasing order, as bbolt does.
+	var pageSizes []int64
+	if meta0Err == nil {
 		pageSizes = append(pageSizes, meta0.PageSize())
-	}
-	newFilePageSize := db.options.newFilePageSize()
-	if validMetaPageSize(newFilePageSize) && (len(pageSizes) == 0 || pageSizes[0] != newFilePageSize) {
-		pageSizes = append(pageSizes, newFilePageSize)
+	} else {
+		pageSizes = append(pageSizes, 4096, 16384, 65536)
+		for pageSize := int64(1); pageSize <= MaxValueSize; pageSize *= 2 {
+			if validMetaPageSize(pageSize) && !slices.Contains(pageSizes, pageSize) {
+				pageSizes = append(pageSizes, pageSize)
+			}
+		}
 	}
 
 	var meta1 *page.Meta
 	meta1Err := error(page.ErrInvalid)
+	fileEnd := int64(math.MaxInt64) // no metadata copy starts at or after this offset
 	for _, pageSize := range pageSizes {
+		if pageSize >= fileEnd {
+			continue
+		}
 		candidate, readErr := db.readMetaAt(pageSize)
 		if errors.Is(readErr, errMetaRead) {
 			return nil, 0, readErr
 		}
 		if readErr != nil {
+			// The file ends before this offset, so it also ends before every larger offset.
 			meta1Err = errors.Join(meta1Err, readErr)
+			fileEnd = pageSize
+			continue
+		}
+		// A copy counts only at the offset that its page-size field gives.
+		// The other offsets hold the zero padding of page 0 or the start of a tree or allocation page.
+		if candidate.PageSize() != pageSize {
 			continue
 		}
 
 		candidateErr := validateMeta(candidate)
-		if candidateErr == nil && candidate.PageSize() != pageSize {
-			candidateErr = fmt.Errorf("metadata page size %d does not match page offset %d: %w", candidate.PageSize(), pageSize, page.ErrInvalid)
-		}
 		if candidateErr == nil {
 			meta1 = candidate
 			meta1Err = nil
 			break
 		}
-		if walPageSize == 0 && validMetaPageSize(candidate.PageSize()) {
-			walPageSize = candidate.PageSize()
+		if walPageSize == 0 {
+			walPageSize = pageSize
 		}
 		meta1Err = errors.Join(meta1Err, candidateErr)
 	}
@@ -828,7 +843,8 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 	}
 
 	// WAL decoding needs a page size before it can recover metadata. A supported field from an invalid metadata copy can set this size. It never makes that copy valid or assigns it to db.meta.
-	if meta0 != nil && validMetaPageSize(meta0.PageSize()) {
+	// A copy of page 1 at the offset that its own field gives is the better source, because two facts agree there.
+	if walPageSize == 0 && meta0 != nil && validMetaPageSize(meta0.PageSize()) {
 		walPageSize = meta0.PageSize()
 	}
 	return nil, walPageSize, errors.Join(

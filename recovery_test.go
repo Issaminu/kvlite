@@ -524,6 +524,87 @@ func TestRecovery_DamagedMetadataPageSizeKeepsCommittedData(t *testing.T) {
 	checkKeys(reopened, "Open after the damage is gone")
 }
 
+// Open must find metadata page 1 when damage stays in the page-size field of metadata page 0.
+// Page 0 then gives no offset for page 1, and a host with 4 KiB pages gives no offset for 16 KiB pages either.
+// So Open tries every supported page size, as bbolt does.
+// Before, every Open of such a file failed, although page 1 and the WAL were intact.
+func TestRecovery_FindsMetadataPage1AfterPage0Damage(t *testing.T) {
+	const databasePageSize, hostPageSize = 16384, 4096
+	for _, test := range []struct {
+		name         string
+		page0Damage  byte // the changed bits in byte 9, in the page-size field of page 0
+		committedWAL bool
+		damageMeta1  bool // a changed bit in the high-water field of page 1 breaks its checksum but keeps its page-size field
+	}{
+		{name: "checkpointed", page0Damage: 0x80},
+		{name: "committed WAL", page0Damage: 0x80, committedWAL: true},
+		{name: "both copies damaged, committed WAL", page0Damage: 0x80, committedWAL: true, damageMeta1: true},
+		// Two changed bits make 16384 into 32768, which is a power of two, so only page 1 can give the WAL page size.
+		{name: "both copies damaged, page 0 gives another power of two", page0Damage: 0xc0, committedWAL: true, damageMeta1: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := open(path, 0o600, &Options{CheckpointThresholdBytes: 1 << 40, pageSize: databasePageSize}, fileio.OSFS{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			createBucket(t, db, testBucketName)
+			value := bytes.Repeat([]byte{'v'}, 3000)
+			const keys = 8
+			for index := range keys {
+				if err := db.Put(testBucketName, []byte(fmt.Sprintf("key-%03d", index)), value); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Without a checkpoint, the commits are only in the WAL, as after a process crash.
+			main, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			log, err := os.ReadFile(path + "-wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !test.committedWAL {
+				// Close checkpointed every commit.
+				if main, err = os.ReadFile(path); err != nil {
+					t.Fatal(err)
+				}
+				log = nil
+			}
+			// Byte 9 is in the page-size field of metadata page 0, and bit 79 makes 16384 into 49152.
+			main[9] ^= test.page0Damage
+			if test.damageMeta1 {
+				main[databasePageSize+20] ^= 0x01
+			}
+			if err := os.WriteFile(path, main, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path+"-wal", log, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			reopened, err := open(path, 0o600, &Options{pageSize: hostPageSize}, fileio.OSFS{})
+			if err != nil {
+				t.Fatalf("Open with damaged metadata page 0: %v", err)
+			}
+			defer reopened.Close()
+			if got := reopened.meta.PageSize(); got != databasePageSize {
+				t.Fatalf("page size: got %d, want %d", got, databasePageSize)
+			}
+			for index := range keys {
+				got, err := reopened.Get(testBucketName, []byte(fmt.Sprintf("key-%03d", index)))
+				if err != nil || !bytes.Equal(got, value) {
+					t.Fatalf("key %d: got %d bytes, error %v", index, len(got), err)
+				}
+			}
+		})
+	}
+}
+
 func TestCommittedWALRecords_StopsAtInvalidTransaction(t *testing.T) {
 	stable := wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: 3, TxID: 1}}
 	marker := wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: 2}}
