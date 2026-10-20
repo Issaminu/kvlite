@@ -42,6 +42,8 @@ jobs:
       ENGINES: ${{ inputs.engines || 'kvlite,bbolt,redis' }}
       CASE: ${{ inputs.case || '' }}
       PROFILING: ${{ inputs.profiling || false }}
+      # The Tests workflow runs the tests for pushes and pull requests. A manual run can use a branch that no other workflow tests.
+      SKIP_TESTS: ${{ github.event_name != 'workflow_dispatch' }}
     steps:
       - uses: actions/checkout@v5
 
@@ -53,6 +55,9 @@ jobs:
           fi
           if [[ "$PROFILING" == true ]]; then
             args+=("--profile")
+          fi
+          if [[ "$SKIP_TESTS" == true ]]; then
+            args+=("--skip-tests")
           fi
           ./benchmarks/kvbench/run-docker.sh "${args[@]}"
 

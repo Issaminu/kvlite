@@ -15,7 +15,7 @@ readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile] [--profile-engines=kvlite,bbolt,redis]"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile] [--profile-engines=kvlite,bbolt,redis] [--skip-tests]"
 benchmark_scale="light"
 engine_option="--engines=kvlite,bbolt,redis"
 workload_option=""
@@ -23,6 +23,7 @@ storage_option=""
 case_option=""
 profile_enabled=0
 profile_engine_csv=""
+skip_tests=0
 scale_set=0
 engine_set=0
 workload_set=0
@@ -90,6 +91,14 @@ for argument in "$@"; do
 			exit 1
 		fi
 		;;
+	--skip-tests)
+		# Skip the KVLite and KVBench tests before measurement when another job runs them, for example the Tests workflow.
+		if ((skip_tests)); then
+			echo "select --skip-tests once" >&2
+			exit 1
+		fi
+		skip_tests=1
+		;;
 	*)
 		echo "${usage}" >&2
 		exit 1
@@ -98,6 +107,7 @@ for argument in "$@"; do
 done
 readonly benchmark_scale
 readonly engine_option
+readonly skip_tests
 case "${benchmark_scale}" in
 light)
 	measured_count=3
@@ -548,8 +558,15 @@ fi
 ) >"${results_dir}/source-sha256.txt"
 
 if [[ "${benchmark_scale}" != "light" ]]; then
-	run_root_tests
-	run_go durable "" -count=1 ./...
+	if ((skip_tests)); then
+		# The Redis contract test checks the settings of this run's Redis server, so no other job can run it.
+		if ((uses_redis)); then
+			run_go durable "" -count=1 -run '^TestRedisEngineContract$' ./...
+		fi
+	else
+		run_root_tests
+		run_go durable "" -count=1 ./...
+	fi
 	if ((uses_redis)) && [[ "${benchmark_workload}" != "reads" ]]; then
 		if [[ "${benchmark_storage}" == "volume" ]]; then
 			verify_redis_reopen_after_kill

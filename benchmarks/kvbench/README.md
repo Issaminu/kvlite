@@ -24,7 +24,7 @@ See the repository [benchmark report](../../BENCHMARKS.md) for the latest full r
 
 ## Run benchmarks on GitHub Actions
 
-The [test workflow](../../.github/workflows/ci.yml) tests both Go modules on each pull request and push to main. The [KVBench workflow](../../.github/workflows/kvbench.yml) runs the Docker runner below on a remote machine. Pull requests use `light`, `focused`, and all three engines. Pushes to main use `medium`, `all`, and all three engines. Normal runs measure both durability modes. Each run saves the raw results and environment record as a workflow artifact.
+The [test workflow](../../.github/workflows/ci.yml) tests both Go modules on each pull request and push to main. The [KVBench workflow](../../.github/workflows/kvbench.yml) runs the Docker runner below on a remote machine. Pull requests use `light`, `focused`, and all three engines. Pushes to main use `medium`, `all`, and all three engines. Pushes and pull requests pass `--skip-tests`, because the test workflow runs those tests. A manual run keeps the tests, because no other workflow tests its branch. Normal runs measure both durability modes. Each run saves the raw results and environment record as a workflow artifact.
 
 To run a selected branch away from your computer, commit and push its changes. GitHub Actions cannot read changes that stay on your computer. After the workflow is on the default branch, start a manual run with the scale, workload, and engines you need:
 
@@ -125,7 +125,7 @@ A large run is suitable for environment-specific publication. Keep the raw value
 
 All scales use pinned Go and Redis images. The Go module pins bbolt and go-redis. The runner uses the current KVLite checkout and runs the selected engines on Linux. Light uses `tmpfs` by default for quick development feedback. Medium and large use a Docker volume by default for storage-sensitive results. An explicit `--storage` value overrides these defaults. The runner keeps the Go module and build caches in the `kvlite-kvbench-go-cache` Docker volume. The cache reduces repeat-run setup time. It does not contain benchmark data.
 
-The full warm-up pass prepares the executable, container, and shared operating-system state. It does not reuse a measured database fixture. Read-latency cases also perform unrecorded operations against their own loaded fixture before they start the timer. Medium and large run the correctness tests before warm-up and measurement. Light skips these tests.
+The full warm-up pass prepares the executable, container, and shared operating-system state. It does not reuse a measured database fixture. Read-latency cases also perform unrecorded operations against their own loaded fixture before they start the timer. Medium and large run the correctness tests before warm-up and measurement. Light skips these tests. `--skip-tests` also skips them, except the Redis contract test, because only this run's Redis server has the settings that the test checks.
 
 The Docker scales use up to four CPUs by default. Advanced runs can set `KVBENCH_CPUSET` to select another shared CPU set. All scales can set `KVBENCH_RESULTS_DIR` to select the output directory.
 
