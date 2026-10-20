@@ -426,6 +426,10 @@ func TestRecovery_UsesSyncMode(t *testing.T) {
 				}
 				// A failed WAL sync stops this WAL, so a new Open recovers again.
 				db.wal.SetSyncFileForTesting(nil)
+				// On Linux, the mapping keeps the main file and its lock after the descriptor closes.
+				if err := db.unmapMainFile(); err != nil {
+					t.Fatal(err)
+				}
 				if err := db.closeFiles(); err != nil {
 					t.Fatal(err)
 				}
