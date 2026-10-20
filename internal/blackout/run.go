@@ -284,6 +284,8 @@ func (runner *runner) updateFloor() {
 	}
 	if runner.tainted {
 		runner.clearTaint()
+		// A checkpoint up to now either moved the floor here, or ran while the storage was tainted, so it must not move the floor again later.
+		runner.checkpointCount = runner.target.CheckpointCount(runner.db)
 		return
 	}
 	switch runner.session.sync {
