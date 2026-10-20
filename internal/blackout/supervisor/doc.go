@@ -97,6 +97,17 @@
 // The shorter run then becomes the first seed of the error.
 // At most one shrink runs at a time, and its runs use the same worker slots as the new seeds.
 //
+// # Issues
+//
+// With -issues OWNER/NAME, the supervisor makes a GitHub issue for each new error, with the token in the environment variable GITHUB_TOKEN.
+// A fine-grained token with the permission "Issues: Read and write" on the repository is enough.
+// The issue says that a program made it, and it holds the error, the seed, the step count, the failed step, the commit, the platform, the replay command, and the report of the run.
+// When the same error comes back while its issue is open, for example on a new commit or after a restart, the supervisor adds a comment instead.
+// An error that comes back on a new commit after its issue was closed gets a new issue.
+// When the shrink finds a shorter run, the supervisor adds it to the issue in a comment.
+// One commit makes at most 5 new issues, so a broken commit cannot make many.
+// The calls to GitHub run in the background with a time limit, and a failed call only goes into the log.
+//
 // # Output
 //
 // status.json is the result of the runs of the current commit, rewritten every few seconds.

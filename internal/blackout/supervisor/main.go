@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -30,6 +31,7 @@ type options struct {
 	steps          int   // safety-phase steps of every seed; zero means defaultLanes
 	duration       time.Duration
 	reports        bool
+	issues         string // owner/name of the GitHub repository for automatic issues; empty means none
 	follow         bool
 	followInterval time.Duration
 	remote         string
@@ -64,6 +66,7 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 	flags.IntVar(&opts.steps, "steps", 0, "safety-phase steps of every seed, for example for a quick check (default: 80% of the seeds with 300 steps and 20% with 3000 steps)")
 	flags.DurationVar(&opts.duration, "duration", 0, "stop after this time; zero runs until a signal")
 	flags.BoolVar(&opts.reports, "reports", false, "write the full report of each failed seed to reports/SEED.txt; a replay of the seed gives the same report")
+	flags.StringVar(&opts.issues, "issues", "", "GitHub `repository` (owner/name) that gets an automatic issue for each new error; the token is in the environment variable GITHUB_TOKEN")
 	flags.BoolVar(&opts.follow, "follow", false, "fetch the remote and check out each new commit of the branch in -repo")
 	flags.DurationVar(&opts.followInterval, "follow-interval", 5*time.Minute, "time between two fetches in follow mode")
 	flags.StringVar(&opts.remote, "remote", "origin", "git remote for follow mode")
@@ -112,6 +115,10 @@ func parseOptions(args []string, output io.Writer) (options, []lane, error) {
 		return opts, nil, errors.New("-steps must not be negative")
 	case opts.timeout <= 0:
 		return opts, nil, errors.New("-timeout must be positive")
+	case opts.issues != "" && strings.Count(opts.issues, "/") != 1:
+		return opts, nil, fmt.Errorf("-issues %q is not a repository of the form owner/name", opts.issues)
+	case opts.issues != "" && os.Getenv("GITHUB_TOKEN") == "":
+		return opts, nil, errors.New("-issues needs a GitHub token in the environment variable GITHUB_TOKEN")
 	case opts.followInterval <= 0:
 		return opts, nil, errors.New("-follow-interval must be positive")
 	case !memoryLimitPattern.MatchString(opts.memoryLimit):

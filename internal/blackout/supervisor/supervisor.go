@@ -39,9 +39,10 @@ type supervisor struct {
 	hard       context.Context    // done when the running workers must die
 	shrinkWake chan struct{}      // gets a value when a shrink job is queued
 	workers    sync.WaitGroup     // runs of new seeds
-	background sync.WaitGroup     // the shrinker
+	background sync.WaitGroup     // the shrinker and the calls to GitHub
 	// memory returns the memory of the system and the available part, as systemMemory does; tests replace it.
 	memory func() (total, available int64)
+	issues *issueTracker // nil without -issues
 
 	mu         sync.Mutex
 	current    *build
@@ -61,7 +62,7 @@ type shrinkJob struct {
 }
 
 func newSupervisor(opts options, lanes []lane, stop context.Context, stopCancel context.CancelFunc, hard context.Context) *supervisor {
-	return &supervisor{
+	s := &supervisor{
 		opts:       opts,
 		lanes:      lanes,
 		errors:     newErrorLog(),
@@ -76,6 +77,10 @@ func newSupervisor(opts options, lanes []lane, stop context.Context, stopCancel 
 		memory:     systemMemory,
 		counts:     counters{Failures: make(map[string]int)},
 	}
+	if opts.issues != "" {
+		s.issues = newIssueTracker(opts.issues, os.Getenv("GITHUB_TOKEN"))
+	}
+	return s
 }
 
 // run compiles the test binary and runs seeds until the stop context is done.
@@ -375,7 +380,7 @@ func (s *supervisor) handleSeed(current *build, outcome runOutcome, err error) {
 
 // recordFailure adds a failed run to the status and returns the text of its error.
 // With -reports, it writes the full report of the run to reports/SEED.txt.
-// For a new error, it queues a shrink.
+// For a new error, it queues a shrink, and with -issues it reports the error to GitHub.
 func (s *supervisor) recordFailure(current *build, outcome runOutcome) string {
 	text := signatureText(outcome.Kind, outcome.FirstLine, outcome.Output)
 	isNew := s.errors.add(text, seedFrom(outcome))
@@ -392,8 +397,23 @@ func (s *supervisor) recordFailure(current *build, outcome runOutcome) string {
 	s.logf("seed %d (%d steps): %s%s", outcome.Seed, outcome.Steps, outcome.FirstLine, marker)
 	if isNew {
 		s.queueShrink(shrinkJob{build: current, text: text, seed: outcome.Seed, steps: outcome.Steps, hint: failedStep(outcome.FirstLine) + 1})
+		s.fileIssue(current, outcome, text)
 	}
 	return text
+}
+
+// fileIssue reports a new error to GitHub in the background, so a slow or failed call never stops the runs.
+func (s *supervisor) fileIssue(current *build, outcome runOutcome, text string) {
+	if s.issues == nil {
+		return
+	}
+	s.background.Go(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), issueTimeout)
+		defer cancel()
+		if err := s.issues.report(ctx, current, s.platform(current), text, outcome); err != nil {
+			s.logf("GitHub issue of seed %d: %v", outcome.Seed, err)
+		}
+	})
 }
 
 // queueShrink adds a shrink job to the queue.
@@ -489,6 +509,13 @@ func (s *supervisor) shrink(job shrinkJob) {
 		return
 	}
 	s.logf("shrank seed %d from %d to %d steps: %s", job.seed, job.steps, steps, job.text)
+	if s.issues != nil && steps < job.steps {
+		ctx, cancel := context.WithTimeout(context.Background(), issueTimeout)
+		defer cancel()
+		if err := s.issues.shrunk(ctx, job.build, job.text, job.seed, steps); err != nil {
+			s.logf("GitHub issue of seed %d: %v", job.seed, err)
+		}
+	}
 }
 
 // pruneBinaries removes the test binaries that neither the current build nor a shrink uses.
@@ -532,10 +559,15 @@ func (s *supervisor) status() status {
 	errors := s.errors.snapshot()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	platform := fmt.Sprintf("%s/%s, %d-byte operating-system pages", s.current.GOOS, s.current.GOARCH, s.pageSize)
-	current := newStatus(s.current, platform, s.counts, errors, s.start, time.Now())
+	current := newStatus(s.current, s.platform(s.current), s.counts, errors, s.start, time.Now())
 	current.BuildError = s.buildError
 	return current
+}
+
+// platform returns the platform of a build: the operating system, the architecture, and the operating-system page size.
+// A seed replays exactly only on a platform with the same page size.
+func (s *supervisor) platform(current *build) string {
+	return fmt.Sprintf("%s/%s, %d-byte operating-system pages", current.GOOS, current.GOARCH, s.pageSize)
 }
 
 // currentBuild returns the test binary of the current commit.

@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"log"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,6 +24,7 @@ func (writer testWriter) Write(data []byte) (int, error) {
 
 // TestSupervisorRecordsAndShrinks runs the loop of the supervisor with the test binary as the worker.
 // Every run of 5 or more steps fails at step 4, so the status must list each failed seed, and the shrink must make one seed 5 steps long.
+// The error must also get one GitHub issue, and the shrink must add the 5-step run to it.
 func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	executable, err := os.Executable()
 	if err != nil {
@@ -46,6 +48,11 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	defer stopCancel()
 	s := newSupervisor(opts, lanes, stop, stopCancel, context.Background())
 	s.logger = log.New(testWriter{t}, "", log.Lmicroseconds)
+	github := &fakeGitHub{open: make(map[string]int), comments: make(map[int][]string)}
+	server := httptest.NewServer(github)
+	defer server.Close()
+	s.issues = newIssueTracker("owner/name", "test-token")
+	s.issues.api = server.URL
 	if err := s.prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +68,7 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		errors := s.errors.snapshot()
-		if len(errors) == 1 && errors[0].Seeds[0].Steps == 5 {
+		if len(errors) == 1 && errors[0].Seeds[0].Steps == 5 && len(github.commentsOf(101)) == 1 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -96,6 +103,9 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	reports, err := filepath.Glob(filepath.Join(out, "reports", "*.txt"))
 	if err != nil || len(reports) != current.Runs {
 		t.Fatalf("reports: %d files for %d failed runs, %v", len(reports), current.Runs, err)
+	}
+	if len(github.issues) != 1 || !strings.Contains(github.commentsOf(101)[0], "-blackout.steps=5") {
+		t.Fatalf("GitHub: %d issues, comments %q", len(github.issues), github.commentsOf(101))
 	}
 	if left, _ := os.ReadDir(filepath.Join(out, "tmp")); len(left) != 0 {
 		t.Fatalf("the runs left %d working directories", len(left))

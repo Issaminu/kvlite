@@ -9,6 +9,9 @@
 #        cd /var/lib/blackout/kvlite && go build -o /var/lib/blackout/bin/blackout-supervisor ./internal/blackout/supervisor
 #   4. Copy this file to /etc/systemd/system/blackout.service and change the paths.
 #   5. Start the service: systemctl enable --now blackout
+#   6. Optional, for an automatic GitHub issue for each new error: add -issues OWNER/NAME to ExecStart,
+#      and write GITHUB_TOKEN=TOKEN into /etc/blackout/github.env (mode 0600, owner root).
+#      A fine-grained token with the permission "Issues: Read and write" on the repository is enough.
 #
 # The status is in /var/lib/blackout/results/status.json, and the log is in journalctl -u blackout.
 
@@ -25,9 +28,11 @@ WorkingDirectory=/var/lib/blackout
 Environment=HOME=/var/lib/blackout
 Environment=GOCACHE=/var/lib/blackout/.cache/go-build
 Environment=PATH=/usr/local/go/bin:/usr/bin:/bin
+# The token for automatic GitHub issues, if the file exists; systemd reads it as root, so only root can read the file.
+EnvironmentFile=-/etc/blackout/github.env
 ExecStart=/var/lib/blackout/bin/blackout-supervisor -repo /var/lib/blackout/kvlite -out /var/lib/blackout/results -follow
 
-# Restart the supervisor when it stops, for example after a failed compile at startup.
+# Restart the supervisor when it stops.
 Restart=always
 RestartSec=60s
 
@@ -35,6 +40,9 @@ RestartSec=60s
 Nice=19
 CPUSchedulingPolicy=idle
 IOSchedulingClass=idle
+# The cgroup of the service is idle too (cgroup v2 cpu.idle).
+# Without it, the service competes with each other service at the normal cgroup weight, also when its threads are idle.
+CPUWeight=idle
 
 # A stop sends SIGTERM to the supervisor only.
 # The supervisor then lets the running workers finish, and systemd kills them after TimeoutStopSec.
