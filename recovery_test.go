@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -94,6 +95,93 @@ func TestRecovery_EmptyMainFileIgnoresTheWAL(t *testing.T) {
 		if err := db.Close(); err != nil {
 			t.Fatal(err)
 		}
+	}
+}
+
+// walOpenCountFS counts the calls that open the WAL, the failed calls among them, and the syncs of the WAL.
+// Its WAL files are not *os.File values, so KVLite syncs them with their Sync method.
+type walOpenCountFS struct {
+	fileio.OSFS
+	opens       int
+	failedOpens int
+	syncs       int
+}
+
+func (fsys *walOpenCountFS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
+	file, err := fsys.OSFS.OpenFile(name, flag, perm)
+	if !strings.HasSuffix(name, "-wal") {
+		return file, err
+	}
+	fsys.opens++
+	if err != nil {
+		fsys.failedOpens++
+		return file, err
+	}
+	return &walSyncCountFile{File: file, fsys: fsys}, nil
+}
+
+type walSyncCountFile struct {
+	fileio.File
+	fsys *walOpenCountFS
+}
+
+func (file *walSyncCountFile) Sync() error {
+	file.fsys.syncs++
+	return file.File.Sync()
+}
+
+// Close removes the WAL, so the Open of a cleanly closed database creates the WAL again.
+// That Open must create it with one call and must not sync it.
+func TestRecovery_CleanOpenCreatesWALWithOneCall(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	fsys := &walOpenCountFS{}
+	db, err = open(path, 0600, &Options{Synchronous: SyncFull}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fsys.opens != 1 || fsys.failedOpens != 0 || fsys.syncs != 0 {
+		t.Errorf("Open of a cleanly closed database: %d WAL opens, %d failed, %d WAL syncs; want 1, 0, 0", fsys.opens, fsys.failedOpens, fsys.syncs)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A WAL that Open finds comes from a process that did not close the database.
+// A writable Open must sync it before it returns, also when it holds no record (see open).
+func TestRecovery_FoundEmptyWALIsSyncedBeforeOpenReturns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+"-wal", nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	fsys := &walOpenCountFS{}
+	db, err = open(path, 0600, &Options{Synchronous: SyncFull}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fsys.syncs != 1 {
+		t.Errorf("Open that found an empty WAL: %d WAL syncs, want 1", fsys.syncs)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

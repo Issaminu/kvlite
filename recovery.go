@@ -50,19 +50,24 @@ func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncD
 	walPath := path + "-wal"
 	var walFile fileio.File
 	var err error
+	var found bool
 
 	if db.options.ReadOnly {
 		walFile, err = fsys.OpenFile(walPath, os.O_RDONLY, 0)
+		found = err == nil
 	} else {
-		walFile, err = fsys.OpenFile(walPath, os.O_RDWR, 0)
-	}
-	found := err == nil
-	if !db.options.ReadOnly && errors.Is(err, os.ErrNotExist) {
 		info, statErr := db.file.Stat()
 		if statErr != nil {
 			return nil, nil, false, statErr
 		}
-		walFile, err = fsys.OpenFile(walPath, os.O_RDWR|os.O_CREATE, info.Mode().Perm())
+		// Close removes the WAL, so the Open of a cleanly closed database creates it.
+		// O_EXCL creates a missing WAL and reports an existing one in the same call, so that Open makes no failed open call.
+		walFile, err = fsys.OpenFile(walPath, os.O_RDWR|os.O_CREATE|os.O_EXCL, info.Mode().Perm())
+		if errors.Is(err, os.ErrExist) {
+			// O_CREATE also creates the target of a dangling symbolic link, which O_EXCL refuses.
+			walFile, err = fsys.OpenFile(walPath, os.O_RDWR|os.O_CREATE, info.Mode().Perm())
+			found = err == nil
+		}
 	}
 
 	if err != nil {
