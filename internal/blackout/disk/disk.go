@@ -858,15 +858,16 @@ func crashedError(op, name string) error {
 }
 
 // OpenFile opens name.
-// It supports os.O_RDONLY, os.O_RDWR, os.O_WRONLY, and os.O_CREATE.
+// It supports os.O_RDONLY, os.O_RDWR, os.O_WRONLY, os.O_CREATE, and os.O_EXCL.
 func (fsys *FS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
 	fsys.mu.Lock()
 	defer fsys.mu.Unlock()
+	_, link := fsys.links[fsys.abs(name)]
 	name = fsys.follow(name)
 	if fsys.crashed {
 		return nil, crashedError("open", name)
 	}
-	if flag&^(os.O_RDONLY|os.O_RDWR|os.O_WRONLY|os.O_CREATE) != 0 {
+	if flag&^(os.O_RDONLY|os.O_RDWR|os.O_WRONLY|os.O_CREATE|os.O_EXCL) != 0 {
 		return nil, &fs.PathError{Op: "open", Path: name, Err: errors.ErrUnsupported}
 	}
 	if fsys.inject(fsys.config.OpenFault) {
@@ -874,6 +875,11 @@ func (fsys *FS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, 
 		return nil, injectedError("open", name)
 	}
 	node, ok := fsys.names[name]
+	// As in open(2), O_CREATE with O_EXCL fails for an existing name, and also for a symbolic link at the name.
+	if flag&(os.O_CREATE|os.O_EXCL) == os.O_CREATE|os.O_EXCL && (ok || link) {
+		fsys.record(Event{Mutation: fsys.mutations, Op: "open", Name: name, Result: "exist"})
+		return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrExist}
+	}
 	if !ok {
 		if flag&os.O_CREATE == 0 {
 			fsys.record(Event{Mutation: fsys.mutations, Op: "open", Name: name, Result: "not exist"})

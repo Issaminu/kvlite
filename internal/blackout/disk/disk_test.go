@@ -854,6 +854,48 @@ func TestRelativeNamesAndSymbolicLinks(t *testing.T) {
 	}
 }
 
+// O_CREATE with O_EXCL creates a missing name and fails with ErrExist for an existing name or a symbolic link, like the operating system.
+func TestExclusiveCreateMatchesOSFile(t *testing.T) {
+	const flag = os.O_RDWR | os.O_CREATE | os.O_EXCL
+	osDir := t.TempDir()
+	osName := filepath.Join(osDir, "file")
+	osFile, err := os.OpenFile(osName, flag, 0o600)
+	if err != nil {
+		t.Fatalf("an exclusive create of a new name on the OS: %v", err)
+	}
+	if err := osFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.OpenFile(osName, flag, 0o600); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("an exclusive create of an existing name on the OS: %v, want ErrExist", err)
+	}
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink("missing", filepath.Join(osDir, "link")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.OpenFile(filepath.Join(osDir, "link"), flag, 0o600); !errors.Is(err, fs.ErrExist) {
+			t.Fatalf("an exclusive create at a dangling link on the OS: %v, want ErrExist", err)
+		}
+	}
+
+	fsys := New(1, Config{})
+	file, err := fsys.OpenFile(testName, flag, 0o600)
+	if err != nil {
+		t.Fatalf("an exclusive create of a new name: %v", err)
+	}
+	mustWrite(t, file, []byte("x"), 0)
+	if _, err := fsys.OpenFile(testName, flag, 0o600); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("an exclusive create of an existing name: %v, want ErrExist", err)
+	}
+	fsys.Symlink("missing", testDir+"/link")
+	if _, err := fsys.OpenFile(testDir+"/link", flag, 0o600); !errors.Is(err, fs.ErrExist) {
+		t.Fatalf("an exclusive create at a dangling link: %v, want ErrExist", err)
+	}
+	if got := content(fsys, testName); string(got) != "x" {
+		t.Fatalf("the failed exclusive create changed the file: %q", got)
+	}
+}
+
 func TestHardLinkSharesTheFileUntilADirectorySync(t *testing.T) {
 	fsys := New(1, Config{KeepChange: Ratio{Num: 1, Den: 1 << 30}})
 	temp, tempName, err := fsys.CreateTemp(testDir, ".tmp-*")
