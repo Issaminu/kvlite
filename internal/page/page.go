@@ -17,9 +17,13 @@ func EncodeID(id ID) []byte {
 	return data
 }
 
+// errIDSize is the error of DecodeID for data that is not IDSize bytes long.
+// A fixed error keeps DecodeID small enough to inline, so a bucket lookup decodes its root page ID without a call.
+var errIDSize = fmt.Errorf("decode page ID: the data is not %d bytes: %w", IDSize, ErrInvalid)
+
 func DecodeID(data []byte) (ID, error) {
 	if len(data) != IDSize {
-		return 0, fmt.Errorf("decode page ID: got %d bytes, want %d: %w", len(data), IDSize, ErrInvalid)
+		return 0, errIDSize
 	}
 	return ID(binary.LittleEndian.Uint64(data)), nil
 }
