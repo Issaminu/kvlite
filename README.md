@@ -456,21 +456,21 @@ db, err := kvlite.Open("app.db", 0o600, options)
 
 ## Benchmarks
 
-The current [KVBench report](BENCHMARKS.md) contains the median of 15 measured `large --workloads=all --storage=volume` runs at commit `689a4dc`. At eight clients, KVLite delivered **6.06x the point-read throughput of bbolt** and **24.29x the throughput of Redis**. Its 792 ns p99 latency gave it a **6.73x advantage over bbolt** and a **125.84x advantage over Redis**. KVLite also led the highlighted durable point-update, durable point-insert, mixed-work, no-commit-sync key-delete, large-key read, and clean-open cases.
+The current [KVBench report](BENCHMARKS.md) contains the median of 15 measured `large --workloads=all --storage=volume` runs at commit `2196993`. At eight clients, KVLite delivered **6.25x the point-read throughput of bbolt** and **24.64x the throughput of Redis**. Its 1.00 µs p99 latency gave it a **5.71x advantage over bbolt** and a **100.42x advantage over Redis**. KVLite also led the highlighted durable point-update, durable point-insert, mixed-work, no-commit-sync key-delete, large-key read, and clean-open cases.
 
 #### Highlights
 
 | Workload | KVLite | bbolt | Redis | Highlight |
 | --- | ---: | ---: | ---: | --- |
-| Random point reads, eight clients | 5,985,140 keys/s | 988,029 keys/s | 246,384 keys/s | **KVLite: 6.06x bbolt; 24.29x Redis** |
-| Point-read p99, eight clients | 792 ns | 5.33 µs | 99.67 µs | **KVLite: 6.73x advantage over bbolt; 125.84x over Redis** |
-| Durable random point updates, batch of 100 | 113,511 keys/s | 27,053 keys/s | 39,352 keys/s | **KVLite: 4.20x bbolt; 2.88x Redis** |
-| Durable random point inserts, batch of 100 | 125,512 keys/s | 28,999 keys/s | 42,909 keys/s | **KVLite: 4.33x bbolt; 2.93x Redis** |
-| Durable mixed work, 95% reads | 148,031 operations/s | 8,111 operations/s | 14,266 operations/s | **KVLite: 18.25x bbolt; 10.38x Redis** |
-| No-commit-sync mixed work, 95% reads | 2,116,491 operations/s | 358,264 operations/s | 224,632 operations/s | **KVLite: 5.91x bbolt; 9.42x Redis** |
-| No-commit-sync random key deletes, one client | 403,867 keys/s | 80,063 keys/s | 110,016 keys/s | **KVLite: 5.04x bbolt; 3.67x Redis** |
-| Random reads with 32 KiB keys | 77,414 keys/s | 62,654 keys/s | 45,132 keys/s | **KVLite: 1.24x bbolt; 1.72x Redis** |
-| Open an existing clean database | 76.70 µs | 2.96 ms | Not comparable | **KVLite: 38.62x advantage** |
+| Random point reads, eight clients | 5,892,288 keys/s | 942,708 keys/s | 239,126 keys/s | **KVLite: 6.25x bbolt; 24.64x Redis** |
+| Point-read p99, eight clients | 1.00 µs | 5.71 µs | 100.42 µs | **KVLite: 5.71x advantage over bbolt; 100.42x over Redis** |
+| Durable random point updates, batch of 100 | 107,962 keys/s | 22,566 keys/s | 51,327 keys/s | **KVLite: 4.78x bbolt; 2.10x Redis** |
+| Durable random point inserts, batch of 100 | 95,009 keys/s | 18,065 keys/s | 47,223 keys/s | **KVLite: 5.26x bbolt; 2.01x Redis** |
+| Durable mixed work, 95% reads | 96,657 operations/s | 8,584 operations/s | 13,956 operations/s | **KVLite: 11.26x bbolt; 6.93x Redis** |
+| No-commit-sync mixed work, 95% reads | 1,835,915 operations/s | 363,121 operations/s | 226,411 operations/s | **KVLite: 5.06x bbolt; 8.11x Redis** |
+| No-commit-sync random key deletes, one client | 385,900 keys/s | 77,531 keys/s | 107,542 keys/s | **KVLite: 4.98x bbolt; 3.59x Redis** |
+| Random reads with 32 KiB keys | 75,805 keys/s | 64,127 keys/s | 37,584 keys/s | **KVLite: 1.18x bbolt; 2.02x Redis** |
+| Open an existing clean database | 91.55 µs | 2.54 ms | Not comparable | **KVLite: 27.69x advantage** |
 
 The results apply only to the tested machine and workloads. The Docker volume path includes the OrbStack virtual machine and host storage path. It does not prove bare-metal device performance. Durable and no-commit-sync results have different guarantees. KVLite ran with the default `DataPageChecksums=false`. bbolt read 64 KiB and 1 MiB values faster than KVLite. See the [complete benchmark report](BENCHMARKS.md) and the [benchmark suite guide](benchmarks/kvbench/README.md).
 
