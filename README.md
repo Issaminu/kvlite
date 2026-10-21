@@ -338,7 +338,7 @@ One 64-bit seed selects the database options, the workload, the time of each cra
 - A read-only recovery and a writable recovery of the same files must show the same state.
 - At the end of each run, all faults stop. Each operation must then succeed, and a clean close and reopen must keep the latest state.
 
-#### Continues, non-stop chaos simulationa
+#### Continuous, non-stop chaos simulations
 
 - Each push to `main` and each pull request runs 200 new seeds, the fixed seeds, and the tests of Blackout itself ([workflow](.github/workflows/blackout.yml)).
 - The Blackout [supervisor](internal/blackout/supervisor/doc.go) runs random seeds without end on a small server with 2 ARM CPUs. It tests each new commit of `main`. It makes a failing seed shorter, and it opens a GitHub issue with the seed, the report, and the replay command. These issues have the label [`blackout`](https://github.com/Issaminu/kvlite/issues?q=label%3Ablackout).
