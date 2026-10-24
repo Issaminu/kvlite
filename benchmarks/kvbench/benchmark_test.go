@@ -2,6 +2,7 @@ package kvbench
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -535,15 +536,67 @@ func makeMissingKey(position string, index int) []byte {
 	}
 }
 
-// warmUpHandle makes one untimed commit on a new engine handle before a timed write workload.
+// warmUpHandle makes two untimed writes on a new engine handle before a timed write workload.
 // The first commit of a handle can pay one-time costs, such as the directory sync of a new KVLite WAL file.
 // Each timed run opens a new handle, so a case with few commits would measure mostly those costs instead of steady writes.
-// It writes pair again with its stored value, so the stored data does not change.
+// It changes one value and then restores it.
+// Both writes change bytes, so an engine cannot skip them as identical replacements.
 // Call it before the write counters are read.
 func warmUpHandle(tb testing.TB, engine Engine, pair Pair) {
 	tb.Helper()
+	changed := bytes.Clone(pair.Value)
+	if len(changed) == 0 {
+		changed = []byte{1}
+	} else {
+		changed[0] ^= 1
+	}
+	if err := engine.Put(tb.Context(), pair.Key, changed); err != nil {
+		tb.Fatalf("warm-up write: %v", err)
+	}
 	if err := engine.Put(tb.Context(), pair.Key, pair.Value); err != nil {
-		tb.Fatalf("warm-up commit: %v", err)
+		tb.Fatalf("warm-up restore: %v", err)
+	}
+}
+
+type warmUpRecordingEngine struct {
+	Engine
+	value   []byte
+	writes  []Pair
+	changes []bool
+}
+
+func (engine *warmUpRecordingEngine) Put(_ context.Context, key, value []byte) error {
+	engine.changes = append(engine.changes, !bytes.Equal(engine.value, value))
+	engine.writes = append(engine.writes, Pair{Key: bytes.Clone(key), Value: bytes.Clone(value)})
+	engine.value = bytes.Clone(value)
+	return nil
+}
+
+func TestWarmUpHandleMakesRealWrites(t *testing.T) {
+	for index, value := range [][]byte{nil, {}, {0}, {255}, bytes.Repeat([]byte("v"), 128)} {
+		t.Run(fmt.Sprint(index), func(t *testing.T) {
+			pair := Pair{Key: []byte("key"), Value: value}
+			originalKey, originalValue := bytes.Clone(pair.Key), bytes.Clone(pair.Value)
+			engine := &warmUpRecordingEngine{value: bytes.Clone(pair.Value)}
+			warmUpHandle(t, engine, pair)
+			if len(engine.writes) != 2 {
+				t.Fatalf("write count: got %d, want 2", len(engine.writes))
+			}
+			if !engine.changes[0] || !engine.changes[1] {
+				t.Fatal("warm-up included an identical replacement")
+			}
+			if !bytes.Equal(engine.value, originalValue) || !bytes.Equal(engine.writes[1].Value, originalValue) {
+				t.Fatal("warm-up did not restore the original value")
+			}
+			for _, write := range engine.writes {
+				if !bytes.Equal(write.Key, originalKey) {
+					t.Fatal("warm-up changed the key")
+				}
+			}
+			if !bytes.Equal(pair.Key, originalKey) || !bytes.Equal(pair.Value, originalValue) {
+				t.Fatal("warm-up changed caller bytes")
+			}
+		})
 	}
 }
 
