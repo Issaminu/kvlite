@@ -45,6 +45,9 @@ type Store interface {
 // It keeps no page state outside that store.
 type Tree struct {
 	store Store
+
+	// SkipIdenticalPuts keeps an identical entry clean when the caller requires no durable rewrite (SyncNone).
+	SkipIdenticalPuts bool
 }
 
 // treePathStep records one move from a branch node to one child node.
@@ -149,6 +152,13 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 	prepared, err := node.prepareInsert(entry)
 	if err != nil {
 		return nil, err
+	}
+
+	if tree.SkipIdenticalPuts && prepared.found {
+		existing := node.entries[prepared.index]
+		if existing.flags == entry.flags && bytes.Equal(existing.value, entry.value) {
+			return root, nil
+		}
 	}
 
 	// WritableNode clones and stages the leaf on its first write in this transaction.

@@ -309,6 +309,107 @@ func TestTreePutEntry_ClonesOnlyChangedLeafWithoutSplit(t *testing.T) {
 	}
 }
 
+type countingPutStore struct {
+	*memoryTreeStore
+	writes int
+}
+
+func (store *countingPutStore) WritableNode(node *Node) *Node {
+	store.writes++
+	return store.memoryTreeStore.WritableNode(node)
+}
+
+func TestTreePutIdenticalEntryKeepsNodesClean(t *testing.T) {
+	for _, size := range []int{0, 128, 65536} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+			node := NewLeafNode(2)
+			value := bytes.Repeat([]byte("v"), size)
+			if err := node.InsertEntry(NewEntry(0, []byte("key"), value)); err != nil {
+				t.Fatal(err)
+			}
+			store.nodes[node.PageID()] = node
+			tree := NewTree(store)
+			tree.SkipIdenticalPuts = true
+			replacement := bytes.Clone(value)
+			got, err := tree.PutEntry(node, NewEntry(0, []byte("key"), replacement))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != node || store.writes != 0 || len(store.dirty) != 0 {
+				t.Fatalf("identical entry changed nodes: writes=%d dirty=%d", store.writes, len(store.dirty))
+			}
+			if len(replacement) != 0 {
+				replacement[0] = 'x'
+				if node.entries[0].value[0] != 'v' {
+					t.Fatal("identical replacement borrowed caller bytes")
+				}
+			}
+		})
+	}
+}
+
+func TestTreePutIdenticalPrivateEntrySkipsWrite(t *testing.T) {
+	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+	committed := NewLeafNode(2)
+	if err := committed.InsertEntry(NewEntry(0, []byte("key"), []byte("old"))); err != nil {
+		t.Fatal(err)
+	}
+	store.nodes[committed.PageID()] = committed
+	tree := NewTree(store)
+	tree.SkipIdenticalPuts = true
+	private, err := tree.PutEntry(committed, NewEntry(0, []byte("key"), []byte("new")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tree.PutEntry(private, NewEntry(0, []byte("key"), []byte("new"))); err != nil {
+		t.Fatal(err)
+	}
+	if store.writes != 1 || string(committed.entries[0].value) != "old" {
+		t.Fatalf("private replacement: writes=%d committed=%q", store.writes, committed.entries[0].value)
+	}
+}
+
+func TestTreePutIdenticalValueStillChangesFlags(t *testing.T) {
+	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+	node := NewLeafNode(2)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	store.nodes[node.PageID()] = node
+	tree := NewTree(store)
+	tree.SkipIdenticalPuts = true
+	private, err := tree.PutEntry(node, NewEntry(2, []byte("key"), []byte("value")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.writes != 1 || private.entries[0].flags != 2 || node.entries[0].flags != 0 {
+		t.Fatal("flag replacement was lost or changed committed state")
+	}
+	if _, err := tree.PutEntry(private, NewEntry(BucketLeafFlag, []byte("key"), []byte("value"))); !errors.Is(err, ErrIncompatibleValue) {
+		t.Fatalf("bucket conflict: got %v", err)
+	}
+	if store.writes != 1 {
+		t.Fatal("bucket conflict changed the node")
+	}
+}
+
+func TestTreePutIdenticalEntryRewritesByDefault(t *testing.T) {
+	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+	node := NewLeafNode(2)
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	store.nodes[node.PageID()] = node
+	tree := NewTree(store)
+	if _, err := tree.PutEntry(node, NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	if store.writes != 1 || len(store.dirty) != 1 {
+		t.Fatalf("default identical Put stayed clean: writes=%d dirty=%d", store.writes, len(store.dirty))
+	}
+}
+
 func TestTreeDeleteEntryRemovesExistingKey(t *testing.T) {
 	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
 	tree := NewTree(store)

@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Issaminu/kvlite/internal/blackout/disk"
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
@@ -2650,6 +2651,85 @@ func TestOpen_CheckpointThresholdOptionTriggersCheckpoint(t *testing.T) {
 
 // An automatic checkpoint syncs its WAL truncate, so the first commit of the next WAL generation need not sync its header.
 // SyncFull checkpoints in the write batcher, and SyncNormal checkpoints in Update.
+func TestIdenticalPutAfterSyncNoneCloseIsDurable(t *testing.T) {
+	for _, mode := range []Sync{SyncFull, SyncNormal} {
+		t.Run(map[Sync]string{SyncFull: "full", SyncNormal: "normal"}[mode], func(t *testing.T) {
+			fsys := disk.New(1, disk.Config{KeepChange: disk.Ratio{Num: 0, Den: 1}})
+			db, err := open(simulatedPath, 0o600, &Options{Synchronous: SyncFull}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			simulatedPut(t, db, "key", "A")
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db, err = open(simulatedPath, 0o600, &Options{Synchronous: SyncNone}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rootID, pageCount := db.meta.Root(), db.meta.LastPage()
+			simulatedPut(t, db, "key", "B")
+			if db.meta.Root() != rootID || db.meta.LastPage() != pageCount {
+				t.Fatal("fixture changed the tree shape")
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			db, err = open(simulatedPath, 0o600, &Options{Synchronous: mode}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			simulatedPut(t, db, "key", "B")
+			if mode == SyncNormal {
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				simulatedCrash(fsys, db)
+			}
+			fsys.Restart(true)
+			if value, err := simulatedGet(t, fsys, mode, "key"); err != nil || value != "B" {
+				t.Fatalf("durable identical Put lost its value: got %q, %v, want B", value, err)
+			}
+		})
+	}
+}
+
+func TestIdenticalPutCommitDependsOnSyncMode(t *testing.T) {
+	for _, mode := range []Sync{SyncFull, SyncNormal, SyncNone} {
+		t.Run(map[Sync]string{SyncFull: "full", SyncNormal: "normal", SyncNone: "none"}[mode], func(t *testing.T) {
+			fsys := disk.New(1, disk.Config{})
+			db, err := open(simulatedPath, 0o600, &Options{Synchronous: mode}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			simulatedPut(t, db, "key", "value")
+			if err := db.checkpointWAL(); err != nil {
+				t.Fatal(err)
+			}
+			before, err := db.Stats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			simulatedPut(t, db, "key", "value")
+			after, err := db.Stats()
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := uint64(1)
+			if mode == SyncNone {
+				want = 0
+			}
+			if got := after.WALCommitCount - before.WALCommitCount; got != want {
+				t.Fatalf("identical Put WAL commits: got %d, want %d", got, want)
+			}
+		})
+	}
+}
+
 func TestUpdate_AutomaticCheckpointSyncsTheWALTruncate(t *testing.T) {
 	for name, mode := range map[string]Sync{"full": SyncFull, "normal": SyncNormal} {
 		t.Run(name, func(t *testing.T) {

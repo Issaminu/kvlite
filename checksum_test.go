@@ -322,7 +322,8 @@ func TestDataPageChecksums_RecoveryUsesWALMetadata(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Write an unchanged base image before the compact record.
+				// Write a changed base image before the compact record.
+				value[0] = 'c'
 				if err := db.Put([]byte("bucket"), []byte("key"), value); err != nil {
 					t.Fatal(err)
 				}

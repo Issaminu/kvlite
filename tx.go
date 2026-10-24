@@ -50,6 +50,7 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 		dirty:     make(map[page.ID]dirtyNode),
 	}
 	tx.tree = *btree.NewTree(&tx.store)
+	tx.tree.SkipIdenticalPuts = db.options != nil && db.options.Synchronous == SyncNone
 
 	// B+tree writes clone this read-only root before they change it.
 	tx.store.nodes[baseRoot.PageID()] = baseRoot
