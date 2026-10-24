@@ -512,6 +512,89 @@ func TestTreeDeleteEntryMergesAndCollapsesRoot(t *testing.T) {
 	}
 }
 
+func TestTreeDeleteEmptyLeafKeepsOtherLeavesClean(t *testing.T) {
+	for _, count := range []int{2, 3} {
+		for removed := range count {
+			t.Run(fmt.Sprintf("children=%d/remove=%d", count, removed), func(t *testing.T) {
+				store := &memoryTreeStore{pageSize: 128, nodes: make(map[page.ID]*Node)}
+				root := &Node{header: newNodeHeader(NodeTypeBranch, 2)}
+				leaves := make([]*Node, count)
+				for i := range count {
+					leaf := NewLeafNode(page.ID(i + 3))
+					key := []byte{byte('a' + i)}
+					if err := leaf.InsertEntry(NewEntry(0, key, bytes.Repeat([]byte("v"), 65536))); err != nil {
+						t.Fatal(err)
+					}
+					leaves[i] = leaf
+					store.nodes[leaf.PageID()] = leaf
+					root.Children = append(root.Children, leaf.PageID())
+					if i != 0 {
+						root.entries = append(root.entries, NewEntry(0, key, nil))
+					}
+				}
+				store.nodes[root.PageID()] = root
+				gotRoot, found, err := NewTree(store).DeleteEntry(root, []byte{byte('a' + removed)})
+				if err != nil || !found {
+					t.Fatalf("delete: found=%t error=%v", found, err)
+				}
+				for i, leaf := range leaves {
+					if i == removed {
+						if !slices.Contains(store.freed, leaf.PageID()) {
+							t.Fatal("empty leaf was not freed")
+						}
+						continue
+					}
+					if _, dirty := store.dirty[leaf.PageID()]; dirty {
+						t.Fatalf("unchanged leaf %d is dirty", leaf.PageID())
+					}
+					entry, found, err := NewTree(store).FindEntryRef(gotRoot, []byte{byte('a' + i)}, true)
+					if err != nil || !found || !bytes.Equal(entry.Value(), leaf.entries[0].value) {
+						t.Fatalf("retained leaf %d: found=%t error=%v", leaf.PageID(), found, err)
+					}
+				}
+				assertTreeSeparators(t, store, gotRoot)
+			})
+		}
+	}
+}
+
+func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
+	store := &memoryTreeStore{pageSize: 128, nodes: make(map[page.ID]*Node)}
+	branch := func(id page.ID, keys string, firstLeaf page.ID) *Node {
+		node := &Node{header: newNodeHeader(NodeTypeBranch, id)}
+		for i := range len(keys) {
+			leaf := NewLeafNode(firstLeaf + page.ID(i))
+			if err := leaf.InsertEntry(NewEntry(0, []byte{keys[i]}, bytes.Repeat([]byte("v"), 65536))); err != nil {
+				t.Fatal(err)
+			}
+			store.nodes[leaf.PageID()] = leaf
+			node.Children = append(node.Children, leaf.PageID())
+			if i != 0 {
+				node.entries = append(node.entries, NewEntry(0, []byte{keys[i]}, nil))
+			}
+		}
+		store.nodes[id] = node
+		return node
+	}
+	left := branch(3, "abc", 10)
+	right := branch(4, "mno", 20)
+	root := NewRootNode(2, left, right, []byte("m"))
+	store.nodes[root.PageID()] = root
+	gotRoot, found, err := NewTree(store).DeleteEntry(root, []byte("m"))
+	if err != nil || !found {
+		t.Fatalf("delete: found=%t error=%v", found, err)
+	}
+	if string(gotRoot.entries[0].key) != "n" {
+		t.Fatalf("ancestor separator: got %q, want n", gotRoot.entries[0].key)
+	}
+	for _, id := range []page.ID{10, 11, 12, 21, 22} {
+		if _, dirty := store.dirty[id]; dirty {
+			t.Fatalf("unchanged leaf %d is dirty", id)
+		}
+	}
+	assertTreeSeparators(t, store, gotRoot)
+}
+
 func TestTreeDeleteEntryRandomOrderKeepsExactSeparators(t *testing.T) {
 	store := &memoryTreeStore{pageSize: 192, nextID: 3, nodes: make(map[page.ID]*Node)}
 	tree := NewTree(store)

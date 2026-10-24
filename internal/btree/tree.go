@@ -458,6 +458,21 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 		if parent.PageID() == root.PageID() {
 			root = parent
 		}
+		// An empty leaf contributes no data to its neighbor.
+		// Remove its parent link without changing or decoding that neighbor.
+		if node.IsLeaf() && node.EntryCount() == 0 && len(parent.Children) > 1 {
+			separatorIndex := max(step.childIndex-1, 0)
+			parent.entries = slices.Delete(parent.entries, separatorIndex, separatorIndex+1)
+			parent.Children = slices.Delete(parent.Children, step.childIndex, step.childIndex+1)
+			parent.encodedSize = 0
+			parent.header.Checksum = 0
+			if err := tree.store.FreePage(node.PageID()); err != nil {
+				return nil, err
+			}
+			node = parent
+			minimumChanged = step.childIndex == 0
+			continue
+		}
 		if minimumChanged && step.childIndex > 0 {
 			// Fix the child's key before a merge. For branch nodes, the merge
 			// can move that key down into a child.
