@@ -24,6 +24,7 @@ func TestPlainNodeHeader_AcceptsOnlyPagesThatReadNodeHeaderAccepts(t *testing.T)
 		binary.LittleEndian.PutUint64(data[2:10], uint64(pageID))
 		binary.LittleEndian.PutUint32(data[10:14], 3)
 		binary.LittleEndian.PutUint32(data[14:18], checksum)
+		binary.LittleEndian.PutUint32(data[18:22], uint32(size-NodeHeaderSize))
 		return data
 	}
 	checked := header(NodeTypeLeaf, id, 0, 32)
@@ -34,10 +35,10 @@ func TestPlainNodeHeader_AcceptsOnlyPagesThatReadNodeHeaderAccepts(t *testing.T)
 	}{
 		{name: "leaf", data: header(NodeTypeLeaf, id, 0, 32)},
 		{name: "branch", data: header(NodeTypeBranch, id, 0, 32)},
-		{name: "continued leaf", data: header(NodeTypeLeaf|overflowNodeFlag, id, 0, pageSize)},
-		{name: "continued branch", data: header(NodeTypeBranch|overflowNodeFlag, id, 0, pageSize)},
+		{name: "continued leaf", data: header(NodeType(0x8001), id, 0, pageSize)},
+		{name: "continued branch", data: header(NodeType(0x8002), id, 0, pageSize)},
 		{name: "other page", data: header(NodeTypeLeaf, id+1, 0, 32)},
-		{name: "continuation page", data: header(NodeTypeContinuation, id, 0, 32)},
+		{name: "continuation page", data: header(NodeType(3), id, 0, 32)},
 		{name: "wrong checksum", data: header(NodeTypeLeaf, id, 1, 32)},
 		{name: "correct checksum", data: checked},
 		{name: "short", data: header(NodeTypeLeaf, id, 0, 32)[:NodeHeaderSize-1]},
@@ -52,8 +53,8 @@ func TestPlainNodeHeader_AcceptsOnlyPagesThatReadNodeHeaderAccepts(t *testing.T)
 					continue
 				}
 				accepted++
-				h, err := readNodeHeader(test.data, id, pageSize, forWAL, checksums)
-				if err != nil || h.isContinued() || kind != h.kind() || count != h.EntryCount {
+				h, err := readNodeHeader(test.data, id, pageSize, forWAL)
+				if err != nil || kind != h.Type || count != h.EntryCount {
 					t.Errorf("%s (forWAL=%t, checksums=%t): fast path accepted kind %d count %d; readNodeHeader returned %+v, %v", test.name, forWAL, checksums, kind, count, h, err)
 				}
 			}
@@ -169,8 +170,8 @@ func TestNodeCodec_UsesProtectedNodeHeader(t *testing.T) {
 
 	hash := crc32.New(crc32.MakeTable(crc32.Castagnoli))
 	_, _ = hash.Write(encoded[:nodeChecksumOffset])
-	_, _ = hash.Write(encoded[NodeHeaderSize:])
-	if got, want := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset:NodeHeaderSize]), hash.Sum32(); got != want {
+	_, _ = hash.Write(encoded[nodeChecksumOffset+4:])
+	if got, want := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset:nodeChecksumOffset+4]), hash.Sum32(); got != want {
 		t.Fatalf("node checksum: got %x, want %x", got, want)
 	}
 }
@@ -193,7 +194,7 @@ func TestPageChecksum_ZeroCRCUsesNonzeroMarker(t *testing.T) {
 	const pageSize int64 = 64
 	node := NewLeafNode(7)
 	// This value makes the raw CRC32C zero for this page layout.
-	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte{0xac, 0x3e, 0xdf, 0xeb})); err != nil {
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte{0xb2, 0x2b, 0xf3, 0x5a})); err != nil {
 		t.Fatal(err)
 	}
 	var encoded bytes.Buffer
@@ -203,9 +204,9 @@ func TestPageChecksum_ZeroCRCUsesNonzeroMarker(t *testing.T) {
 	data := encoded.Bytes()
 	table := crc32.MakeTable(crc32.Castagnoli)
 	raw := crc32.Update(0, table, data[:nodeChecksumOffset])
-	raw = crc32.Update(raw, table, data[NodeHeaderSize:])
-	if raw != 0 || binary.LittleEndian.Uint32(data[nodeChecksumOffset:NodeHeaderSize]) != 1 {
-		t.Fatalf("raw CRC=%x, stored=%x; want zero and one", raw, data[nodeChecksumOffset:NodeHeaderSize])
+	raw = crc32.Update(raw, table, data[nodeChecksumOffset+4:])
+	if raw != 0 || binary.LittleEndian.Uint32(data[nodeChecksumOffset:nodeChecksumOffset+4]) != 1 {
+		t.Fatalf("raw CRC=%x, stored=%x; want zero and one", raw, data[nodeChecksumOffset:nodeChecksumOffset+4])
 	}
 	if _, err := DecodeNode(data, 7, pageSize, nil, true); err != nil {
 		t.Fatal(err)
@@ -251,16 +252,14 @@ func TestUncheckedNodePages_KeepStructuralChecks(t *testing.T) {
 				}
 				ids := make([]page.ID, NodePageCount(node, pageSize))
 				for i := range ids {
-					ids[i] = 7 + page.ID(i)*3
+					ids[i] = 7 + page.ID(i)
 				}
 				pages, err := EncodeNodePages(node, pageSize, ids)
 				if err != nil {
 					t.Fatal(err)
 				}
-				for i, data := range pages {
-					if err := VerifyNodeIDAndSetChecksum(data, ids[i], false); err != nil {
-						t.Fatal(err)
-					}
+				if err := VerifyNodeIDAndSetChecksum(pages[0], ids[0], false); err != nil {
+					t.Fatal(err)
 				}
 				read := func(id page.ID) ([]byte, error) {
 					for i, want := range ids {
@@ -329,7 +328,7 @@ func resealNodeForTest(data []byte, pageSize int64) {
 	checksum := crc32.Update(0, table, data[:nodeChecksumOffset])
 	checksum = crc32.Update(checksum, table, data[NodeHeaderSize:])
 	checksum = crc32.Update(checksum, table, make([]byte, pageSize-int64(len(data))))
-	binary.LittleEndian.PutUint32(data[nodeChecksumOffset:NodeHeaderSize], checksum)
+	binary.LittleEndian.PutUint32(data[nodeChecksumOffset:nodeChecksumOffset+4], checksum)
 }
 
 func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
@@ -601,43 +600,32 @@ func BenchmarkWriteNode(b *testing.B) {
 	}
 }
 
-// BenchmarkDecodeContinuedLeaf measures a full decode of one continued leaf from in-memory pages.
-// Ascending IDs are the usual order for new pages. Descending IDs come from reused lower pages.
-func BenchmarkDecodeContinuedLeaf(b *testing.B) {
+// BenchmarkDecodeNodeSpan measures decoding from raw consecutive pages.
+func BenchmarkDecodeNodeSpan(b *testing.B) {
 	const pageSize int64 = 4096
 	for _, size := range []int{64 << 10, 1 << 20} {
-		for _, order := range []string{"ascending", "descending"} {
-			b.Run(fmt.Sprintf("bytes=%d/ids=%s", size, order), func(b *testing.B) {
-				node := NewLeafNode(7)
-				if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), size))); err != nil {
+		b.Run(fmt.Sprintf("bytes=%d", size), func(b *testing.B) {
+			node := NewLeafNode(7)
+			if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), size))); err != nil {
+				b.Fatal(err)
+			}
+			ids := make([]page.ID, NodePageCount(node, pageSize))
+			for i := range ids {
+				ids[i] = 7 + page.ID(i)
+			}
+			pages, err := EncodeNodePages(node, pageSize, ids)
+			if err != nil {
+				b.Fatal(err)
+			}
+			read := func(id page.ID) ([]byte, error) { return pages[int(id-7)], nil }
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := DecodeNode(pages[0], 7, pageSize, read, false); err != nil {
 					b.Fatal(err)
 				}
-				ids := make([]page.ID, NodePageCount(node, pageSize))
-				ids[0] = node.PageID()
-				for i := 1; i < len(ids); i++ {
-					ids[i] = page.ID(10 + i)
-					if order == "descending" {
-						ids[i] = page.ID(10 + len(ids) - i)
-					}
-				}
-				pages, err := EncodeNodePages(node, pageSize, ids)
-				if err != nil {
-					b.Fatal(err)
-				}
-				byID := make(map[page.ID][]byte, len(pages))
-				for i, data := range pages {
-					byID[ids[i]] = data
-				}
-				read := func(id page.ID) ([]byte, error) { return byID[id], nil }
-				b.SetBytes(int64(size))
-				b.ReportAllocs()
-				for b.Loop() {
-					if _, err := DecodeNode(pages[0], node.PageID(), pageSize, read, false); err != nil {
-						b.Fatal(err)
-					}
-				}
-			})
-		}
+			}
+		})
 	}
 }
 
@@ -662,6 +650,7 @@ func fixedLeafImageForTest() []byte {
 	binary.LittleEndian.PutUint32(second[8:12], 1)
 	binary.LittleEndian.PutUint32(second[12:16], 1)
 	copy(data[firstDataOffset:], []byte{'a', '1', 'b', '2'})
+	binary.LittleEndian.PutUint32(data[18:22], uint32(len(data)-NodeHeaderSize))
 	return data
 }
 
@@ -688,6 +677,7 @@ func fixedBranchImageForTest() []byte {
 	binary.LittleEndian.PutUint64(data[childrenStart+page.IDSize:childrenStart+2*page.IDSize], 3)
 	binary.LittleEndian.PutUint64(data[childrenStart+2*page.IDSize:firstDataOffset], 4)
 	copy(data[firstDataOffset:], []byte{'m', 't'})
+	binary.LittleEndian.PutUint32(data[18:22], uint32(len(data)-NodeHeaderSize))
 	return data
 }
 
@@ -917,7 +907,7 @@ func TestEncodeWALNode_LeavesDatabasePageChecksumUnset(t *testing.T) {
 	}
 
 	encoded := EncodeWALNode(node)
-	if got := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset:NodeHeaderSize]); got != 0 {
+	if got := binary.LittleEndian.Uint32(encoded[nodeChecksumOffset : nodeChecksumOffset+4]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
 	decoded, err := DecodeWALNode(encoded, node.PageID(), 4096, nil)
@@ -996,17 +986,18 @@ func TestLookupEncodedWALNode_SelectsBranchChild(t *testing.T) {
 	}
 }
 
-func TestNodeClone_OwnsContinuationPageIDs(t *testing.T) {
-	base := NewLeafNode(2)
-	base.SetOverflowPages([]page.ID{7, 9})
+func TestNodeClone_KeepsStoragePagesPrivate(t *testing.T) {
+	base := NewLeafNode(8)
+	base.SetStoragePageCount(3)
 	clone := base.Clone()
-	clone.continuationPageIDs[0] = 11
-	if !slices.Equal(base.OverflowPages(), []page.ID{7, 9}) {
-		t.Fatalf("clone changed original page IDs: %v", base.OverflowPages())
+	ids := clone.OverflowPages()
+	ids[0] = 99
+	if !slices.Equal(base.OverflowPages(), []page.ID{9, 10}) {
+		t.Fatal("derived page IDs changed the original node")
 	}
-	clone.SetOverflowPages(nil)
-	if len(clone.OverflowPages()) != 0 || len(base.OverflowPages()) != 2 {
-		t.Fatal("clearing clone page IDs changed the original node")
+	clone.SetStoragePageCount(1)
+	if clone.StoragePageCount() != 1 || base.StoragePageCount() != 3 {
+		t.Fatal("private storage change modified the original node")
 	}
 }
 
@@ -1022,17 +1013,27 @@ func TestEncodeNodePages_RejectsInvalidIDs(t *testing.T) {
 	}
 }
 
-func TestNodePageCount_RequiresSpaceForContinuationID(t *testing.T) {
+func TestNodePageCount_RequiresOnlyTheNodeHeader(t *testing.T) {
 	node := NewLeafNode(8)
 	if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 80))); err != nil {
 		t.Fatal(err)
 	}
-	for _, size := range []int64{0, 26, 27, 34} {
+	for _, size := range []int64{0, NodeHeaderSize - 1} {
 		if got := NodePageCount(node, size); got != 0 {
-			t.Fatalf("page size %d cannot hold an ID and body byte: got %d pages", size, got)
+			t.Fatalf("page size %d accepted: %d pages", size, got)
 		}
-		if _, err := EncodeNodePages(node, size, []page.ID{8, 42}); !errors.Is(err, page.ErrInvalid) {
-			t.Fatalf("page size %d: got %v", size, err)
+	}
+	for _, size := range []int64{NodeHeaderSize, NodeHeaderSize + 1, 32, 64} {
+		count := (node.EncodedSize() + int(size) - 1) / int(size)
+		if got := NodePageCount(node, size); got != count {
+			t.Fatalf("page count: got %d, want %d", got, count)
+		}
+		ids := make([]page.ID, count)
+		for i := range ids {
+			ids[i] = 8 + page.ID(i)
+		}
+		if _, err := EncodeNodePages(node, size, ids); err != nil {
+			t.Fatal(err)
 		}
 	}
 }
@@ -1053,12 +1054,12 @@ func TestNodePages_FileRoundTrip(t *testing.T) {
 		branch               bool
 		pageSize             int64
 	}{
-		{"below two-page capacity", 56, 2, false, 64},
-		{"exact two-page capacity", 57, 2, false, 64},
-		{"above two-page capacity", 58, 3, false, 64},
-		{"leaf with many groups", 2048, 55, false, 64},
-		{"branch with many groups", 0, 8, true, 64},
-		{"smallest overflow pages", 57, 9, false, 35},
+		{"below two-page capacity", 86, 2, false, 64},
+		{"exact two-page capacity", 87, 2, false, 64},
+		{"above two-page capacity", 88, 3, false, 64},
+		{"leaf with many pages", 2048, 33, false, 64},
+		{"branch with many pages", 0, 5, true, 64},
+		{"header-sized pages", 87, 6, false, 22},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			pageSize := test.pageSize
@@ -1075,7 +1076,7 @@ func TestNodePages_FileRoundTrip(t *testing.T) {
 			ids := make([]page.ID, test.wantPages)
 			ids[0] = node.PageID()
 			for i := 1; i < len(ids); i++ {
-				ids[i] = page.ID(42 + i*3)
+				ids[i] = ids[0] + page.ID(i)
 			}
 			pages, err := EncodeNodePages(node, pageSize, ids)
 			if err != nil {
@@ -1088,7 +1089,7 @@ func TestNodePages_FileRoundTrip(t *testing.T) {
 			}
 			defer file.Close()
 			for i, data := range pages {
-				if page.ID(binary.LittleEndian.Uint64(data[2:10])) != ids[i] {
+				if i == 0 && page.ID(binary.LittleEndian.Uint64(data[2:10])) != ids[i] {
 					t.Fatal("encoder changed page order")
 				}
 				if _, err := file.WriteAt(data, int64(ids[i])*pageSize); err != nil {
@@ -1138,7 +1139,7 @@ func TestNodePages_FileRoundTrip(t *testing.T) {
 	}
 }
 
-func TestNodePages_MappedLookupSkipsLargeValue(t *testing.T) {
+func TestNodePages_CompleteMappedLookupNeedsNoPageReads(t *testing.T) {
 	leaf := NewLeafNode(8)
 	if err := leaf.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 2048))); err != nil {
 		t.Fatal(err)
@@ -1156,7 +1157,7 @@ func TestNodePages_MappedLookupSkipsLargeValue(t *testing.T) {
 		ids := make([]page.ID, NodePageCount(node, size))
 		ids[0] = 8
 		for i := 1; i < len(ids); i++ {
-			ids[i] = page.ID(42 + i*3)
+			ids[i] = ids[0] + page.ID(i)
 		}
 		pages, err := EncodeNodePages(node, size, ids)
 		if err != nil {
@@ -1178,14 +1179,15 @@ func TestNodePages_MappedLookupSkipsLargeValue(t *testing.T) {
 			}
 			return nil, ErrInvalid
 		}
+		input := bytes.Join(pages, nil)
 		var found bool
 		var child page.ID
 		query := []byte("z")
 		allocations := testing.AllocsPerRun(100, func() {
 			if forWAL {
-				_, found, child, err = LookupEncodedWALNode(pages[0], 8, query, size, read, true)
+				_, found, child, err = LookupEncodedWALNode(input, 8, query, size, read, true)
 			} else {
-				_, found, child, err = LookupMappedNode(pages[0], 8, query, read, true, true)
+				_, found, child, err = LookupMappedNode(input, 8, query, read, true, true)
 			}
 		})
 		if err != nil || found || (node.IsLeaf() && child != 0) || (!node.IsLeaf() && child != 21) {
@@ -1194,70 +1196,46 @@ func TestNodePages_MappedLookupSkipsLargeValue(t *testing.T) {
 		if allocations != 0 {
 			t.Fatalf("mapped lookup allocated %v times", allocations)
 		}
-		if (node.IsLeaf() && reads > 202) || (!node.IsLeaf() && reads != 0) {
+		if reads != 0 {
 			t.Fatalf("mapped lookup read unneeded pages: %d", reads)
 		}
 	}
 }
 
-func TestNodePages_RejectsDamageAndCycles(t *testing.T) {
+func TestNodePages_RejectsMissingOrDamagedTail(t *testing.T) {
 	node := NewLeafNode(8)
 	if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 80))); err != nil {
 		t.Fatal(err)
 	}
-	ids := []page.ID{8, 42, 91}
+	ids := []page.ID{8, 9}
 	pages, err := EncodeNodePages(node, 64, ids)
 	if err != nil {
 		t.Fatal(err)
 	}
 	read := func(id page.ID) ([]byte, error) {
-		for i, got := range ids {
-			if got == id {
-				return pages[i], nil
-			}
+		if id != 9 {
+			return nil, ErrInvalid
 		}
-		return nil, ErrInvalid
-	}
-	invalid := bytes.Clone(pages[0])
-	binary.LittleEndian.PutUint32(invalid[22:26], ^uint32(0))
-	binary.LittleEndian.PutUint32(invalid[14:18], pageChecksum(invalid, 64, nodeChecksumOffset))
-	if _, err := readNodeHeader(invalid, 8, 64, false, true); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("invalid node ID array with valid CRC: %v", err)
-	}
-	if _, err := DecodeNode(invalid, 8, 64, read, true); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("decode invalid node ID array: %v", err)
-	}
-	// Without a new checksum, the checksum check finds the damage before the continued fields are used.
-	damaged := bytes.Clone(pages[0])
-	binary.LittleEndian.PutUint32(damaged[22:26], ^uint32(0))
-	if _, err := DecodeNode(damaged, 8, 64, read, true); !errors.Is(err, page.ErrChecksum) {
-		t.Fatalf("decode damaged continued header with checksums: %v", err)
+		return pages[1], nil
 	}
 	if _, err := DecodeNode(pages[0], 8, 64, nil, true); !errors.Is(err, ErrInvalid) {
-		t.Fatal("continued node accepted no reader")
+		t.Fatalf("missing reader: %v", err)
+	}
+	short := func(page.ID) ([]byte, error) { return pages[1][:63], nil }
+	if _, err := DecodeNode(pages[0], 8, 64, short, true); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("short tail: %v", err)
+	}
+	failure := errors.New("tail read failed")
+	failed := func(page.ID) ([]byte, error) { return nil, failure }
+	if _, err := DecodeNode(pages[0], 8, 64, failed, true); !errors.Is(err, failure) {
+		t.Fatalf("read failure: %v", err)
 	}
 	pages[1][63] ^= 1
 	if _, err := DecodeNode(pages[0], 8, 64, read, true); !errors.Is(err, page.ErrChecksum) {
-		t.Fatalf("full decode missed damaged tail: %v", err)
+		t.Fatalf("damaged tail: %v", err)
 	}
 	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read, true, true); !errors.Is(err, page.ErrChecksum) {
-		t.Fatalf("mapped lookup missed damaged tail: %v", err)
-	}
-	pages[1][63] ^= 1
-	pages[2][63] ^= 1
-	sealContinuationPage(pages[2])
-	if _, err := DecodeNode(pages[0], 8, 64, read, true); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("full decode missed nonzero padding with valid CRC: %v", err)
-	}
-	pages[2][63] ^= 1
-	sealContinuationPage(pages[2])
-	binary.LittleEndian.PutUint64(pages[0][26:34], 8)
-	binary.LittleEndian.PutUint32(pages[0][14:18], pageChecksum(pages[0], 64, nodeChecksumOffset))
-	if _, err := DecodeNode(pages[0], 8, 64, read, true); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("full decode missed self link: %v", err)
-	}
-	if _, _, _, err := LookupMappedNode(pages[0], 8, []byte("key"), read, true, true); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("mapped lookup missed self link: %v", err)
+		t.Fatalf("lookup damaged tail: %v", err)
 	}
 }
 
@@ -1266,7 +1244,7 @@ func TestNodePages_SinglePageAndShrink(t *testing.T) {
 	if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), 80))); err != nil {
 		t.Fatal(err)
 	}
-	ids := []page.ID{8, 42, 91}
+	ids := []page.ID{8, 9}
 	pages, err := EncodeNodePages(node, 64, ids)
 	if err != nil {
 		t.Fatal(err)
@@ -1283,14 +1261,14 @@ func TestNodePages_SinglePageAndShrink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if node.header.Type != NodeTypeLeaf|overflowNodeFlag || !node.IsLeaf() {
+	if node.header.Type != NodeTypeLeaf || !node.IsLeaf() {
 		t.Fatal("continued leaf lost its type")
 	}
 	if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), 22))); err != nil {
 		t.Fatal(err)
 	}
-	node.SetOverflowPages(nil)
-	if node.header.Type != NodeTypeLeaf || node.header.BodyLength != 0 || node.header.NextPageCount != 0 {
+	node.SetStoragePageCount(1)
+	if node.header.Type != NodeTypeLeaf || node.StoragePageCount() != 1 {
 		t.Fatal("normal node kept continuation header fields")
 	}
 	if NodePageCount(node, 64) != 1 {
@@ -1336,7 +1314,7 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 				ids := make([]page.ID, NodePageCount(node, pageSize))
 				ids[0] = node.PageID()
 				for i := 1; i < len(ids); i++ {
-					ids[i] = page.ID(42 + i*3)
+					ids[i] = ids[0] + page.ID(i)
 				}
 				pages, err := EncodeNodePages(node, pageSize, ids)
 				if err != nil {
@@ -1360,7 +1338,7 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 				}
 				var decoded *Node
 				if forWAL {
-					decoded, err = DecodeWALNode(pages[0], node.PageID(), pageSize, read)
+					decoded, err = DecodeWALNode(bytes.Join(pages, nil), node.PageID(), pageSize, read)
 				} else {
 					decoded, err = DecodeNode(pages[0], node.PageID(), pageSize, read, true)
 				}
@@ -1380,7 +1358,7 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 					var gotFound bool
 					var gotChild page.ID
 					if forWAL {
-						got, gotFound, gotChild, err = LookupEncodedWALNode(pages[0], node.PageID(), query, pageSize, read, true)
+						got, gotFound, gotChild, err = LookupEncodedWALNode(bytes.Join(pages, nil), node.PageID(), query, pageSize, read, true)
 					} else {
 						got, gotFound, gotChild, err = LookupMappedNode(pages[0], node.PageID(), query, read, true, true)
 					}
@@ -1393,34 +1371,25 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 	}
 }
 
-// TestNodePages_RejectsTooSmallContinuedPage checks a valid checksum with a
-// continued header that cannot hold a page ID. Full decode must return an error.
-func TestNodePages_RejectsTooSmallContinuedPage(t *testing.T) {
-	for _, branch := range []bool{false, true} {
-		data := make([]byte, 27)
-		kind := NodeTypeLeaf
-		if branch {
-			kind = NodeTypeBranch
-		}
-		binary.LittleEndian.PutUint16(data[:2], uint16(kind|overflowNodeFlag))
+// TestNodePages_RejectsShortHead checks the header before any tail page is read.
+func TestNodePages_RejectsShortHead(t *testing.T) {
+	for _, kind := range []NodeType{NodeTypeLeaf, NodeTypeBranch} {
+		data := make([]byte, NodeHeaderSize)
+		binary.LittleEndian.PutUint16(data[:2], uint16(kind))
 		binary.LittleEndian.PutUint64(data[2:10], 8)
-		binary.LittleEndian.PutUint32(data[18:22], 80)
-		binary.LittleEndian.PutUint32(data[14:18], pageChecksum(data, 27, nodeChecksumOffset))
-		read := func(page.ID) ([]byte, error) {
-			t.Fatal("invalid first page followed an ID")
-			return nil, ErrInvalid
-		}
-		if _, err := DecodeNode(data, 8, 27, read, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("decode small continued page: %v", err)
+		data = data[:NodeHeaderSize-1]
+		read := func(page.ID) ([]byte, error) { t.Fatal("short header read a tail page"); return nil, ErrInvalid }
+		if _, err := DecodeNode(data, 8, 64, read, true); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("decode short header: %v", err)
 		}
 		if _, _, _, err := LookupMappedNode(data, 8, []byte("key"), read, true, true); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("lookup small continued page: %v", err)
+			t.Fatalf("lookup short header: %v", err)
 		}
 	}
 }
 
-// TestVisitContinuedNodeReferences checks child and storage ownership at page boundaries.
-func TestVisitContinuedNodeReferences(t *testing.T) {
+// TestVisitNodeSpanReferences checks child and storage ownership at page boundaries.
+func TestVisitNodeSpanReferences(t *testing.T) {
 	for _, pageSize := range []int64{35, 64, 128, 4096} {
 		for _, forWAL := range []bool{false, true} {
 			for _, branch := range []bool{false, true} {
@@ -1442,7 +1411,7 @@ func TestVisitContinuedNodeReferences(t *testing.T) {
 					ids := make([]page.ID, NodePageCount(node, pageSize))
 					ids[0] = 7
 					for i := 1; i < len(ids); i++ {
-						ids[i] = page.ID(20 + i*11)
+						ids[i] = ids[0] + page.ID(i)
 					}
 					var images [][]byte
 					var err error
@@ -1471,7 +1440,7 @@ func TestVisitContinuedNodeReferences(t *testing.T) {
 					check := func() error {
 						children, continuations = nil, nil
 						if forWAL {
-							return VisitWALNodeReferences(images[0], 7, pageSize, read, visit, own)
+							return VisitWALNodeReferences(bytes.Join(images, nil), 7, pageSize, read, visit, own)
 						}
 						return VisitMappedNodeReferences(images[0], 7, pageSize, read, visit, own, true)
 					}
@@ -1481,14 +1450,23 @@ func TestVisitContinuedNodeReferences(t *testing.T) {
 					if !slices.Equal(children, expected) || !slices.Equal(continuations, ids[1:]) {
 						t.Fatalf("children=%v, continuation IDs=%v", children, continuations)
 					}
-					// Missing value pages must fail even when no nested root is stored there.
+					// A main-file reader needs every tail page. A compact WAL image needs its last byte.
 					last := ids[len(ids)-1]
 					saved := pages[last]
-					delete(pages, last)
-					if err := check(); err == nil {
-						t.Fatal("visitor accepted a missing continuation")
+					if forWAL {
+						tail := images[len(images)-1]
+						images[len(images)-1] = tail[:len(tail)-1]
+						if err := check(); err == nil {
+							t.Fatal("visitor accepted a truncated WAL image")
+						}
+						images[len(images)-1] = tail
+					} else {
+						delete(pages, last)
+						if err := check(); err == nil {
+							t.Fatal("visitor accepted a missing tail page")
+						}
+						pages[last] = saved
 					}
-					pages[last] = saved
 					if !forWAL {
 						pages[last] = bytes.Clone(saved)
 						pages[last][len(saved)-1] ^= 1
@@ -1502,7 +1480,7 @@ func TestVisitContinuedNodeReferences(t *testing.T) {
 					}
 					stop := errors.New("stop ownership visit")
 					if forWAL {
-						err = VisitWALNodeReferences(images[0], 7, pageSize, read, visit, func(page.ID) error { return stop })
+						err = VisitWALNodeReferences(bytes.Join(images, nil), 7, pageSize, read, visit, func(page.ID) error { return stop })
 					} else {
 						err = VisitMappedNodeReferences(images[0], 7, pageSize, read, visit, func(page.ID) error { return stop }, true)
 					}
@@ -1541,7 +1519,7 @@ func TestLeafDeletionCopiesOnlyRetainedEntries(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			base.SetOverflowPages([]page.ID{10, 11})
+			base.SetStoragePageCount(3)
 			base.header.Checksum = 42
 			base.CacheEncodedSize()
 			before := EncodeWALNode(base)
@@ -1565,12 +1543,12 @@ func TestLeafDeletionCopiesOnlyRetainedEntries(t *testing.T) {
 					t.Fatal("private compaction retained a removed entry")
 				}
 			}
-			private.continuationPageIDs[0] = 99
+			private.SetStoragePageCount(9)
 			private.SetPageID(100)
 			if private.EntryCount() != 0 {
 				private.entries[0] = NewEntry(0, []byte("changed"), nil)
 			}
-			if !bytes.Equal(EncodeWALNode(base), before) || base.OverflowPages()[0] != 10 || base.header.Checksum != 42 {
+			if !bytes.Equal(EncodeWALNode(base), before) || base.StoragePageCount() != 3 || base.header.Checksum != 42 {
 				t.Fatal("private deletion changed the committed node")
 			}
 		})
@@ -1585,7 +1563,7 @@ func TestLeafDeletionKeepsCapacityForMerge(t *testing.T) {
 		}
 	}
 	private := base.CloneWithoutLeafEntries(0, []int{1, 2}, 64)
-	if private.EntryCount() != 2 || cap(private.entries) < base.EntryCount() || private.EncodedSize() != 54 {
+	if private.EntryCount() != 2 || cap(private.entries) < base.EntryCount() || private.EncodedSize() != 58 {
 		t.Fatal("underfull leaf did not keep merge capacity and its exact size")
 	}
 	right := NewLeafNode(5)
@@ -1597,7 +1575,7 @@ func TestLeafDeletionKeepsCapacityForMerge(t *testing.T) {
 	parent := NewRootNode(4, private, right, []byte("f"))
 	storage := &private.entries[0]
 	mergeChildren(parent, 0, private, right)
-	if &private.entries[0] != storage || private.EntryCount() != 4 || private.EncodedSize() != 90 {
+	if &private.entries[0] != storage || private.EntryCount() != 4 || private.EncodedSize() != 94 {
 		t.Fatal("leaf merge replaced reserved storage or kept a stale size")
 	}
 	if base.EntryCount() != 5 || string(base.EntryAt(0).Key()) != "a" {
@@ -1665,8 +1643,8 @@ func TestNodeCodecRejectsWrongTypeBeforeContinuationPages(t *testing.T) {
 		tag  NodeType
 	}{
 		"unknown type":           {leaf, 7},
-		"unknown continued type": {leaf, 7 | overflowNodeFlag},
-		"continuation page":      {leaf, NodeTypeContinuation},
+		"unknown continued type": {leaf, NodeType(0x8007)},
+		"continuation page":      {leaf, NodeType(3)},
 		"leaf read as branch":    {leaf, NodeTypeBranch},
 		"branch read as leaf":    {branch, NodeTypeLeaf},
 	} {
@@ -1692,12 +1670,345 @@ func TestNodeCodecRejectsWrongTypeBeforeContinuationPages(t *testing.T) {
 			if err := VisitWALNodeReferences(data, 8, 64, read, visit, visit); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("WAL reference check: %v", err)
 			}
-			// A continuation page is a valid WAL payload, so only the other types apply.
-			if test.tag != NodeTypeContinuation {
-				if err := ValidateWALNode(data, 8); !errors.Is(err, ErrInvalid) {
-					t.Fatalf("WAL validation: %v", err)
+			if err := ValidateWALNode(data, 8); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("WAL validation: %v", err)
+			}
+		})
+	}
+}
+
+func TestNodeSpanWriterLayout(t *testing.T) {
+	for _, pageSize := range []int64{64, 4096, 16384} {
+		for _, size := range []int{1, 513, 32768} {
+			for _, branch := range []bool{false, true} {
+				t.Run(fmt.Sprintf("page=%d/size=%d/branch=%t", pageSize, size, branch), func(t *testing.T) {
+					node := NewLeafNode(8)
+					var body bytes.Buffer
+					if branch {
+						key := bytes.Repeat([]byte("k"), size)
+						node = NewRootNode(8, NewLeafNode(20), NewLeafNode(21), key)
+						for _, value := range []uint32{22 + 8 + 16, uint32(len(key))} {
+							if err := binary.Write(&body, binary.LittleEndian, value); err != nil {
+								t.Fatal(err)
+							}
+						}
+						for _, id := range []uint64{20, 21} {
+							if err := binary.Write(&body, binary.LittleEndian, id); err != nil {
+								t.Fatal(err)
+							}
+						}
+						body.Write(key)
+					} else {
+						value := bytes.Repeat([]byte("v"), size)
+						if err := node.InsertEntry(NewEntry(0, []byte("k"), value)); err != nil {
+							t.Fatal(err)
+						}
+						for _, field := range []uint32{0, 22 + 16, 1, uint32(len(value))} {
+							if err := binary.Write(&body, binary.LittleEndian, field); err != nil {
+								t.Fatal(err)
+							}
+						}
+						body.WriteByte('k')
+						body.Write(value)
+					}
+					logicalSize := 22 + body.Len()
+					count := (logicalSize + int(pageSize) - 1) / int(pageSize)
+					if got := NodePageCount(node, pageSize); got != count {
+						t.Fatalf("page count: got %d, want %d", got, count)
+					}
+					ids := make([]page.ID, count)
+					for i := range ids {
+						ids[i] = node.PageID() + page.ID(i)
+					}
+					node.SetStoragePageCount(count + 3)
+					original := node.StoragePageCount()
+					pages, err := EncodeNodePages(node, pageSize, ids)
+					if err != nil {
+						t.Fatal(err)
+					}
+					image := bytes.Join(pages, nil)
+					if len(image) != count*int(pageSize) || !bytes.Equal(image[22:logicalSize], body.Bytes()) {
+						t.Fatal("span does not contain one header followed by the complete raw body")
+					}
+					for _, value := range image[logicalSize:] {
+						if value != 0 {
+							t.Fatal("nonzero final padding")
+						}
+					}
+					kind := node.kind()
+					if binary.LittleEndian.Uint16(image[:2]) != uint16(kind) ||
+						binary.LittleEndian.Uint64(image[2:10]) != uint64(node.PageID()) ||
+						binary.LittleEndian.Uint32(image[10:14]) != 1 ||
+						binary.LittleEndian.Uint32(image[18:22]) != uint32(body.Len()) {
+						t.Fatal("span header fields differ from the format")
+					}
+					table := crc32.MakeTable(crc32.Castagnoli)
+					sum := crc32.Update(0, table, image[:14])
+					sum = crc32.Update(sum, table, image[18:])
+					if sum == 0 {
+						sum = 1
+					}
+					if binary.LittleEndian.Uint32(image[14:18]) != sum {
+						t.Fatal("checksum does not cover the complete padded span")
+					}
+					for _, pad := range []bool{false, true} {
+						var output bytes.Buffer
+						if err := WriteNode(&output, node, pageSize, pad, true); err != nil {
+							t.Fatal(err)
+						}
+						want := image[:logicalSize]
+						if pad {
+							want = image
+						}
+						if !bytes.Equal(output.Bytes(), want) {
+							t.Fatal("WriteNode differs from the span encoder")
+						}
+					}
+					walPages, err := EncodeWALNodePages(node, pageSize, ids)
+					if err != nil {
+						t.Fatal(err)
+					}
+					walImage := bytes.Join(walPages, nil)
+					clear(image[14:18])
+					if !bytes.Equal(walImage, image[:logicalSize]) || WALNodePagesEncodedSize(node, pageSize) != logicalSize {
+						t.Fatal("WAL image contains padding, tail headers, or page ID lists")
+					}
+					if node.StoragePageCount() != original {
+						t.Fatal("encoding changed the node's allocated page count")
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestNodeSpanStorageCountStaysPrivate(t *testing.T) {
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	before := EncodeWALNode(node)
+	node.SetStoragePageCount(7)
+	if !bytes.Equal(EncodeWALNode(node), before) {
+		t.Fatal("allocated page count changed the serialized node")
+	}
+	if node.Clone().StoragePageCount() != 7 || node.CloneWithoutLeafEntries(0, nil, 0).StoragePageCount() != 7 {
+		t.Fatal("a private clone lost the old allocated page count")
+	}
+}
+
+func TestNodeSpanWriterRejectsNonconsecutivePages(t *testing.T) {
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), 160))); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]page.ID, NodePageCount(node, 64))
+	for i := range ids {
+		ids[i] = node.PageID() + page.ID(i)
+	}
+	ids[len(ids)-1]++
+	if _, err := EncodeNodePages(node, 64, ids); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("nonconsecutive pages: %v", err)
+	}
+}
+
+func TestNodeSpanReaderRoundTrip(t *testing.T) {
+	for _, pageSize := range []int64{32, 64, 4096, 16384} {
+		for _, valueSize := range []int{0, 1, 21, 22, 23, 25, 26, 27, 4095, 4096, 65536} {
+			t.Run(fmt.Sprintf("page=%d/value=%d", pageSize, valueSize), func(t *testing.T) {
+				node := NewLeafNode(8)
+				value := bytes.Repeat([]byte("v"), valueSize)
+				if len(value) != 0 {
+					value[len(value)-1] = 0
+				}
+				if err := node.InsertEntry(NewEntry(0, []byte("k"), value)); err != nil {
+					t.Fatal(err)
+				}
+				count := NodePageCount(node, pageSize)
+				ids := make([]page.ID, count)
+				for i := range ids {
+					ids[i] = 8 + page.ID(i)
+				}
+				pages, err := EncodeNodePages(node, pageSize, ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				image := bytes.Join(pages, nil)
+				read := func(id page.ID) ([]byte, error) {
+					if id < 8 || id >= 8+page.ID(count) {
+						return nil, ErrInvalid
+					}
+					return pages[int(id-8)], nil
+				}
+				for _, data := range [][]byte{image, pages[0]} {
+					decoded, err := DecodeNode(data, 8, pageSize, read, true)
+					if err != nil || decoded.StoragePageCount() != count {
+						t.Fatalf("derived allocation count: node=%v err=%v want=%d", decoded, err, count)
+					}
+					entry, found, err := decoded.FindEntryRef([]byte("k"))
+					if err != nil || !found || !bytes.Equal(entry.Value(), value) {
+						t.Fatalf("decoded value: %v", err)
+					}
+					for _, checksums := range []bool{false, true} {
+						entry, found, _, err = LookupMappedNode(data, 8, []byte("k"), read, true, checksums)
+						if err != nil || !found || !bytes.Equal(entry.Value(), value) {
+							t.Fatalf("mapped value: %v", err)
+						}
+					}
+					if err := decoded.InsertOrReplaceLeafEntry(NewEntry(0, []byte("k"), []byte("x"))); err != nil {
+						t.Fatal(err)
+					}
+					if decoded.StoragePageCount() != count {
+						t.Fatal("changing the body lost the old allocated count")
+					}
+				}
+				walPages, err := EncodeWALNodePages(node, pageSize, ids)
+				if err != nil {
+					t.Fatal(err)
+				}
+				wal := bytes.Join(walPages, nil)
+				decoded, err := DecodeWALNode(wal, 8, pageSize, nil)
+				if err != nil || decoded.StoragePageCount() != count {
+					t.Fatalf("WAL count: %v", err)
+				}
+				if err := ValidateWALNode(wal, 8); err != nil {
+					t.Fatal(err)
+				}
+				entry, found, _, err := LookupEncodedWALNode(wal, 8, []byte("k"), pageSize, nil, true)
+				if err != nil || !found || !bytes.Equal(entry.Value(), value) {
+					t.Fatalf("WAL lookup: %v", err)
+				}
+
+				binary.LittleEndian.PutUint16(wal[:2], 0x8001)
+				if err := ValidateWALNode(wal, 8); err == nil {
+					t.Fatal("removed flag was accepted")
+				}
+			})
+		}
+	}
+}
+
+func TestNodeSpanReaderReferencesAndScans(t *testing.T) {
+	const pageSize int64 = 4096
+	key := bytes.Repeat([]byte("k"), 8192)
+	value := bytes.Repeat([]byte("v"), 12289)
+	for _, branch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("branch=%t", branch), func(t *testing.T) {
+			node := NewLeafNode(8)
+			if branch {
+				node = NewRootNode(8, NewLeafNode(1000), NewLeafNode(2000), key)
+			} else if err := node.InsertEntry(NewEntry(0, key, value)); err != nil {
+				t.Fatal(err)
+			}
+			count := NodePageCount(node, pageSize)
+			ids := make([]page.ID, count)
+			for i := range ids {
+				ids[i] = node.PageID() + page.ID(i)
+			}
+			pages, err := EncodeNodePages(node, pageSize, ids)
+			if err != nil {
+				t.Fatal(err)
+			}
+			read := func(id page.ID) ([]byte, error) {
+				if id < 8 || id >= 8+page.ID(count) {
+					return nil, ErrInvalid
+				}
+				return pages[int(id-8)], nil
+			}
+			for _, input := range [][]byte{bytes.Join(pages, nil), pages[0]} {
+				decoded, err := DecodeNode(input, 8, pageSize, read, true)
+				if err != nil || decoded.StoragePageCount() != count {
+					t.Fatalf("decode count: %v", err)
+				}
+				entry, found, child, err := LookupMappedNode(input, 8, key, read, true, true)
+				if err != nil || branch && child != 2000 || !branch && (!found || !bytes.Equal(entry.Value(), value)) {
+					t.Fatalf("lookup: found=%t child=%d err=%v", found, child, err)
+				}
+				var children, tails []page.ID
+				err = VisitMappedNodeReferences(input, 8, pageSize, read, func(id page.ID) error { children = append(children, id); return nil }, func(id page.ID) error { tails = append(tails, id); return nil }, true)
+				if err != nil || !slices.Equal(tails, ids[1:]) {
+					t.Fatalf("storage references: %v, %v", tails, err)
+				}
+				if branch {
+					if !slices.Equal(children, []page.ID{1000, 2000}) {
+						t.Fatalf("children: %v", children)
+					}
+					continue
+				}
+				seen := 0
+				visit := func(flags uint32, k, v []byte) error {
+					if flags != 0 || !bytes.Equal(k, key) || !bytes.Equal(v, value) {
+						t.Fatal("scan returned wrong bytes")
+					}
+					seen++
+					return nil
+				}
+				if err := VisitMappedLeafRange(input, 8, nil, nil, visit, true, read); err != nil {
+					t.Fatal(err)
+				}
+				if err := VisitMappedLeafReverse(input, 8, visit, true, read); err != nil {
+					t.Fatal(err)
+				}
+				if seen != 2 {
+					t.Fatalf("scan callbacks: got %d, want 2", seen)
 				}
 			}
 		})
+	}
+}
+
+func TestNodeSpanReaderRejectsInvalidHeader(t *testing.T) {
+	plain := NewLeafNode(8)
+	if err := plain.InsertEntry(NewEntry(0, []byte("k"), []byte("v"))); err != nil {
+		t.Fatal(err)
+	}
+	paddedWAL := append(EncodeWALNode(plain), 0)
+	if _, _, _, err := LookupEncodedWALNode(paddedWAL, 8, []byte("k"), 4096, nil, true); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("compact WAL lookup accepted extra bytes: %v", err)
+	}
+	header := make([]byte, NodeHeaderSize)
+	binary.LittleEndian.PutUint16(header[:2], uint16(NodeTypeLeaf))
+	binary.LittleEndian.PutUint64(header[2:10], 8)
+	binary.LittleEndian.PutUint32(header[18:22], 8192)
+	for _, test := range []struct {
+		name   string
+		change func([]byte) ([]byte, page.ID)
+	}{
+		{"short header", func(data []byte) ([]byte, page.ID) { return data[:NodeHeaderSize-1], 8 }},
+		{"old overflow flag", func(data []byte) ([]byte, page.ID) { binary.LittleEndian.PutUint16(data[:2], 0x8001); return data, 8 }},
+		{"old continuation type", func(data []byte) ([]byte, page.ID) { binary.LittleEndian.PutUint16(data[:2], 3); return data, 8 }},
+		{"wrong page ID", func(data []byte) ([]byte, page.ID) { return data, 9 }},
+		{"excess body length", func(data []byte) ([]byte, page.ID) {
+			binary.LittleEndian.PutUint32(data[18:22], ^uint32(0))
+			return data, 8
+		}},
+		{"page address overflow", func(data []byte) ([]byte, page.ID) {
+			id := ^page.ID(0)
+			binary.LittleEndian.PutUint64(data[2:10], uint64(id))
+			return data, id
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			data, id := test.change(slices.Clone(header))
+			if _, err := NodeSpan(data, id, 4096); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("header accepted: %v", err)
+			}
+		})
+	}
+	node := NewLeafNode(8)
+	if err := node.InsertEntry(NewEntry(0, []byte("k"), bytes.Repeat([]byte("v"), 8192))); err != nil {
+		t.Fatal(err)
+	}
+	ids := make([]page.ID, NodePageCount(node, 4096))
+	for i := range ids {
+		ids[i] = 8 + page.ID(i)
+	}
+	pages, err := EncodeNodePages(node, 4096, ids)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pages[len(pages)-1][4095] ^= 1
+	if _, err := DecodeNode(bytes.Join(pages, nil), 8, 4096, nil, true); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("damaged final padding accepted: %v", err)
 	}
 }

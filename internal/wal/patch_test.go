@@ -310,9 +310,9 @@ func TestWALCommit_LargeNodeToSinglePage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	base.SetOverflowPages([]page.ID{7, 9})
+	setNativeSpan(base, pageSize)
 	target := base.Clone()
-	target.SetOverflowPages(nil)
+	target.SetStoragePageCount(1)
 	if err := target.DeleteKey([]byte("b")); err != nil {
 		t.Fatal(err)
 	}
@@ -495,7 +495,7 @@ func BenchmarkAppendLeafBytePatch(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		patch = patch[:0]
-		if _, compatible := appendLeafBytePatch(&patch, base, target); !compatible {
+		if _, compatible := appendLeafBytePatch(&patch, base, target, 4096); !compatible {
 			b.Fatal("leaf layout changed")
 		}
 	}
@@ -572,71 +572,50 @@ func TestWALCommit_EncodesAllocationBytePatch(t *testing.T) {
 	}
 }
 
-func TestWALCommit_EncodesContinuedNodeBytePatches(t *testing.T) {
-	const pageSize = 128
-	file, err := os.CreateTemp(t.TempDir(), "wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	value := bytes.Repeat([]byte("v"), 500)
-	base := btree.NewLeafNode(2)
-	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
-		t.Fatal(err)
-	}
-	ids := make([]page.ID, btree.NodePageCount(base, pageSize))
-	ids[0] = 2
-	for i := 1; i < len(ids); i++ {
-		ids[i] = page.ID(10 + i)
-	}
-	base.SetOverflowPages(ids[1:])
-	target := base.Clone()
-	value = bytes.Clone(value)
-	value[300] = 'X'
-	if err := target.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
-		t.Fatal(err)
-	}
-	basePages, err := btree.EncodeWALNodePages(base, pageSize, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	targetPages, err := btree.EncodeWALNodePages(target, pageSize, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	log := New(Config{File: file, PageSize: pageSize, CheckpointThresholdBytes: 1 << 20})
-	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	records, err := log.ReadRecords()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The first transaction writes every page. The second writes a byte patch only for the page that changed.
-	if len(records) != len(ids)+3 {
-		t.Fatalf("WAL records: got %d, want %d complete pages, one byte patch, and two commit markers", len(records), len(ids))
-	}
-	patch := records[len(ids)+1]
-	changed := slices.Index(ids, patch.Header.PageID)
-	if patch.Header.Type != RecordTypeBytePatch || changed < 0 {
-		t.Fatalf("second transaction: got %+v, want one byte patch for a page of the node", patch.Header)
-	}
-	for i := range ids {
-		if i != changed && !bytes.Equal(basePages[i], targetPages[i]) {
-			t.Fatalf("page %d changed without a record", ids[i])
-		}
-	}
-	patched, err := ApplyBytePatch(basePages[changed], patch.Payload, pageSize)
-	if err != nil || !bytes.Equal(patched, targetPages[changed]) {
-		t.Fatalf("byte patch did not rebuild page %d: %v", ids[changed], err)
-	}
-	for i, id := range ids {
-		if committed, ok := log.Lookup(id); !ok || !bytes.Equal(committed.Payload, targetPages[i]) {
-			t.Fatalf("committed page %d: got %+v, want the final page image", id, committed.Header)
-		}
+func TestLimitedByteRangesEqualSuffixAndBudget(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		edits   []int
+		limit   int
+		all     bool
+		wantFit bool
+	}{
+		{name: "unchanged", limit: 64, wantFit: true},
+		{name: "early", edits: []int{0}, limit: 64, wantFit: true},
+		{name: "late", edits: []int{65535}, limit: 64, wantFit: true},
+		{name: "multiple", edits: []int{0, 32768, 65535}, limit: 64, wantFit: true},
+		{name: "small-budget", edits: []int{0}, limit: 9},
+		{name: "small-edit-fits", edits: []int{0}, limit: 20, wantFit: true},
+		{name: "budget-after-first-edit", edits: []int{0, 32}, limit: 18},
+		{name: "full-replacement", all: true, limit: 64},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			base := bytes.Repeat([]byte{'v'}, 65536)
+			target := bytes.Clone(base)
+			for _, at := range test.edits {
+				target[at] ^= 0xff
+			}
+			if test.all {
+				for i := range target {
+					target[i] ^= 0xff
+				}
+			}
+			patch, fits := appendLimitedByteRanges(nil, 128, base, target, test.limit)
+			if fits != test.wantFit {
+				t.Fatalf("fits=%v, want %v", fits, test.wantFit)
+			}
+			if !bytes.Equal(base, bytes.Repeat([]byte{'v'}, len(base))) {
+				t.Fatal("patch generation changed its base")
+			}
+			if !fits {
+				return
+			}
+			before := append(make([]byte, 128), base...)
+			want := append(make([]byte, 128), target...)
+			got, err := ApplyBytePatch(before, patch, int64(len(before)))
+			if err != nil || !bytes.Equal(got, want) {
+				t.Fatalf("patch replay differs from target: %v", err)
+			}
+		})
 	}
 }

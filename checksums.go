@@ -1,13 +1,13 @@
 package kvlite
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
+	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
@@ -123,24 +123,12 @@ func (db *DB) enableDataPageChecksums() error {
 		if err != nil {
 			return err
 		}
-		if btree.NodeType(binary.LittleEndian.Uint16(data[:2])) == btree.NodeTypeContinuation {
-			continue
-		}
 		node, err := btree.DecodeNode(slices.Clone(data), id, db.meta.PageSize(), db.readMainNodePage, true)
 		if err != nil {
 			return fmt.Errorf("enable data-page checksums at page %d: %w", id, err)
 		}
 		missing := btree.CheckNodeChecksumMode(data, true) != nil
-		for _, next := range node.OverflowPages() {
-			if !db.allocation.allocated(next) || db.allocation.isSegmentPage(next) || next > db.meta.LastPage() {
-				return fmt.Errorf("node %d continuation page %d: %w", id, next, ErrInvalid)
-			}
-			part, err := db.readMainNodePage(next)
-			if err != nil {
-				return err
-			}
-			missing = missing || btree.CheckNodeChecksumMode(part, true) != nil
-		}
+		id += page.ID(node.StoragePageCount() - 1)
 		if !missing {
 			continue
 		}
@@ -163,8 +151,8 @@ func (db *DB) enableDataPageChecksums() error {
 	if err := flush(); err != nil {
 		return err
 	}
-	// Check every allocated data page, including continuation pages. The mode
-	// must not become enabled if any page still has zero or a wrong checksum.
+	// Check every complete node, including its raw tail bytes. The mode
+	// must not become enabled if any node has a missing or wrong checksum.
 	for id := firstTreePageID; id <= db.meta.LastPage(); id++ {
 		if !db.allocation.allocated(id) || db.allocation.isSegmentPage(id) {
 			continue
@@ -176,6 +164,11 @@ func (db *DB) enableDataPageChecksums() error {
 		if err := btree.CheckNodeChecksum(data, id); err != nil {
 			return fmt.Errorf("enable data-page checksums at page %d: %w", id, err)
 		}
+		count, err := btree.NodeSpan(data, id, db.meta.PageSize())
+		if err != nil {
+			return err
+		}
+		id += page.ID(count - 1)
 	}
 	// Valid retained sums can come from an earlier SyncNone handle. Sync the
 	// whole main file before committing ON, even if this pass changed no pages.

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
@@ -89,18 +88,13 @@ func TestDataPageChecksums_ReopenAndBackup(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				data, err := os.ReadFile(name)
+				verified, err := Open(name, 0600, &Options{ReadOnly: true})
 				if err != nil {
 					t.Fatal(err)
 				}
-				pageSize := int(binary.LittleEndian.Uint64(data[8:16]))
-				for at := 3 * pageSize; at < len(data); at += pageSize {
-					if kind := binary.LittleEndian.Uint16(data[at : at+2]); kind == 0 {
-						continue
-					}
-					if err := btree.CheckNodeChecksumMode(data[at:at+pageSize], enabled); err != nil {
-						t.Fatalf("page %d mode: %v", at/pageSize, err)
-					}
+				checkDataPageFields(t, verified, enabled)
+				if err := verified.Close(); err != nil {
+					t.Fatal(err)
 				}
 			}
 		})
@@ -119,7 +113,7 @@ func TestDataPageChecksums_ReadCorruption(t *testing.T) {
 				createBucket(t, db, []byte("bucket"))
 				value := []byte("value-with-checksum-test-marker")
 				if continued {
-					value = bytes.Repeat(value, 600)
+					value = bytes.Repeat(value, 2*int(db.meta.PageSize())/len(value)+1)
 				}
 				if err := db.Put([]byte("bucket"), []byte("key"), value); err != nil {
 					t.Fatal(err)
@@ -132,15 +126,9 @@ func TestDataPageChecksums_ReadCorruption(t *testing.T) {
 					t.Fatal(err)
 				}
 				at := bytes.Index(data, []byte("value-with-checksum-test-marker"))
-				if continued {
+				if continued && at >= 0 {
 					pageSize := int(binary.LittleEndian.Uint64(data[8:16]))
-					// Change a value byte on a later continuation page.
-					for offset := 3 * pageSize; offset < len(data); offset += pageSize {
-						if binary.LittleEndian.Uint16(data[offset:offset+2]) == uint16(btree.NodeTypeContinuation) {
-							at = offset + btree.ContinuationHeaderSize
-							break
-						}
-					}
+					at = (at/pageSize + 1) * pageSize
 				}
 				if at < 0 {
 					t.Fatal("value bytes are missing")

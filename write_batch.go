@@ -187,12 +187,14 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		tx := Tx{
 			db:              db,
 			meta:            state.meta,
+			rootNode:        state.rootNode,
 			allocation:      state.allocation,
 			allocationOwned: state.allocation != nil,
 		}
 		tx.store.dirty = state.dirty
 		commitErr = tx.prepareCommit()
 		state.meta = tx.meta
+		state.rootNode = tx.rootNode
 		state.metaDirty = state.metaDirty || tx.metaDirty
 		state.allocation = tx.allocation
 		if commitErr == nil {

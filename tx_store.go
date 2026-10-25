@@ -9,10 +9,21 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// dirtyNode keeps the original committed image and the final private image of one changed page. original is nil for a new page.
+// dirtyNode keeps the original and final images of one changed page.
+// original is nil for a new page or a replacement that needs a complete WAL image.
 type dirtyNode struct {
 	original *btree.Node
 	final    *btree.Node
+	// parent holds the branch or bucket-entry leaf that points to this node.
+	// Set before relocation (due to large-page not fitting the next N nodes). Only the database root has no parent then.
+	parent *btree.Node
+}
+
+// txNode keeps the current node and the parent found during this callback's traversal.
+// A parent can be known before its child node is loaded.
+type txNode struct {
+	node   *btree.Node
+	parent *btree.Node
 }
 
 // txTreeStore reads committed nodes for both transaction modes and owns private nodes only for a write transaction.
@@ -21,11 +32,11 @@ type txTreeStore struct {
 	tx *Tx
 	// baseDirty contains changes from earlier callbacks in the same write batch. They remain private until the full batch commits to the WAL.
 	baseDirty map[page.ID]dirtyNode
-	// nodes is a write transaction's complete page view. It contains committed
-	// nodes read by the transaction and private nodes staged by the transaction.
-	// It stays nil for a read transaction.
-	nodes map[page.ID]*btree.Node
-	// dirty contains one original and final image for each changed page. A nil original means that the transaction created the page.
+	// nodes caches this callback's node images and direct parents.
+	// A parent-only entry does not load its child. Read transactions keep this map nil.
+	nodes map[page.ID]txNode
+	// dirty contains one original and final image for each changed page.
+	// A nil original requires a complete WAL image instead of an entry patch.
 	dirty map[page.ID]dirtyNode
 }
 
@@ -46,17 +57,30 @@ func (store *txTreeStore) LookupPage(pageID page.ID, key []byte, includeKey bool
 	if node == nil {
 		return btree.Entry{}, false, 0, btree.ErrKeyNotFound
 	}
-	return btree.LookupNode(node, key)
+	entry, found, child, err := btree.LookupNode(node, key)
+	if err == nil && found && entry.Flags()&btree.BucketLeafFlag != 0 {
+		root, decodeErr := page.DecodeID(entry.Value())
+		if decodeErr != nil {
+			return btree.Entry{}, false, 0, decodeErr
+		}
+		store.SetParent(root, node)
+	}
+	return entry, found, child, err
 }
 
 func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 	// Returning the cached pointer makes later reads observe writes made earlier in this transaction.
-	if node, ok := store.nodes[pageID]; ok {
-		return node, nil
+	view, cached := store.nodes[pageID]
+	if view.node != nil {
+		return view.node, nil
 	}
 	// WritableNode clones this shared batch image before it changes the node. This keeps an unsuccessful callback from changing an earlier result.
 	if dirty, ok := store.baseDirty[pageID]; ok {
-		store.nodes[pageID] = dirty.final
+		view.node = dirty.final
+		if !cached {
+			view.parent = dirty.parent
+		}
+		store.nodes[pageID] = view
 		return dirty.final, nil
 	}
 
@@ -71,15 +95,16 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 		return nil, err
 	}
 	if store.nodes != nil {
-		store.nodes[pageID] = node
+		view.node = node
+		store.nodes[pageID] = view
 	}
 	return node, nil
 }
 
 // VisitNodeReferences visits one node without decoding a committed main page.
 func (store *txTreeStore) VisitNodeReferences(pageID page.ID, visit, visitContinuation func(page.ID) error) error {
-	if node, ok := store.nodes[pageID]; ok {
-		return btree.VisitNodeReferences(node, visit, visitContinuation)
+	if view := store.nodes[pageID]; view.node != nil {
+		return btree.VisitNodeReferences(view.node, visit, visitContinuation)
 	}
 	if dirty, ok := store.baseDirty[pageID]; ok {
 		return btree.VisitNodeReferences(dirty.final, visit, visitContinuation)
@@ -99,7 +124,7 @@ func (store *txTreeStore) AllocatePage() (page.ID, error) {
 	return pageID, nil
 }
 
-// FreePage marks a removed tree node and all of its continuation pages for release at commit.
+// FreePage marks every page of a removed node for release at commit.
 // It drops any private node image so the WAL does not write a page that the tree no longer owns.
 // The page stays allocated until commit preparation, so this transaction cannot reuse it early.
 func (store *txTreeStore) FreePage(pageID page.ID) error {
@@ -109,8 +134,8 @@ func (store *txTreeStore) FreePage(pageID page.ID) error {
 	}
 	allocation := store.tx.writableAllocation()
 	if node != nil {
-		for _, id := range node.OverflowPages() {
-			if err := allocation.retire(id); err != nil {
+		for offset := 1; offset < node.StoragePageCount(); offset++ {
+			if err := allocation.retire(pageID + page.ID(offset)); err != nil {
 				return err
 			}
 		}
@@ -127,7 +152,10 @@ func (store *txTreeStore) FreePage(pageID page.ID) error {
 // copies a committed node. Later writes reuse the same dirty node.
 func (store *txTreeStore) WritableNode(node *btree.Node) *btree.Node {
 	if dirty, ok := store.dirty[node.PageID()]; ok {
-		return dirty.final
+		// A parent-link change can retain an earlier callback's image without owning it.
+		if base, shared := store.baseDirty[node.PageID()]; !shared || dirty.final != base.final {
+			return dirty.final
+		}
 	}
 	return store.stageNodeClone(node, node.Clone())
 }
@@ -136,20 +164,26 @@ func (store *txTreeStore) WritableNode(node *btree.Node) *btree.Node {
 // Later deletes compact the transaction's private entry list in place.
 func (store *txTreeStore) DeleteLeafEntries(node *btree.Node, firstIndex int, rest []int, minimumSize int64) *btree.Node {
 	if dirty, ok := store.dirty[node.PageID()]; ok {
-		dirty.final.DeleteLeafEntries(firstIndex, rest)
-		return dirty.final
+		if base, shared := store.baseDirty[node.PageID()]; !shared || dirty.final != base.final {
+			dirty.final.DeleteLeafEntries(firstIndex, rest)
+			return dirty.final
+		}
 	}
 	return store.stageNodeClone(node, node.CloneWithoutLeafEntries(firstIndex, rest, minimumSize))
 }
 
 // stageNodeClone records the committed base and the new callback-owned image.
 func (store *txTreeStore) stageNodeClone(node, private *btree.Node) *btree.Node {
-	original := node
-	if batchDirty, ok := store.baseDirty[node.PageID()]; ok {
-		original = batchDirty.original
+	change, ok := store.baseDirty[node.PageID()]
+	if !ok {
+		change.original = node
 	}
-	store.nodes[node.PageID()] = private
-	store.dirty[node.PageID()] = dirtyNode{original: original, final: private}
+	change.final = private
+	if view, cached := store.nodes[node.PageID()]; cached {
+		change.parent = view.parent
+	}
+	store.nodes[node.PageID()] = txNode{node: private, parent: change.parent}
+	store.dirty[node.PageID()] = change
 	return private
 }
 
@@ -158,94 +192,258 @@ func (store *txTreeStore) StageNode(node *btree.Node) {
 	dirty.final = node
 	if baseDirty, ok := store.baseDirty[node.PageID()]; ok {
 		dirty.original = baseDirty.original
+		dirty.parent = baseDirty.parent
+	}
+	if view, cached := store.nodes[node.PageID()]; cached {
+		dirty.parent = view.parent
 	}
 	// Keep the mutable node here. The commit path encodes its final state once after the callback succeeds.
-	store.nodes[node.PageID()] = node
+	store.nodes[node.PageID()] = txNode{node: node, parent: dirty.parent}
 	store.dirty[node.PageID()] = dirty
 }
 
-// prepareCommit assigns continuation pages after all tree changes finish.
-// It serves direct writes and write batches. The first leaf or branch page
-// keeps its ID. Each changed node keeps as many of its committed continuation
-// IDs as its final body needs. Growth allocates additional pages through the
-// normal allocator. Shrink retires only the surplus IDs. A body that fits one
-// page loses all continuation IDs. IDs need not be consecutive.
-//
-// This function changes only private node and allocation state.
-// A file database writes the changed pages to the WAL before it publishes them.
-// A memory database publishes the changed nodes without file operations.
-// The caller must discard private state if preparation or the WAL commit fails.
+// SetParent records a known branch or bucket-entry owner without searching other nodes.
+// A nil parent selects the metadata root. Earlier batch images stay shared until WritableNode copies them.
+func (store *txTreeStore) SetParent(child page.ID, parent *btree.Node) {
+	if store.tx.readOnly {
+		return
+	}
+	view := store.nodes[child]
+	view.parent = parent
+	if change, ok := store.dirty[child]; ok {
+		change.parent = parent
+		store.dirty[child] = change
+	} else if change, ok := store.baseDirty[child]; ok {
+		view.node = change.final
+		// A new object at the same page ID is still the same parent.
+		// Commit preparation resolves its latest private image.
+		if change.parent != parent && (change.parent == nil || parent == nil || change.parent.PageID() != parent.PageID()) {
+			change.parent = parent
+			store.dirty[child] = change
+		}
+	}
+	store.nodes[child] = view
+}
+
+// prepareCommit assigns one consecutive storage span to each changed node.
+// Moved nodes and their reference changes stay private until commit.
 func (tx *Tx) prepareCommit() error {
 	if tx.allocation != nil {
-		// A later batch callback can remove a node changed by an earlier callback.
 		for id := range tx.allocation.retired {
 			delete(tx.store.dirty, id)
 		}
 	}
-	// Map order is random.
-	// Nodes that need new continuation IDs wait in growing, and the next loop allocates them in page-ID order.
-	// So the same changes always give the same file layout, and a simulation seed can replay it.
-	var growing []dirtyNode
-	for _, change := range tx.store.dirty {
-		// The final node stays unchanged through WAL encoding. Reuse its exact size.
-		change.final.CacheEncodedSize()
-		count := btree.NodePageCount(change.final, tx.meta.PageSize())
-		if count == 0 {
-			return fmt.Errorf("node %d cannot hold a continuation ID: %w", change.final.PageID(), btree.ErrInvalid)
-		}
-		var previous []page.ID
-		if change.original != nil {
-			previous = change.original.OverflowPages()
-		}
-		required := count - 1
-		if required > len(previous) {
-			growing = append(growing, change)
-			continue
-		}
-		var ids []page.ID
-		if required > 0 {
-			ids = make([]page.ID, required)
-			copy(ids, previous)
-		}
-		if required != len(previous) {
+	if len(tx.store.dirty) == 0 {
+		if tx.allocation != nil && len(tx.allocation.retired) != 0 {
 			allocation := tx.writableAllocation()
-			// Retired IDs stay allocated until every node's new IDs are assigned.
-			for _, id := range previous[required:] {
-				if err := allocation.retire(id); err != nil {
-					return err
-				}
-			}
-		}
-		change.final.SetOverflowPages(ids)
-	}
-	slices.SortFunc(growing, func(left, right dirtyNode) int {
-		return cmp.Compare(left.final.PageID(), right.final.PageID())
-	})
-	for _, change := range growing {
-		var previous []page.ID
-		if change.original != nil {
-			previous = change.original.OverflowPages()
-		}
-		ids := make([]page.ID, btree.NodePageCount(change.final, tx.meta.PageSize())-1)
-		copy(ids, previous)
-		allocation := tx.writableAllocation()
-		for i := len(previous); i < len(ids); i++ {
-			id, err := allocation.allocate(tx.meta.LastPage())
-			if err != nil {
-				return err
-			}
-			ids[i] = id
-			if id > tx.meta.LastPage() {
-				tx.writableMeta().SetLastPage(id)
+			if allocation.finalize(tx.meta) {
 				tx.metaDirty = true
 			}
 		}
-		change.final.SetOverflowPages(ids)
+		return nil
+	}
+	// Equal span lengths keep every head in place, so no parent repair is needed.
+	unchangedSpans := true
+	for _, change := range tx.store.dirty {
+		node := change.final
+		oldCount := node.StoragePageCount()
+		if oldCount <= 0 || page.ID(oldCount)-1 > ^page.ID(0)-node.PageID() {
+			return fmt.Errorf("node %d has an invalid old span: %w", node.PageID(), btree.ErrInvalid)
+		}
+		node.CacheEncodedSize()
+		count := btree.NodePageCount(node, tx.meta.PageSize())
+		if count <= 0 {
+			return fmt.Errorf("node %d has an invalid span: %w", node.PageID(), btree.ErrInvalid)
+		}
+		if count != oldCount {
+			unchangedSpans = false
+			break
+		}
+	}
+	if unchangedSpans {
+		if tx.allocation != nil && len(tx.allocation.retired) != 0 {
+			allocation := tx.writableAllocation()
+			if allocation.finalize(tx.meta) {
+				tx.metaDirty = true
+			}
+		}
+		return nil
+	}
+	tx.store.tx = tx
+	if tx.store.nodes == nil {
+		tx.store.nodes = make(map[page.ID]txNode)
+	}
+	prepared := make(map[*btree.Node]bool, len(tx.store.dirty))
+	for {
+		var pending []dirtyNode
+		for _, change := range tx.store.dirty {
+			if !prepared[change.final] {
+				pending = append(pending, change)
+			}
+		}
+		if len(pending) == 0 {
+			break
+		}
+		slices.SortFunc(pending, func(left, right dirtyNode) int { return cmp.Compare(left.final.PageID(), right.final.PageID()) })
+		moved := make(map[page.ID]page.ID)
+		for _, change := range pending {
+			node := change.final
+			head := node.PageID()
+			oldCount := node.StoragePageCount()
+			if oldCount <= 0 || page.ID(oldCount)-1 > ^page.ID(0)-head {
+				return fmt.Errorf("node %d has an invalid old span: %w", head, btree.ErrInvalid)
+			}
+			node.CacheEncodedSize()
+			count := btree.NodePageCount(node, tx.meta.PageSize())
+			if count <= 0 {
+				return fmt.Errorf("node %d has an invalid span: %w", head, btree.ErrInvalid)
+			}
+			if count > oldCount {
+				allocation := tx.writableAllocation()
+				if !allocation.extendSpan(head, oldCount, count, tx.meta.LastPage()) {
+					newHead, err := allocation.allocateSpan(tx.meta.LastPage(), count)
+					if err != nil {
+						return err
+					}
+					for step := 0; step < oldCount; step++ {
+						if err := allocation.retire(head + page.ID(step)); err != nil {
+							return err
+						}
+					}
+					delete(tx.store.dirty, head)
+					delete(tx.store.nodes, head)
+					node.SetPageID(newHead)
+					change.original = nil
+					tx.store.nodes[newHead] = txNode{node: node, parent: change.parent}
+					tx.store.dirty[newHead] = change
+					moved[head] = newHead
+					head = newHead
+				}
+				last := head + page.ID(count) - 1
+				if last > tx.meta.LastPage() {
+					tx.writableMeta().SetLastPage(last)
+					tx.metaDirty = true
+				}
+			} else if count < oldCount {
+				for offset := count; offset < oldCount; offset++ {
+					if err := tx.writableAllocation().retire(head + page.ID(offset)); err != nil {
+						return err
+					}
+				}
+			}
+			node.SetStoragePageCount(count)
+			prepared[node] = true
+		}
+		if len(moved) != 0 {
+			if err := tx.repairMovedNodes(moved); err != nil {
+				return err
+			}
+		}
 	}
 	if tx.allocation != nil && len(tx.allocation.retired) != 0 {
-		if tx.writableAllocation().finalize(tx.meta) {
+		allocation := tx.writableAllocation()
+		if allocation.finalize(tx.meta) {
 			tx.metaDirty = true
 		}
+	}
+	return nil
+}
+
+// repairMovedNodes changes only the saved direct parent of each moved node.
+// A later callback or this preparation pass can replace that parent. Use its latest private version before changing the reference.
+func (tx *Tx) repairMovedNodes(moved map[page.ID]page.ID) error {
+	parents := make([]*btree.Node, 0, len(moved))
+	for id, target := range moved {
+		parent := tx.store.dirty[target].parent
+		if parent == nil {
+			if id != tx.meta.Root() {
+				return fmt.Errorf("moved node %d has no parent: %w", id, btree.ErrInvalid)
+			}
+			continue
+		}
+		parentID := parent.PageID()
+		if replacement, ok := moved[parentID]; ok {
+			parentID = replacement
+		}
+		if change, ok := tx.store.dirty[parentID]; ok {
+			parent = change.final
+		}
+		parents = append(parents, parent)
+	}
+	// Several moved children can share one parent. Repair that parent once.
+	slices.SortFunc(parents, func(left, right *btree.Node) int { return cmp.Compare(left.PageID(), right.PageID()) })
+	for first := 0; first < len(parents); {
+		parent := parents[first]
+		last := first + 1
+		for last < len(parents) && parents[last].PageID() == parent.PageID() {
+			last++
+		}
+		parent = tx.store.WritableNode(parent)
+		repaired := 0
+		if !parent.IsLeaf() {
+			for index, child := range parent.Children {
+				if target, ok := moved[child]; ok {
+					parent.Children[index] = target
+					repaired++
+				}
+			}
+		} else {
+			for index := range parent.EntryCount() {
+				entry := parent.EntryAt(index)
+				if entry.Flags()&btree.BucketLeafFlag == 0 {
+					continue
+				}
+				root, err := page.DecodeID(entry.Value())
+				if err != nil {
+					return err
+				}
+				if target, ok := moved[root]; ok {
+					if err := parent.InsertOrReplaceLeafEntry(btree.NewEntry(entry.Flags(), entry.Key(), page.EncodeID(target))); err != nil {
+						return err
+					}
+					repaired++
+				}
+			}
+		}
+		if repaired != last-first {
+			return fmt.Errorf("parent %d repaired %d moved children, want %d: %w", parent.PageID(), repaired, last-first, btree.ErrInvalid)
+		}
+		first = last
+	}
+	rootID := tx.meta.Root()
+	if target, ok := moved[rootID]; ok {
+		rootID = target
+		tx.writableMeta().SetRoot(target)
+		tx.metaDirty = true
+	}
+	if change, ok := tx.store.dirty[rootID]; ok {
+		tx.rootNode = change.final
+	}
+	if tx.rootNode == nil {
+		return fmt.Errorf("relocated root %d is absent: %w", rootID, btree.ErrInvalid)
+	}
+	var refresh func(*Bucket)
+	refresh = func(bucket *Bucket) {
+		if bucket == nil || bucket.deleted {
+			return
+		}
+		if bucket.rootNode != nil {
+			id := bucket.rootNode.PageID()
+			if target, ok := moved[id]; ok {
+				id = target
+			}
+			if change, ok := tx.store.dirty[id]; ok {
+				bucket.rootNode = change.final
+			}
+		}
+		refresh(bucket.child)
+		for _, child := range bucket.children {
+			refresh(child)
+		}
+	}
+	refresh(tx.bucket)
+	for _, bucket := range tx.buckets {
+		refresh(bucket)
 	}
 	return nil
 }

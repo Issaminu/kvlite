@@ -103,32 +103,31 @@ func TestContinuedMainFileReads(t *testing.T) {
 			defer db.Close()
 			if fromWAL {
 				// WAL values differ from the main file. Get must use the WAL tree.
-				for _, id := range []page.ID{db.meta.Root(), 4, 5, 6} {
-					data, err := db.readMainPage(id)
+				ids := []page.ID{db.meta.Root()}
+				walkNodes(t, db, mustBucketRoot(t, db, bucketName), func(node *btree.Node) { ids = append(ids, node.PageID()) })
+				for _, id := range ids {
+					data, err := db.readMainNodePage(id)
 					if err != nil {
 						t.Fatal(err)
 					}
-					node, err := btree.DecodeNode(bytes.Clone(data), id, db.meta.PageSize(), db.readMainPage, db.meta.DataPageChecksums())
+					node, err := btree.DecodeNode(bytes.Clone(data), id, db.meta.PageSize(), nil, db.meta.DataPageChecksums())
 					if err != nil {
 						t.Fatal(err)
 					}
-					if id == 5 || id == 6 {
+					if id != db.meta.Root() && node.IsLeaf() {
 						for index := 0; index < node.EntryCount(); index++ {
 							node.EntryAt(index).Value()[0] ^= 1
 						}
 					}
-					ids := append([]page.ID{id}, node.OverflowPages()...)
-					images, err := btree.EncodeWALNodePages(node, db.meta.PageSize(), ids)
-					if err != nil {
-						t.Fatal(err)
-					}
-					for index, pageID := range ids {
-						db.wal.LoadCommittedRecord(wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: pageID}, Payload: images[index]})
-					}
+					db.wal.LoadCommittedRecord(wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: id}, Payload: btree.EncodeWALNode(node)})
 				}
 				for _, entry := range entries {
 					entry.Value()[0] ^= 1
 				}
+				clear(db.writeNodes)
+				db.writeNodeSlots = nil
+				db.nextWriteNodeSlot = 0
+				db.cacheWriteNode(db.rootNode)
 			}
 			if !mapped {
 				if err := db.unmapMainFile(); err != nil {
@@ -204,7 +203,7 @@ func TestContinuedMainFileReadsRejectDamagedPage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Change body bytes without updating the continuation page's checksum.
+	// Change raw tail bytes without updating the complete node checksum.
 	if _, err := file.WriteAt([]byte{0xff}, int64(continuationID)*64+63); err != nil {
 		t.Fatal(err)
 	}
@@ -247,10 +246,8 @@ func TestContinuedMainFileReadsRejectDamagedPage(t *testing.T) {
 	}
 }
 
-// writeContinuedReadDatabase writes a catalog, a branch, and two leaves.
-// The catalog, branch, and right leaf need continuation pages. The small
-// pages force several ID groups. Storage IDs have gaps and change direction.
-// This fixture tests reads independently of the pending insertion/WAL work.
+// writeContinuedReadDatabase writes an independent native-format fixture.
+// Small pages force the catalog, branch, keys, and values across raw boundaries.
 func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, []btree.Entry, page.ID) {
 	t.Helper()
 	const pageSize int64 = 64
@@ -264,7 +261,7 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 	meta := page.NewMeta(pageSize)
 	meta.SetDataPageChecksums(checksums)
 	catalog := btree.NewLeafNode(meta.Root())
-	left, right := btree.NewLeafNode(5), btree.NewLeafNode(6)
+	left, right := btree.NewLeafNode(0), btree.NewLeafNode(0)
 	for index, entry := range entries {
 		node := right
 		if index == 0 {
@@ -274,7 +271,7 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 			t.Fatal(err)
 		}
 	}
-	branch := btree.NewRootNode(4, left, right, entries[1].Key())
+	branch := btree.NewRootNode(0, left, right, entries[1].Key())
 	if err := catalog.InsertEntry(btree.NewEntry(btree.BucketLeafFlag, bucketName, page.EncodeID(branch.PageID()))); err != nil {
 		t.Fatal(err)
 	}
@@ -289,15 +286,25 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 		}
 	}
 	allocation := newAllocationBitmap(pageSize)
-	nextID := page.ID(7)
+	nextID := meta.Root()
+	for _, node := range []*btree.Node{catalog, branch, left, right} {
+		node.SetPageID(nextID)
+		nextID += page.ID(btree.NodePageCount(node, pageSize))
+	}
+	pagesPerFrame := page.ID((pageSize - allocationHeaderSize) * 8)
+	right.SetPageID((right.PageID()/pagesPerFrame+1)*pagesPerFrame - 1)
+	branch.Children = []page.ID{left.PageID(), right.PageID()}
+	if err := catalog.InsertOrReplaceLeafEntry(btree.NewEntry(btree.BucketLeafFlag, bucketName, page.EncodeID(branch.PageID()))); err != nil {
+		t.Fatal(err)
+	}
 	var damagedPageID page.ID
 	for _, node := range []*btree.Node{catalog, branch, left, right} {
 		ids := make([]page.ID, btree.NodePageCount(node, pageSize))
 		ids[0] = node.PageID()
 		for index := 1; index < len(ids); index++ {
-			ids[index] = nextID
-			nextID = 7 + (nextID-7+73)%300
+			ids[index] = node.PageID() + page.ID(index)
 		}
+		node.SetStoragePageCount(len(ids))
 		var encoded [][]byte
 		var err error
 		if checksums {
@@ -323,7 +330,11 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 			damagedPageID = ids[len(ids)-1]
 		}
 	}
-	write(firstAllocationSegmentID, allocation.encodeSegment(0))
+	allocationData := make([]byte, int64(len(allocation.segments))*pageSize)
+	for index := range allocation.segments {
+		copy(allocationData[int64(index)*pageSize:], allocation.encodeSegment(index))
+	}
+	write(firstAllocationSegmentID, allocationData)
 	meta.RefreshChecksum()
 	for _, id := range []page.ID{page.Meta0ID, page.Meta1ID} {
 		write(id, page.EncodeMeta(meta))
@@ -333,7 +344,7 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 
 func TestMakeWALCommitData_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 	meta := page.NewMeta(4096)
-	node := btree.NewLeafNode(1)
+	node := btree.NewLeafNode(meta.Root())
 	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
@@ -346,7 +357,7 @@ func TestMakeWALCommitData_DoesNotCalculateDatabasePageChecksum(t *testing.T) {
 		t.Fatal("node record did not keep the final node for direct encoding")
 	}
 	payload := btree.EncodeWALNode(nodes[0].Final)
-	if got := binary.LittleEndian.Uint32(payload[btree.NodeHeaderSize-4 : btree.NodeHeaderSize]); got != 0 {
+	if got := binary.LittleEndian.Uint32(payload[14:18]); got != 0 {
 		t.Fatalf("WAL node page checksum: got %x, want zero", got)
 	}
 }
@@ -1045,10 +1056,10 @@ func TestFile_SinglePage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pages 0 and 1 are metadata, page 2 is allocation, page 3 is the bucket catalog, and page 4 is the data leaf.
-	if size := fileSize(t, path); size != 5*pageBytes {
-		t.Fatalf("a small bucket should occupy exactly five %d-byte pages (two metadata + allocation + catalog + data leaf), got %d bytes "+
-			"(nodes must be padded to page boundaries)", pageBytes, size)
+	// Two metadata pages and the bitmap group precede the catalog and data leaf.
+	pageCount := int64(page.AllocationSegmentPages(pageBytes)) + 4
+	if size := fileSize(t, path); size != pageCount*pageBytes {
+		t.Fatalf("small bucket file size: got %d, want %d pages of %d bytes", size, pageCount, pageBytes)
 	}
 }
 
@@ -2290,8 +2301,9 @@ func TestOpen_NewDatabaseUsesOperatingSystemPageSize(t *testing.T) {
 	if db.meta.PageSize() != pageSize {
 		t.Fatalf("new database page size: got %d, want %d", db.meta.PageSize(), pageSize)
 	}
-	if got := fileSize(t, path); got != 4*pageSize {
-		t.Fatalf("new database file size: got %d, want four %d-byte pages", got, pageSize)
+	pageCount := int64(page.AllocationSegmentPages(pageSize)) + 3
+	if got := fileSize(t, path); got != pageCount*pageSize {
+		t.Fatalf("new database file size: got %d, want %d pages of %d bytes", got, pageCount, pageSize)
 	}
 	data := make([]byte, pageSize)
 	if _, err := db.file.ReadAt(data, int64(firstAllocationSegmentID)*pageSize); err != nil {
@@ -2301,7 +2313,7 @@ func TestOpen_NewDatabaseUsesOperatingSystemPageSize(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new database allocation page: %v", err)
 	}
-	for pageID := page.ID(0); pageID <= firstTreePageID; pageID++ {
+	for pageID := page.ID(0); pageID <= db.meta.Root(); pageID++ {
 		if !allocationBitIsSet(segment.bitmapBits(), pageID) {
 			t.Fatalf("initial allocation page marks page %d free", pageID)
 		}
@@ -7119,12 +7131,15 @@ func TestWriteBatch_RetirementReusesPrivateAllocationPage(t *testing.T) {
 	original := db.allocation.segments[0].data
 	wantOriginal := bytes.Clone(original)
 	var private *allocationSegment
+	var retiredPage page.ID
 	request := &writeRequest{
 		transaction: func(tx *Tx) error {
 			name := []byte("temporary")
-			if _, err := tx.CreateBucket(name); err != nil {
+			bucket, err := tx.CreateBucket(name)
+			if err != nil {
 				return err
 			}
+			retiredPage = bucket.rootNode.PageID()
 			if err := tx.DeleteBucket(name); err != nil {
 				return err
 			}
@@ -7148,7 +7163,7 @@ func TestWriteBatch_RetirementReusesPrivateAllocationPage(t *testing.T) {
 	if !bytes.Equal(original, wantOriginal) {
 		t.Fatal("batch preparation changed the original allocation page")
 	}
-	if db.allocation.allocated(4) {
+	if db.allocation.allocated(retiredPage) {
 		t.Fatal("retired bucket page is still allocated")
 	}
 }
@@ -8496,10 +8511,11 @@ func TestPut_ContinuedTree(t *testing.T) {
 				}
 			}
 			check()
-			oldBranches := make(map[page.ID][]page.ID)
+			// Appending a key preserves each old branch's first separator, even if the branch moves.
+			oldBranches := make(map[string]int)
 			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
 				if !node.IsLeaf() {
-					oldBranches[node.PageID()] = slices.Clone(node.OverflowPages())
+					oldBranches[string(node.EntryAt(0).Key())] = node.StoragePageCount()
 				}
 			})
 			// Another leaf split grows a committed branch with large separator keys.
@@ -8511,22 +8527,21 @@ func TestPut_ContinuedTree(t *testing.T) {
 			keys, values = append(keys, key), append(values, value)
 			grew := false
 			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
-				previous, found := oldBranches[node.PageID()]
+				key := string(node.EntryAt(0).Key())
+				previous, found := oldBranches[key]
 				if !found {
 					return
 				}
-				ids := node.OverflowPages()
-				kept := min(len(ids), len(previous))
-				if !slices.Equal(ids[:kept], previous[:kept]) {
-					t.Fatal("branch update replaced existing continuation IDs")
-				}
-				grew = grew || len(ids) > len(previous)
-				delete(oldBranches, node.PageID())
+				grew = grew || node.StoragePageCount() > previous
+				delete(oldBranches, key)
 			})
 			if !grew || len(oldBranches) != 0 {
 				t.Fatalf("branch growth=%t, missing original branches=%d", grew, len(oldBranches))
 			}
 			check()
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
+			}
 			leaves, branches := 0, 0
 			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
 				if len(node.OverflowPages()) == 0 {
@@ -8571,8 +8586,8 @@ func TestPut_ContinuedTree(t *testing.T) {
 	}
 }
 
-// TestPut_ContinuationPageOwnership checks growth, splits, replacement, and reuse.
-func TestPut_ContinuationPageOwnership(t *testing.T) {
+// TestPut_ConsecutivePageOwnership checks growth, splits, replacement, and page ownership.
+func TestPut_ConsecutivePageOwnership(t *testing.T) {
 	for _, mode := range []Sync{SyncNone, SyncFull} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			db, err := Open(filepath.Join(t.TempDir(), "database"), 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30})
@@ -8666,7 +8681,7 @@ func TestPut_ContinuationPageOwnership(t *testing.T) {
 			second := findLeaf("b")
 			secondHead := second.PageID()
 			secondOld := slices.Clone(second.OverflowPages())
-			// Keep existing IDs and append reused low IDs. The list must have a gap.
+			// Growth keeps adjacent storage when it is free. Tail pages must remain consecutive.
 			larger := bytes.Repeat([]byte("w"), 6*int(db.meta.PageSize()))
 			put("b", larger)
 			second = findLeaf("b")
@@ -8677,20 +8692,17 @@ func TestPut_ContinuationPageOwnership(t *testing.T) {
 			if len(ids) <= len(secondOld) || !slices.Equal(ids[:len(secondOld)], secondOld) {
 				t.Fatal("growth replaced existing continuation IDs")
 			}
-			reused, gap := false, false
+
 			for i, id := range ids {
-				if slices.Contains(old, id) {
-					reused = true
-				}
-				if i > 0 && id != ids[i-1]+1 {
-					gap = true
+				if id != secondHead+page.ID(i)+1 {
+					t.Fatalf("tail page %d is not consecutive after head %d", id, secondHead)
 				}
 				if !db.allocation.allocated(id) {
 					t.Fatalf("new continuation %d is free", id)
 				}
 			}
-			if !reused || !gap {
-				t.Fatalf("reuse=%t, non-consecutive IDs=%t", reused, gap)
+			if err := db.validatePageOwnership(); err != nil {
+				t.Fatal(err)
 			}
 			old = slices.Clone(ids)
 			put("b", bytes.Repeat([]byte("s"), 2*int(db.meta.PageSize())))
@@ -8903,8 +8915,8 @@ func TestReadNode_ContinuedWALRecordUsesCommittedNode(t *testing.T) {
 	db.operationMu.Lock()
 	defer db.operationMu.Unlock()
 	record, ok := db.wal.Lookup(leafPageID)
-	if !ok || record.Node != nil || record.Payload == nil {
-		t.Fatalf("leaf %d WAL record: found %t, decoded %t; want an encoded record", leafPageID, ok, record.Node != nil)
+	if !ok || record.Node == nil || record.Payload != nil {
+		t.Fatalf("leaf %d WAL record: found %t, decoded %t; want a committed node", leafPageID, ok, record.Node != nil)
 	}
 	var node *btree.Node
 	allocations := testing.AllocsPerRun(10, func() {
@@ -8913,6 +8925,9 @@ func TestReadNode_ContinuedWALRecordUsesCommittedNode(t *testing.T) {
 			panic(err)
 		}
 	})
+	if node != record.Node {
+		t.Fatal("read did not return the committed WAL node")
+	}
 	if allocations != 0 {
 		t.Fatalf("allocations for each continued WAL leaf read: got %.0f, want 0", allocations)
 	}
@@ -8922,7 +8937,7 @@ func TestReadNode_ContinuedWALRecordUsesCommittedNode(t *testing.T) {
 }
 
 // TestBucketGet_ReadTransactionSkipsContinuedKey checks that a read-only Get does not copy a key that does not fit in one page.
-// Get uses only the value, so the only allocation is the copy of the continued value.
+// The key and value both borrow the mapped node. Get does not need an allocation.
 func TestBucketGet_ReadTransactionSkipsContinuedKey(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, nil)
@@ -8956,8 +8971,8 @@ func TestBucketGet_ReadTransactionSkipsContinuedKey(t *testing.T) {
 				panic(fmt.Sprintf("Get: value %q, error %v", value, err))
 			}
 		})
-		if allocations != 1 {
-			t.Fatalf("allocations for each Get: got %.0f, want 1 for the value copy", allocations)
+		if allocations != 0 {
+			t.Fatalf("allocations for each Get: got %.0f, want 0 for mapped data", allocations)
 		}
 		return nil
 	}); err != nil {
@@ -9334,7 +9349,7 @@ func TestDeleteBucket_ContinuedReadFailure(t *testing.T) {
 			tail = ids[len(ids)-1]
 		}
 	})
-	offset := int64(tail)*db.meta.PageSize() + btree.ContinuationHeaderSize
+	offset := int64(tail)*db.meta.PageSize() + 1
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -9549,5 +9564,356 @@ func TestDeleteLeafEntries_PreservesWriteBatchImages(t *testing.T) {
 	}
 	if string(final.EntryAt(0).Key()) != "a" || string(final.EntryAt(1).Key()) != "f" {
 		t.Fatal("delete kept the wrong callback entries")
+	}
+}
+
+func TestRecoveryWholeNodePatchChain(t *testing.T) {
+	const pageSize = 4096
+	db := &DB{meta: page.NewMeta(pageSize)}
+	base := btree.NewLeafNode(20)
+	value := bytes.Repeat([]byte{'a'}, 3*pageSize)
+	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	base.SetStoragePageCount(btree.NodePageCount(base, pageSize))
+	image := btree.EncodeWALNode(base)
+	bytePatch := func(offset int, value byte) []byte {
+		patch := binary.LittleEndian.AppendUint32(nil, uint32(offset))
+		patch = binary.LittleEndian.AppendUint32(patch, 1)
+		return append(patch, value)
+	}
+	entryPatch := func(key, value []byte) []byte {
+		patch := binary.LittleEndian.AppendUint16([]byte{1}, uint16(len(key)))
+		patch = append(patch, key...)
+		patch = binary.LittleEndian.AppendUint32(patch, 0)
+		patch = binary.LittleEndian.AppendUint32(patch, uint32(len(value)))
+		return append(patch, value...)
+	}
+	value = bytes.Clone(value)
+	value[len(value)-1] = 'b'
+	want := base.Clone()
+	if err := want.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	if err := want.InsertEntry(btree.NewEntry(0, []byte("other"), []byte("new?"))); err != nil {
+		t.Fatal(err)
+	}
+	record := func(kind wal.RecordType, txid wal.TxID, payload []byte) wal.WALRecord {
+		return wal.WALRecord{Header: wal.RecordHeader{Type: kind, PageID: base.PageID(), TxID: txid}, Payload: payload}
+	}
+	records := []wal.WALRecord{
+		record(wal.RecordTypeNode, 1, image),
+		record(wal.RecordTypeBytePatch, 2, bytePatch(len(image)-1, 'b')),
+		record(wal.RecordTypeEntryPatch, 3, entryPatch([]byte("other"), []byte("new?"))),
+		record(wal.RecordTypeBytePatch, 4, bytePatch(want.EncodedSize()-1, '!')),
+	}
+	if err := want.InsertEntry(btree.NewEntry(0, []byte("other"), []byte("new!"))); err != nil {
+		t.Fatal(err)
+	}
+	materialized, err := db.materializeWALPages(records)
+	if err != nil || len(materialized) != 1 {
+		t.Fatalf("materialized records=%d error=%v", len(materialized), err)
+	}
+	latest := materialized[0]
+	if latest.Header.Type != wal.RecordTypeNode || latest.Header.TxID != 4 || !bytes.Equal(latest.Payload, btree.EncodeWALNode(want)) {
+		t.Fatal("mixed patches did not reconstruct the final complete node")
+	}
+	if !bytes.Equal(image, btree.EncodeWALNode(base)) {
+		t.Fatal("replay changed its complete WAL base")
+	}
+	file, err := os.CreateTemp(t.TempDir(), "checkpoint")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := wal.WriteCommittedPages(file, map[page.ID]wal.CommittedPage{base.PageID(): {Header: latest.Header, Payload: latest.Payload}}, pageSize, true); err != nil {
+		t.Fatal(err)
+	}
+	span := make([]byte, want.StoragePageCount()*pageSize)
+	if _, err := file.ReadAt(span, int64(want.PageID())*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	got, err := btree.DecodeNode(span, want.PageID(), pageSize, nil, true)
+	if err != nil || !bytes.Equal(btree.EncodeWALNode(got), btree.EncodeWALNode(want)) {
+		t.Fatalf("replayed checkpoint image: %v", err)
+	}
+	bad := []wal.WALRecord{records[0], record(wal.RecordTypeEntryPatch, 2, entryPatch([]byte("key"), make([]byte, 5*pageSize)))}
+	if _, err := db.materializeWALPages(bad); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("entry patch changed the allocated page count: %v", err)
+	}
+	if _, err := db.materializeWALPages(records[1:]); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("patch chain without a complete WAL base: %v", err)
+	}
+}
+
+func TestRecoveryWholeNodeSpanReuseAndBounds(t *testing.T) {
+	const pageSize = 4096
+	for _, fault := range []string{"stale-head", "same-transaction-overlap", "newer-overlap", "free-tail", "allocation-page", "past-end"} {
+		t.Run(fault, func(t *testing.T) {
+			meta := page.NewMeta(pageSize)
+			meta.SetLastPage(100)
+			allocation := newAllocationBitmap(pageSize)
+			head := page.ID(20)
+			if fault == "allocation-page" {
+				head = firstAllocationSegmentID
+			}
+			node := btree.NewLeafNode(head)
+			if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), bytes.Repeat([]byte{'v'}, 3*pageSize))); err != nil {
+				t.Fatal(err)
+			}
+			count := btree.NodePageCount(node, pageSize)
+			node.SetStoragePageCount(count)
+			for offset := range count {
+				if fault != "free-tail" || offset != count-1 {
+					allocation.markAllocated(head + page.ID(offset))
+				}
+			}
+			if fault == "past-end" {
+				meta.SetLastPage(head + page.ID(count) - 2)
+			}
+			records := []wal.WALRecord{{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: head, TxID: 2}, Payload: btree.EncodeWALNode(node)}}
+			if fault == "stale-head" || fault == "same-transaction-overlap" || fault == "newer-overlap" {
+				old := btree.NewLeafNode(head + 2)
+				txid := wal.TxID(1)
+				if fault == "same-transaction-overlap" {
+					txid = 2
+				} else if fault == "newer-overlap" {
+					txid = 3
+				}
+				records = append(records, wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: old.PageID(), TxID: txid}, Payload: btree.EncodeWALNode(old)})
+			}
+			db := &DB{meta: meta, allocation: allocation}
+			got, err := db.materializeWALPages(records)
+			if fault == "stale-head" {
+				if err != nil || len(got) != 1 || got[0].Header.PageID != head {
+					t.Fatalf("old head inside new raw storage survived: records=%d error=%v", len(got), err)
+				}
+			} else if !errors.Is(err, page.ErrInvalid) {
+				t.Fatalf("invalid recovered span: %v", err)
+			}
+		})
+	}
+}
+
+// TestRecoveryOldHeadReusedInsideRawSpan checks a stale WAL node that becomes raw tail storage.
+// Recovery must retain the new span and discard the older head image.
+func TestRecoveryOldHeadReusedInsideRawSpan(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		for _, checksums := range []bool{false, true} {
+			t.Run(fmt.Sprintf("sync=%d/checksums=%t", mode, checksums), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "source")
+				db, err := Open(path, 0600, &Options{Synchronous: mode, DataPageChecksums: checksums, CheckpointThresholdBytes: 1 << 30})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				names := [][]byte{[]byte("zero"), []byte("one"), []byte("two"), []byte("three"), []byte("four"), []byte("five"), []byte("anchor")}
+				var oldHead page.ID
+				if err := db.Update(func(tx *Tx) error {
+					for i, name := range names {
+						bucket, err := tx.CreateBucket(name)
+						if err != nil {
+							return err
+						}
+						if err := bucket.Put([]byte("key"), []byte("before")); err != nil {
+							return err
+						}
+						if i == 2 {
+							oldHead = bucket.rootNode.PageID()
+						}
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.checkpointWAL(); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Put(names[2], []byte("key"), []byte("old head WAL image")); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Update(func(tx *Tx) error {
+					for _, name := range names[1:6] {
+						if err := tx.DeleteBucket(name); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				pattern := []byte("raw-span-value")
+				value := bytes.Repeat(pattern, (3*int(db.meta.PageSize())+len(pattern)-1)/len(pattern))
+				var newHead page.ID
+				var spanCount int
+				if err := db.Update(func(tx *Tx) error {
+					bucket, err := tx.CreateBucket([]byte("replacement"))
+					if err != nil {
+						return err
+					}
+					return bucket.Put([]byte("key"), value)
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.View(func(tx *Tx) error {
+					bucket, err := tx.Bucket([]byte("replacement"))
+					if err != nil {
+						return err
+					}
+					if err := bucket.loadRootNode(); err != nil {
+						return err
+					}
+					newHead = bucket.rootNode.PageID()
+					spanCount = btree.NodePageCount(bucket.rootNode, tx.meta.PageSize())
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if oldHead <= newHead || oldHead >= newHead+page.ID(spanCount) {
+					t.Fatalf("old head %d is outside raw tail [%d,%d)", oldHead, newHead+1, newHead+page.ID(spanCount))
+				}
+				mainBytes, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				logBytes, err := os.ReadFile(path + "-wal")
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, readOnly := range []bool{true, false} {
+					recoveredPath := fmt.Sprintf("%s.recovered-%t", path, readOnly)
+					if err := os.WriteFile(recoveredPath, mainBytes, 0600); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(recoveredPath+"-wal", logBytes, 0600); err != nil {
+						t.Fatal(err)
+					}
+					copy, err := Open(recoveredPath, 0600, &Options{Synchronous: mode, ReadOnly: readOnly})
+					if err != nil {
+						t.Fatal(err)
+					}
+					got, err := copy.Get([]byte("replacement"), []byte("key"))
+					if err != nil || !bytes.Equal(got, value) {
+						copy.Close()
+						t.Fatalf("readOnly=%t value=%d bytes err=%v", readOnly, len(got), err)
+					}
+					if err := copy.validatePageOwnership(); err != nil {
+						copy.Close()
+						t.Fatal(err)
+					}
+					if err := copy.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+type changedSpanHeaderFile struct {
+	fileio.File
+	offset               int64
+	pageSize             int64
+	change               func([]byte)
+	headReads, fullReads int
+}
+
+func TestMainSpanReadChecksReturnedHeader(t *testing.T) {
+	for _, checksums := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			if err := db.Put(testBucketName, []byte("key"), bytes.Repeat([]byte("v"), 64<<10)); err != nil {
+				t.Fatal(err)
+			}
+			checkpointChecksumTest(t, db)
+			root := mustBucketRoot(t, db, testBucketName)
+			if !root.IsLeaf() || root.StoragePageCount() <= 2 {
+				t.Fatal("fixture has no large leaf")
+			}
+			if err := db.unmapMainFile(); err != nil {
+				t.Fatal(err)
+			}
+			file := &changedSpanHeaderFile{File: db.file, offset: int64(root.PageID()) * db.meta.PageSize(), pageSize: db.meta.PageSize()}
+			db.file = file
+			changes := []struct {
+				name  string
+				apply func([]byte)
+			}{
+				{"page ID", func(data []byte) { binary.LittleEndian.PutUint64(data[2:10], uint64(root.PageID()+1)) }},
+				{"body length", func(data []byte) { binary.LittleEndian.PutUint32(data[18:22], uint32(len(data))) }},
+				{"smaller body", func(data []byte) {
+					binary.LittleEndian.PutUint32(data[18:22], uint32(2*file.pageSize-btree.NodeHeaderSize))
+				}},
+			}
+			operations := []struct {
+				name string
+				run  func() error
+			}{
+				{"Get", func() error { _, err := db.Get(testBucketName, []byte("key")); return err }},
+				{"Scan forward", func() error {
+					return db.View(func(tx *Tx) error {
+						return mustBucket(t, tx, testBucketName).ScanPrefix(nil, func([]byte, []byte) error { return errors.New("bad span reached callback") })
+					})
+				}},
+				{"Scan reverse", func() error {
+					return db.View(func(tx *Tx) error {
+						return mustBucket(t, tx, testBucketName).ScanReverse(func([]byte, []byte) error { return errors.New("bad span reached callback") })
+					})
+				}},
+			}
+			for _, change := range changes {
+				for _, operation := range operations {
+					t.Run(change.name+"/"+operation.name, func(t *testing.T) {
+						file.change, file.headReads, file.fullReads = change.apply, 0, 0
+						if err := operation.run(); !errors.Is(err, ErrInvalid) {
+							t.Fatalf("changed span error: %v", err)
+						}
+						if file.headReads != 1 || file.fullReads != 1 {
+							t.Fatalf("read path: %d heads, %d spans; want 1 each", file.headReads, file.fullReads)
+						}
+					})
+				}
+			}
+		})
+	}
+}
+
+func (file *changedSpanHeaderFile) ReadAt(data []byte, offset int64) (int, error) {
+	n, err := file.File.ReadAt(data, offset)
+	if err == nil && n == len(data) && offset == file.offset {
+		if int64(len(data)) == file.pageSize {
+			file.headReads++
+		} else if int64(len(data)) > file.pageSize {
+			file.fullReads++
+			file.change(data)
+		}
+	}
+	return n, err
+}
+
+func TestMainSpanReadRejectsShortBody(t *testing.T) {
+	path, bucket, entries, _ := writeContinuedReadDatabase(t, false)
+	db, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.unmapMainFile(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := db.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(path, info.Size()-1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Get(bucket, entries[1].Key()); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short node body: got %v, want unexpected EOF", err)
 	}
 }

@@ -87,7 +87,8 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	dataPageChecksums := db.meta.DataPageChecksums()
 	pages := db.wal.CommittedRecords()
 	// A commit replaces changed segments with private copies, so a copy of the list keeps this state.
-	allocation := &allocationBitmap{pageSize: pageSize, segments: slices.Clone(db.allocation.segments)}
+	allocation := *db.allocation
+	allocation.segments = slices.Clone(db.allocation.segments)
 	if db.activeBackups == 0 {
 		db.backupsDone = make(chan struct{})
 	}
@@ -135,7 +136,7 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	if err := temp.Truncate(size); err != nil {
 		return err
 	}
-	if err := checkBackupPages(temp, allocation, pages, size, dataPageChecksums); err != nil {
+	if err := checkBackupPages(temp, &allocation, pages, size, dataPageChecksums); err != nil {
 		return err
 	}
 	if db.options.Synchronous != SyncNone {
@@ -165,29 +166,67 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 // checkBackupPages reads again the backup pages that came from the main file, and checks each page that has a checksum.
 // A read can return wrong bytes, and the backup must hold one committed state.
 // Allocation pages always have a checksum. Tree pages have one only with data-page checksums.
-// The WAL images in pages come from memory, so they need no check.
+// WAL node images come from memory. Allocation spans are checked in all cases.
 func checkBackupPages(file io.ReaderAt, allocation *allocationBitmap, pages map[page.ID]wal.CommittedPage, size int64, dataPageChecksums bool) error {
-	data := make([]byte, allocation.pageSize)
 	for id := page.Meta1ID + 1; int64(id)*allocation.pageSize < size; id++ {
-		if _, inWAL := pages[id]; inWAL || !allocation.allocated(id) {
+		if !allocation.allocated(id) {
 			continue
 		}
 		segment := allocation.isSegmentPage(id)
-		if !segment && !dataPageChecksums {
+		if segment {
+			if !allocation.isSegmentHead(id) {
+				continue
+			}
+			data := make([]byte, allocation.pageSize)
+			if _, err := file.ReadAt(data, int64(id)*allocation.pageSize); err != nil {
+				return err
+			}
+			if err := verifyAllocationPage(data, allocation.pageSize, id); err != nil {
+				return fmt.Errorf("check backup allocation %d: %w", id, err)
+			}
 			continue
 		}
-		if _, err := file.ReadAt(data, int64(id)*allocation.pageSize); err != nil {
+		if committed, inWAL := pages[id]; inWAL {
+			if committed.Header.Type == wal.RecordTypeNode {
+				count := 0
+				if committed.Node != nil {
+					count = btree.NodePageCount(committed.Node, allocation.pageSize)
+				} else {
+					var err error
+					count, err = btree.NodeSpan(committed.Payload, id, allocation.pageSize)
+					if err != nil {
+						return err
+					}
+				}
+				id += page.ID(count - 1)
+			}
+			continue
+		}
+		if !dataPageChecksums {
+			continue
+		}
+		first := make([]byte, allocation.pageSize)
+		if _, err := file.ReadAt(first, int64(id)*allocation.pageSize); err != nil {
 			return err
 		}
-		var err error
-		if segment {
-			err = verifyAllocationPage(data, allocation.pageSize, id)
-		} else {
-			err = btree.CheckNodeChecksum(data, id)
-		}
+		count, err := btree.NodeSpan(first, id, allocation.pageSize)
 		if err != nil {
-			return fmt.Errorf("check backup page %d: %w", id, err)
+			return err
 		}
+		if int64(count)*allocation.pageSize > size-int64(id)*allocation.pageSize {
+			return ErrInvalid
+		}
+		data := first
+		if count > 1 {
+			data = make([]byte, int64(count)*allocation.pageSize)
+			if _, err := file.ReadAt(data, int64(id)*allocation.pageSize); err != nil {
+				return err
+			}
+		}
+		if err := btree.CheckNodeChecksum(data, id); err != nil {
+			return fmt.Errorf("check backup node %d: %w", id, err)
+		}
+		id += page.ID(count - 1)
 	}
 	return nil
 }

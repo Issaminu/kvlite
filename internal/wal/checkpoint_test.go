@@ -218,7 +218,7 @@ func TestCheckpointBuffers_BoundsRetainedStorage(t *testing.T) {
 	pages := make(map[page.ID]CommittedPage, maxRetainedCheckpointRecords+1)
 	for i := range maxRetainedCheckpointRecords + 1 {
 		id := page.ID(3 + i)
-		pages[id] = CommittedPage{Header: RecordHeader{Type: RecordTypeAllocation, PageID: id}, Payload: make([]byte, 64)}
+		pages[id] = CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: id}, Node: btree.NewLeafNode(id)}
 	}
 	if err := buffers.writeCommittedPages(&checkpointWriter{}, pages, 64, false); err != nil {
 		t.Fatal(err)
@@ -226,7 +226,7 @@ func TestCheckpointBuffers_BoundsRetainedStorage(t *testing.T) {
 	if buffers.records != nil {
 		t.Fatal("checkpoint retained an oversized record array")
 	}
-	pages = map[page.ID]CommittedPage{3: {Header: RecordHeader{Type: RecordTypeAllocation, PageID: 3}}}
+	pages = map[page.ID]CommittedPage{3: {Header: RecordHeader{Type: RecordTypeNode, PageID: 3}, Node: btree.NewLeafNode(3)}}
 	if err := buffers.writeCommittedPages(&checkpointWriter{}, pages, 2*checkpointWriteBatchBytes, false); err != nil {
 		t.Fatal(err)
 	}
@@ -235,314 +235,9 @@ func TestCheckpointBuffers_BoundsRetainedStorage(t *testing.T) {
 	}
 }
 
-func TestWALCommit_MixedContinuedImagesKeepOwnedBytes(t *testing.T) {
-	const pageSize = 64
-	file, err := os.Create(filepath.Join(t.TempDir(), "wal"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer file.Close()
-	log := New(Config{File: file, PageSize: pageSize, CheckpointThresholdBytes: ^uint64(0)})
-	// Warm reusable storage before a transaction with owned continuation images.
-	log.encodingBuffer = make([]byte, 0, 4096)
-	nodes := []NodeRecord{
-		{Final: btree.NewLeafNode(3)},
-		{Final: btree.NewRootNode(100, btree.NewLeafNode(4), btree.NewLeafNode(5), make([]byte, 200))},
-		{Final: btree.NewLeafNode(200)},
-		{Final: btree.NewLeafNode(300)},
-	}
-	if err := nodes[2].Final.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 200))); err != nil {
-		t.Fatal(err)
-	}
-	allocation := []AllocationRecord{{PageID: 400, Payload: make([]byte, pageSize)}}
-	meta := []byte("meta")
-	want := make(map[page.ID][]byte)
-	var expectedRecords []WALRecord
-	for _, record := range nodes {
-		ids := make([]page.ID, btree.NodePageCount(record.Final, pageSize))
-		for i := range ids {
-			ids[i] = record.Final.PageID() + page.ID(i)
-		}
-		record.Final.SetOverflowPages(ids[1:])
-		images, err := btree.EncodeWALNodePages(record.Final, pageSize, ids)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for i, data := range images {
-			want[ids[i]] = data
-			expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: ids[i], TxID: 1}, Payload: data})
-		}
-	}
-	expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeAllocation, PageID: 400, TxID: 1}, Payload: allocation[0].Payload})
-	for _, id := range []page.ID{page.Meta0ID, page.Meta1ID} {
-		expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeMeta, PageID: id, TxID: 1}, Payload: meta})
-	}
-	expectedRecords = append(expectedRecords, WALRecord{Header: RecordHeader{Type: RecordTypeCommit, TxID: 1}})
-	if _, err := log.Commit(nodes, allocation, meta, nil); err != nil {
-		t.Fatal(err)
-	}
-	// Record checksums use the salt that the commit selected.
-	var expected []byte
-	for index := range expectedRecords {
-		expected = AppendEncodedWALRecord(expected, &expectedRecords[index], log.checksumSeed)
-	}
-	got, err := os.ReadFile(file.Name())
-	if err != nil || !bytes.Equal(got[walFileHeaderSize:], expected) {
-		t.Fatalf("mixed WAL transaction changed: %v", err)
-	}
-	// A later large transaction must not reuse any retained payload storage.
-	other := btree.NewRootNode(500, btree.NewLeafNode(4), btree.NewLeafNode(5), bytes.Repeat([]byte{0xff}, 1000))
-	ids := make([]page.ID, btree.NodePageCount(other, pageSize)-1)
-	for i := range ids {
-		ids[i] = page.ID(501 + i)
-	}
-	other.SetOverflowPages(ids)
-	if _, err := log.Commit([]NodeRecord{{Final: other}}, nil, nil, nil); err != nil {
-		t.Fatal(err)
-	}
-	clear(log.encodingBuffer[:cap(log.encodingBuffer)])
-	for id, expected := range want {
-		record, ok := log.Lookup(id)
-		if !ok {
-			t.Fatalf("committed page %d is missing", id)
-		}
-		if record.Node != nil {
-			continue
-		}
-		if !bytes.Equal(record.Payload, expected) || cap(record.Payload) != len(record.Payload) {
-			t.Fatalf("committed page %d changed after a later commit", id)
-		}
-	}
-	if _, err := log.ReadRecords(); err != nil {
-		t.Fatalf("read mixed WAL records: %v", err)
-	}
-}
-
-func TestNodePageRecordsRoundTripThroughWALAndCheckpoint(t *testing.T) {
-	const pageSize int64 = 64
-	for _, size := range []int{0, 56, 57, 58, 1000} {
-		for _, branch := range []bool{false, true} {
-			name := "leaf"
-			if branch {
-				name = "branch"
-			}
-			name = fmt.Sprintf("%s-%d", name, size)
-			t.Run(name, func(t *testing.T) {
-				key := []byte("key")
-				value := make([]byte, size)
-				if branch {
-					key = append([]byte{'k'}, value...)
-				}
-				node := btree.NewLeafNode(3)
-				if branch {
-					node = btree.NewRootNode(3, btree.NewLeafNode(4), btree.NewLeafNode(5), key)
-				} else if err := node.InsertEntry(btree.NewEntry(0, key, value)); err != nil {
-					t.Fatal(err)
-				}
-				ids := make([]page.ID, btree.NodePageCount(node, pageSize))
-				for index := range ids {
-					// Gaps and descending IDs must not change logical body order.
-					if index == 0 {
-						ids[index] = node.PageID()
-					} else {
-						ids[index] = page.ID(400 - index*7)
-					}
-				}
-				node.SetOverflowPages(ids[1:])
-				pages, err := btree.EncodeNodePages(node, pageSize, ids)
-				if err != nil {
-					t.Fatal(err)
-				}
-				walPages, err := btree.EncodeWALNodePages(node, pageSize, ids)
-				if err != nil {
-					t.Fatal(err)
-				}
-				bodyBytes := 0
-				for index, data := range walPages {
-					fixed, crcOffset := btree.NodeHeaderSize, btree.NodeHeaderSize-4
-					if len(pages) > 1 {
-						if index == 0 {
-							fixed += 8 // Body length and next-page count.
-						} else {
-							fixed, crcOffset = btree.ContinuationHeaderSize, btree.ContinuationHeaderSize-8
-						}
-						bodyBytes -= int(binary.LittleEndian.Uint32(data[fixed-4:fixed])) * page.IDSize
-					}
-					bodyBytes += len(data) - fixed
-					if binary.LittleEndian.Uint32(data[crcOffset:crcOffset+4]) != 0 {
-						t.Fatal("WAL payload contains a page checksum")
-					}
-				}
-				if bodyBytes != node.EncodedSize()-btree.NodeHeaderSize {
-					t.Fatalf("WAL body has %d bytes, want %d", bodyBytes, node.EncodedSize()-btree.NodeHeaderSize)
-				}
-				if !branch && size == 57 && len(walPages[len(walPages)-1]) != int(pageSize) {
-					t.Fatal("WAL shortened an exactly full last page")
-				}
-				path := filepath.Join(t.TempDir(), "pages-wal")
-				file, err := os.Create(path)
-				if err != nil {
-					t.Fatal(err)
-				}
-				log := New(Config{File: file, PageSize: pageSize})
-				if _, err := log.Commit([]NodeRecord{{Final: node}}, nil, nil, nil); err != nil {
-					t.Fatal(err)
-				}
-				if len(ids) > 1 {
-					// Reusing the transaction buffer must not change committed pages.
-					if _, err := log.encodeTransaction(nil, nil, []byte("meta"), log.nextTxid); err != nil {
-						t.Fatal(err)
-					}
-					for index, id := range ids {
-						record, ok := log.Lookup(id)
-						if !ok || record.Header.PageID != id || record.Header.TxID != 1 || record.Node != nil || !bytes.Equal(record.Payload, walPages[index]) {
-							t.Fatalf("committed page %d changed", id)
-						}
-					}
-				}
-				firstRecord, ok := log.Lookup(node.PageID())
-				if !ok {
-					t.Fatal("first WAL page is missing")
-				}
-				entry, found, child, err := log.LookupCommittedPage(&firstRecord, key, true)
-				if err != nil || (branch && (found || child != node.Children[1])) || (!branch && (!found || child != 0 || !bytes.Equal(entry.Value(), value))) {
-					t.Fatalf("direct WAL lookup: found=%t child=%d error=%v", found, child, err)
-				}
-				walNode, err := log.CommittedPageToNode(&firstRecord)
-				if err != nil || walNode.EntryCount() != 1 || !bytes.Equal(walNode.EntryAt(0).Key(), key) || !slices.Equal(walNode.Children, node.Children) || !slices.Equal(walNode.OverflowPages(), ids[1:]) {
-					t.Fatalf("decode live WAL node: %v", err)
-				}
-				if !branch && !bytes.Equal(walNode.EntryAt(0).Value(), value) {
-					t.Fatal("WAL decode changed the leaf value")
-				}
-				if err := log.Close(); err != nil {
-					t.Fatal(err)
-				}
-				file, err = os.OpenFile(path, os.O_RDWR, 0600)
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer file.Close()
-				log = New(Config{File: file, PageSize: pageSize})
-				records, err := log.ReadRecords()
-				if err != nil || len(records) != len(pages)+1 {
-					t.Fatalf("reopened WAL: got %d records, %v", len(records), err)
-				}
-				if !IsCommitMarker(&records[len(pages)]) || records[len(pages)].Header.TxID != 1 {
-					t.Fatal("page records lack their final commit marker")
-				}
-				for index, record := range records[:len(pages)] {
-					if record.Header.Type != RecordTypeNode || record.Header.PageID != ids[index] || record.Header.TxID != 1 || !bytes.Equal(record.Payload, walPages[index]) {
-						t.Fatalf("page record %d changed", index)
-					}
-					log.LoadCommittedRecord(record)
-				}
-				firstRecord, _ = log.Lookup(node.PageID())
-				entry, found, child, err = log.LookupCommittedPage(&firstRecord, key, true)
-				if err != nil || (branch && (found || child != node.Children[1])) || (!branch && (!found || child != 0 || !bytes.Equal(entry.Value(), value))) {
-					t.Fatalf("direct WAL lookup: found=%t child=%d error=%v", found, child, err)
-				}
-				walNode, err = log.CommittedPageToNode(&firstRecord)
-				if err != nil || !bytes.Equal(walNode.EntryAt(0).Key(), key) || !slices.Equal(walNode.Children, node.Children) || !slices.Equal(walNode.OverflowPages(), ids[1:]) || (!branch && !bytes.Equal(walNode.EntryAt(0).Value(), value)) {
-					t.Fatalf("decode reopened WAL node: %v", err)
-				}
-				main, err := os.Create(filepath.Join(t.TempDir(), "main"))
-				if err != nil {
-					t.Fatal(err)
-				}
-				defer main.Close()
-				targetSize := int64(slices.Max(ids)+1) * pageSize
-				if err := log.Checkpoint(main, targetSize, true); err != nil {
-					t.Fatal(err)
-				}
-				readPage := func(id page.ID) ([]byte, error) {
-					data := make([]byte, pageSize)
-					_, err := main.ReadAt(data, int64(id)*pageSize)
-					return data, err
-				}
-				for index, id := range ids {
-					data, err := readPage(id)
-					if err != nil || !bytes.Equal(data, pages[index]) {
-						t.Fatalf("checkpoint page %d changed: %v", id, err)
-					}
-				}
-				first, err := readPage(node.PageID())
-				if err != nil {
-					t.Fatal(err)
-				}
-				decoded, err := btree.DecodeNode(first, node.PageID(), pageSize, readPage, true)
-				if err != nil || decoded.EntryCount() != 1 || !bytes.Equal(decoded.EntryAt(0).Key(), key) || !slices.Equal(decoded.Children, node.Children) || !slices.Equal(decoded.OverflowPages(), ids[1:]) {
-					t.Fatalf("decode checkpointed node: %v", err)
-				}
-				if !branch && !bytes.Equal(decoded.EntryAt(0).Value(), value) {
-					t.Fatal("checkpoint changed the leaf value")
-				}
-			})
-		}
-	}
-}
-
-func TestCheckpointRejectsInvalidNodePageBeforeWriting(t *testing.T) {
-	const pageSize int64 = 64
-	first := btree.NewLeafNode(3)
-	if err := first.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
-		t.Fatal(err)
-	}
-	continuation := make([]byte, btree.ContinuationHeaderSize+4)
-	binary.LittleEndian.PutUint16(continuation[:2], uint16(btree.NodeTypeContinuation))
-	binary.LittleEndian.PutUint64(continuation[2:10], 7)
-	copy(continuation[btree.ContinuationHeaderSize:], "body")
-	for _, mode := range []string{"checksum", "short", "page-id", "page-type", "id-array", "short-array", "decoded-node"} {
-		t.Run(mode, func(t *testing.T) {
-			bad := CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: 7}, Payload: slices.Clone(continuation)}
-			switch mode {
-			case "checksum":
-				binary.LittleEndian.PutUint32(bad.Payload[10:14], 1)
-			case "short":
-				bad.Payload = bad.Payload[:btree.ContinuationHeaderSize-1]
-			case "page-id":
-				bad.Header.PageID++
-			case "page-type":
-				binary.LittleEndian.PutUint16(bad.Payload[:2], 99)
-			case "id-array":
-				binary.LittleEndian.PutUint32(bad.Payload[14:18], 99)
-			case "short-array":
-				binary.LittleEndian.PutUint32(bad.Payload[14:18], 1)
-			case "decoded-node":
-				bad.Node = first
-			}
-			records := []CommittedPage{{Header: RecordHeader{Type: RecordTypeNode, PageID: 3}, Payload: btree.EncodeWALNode(first)}, bad}
-			writer := &checkpointWriter{}
-			wantErr := page.ErrInvalid
-			if err := writeCheckpointRecordRuns(writer, records, pageSize, true, nil); !errors.Is(err, wantErr) {
-				t.Fatalf("checkpoint: got %v, want %v", err, wantErr)
-			}
-			if len(writer.writes) != 0 {
-				t.Fatal("checkpoint wrote pages before it found the invalid page")
-			}
-		})
-	}
-}
-
-func TestCompactContinuationRecordRejectsDamagedWALBytes(t *testing.T) {
-	data := make([]byte, btree.ContinuationHeaderSize+3)
-	binary.LittleEndian.PutUint16(data[:2], uint16(btree.NodeTypeContinuation))
-	binary.LittleEndian.PutUint64(data[2:10], 7)
-	data[btree.ContinuationHeaderSize] = 'b'
-	record := WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: 7, TxID: 1}, Payload: data}
-	encoded, err := EncodeWALRecord(&record, 64, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	encoded[HeaderSize+len(data)-1] ^= 1
-	if _, err := DecodeWALRecord(bytes.NewReader(encoded), 64, 0); !errors.Is(err, page.ErrChecksum) {
-		t.Fatalf("damaged WAL body: got %v, want checksum error", err)
-	}
-}
-
 func TestWriteCheckpointRecordRuns_SealsDataPage(t *testing.T) {
 	const pageSize int64 = 64
-	node := btree.NewLeafNode(1)
+	node := btree.NewLeafNode(3)
 	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
@@ -599,28 +294,28 @@ func (writer *checkpointWriter) WriteAt(data []byte, offset int64) (int, error) 
 }
 
 func TestWriteCheckpointRecordRuns_CombinesAdjacentPages(t *testing.T) {
-	records := []CommittedPage{
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 1}, Payload: []byte("a")},
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 2}, Payload: []byte("bb")},
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 4}, Payload: []byte("d")},
-		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 5}, Payload: []byte("ee")},
+	const pageSize = 64
+	var records []CommittedPage
+	for _, id := range []page.ID{3, 4, 6, 7} {
+		node := nativeLeaf(t, id, 1, pageSize)
+		records = append(records, CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: id}, Node: node})
 	}
 	writer := &checkpointWriter{}
-
-	if err := writeCheckpointRecordRuns(writer, records, 4, true, nil); err != nil {
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, false, nil); err != nil {
 		t.Fatal(err)
 	}
-
-	want := []checkpointWrite{
-		{offset: int64(page.ID(1)) * 4, data: []byte{'a', 0, 0, 0, 'b', 'b', 0, 0}},
-		{offset: int64(page.ID(4)) * 4, data: []byte{'d', 0, 0, 0, 'e', 'e', 0, 0}},
+	if len(writer.writes) != 2 {
+		t.Fatalf("writes=%d", len(writer.writes))
 	}
-	if len(writer.writes) != len(want) {
-		t.Fatalf("checkpoint writes: got %d, want %d", len(writer.writes), len(want))
-	}
-	for index := range want {
-		if writer.writes[index].offset != want[index].offset || !bytes.Equal(writer.writes[index].data, want[index].data) {
-			t.Fatalf("write %d: got offset=%d data=%v, want offset=%d data=%v", index, writer.writes[index].offset, writer.writes[index].data, want[index].offset, want[index].data)
+	for index, write := range writer.writes {
+		var want []byte
+		for _, record := range records[index*2 : index*2+2] {
+			image := make([]byte, pageSize)
+			copy(image, btree.EncodeWALNode(record.Node))
+			want = append(want, image...)
+		}
+		if write.offset != int64(records[index*2].Header.PageID)*pageSize || !bytes.Equal(write.data, want) {
+			t.Fatal("adjacent write changed a gap or payload")
 		}
 	}
 }
@@ -629,8 +324,9 @@ func TestWriteCheckpointRecordRuns_LimitsContiguousWriteSize(t *testing.T) {
 	const pageSize int64 = 4096
 	records := make([]CommittedPage, 257)
 	for index := range records {
-		records[index].Header.Type = RecordTypeMeta
-		records[index].Header.PageID = page.ID(index + 1)
+		records[index].Header.Type = RecordTypeNode
+		records[index].Header.PageID = page.ID(index + 3)
+		records[index].Node = btree.NewLeafNode(records[index].Header.PageID)
 	}
 	writer := &checkpointWriter{}
 
@@ -645,5 +341,81 @@ func TestWriteCheckpointRecordRuns_LimitsContiguousWriteSize(t *testing.T) {
 	want := []int{1 << 20, int(pageSize)}
 	if !slices.Equal(writeSizes, want) {
 		t.Fatalf("checkpoint write sizes: got %v, want %v", writeSizes, want)
+	}
+}
+
+func TestNativeSpanCheckpointAndBackupImages(t *testing.T) {
+	const pageSize = 4096
+	for _, size := range []int{65536, 3<<20 + 37} {
+		for _, checksums := range []bool{false, true} {
+			node := nativeLeaf(t, 20, size, pageSize)
+			for _, encoded := range []bool{false, true} {
+				record := CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID()}, Node: node}
+				if encoded {
+					record.Node = nil
+					record.Payload = btree.EncodeWALNode(node)
+				}
+				before := bytes.Clone(record.Payload)
+				file, err := os.CreateTemp(t.TempDir(), "main")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := WriteCommittedPages(file, map[page.ID]CommittedPage{node.PageID(): record}, pageSize, checksums); err != nil {
+					t.Fatal(err)
+				}
+				span := make([]byte, btree.NodePageCount(node, pageSize)*pageSize)
+				if _, err := file.ReadAt(span, int64(node.PageID())*pageSize); err != nil {
+					t.Fatal(err)
+				}
+				got, err := btree.DecodeNode(span, node.PageID(), pageSize, nil, checksums)
+				if err != nil || !bytes.Equal(got.EntryAt(0).Value(), node.EntryAt(0).Value()) {
+					t.Fatalf("whole span decode: size=%d checksums=%t encoded=%t err=%v", size, checksums, encoded, err)
+				}
+				if !bytes.Equal(before, record.Payload) {
+					t.Fatal("checkpoint changed a retained compact image")
+				}
+				if checksums {
+					span[len(span)-1] ^= 1
+					if err := btree.CheckNodeChecksum(span, node.PageID()); err == nil {
+						t.Fatal("tail padding was outside the checksum")
+					}
+				}
+				if err := file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+}
+
+func TestNativeSpanCheckpointRejectsOverlapBeforeWrite(t *testing.T) {
+	const pageSize = 4096
+	first := nativeLeaf(t, 20, 65536, pageSize)
+	second := nativeLeaf(t, 21, 128, pageSize)
+	writer := &checkpointWriter{}
+	err := WriteCommittedPages(writer, map[page.ID]CommittedPage{
+		20: {Header: RecordHeader{Type: RecordTypeNode, PageID: 20}, Node: first},
+		21: {Header: RecordHeader{Type: RecordTypeNode, PageID: 21}, Node: second},
+	}, pageSize, false)
+	if !errors.Is(err, page.ErrInvalid) || len(writer.writes) != 0 {
+		t.Fatalf("overlap reached storage: %v, writes=%d", err, len(writer.writes))
+	}
+}
+
+func TestNativeSpanCheckpointRejectsInvalidHeadBeforeWrite(t *testing.T) {
+	for _, id := range []page.ID{page.Meta0ID, page.Meta1ID, ^page.ID(0)} {
+		node := nativeLeaf(t, id, 1, 4096)
+		for _, encoded := range []bool{false, true} {
+			record := CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: id}, Node: node}
+			if encoded {
+				record.Node = nil
+				record.Payload = btree.EncodeWALNode(node)
+			}
+			writer := &checkpointWriter{}
+			err := WriteCommittedPages(writer, map[page.ID]CommittedPage{id: record}, 4096, false)
+			if !errors.Is(err, page.ErrInvalid) || len(writer.writes) != 0 {
+				t.Fatalf("invalid head %d encoded=%t reached storage: error=%v writes=%d", id, encoded, err, len(writer.writes))
+			}
+		}
 	}
 }

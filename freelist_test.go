@@ -92,104 +92,105 @@ func (db *DB) validatePageOwnershipWith(readNode func(page.ID) (*btree.Node, err
 }
 
 func TestAllocationChangesPageRecordsOnlyIncludeChangedSegments(t *testing.T) {
-	bitmap := newAllocationBitmap(allocationHeaderSize + 1)
+	bitmap := newAllocationBitmap(4096)
+	id := page.NewMeta(4096).Root() + 1
 	changes := newAllocationChanges(bitmap)
-	changes.markAllocated(4)
+	changes.markAllocated(id)
 	if got := changes.pageRecords(); len(got) != 1 || got[0].PageID != firstAllocationSegmentID || !bytes.Equal(got[0].Payload, changes.segment(0).data) {
 		t.Fatalf("changed allocation pages: got %+v", got)
 	}
 	if got := newAllocationChanges(bitmap).pageRecords(); len(got) != 0 {
 		t.Fatalf("unchanged allocation pages: got %+v", got)
 	}
-	changes.release(4)
+	changes.release(id)
 	if got := changes.pageRecords(); len(got) != 0 {
 		t.Fatalf("restored allocation page: got %+v", got)
 	}
 }
 
 func TestAllocationChangesCloneIsIndependent(t *testing.T) {
-	bitmap := newAllocationBitmap(allocationHeaderSize + 1)
+	bitmap := newAllocationBitmap(4096)
+	first := page.NewMeta(4096).Root() + 1
 	changes := newAllocationChanges(bitmap)
-	changes.markAllocated(4)
+	changes.markAllocated(first)
 
 	clone := changes.clone()
-	clone.markAllocated(5)
+	clone.markAllocated(first + 1)
 
-	if bitmap.allocated(4) {
+	if bitmap.allocated(first) {
 		t.Fatal("private allocation changed the committed bitmap")
 	}
-	if changes.allocated(5) {
+	if changes.allocated(first + 1) {
 		t.Fatal("cloned allocation changed its parent")
 	}
-	if !clone.allocated(5) {
+	if !clone.allocated(first + 1) {
 		t.Fatal("clone did not record its allocation")
 	}
 }
 
 func TestAllocationChangesReusesFreePageAndRetiresTailPage(t *testing.T) {
 	bitmap := newAllocationBitmap(4096)
-	bitmap.markAllocated(4)
-	bitmap.markAllocated(5)
+	first := page.NewMeta(4096).Root() + 1
+	bitmap.markAllocated(first)
+	bitmap.markAllocated(first + 1)
 	changes := newAllocationChanges(bitmap)
-	changes.release(4)
+	changes.release(first)
 
-	if got, err := changes.allocate(5); err != nil || got != 4 {
-		t.Fatalf("reused page: got %d, error %v; want page 4", got, err)
+	if got, err := changes.allocate(first + 1); err != nil || got != first {
+		t.Fatalf("reused page: got %d, error %v; want page %d", got, err, first)
 	}
 	if changes.pagesReused != 1 {
 		t.Fatalf("reused pages: got %d, want 1", changes.pagesReused)
 	}
-	if err := changes.retire(5); err != nil {
+	if err := changes.retire(first + 1); err != nil {
 		t.Fatal(err)
 	}
 	if changes.pagesRetired != 1 {
 		t.Fatalf("retired pages: got %d, want 1", changes.pagesRetired)
 	}
 	meta := page.NewMeta(4096)
-	meta.SetLastPage(5)
+	meta.SetLastPage(first + 1)
 	if !changes.finalize(meta) {
 		t.Fatal("finalize did not lower the last page")
 	}
-	if got := meta.LastPage(); got != 4 {
-		t.Fatalf("last page: got %d, want 4", got)
+	if got := meta.LastPage(); got != first {
+		t.Fatalf("last page: got %d, want %d", got, first)
 	}
 	if changes.tailPagesRemoved != 1 {
 		t.Fatalf("removed tail pages: got %d, want 1", changes.tailPagesRemoved)
 	}
-	if changes.allocated(5) {
+	if changes.allocated(first + 1) {
 		t.Fatal("retired tail page is still allocated")
 	}
 }
 
 func TestAllocationFinalizeTracksRemovedTailSegment(t *testing.T) {
-	bitmap := newAllocationBitmap(allocationHeaderSize + 1)
-	setup := newAllocationChanges(bitmap)
-	highest := firstTreePageID
-	for range 5 {
-		pageID, err := setup.allocate(highest)
-		if err != nil {
-			t.Fatal(err)
-		}
-		highest = pageID
-	}
-	bitmap = setup.publish()
+	const pageSize = 4096
+	bitmap := newAllocationBitmap(pageSize)
+	bitmap.addSegment()
+	firstRemoved := bitmap.segmentsPerGroup()
+	head := bitmap.segmentPageID(firstRemoved)
+	highest := head + page.ID(bitmap.segmentsPerGroup())
+	bitmap.markAllocated(highest)
 	changes := newAllocationChanges(bitmap)
 	if err := changes.retire(highest); err != nil {
 		t.Fatal(err)
 	}
-	meta := page.NewMeta(4096)
+	meta := page.NewMeta(pageSize)
 	meta.SetLastPage(highest)
 	changes.finalize(meta)
-
-	if _, found := changes.obsoleteWALPages[8]; !found {
-		t.Fatal("removed allocation page 8 was not recorded")
+	for index := firstRemoved; index < len(bitmap.segments); index++ {
+		id := bitmap.segmentPageID(index)
+		if _, found := changes.obsoleteWALPages[id]; !found {
+			t.Fatalf("removed allocation page %d was not recorded", id)
+		}
 	}
-	if got := meta.LastPage(); got != 7 {
-		t.Fatalf("last page: got %d, want 7", got)
+	if got := meta.LastPage(); got != meta.Root() {
+		t.Fatalf("last page: got %d, want root %d", got, meta.Root())
 	}
 	clone := changes.clone()
-	delete(clone.obsoleteWALPages, 8)
-	if _, found := changes.obsoleteWALPages[8]; !found {
+	delete(clone.obsoleteWALPages, head)
+	if _, found := changes.obsoleteWALPages[head]; !found {
 		t.Fatal("clone changed the original obsolete page set")
 	}
 }
@@ -206,16 +207,16 @@ func TestReadAllocationBitmapReadsNewDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(bitmap.segments) != 1 || bitmap.allocatedPageCount() != 4 {
+	if len(bitmap.segments) != bitmap.segmentsPerGroup() || bitmap.allocatedPageCount() != uint64(page.AllocationSegmentPages(db.meta.PageSize()))+3 {
 		t.Fatalf("new database allocation: %d segments, %d used pages", len(bitmap.segments), bitmap.allocatedPageCount())
 	}
-	if bitmap.segments[0].firstFreeBit != firstTreePageID+1 {
-		t.Fatalf("first free bit: got %d, want %d", bitmap.segments[0].firstFreeBit, firstTreePageID+1)
+	if bitmap.segments[0].firstFreeBit != db.meta.Root()+1 {
+		t.Fatalf("first free bit: got %d, want %d", bitmap.segments[0].firstFreeBit, db.meta.Root()+1)
 	}
 }
 
 func TestReadAllocationBitmapReadsOnlySegmentPages(t *testing.T) {
-	const pageSize = int64(512)
+	const pageSize = int64(4096)
 	file, err := os.Create(filepath.Join(t.TempDir(), "database"))
 	if err != nil {
 		t.Fatal(err)
@@ -225,7 +226,8 @@ func TestReadAllocationBitmapReadsOnlySegmentPages(t *testing.T) {
 	bitmap := newAllocationBitmap(pageSize)
 	bitmap.addSegment()
 	meta := page.NewMeta(pageSize)
-	meta.SetLastPage(bitmap.segmentPageID(1))
+	lastIndex := len(bitmap.segments) - 1
+	meta.SetLastPage(bitmap.segmentPageID(lastIndex))
 	meta.RefreshChecksum()
 	for index := range bitmap.segments {
 		pageID := bitmap.segmentPageID(index)
@@ -238,11 +240,11 @@ func TestReadAllocationBitmapReadsOnlySegmentPages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.segments) != 2 || !loaded.allocated(meta.LastPage()) {
+	if len(loaded.segments) != 2*bitmap.segmentsPerGroup() || !loaded.allocated(meta.LastPage()) {
 		t.Fatalf("loaded allocation: %d segments, last page %d allocated: %t", len(loaded.segments), meta.LastPage(), loaded.allocated(meta.LastPage()))
 	}
 
-	valid := bitmap.encodeSegment(1)
+	valid := bitmap.encodeSegment(lastIndex)
 	data := slices.Clone(valid)
 	data[allocationHeaderSize] ^= 1
 	if _, err := file.WriteAt(data, int64(meta.LastPage())*pageSize); err != nil {
@@ -900,8 +902,8 @@ func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
 		bitmap.segments[0].bitmapBits()[index] = 0xff
 	}
 	bitmap.segments[0].firstFreeBit = bitmap.pagesPerSegment()
-	bitmap.addSegment()
-	secondPage := bitmap.segmentPageID(1) + 1
+	// The next logical frame is in the same physical bitmap group.
+	secondPage := bitmap.pagesPerSegment()
 	highPage := secondPage + 1
 	// Keep a used page after secondPage so that secondPage is an interior free page.
 	bitmap.markAllocated(highPage)
@@ -926,8 +928,8 @@ func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	root := btree.NewLeafNode(firstTreePageID)
-	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(firstTreePageID)*pageSize), root, pageSize, true, false); err != nil {
+	root := btree.NewLeafNode(meta.Root())
+	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(meta.Root())*pageSize), root, pageSize, true, false); err != nil {
 		_ = file.Close()
 		t.Fatal(err)
 	}
@@ -1138,5 +1140,889 @@ func TestBucketDeleteIsVisibleInsideTransactionAndAfterCommit(t *testing.T) {
 	}
 	if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrKeyNotFound) {
 		t.Fatalf("read after commit: got %v, want ErrKeyNotFound", err)
+	}
+}
+
+func TestHighestSetBitMatchesBitWalk(t *testing.T) {
+	check := func(data []byte) {
+		t.Helper()
+		want := -1
+		for index, value := range data {
+			for bit := range 8 {
+				if value&(1<<bit) != 0 {
+					want = index*8 + bit
+				}
+			}
+		}
+		got, found := highestSetBit(data)
+		if found != (want >= 0) || found && got != want {
+			t.Fatalf("length=%d: got (%d, %t), want bit %d", len(data), got, found, want)
+		}
+	}
+	check(nil)
+	for length := 0; length <= 65; length++ {
+		data := make([]byte, length)
+		check(data)
+		for bit := range length * 8 {
+			data[bit/8] |= 1 << (bit % 8)
+			check(data)
+			data[0] |= 1
+			check(data)
+			clear(data)
+		}
+	}
+	for _, length := range []int{4080, 4081, 4096, 4097, 16368} {
+		data := make([]byte, length)
+		check(data)
+		for _, bit := range []int{0, 1, 7, 8, 63, 64, length * 4, length*8 - 1} {
+			data[bit/8] |= 1 << (bit % 8)
+			check(data)
+			clear(data)
+		}
+		for index := range data {
+			data[index] = 0xff
+		}
+		check(data)
+	}
+}
+
+func TestHighestAllocatedMatchesOverlayBitWalk(t *testing.T) {
+	for _, pageSize := range []int64{64, 128, 4096} {
+		t.Run(fmt.Sprint(pageSize), func(t *testing.T) {
+			bitmap := &allocationBitmap{pageSize: pageSize, groupSegments: 1, segments: make([]allocationSegment, 3)}
+			for index := range bitmap.segments {
+				bitmap.segments[index].data = make([]byte, pageSize)
+			}
+			pages := bitmap.pagesPerSegment()
+			changes := newAllocationChanges(bitmap)
+			walk := func(count int, segment func(int) *allocationSegment) page.ID {
+				for index := count - 1; index >= 0; index-- {
+					data := segment(index).bitmapBits()
+					for bit := len(data)*8 - 1; bit >= 0; bit-- {
+						if data[bit/8]&(1<<uint(bit%8)) != 0 {
+							return page.ID(index)*pages + page.ID(bit)
+						}
+					}
+				}
+				return page.Meta1ID
+			}
+			check := func() {
+				t.Helper()
+				if got, want := bitmap.highestAllocated(), walk(len(bitmap.segments), func(index int) *allocationSegment { return &bitmap.segments[index] }); got != want {
+					t.Fatalf("committed highest=%d, want %d", got, want)
+				}
+				if got, want := changes.highestAllocated(), walk(changes.segmentCount, changes.segment); got != want {
+					t.Fatalf("private highest=%d, want %d", got, want)
+				}
+			}
+			check()
+			for _, id := range []page.ID{0, 1, pages - 1, pages, pages + 1, 2*pages - 1} {
+				bitmap.markAllocated(id)
+				check()
+			}
+			changes = newAllocationChanges(bitmap)
+			clear(changes.writableSegment(1).bitmapBits())
+			check()
+			if got := bitmap.highestAllocated(); got != 2*pages-1 {
+				t.Fatalf("private clear changed committed highest: %d", got)
+			}
+			for _, id := range []page.ID{2 * pages, 2*pages + 63, 3*pages - 1} {
+				changes.markAllocated(id)
+				check()
+			}
+			changes.segmentCount = 2
+			check()
+			changes.segmentCount = 4
+			changes.dirtySegments[3] = &allocationSegment{data: make([]byte, pageSize)}
+			changes.markAllocated(4*pages - 1)
+			check()
+		})
+	}
+}
+
+func TestAllocationSpanAvoidsReservedStorage(t *testing.T) {
+	bitmap := newAllocationBitmap(4096)
+	changes := newAllocationChanges(bitmap)
+	last := page.NewMeta(bitmap.pageSize).LastPage()
+	head, err := changes.allocateSpan(last, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for step := page.ID(0); step < 4; step++ {
+		if !changes.allocated(head+step) || changes.isSegmentPage(head+step) {
+			t.Fatal("span uses free or reserved storage")
+		}
+	}
+	if err := changes.retire(head + 1); err != nil {
+		t.Fatal(err)
+	}
+	other, err := changes.allocate(head + 3)
+	if err != nil || other == head+1 {
+		t.Fatalf("retired page reused before publication: %d, %v", other, err)
+	}
+	for index := range bitmap.segments {
+		for at := range bitmap.segments[index].bitmapBits() {
+			bitmap.segments[index].bitmapBits()[at] = 0xff
+		}
+		bitmap.segments[index].firstFreeBit = bitmap.pagesPerSegment()
+	}
+	changes = newAllocationChanges(bitmap)
+	boundary := bitmap.pagesPerGroup()
+	head, err = changes.allocateSpan(boundary-2, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if head != boundary+page.AllocationSegmentPages(bitmap.pageSize) {
+		t.Fatalf("span head=%d crosses allocation storage", head)
+	}
+	for step := page.ID(0); step < page.AllocationSegmentPages(bitmap.pageSize); step++ {
+		if !changes.allocated(boundary+step) || !changes.isSegmentPage(boundary+step) {
+			t.Fatal("new allocation span is not reserved")
+		}
+	}
+}
+
+func TestAllocationSpanSearchReusesEarlierSpace(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		firstCount int
+		nextCount  int
+		holeStart  page.ID
+		holeCount  int
+		freePage   page.ID
+		want       page.ID
+	}{
+		{"freed page completes earlier span", 6, 6, 20, 5, 25, 20},
+		{"smaller request fits earlier gap", 6, 5, 20, 5, 0, 20},
+		{"freed page completes large span", 128, 128, 20, 127, 147, 20},
+		{"search start cannot be negative", 128, 128, 2, 127, 1, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			bitmap := newAllocationBitmap(16384)
+			root := page.NewMeta(bitmap.pageSize).Root()
+			last := root + 512
+			for id := root + 1; id <= last; id++ {
+				bitmap.markAllocated(id)
+			}
+			changes := newAllocationChanges(bitmap)
+			for offset := 0; offset < test.holeCount; offset++ {
+				changes.release(root + test.holeStart + page.ID(offset))
+			}
+			head, err := changes.allocateSpan(last, test.firstCount)
+			if err != nil || head != last+1 {
+				t.Fatalf("initial span: got %d, error %v; want %d", head, err, last+1)
+			}
+			last = head + page.ID(test.firstCount) - 1
+			if test.freePage != 0 {
+				changes.release(root + test.freePage)
+			}
+			head, err = changes.allocateSpan(last, test.nextCount)
+			if err != nil || head != root+test.want {
+				t.Fatalf("earlier span: got %d, error %v; want %d", head, err, root+test.want)
+			}
+		})
+	}
+
+	t.Run("later release keeps earlier search position", func(t *testing.T) {
+		bitmap := newAllocationBitmap(16384)
+		root := page.NewMeta(bitmap.pageSize).Root()
+		last := root + 512
+		for id := root + 1; id <= last; id++ {
+			bitmap.markAllocated(id)
+		}
+		changes := newAllocationChanges(bitmap)
+		for _, start := range []page.ID{root + 20, root + 40} {
+			for offset := page.ID(0); offset < 6; offset++ {
+				changes.release(start + offset)
+			}
+		}
+		head, err := changes.allocateSpan(last, 6)
+		if err != nil || head != root+20 {
+			t.Fatalf("first span: got %d, error %v; want %d", head, err, root+20)
+		}
+		changes.release(root + 400)
+		head, err = changes.allocateSpan(last, 6)
+		if err != nil || head != root+40 {
+			t.Fatalf("next span: got %d, error %v; want %d", head, err, root+40)
+		}
+	})
+}
+
+func TestAllocationFramesUseIndependentPageImages(t *testing.T) {
+	bitmap := newAllocationBitmap(4096)
+	if len(bitmap.segments) != bitmap.segmentsPerGroup() {
+		t.Fatal("initial bitmap group has an incomplete frame count")
+	}
+	for index := range bitmap.segments {
+		if len(bitmap.segments[index].data) != int(bitmap.pageSize) {
+			t.Fatal("bitmap frame is not one page")
+		}
+		if err := verifyAllocationPage(bitmap.encodeSegment(index), bitmap.pageSize, bitmap.segmentPageID(index)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := slices.Clone(bitmap.segments[1].data)
+	changes := newAllocationChanges(bitmap)
+	changes.markAllocated(bitmap.pagesPerSegment() + 7)
+	records := changes.pageRecords()
+	if len(records) != 1 || records[0].PageID != bitmap.segmentPageID(1) || len(records[0].Payload) != int(bitmap.pageSize) {
+		t.Fatal("one changed bitmap bit did not produce exactly one page image")
+	}
+	if !bytes.Equal(bitmap.segments[1].data, original) || &changes.segment(1).data[0] == &bitmap.segments[1].data[0] {
+		t.Fatal("private frame change modified or borrowed its committed frame")
+	}
+	if err := verifyAllocationPage(records[0].Payload, bitmap.pageSize, records[0].PageID); err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyAllocationPage(append(slices.Clone(records[0].Payload), records[0].Payload...), bitmap.pageSize, records[0].PageID); !errors.Is(err, page.ErrInvalid) {
+		t.Fatal("multi-page allocation record was accepted")
+	}
+}
+
+func TestAllocationFinalizeKeepsInteriorRetirementAndReclaimsTail(t *testing.T) {
+	bitmap := newAllocationBitmap(4096)
+	meta := page.NewMeta(bitmap.pageSize)
+	root := meta.Root()
+	for offset := page.ID(1); offset <= 3; offset++ {
+		bitmap.markAllocated(root + offset)
+	}
+	meta.SetLastPage(root + 3)
+	changes := newAllocationChanges(bitmap)
+	if err := changes.retire(root + 1); err != nil {
+		t.Fatal(err)
+	}
+	if changes.finalize(meta) || meta.LastPage() != root+3 {
+		t.Fatal("interior retirement moved the live data tail")
+	}
+	if changes.allocated(root+1) || !changes.allocated(root+3) {
+		t.Fatal("interior retirement changed the wrong allocation bits")
+	}
+	if !bitmap.allocated(root + 1) {
+		t.Fatal("private retirement changed committed allocation")
+	}
+	bitmap = changes.publish()
+	changes = newAllocationChanges(bitmap)
+	if err := changes.retire(root + 3); err != nil {
+		t.Fatal(err)
+	}
+	if !changes.finalize(meta) || meta.LastPage() != root+2 {
+		t.Fatal("retired data tail was not reclaimed")
+	}
+	if changes.tailPagesRemoved != 1 {
+		t.Fatalf("reclaimed tail=%d", changes.tailPagesRemoved)
+	}
+}
+
+func TestAllocationSegmentFitsMaximumNode(t *testing.T) {
+	for _, size := range []int64{64, 128, 512, 4096, 16384, 65536} {
+		span := int64(page.AllocationSegmentPages(size))
+		available := span*(size-allocationHeaderSize)*8 - span - 2
+		needed := (int64(btree.MaxValueSize) + int64(btree.MaxKeySize) + 128 + size - 1) / size
+		if span <= 0 || available < needed {
+			t.Fatalf("page size %d leaves %d pages, need %d", size, available, needed)
+		}
+	}
+}
+
+func TestAllocationNodeSpanCrossesLogicalFrame(t *testing.T) {
+	bitmap := newAllocationBitmap(4096)
+	boundary := bitmap.pagesPerSegment()
+	for index := range bitmap.segments[0].bitmapBits() {
+		bitmap.segments[0].bitmapBits()[index] = 0xff
+	}
+	clearAllocationBit(bitmap.segments[0].bitmapBits(), boundary-2)
+	clearAllocationBit(bitmap.segments[0].bitmapBits(), boundary-1)
+	bitmap.segments[0].firstFreeBit = boundary - 2
+	bitmap.markAllocated(boundary + 2)
+	changes := newAllocationChanges(bitmap)
+	head, err := changes.allocateSpan(boundary+2, 4)
+	if err != nil || head != boundary-2 {
+		t.Fatalf("cross-frame span=%d error=%v", head, err)
+	}
+	for offset := page.ID(0); offset < 4; offset++ {
+		if !changes.allocated(head+offset) || changes.isSegmentPage(head+offset) {
+			t.Fatal("cross-frame span has invalid ownership")
+		}
+	}
+	if changes.pagesReused != 4 || len(changes.dirtySegments) != 2 {
+		t.Fatal("cross-frame allocation did not update both logical frames")
+	}
+	bitmap.markAllocated(boundary - 2)
+	bitmap.markAllocated(boundary - 1)
+	grow := newAllocationChanges(bitmap)
+	if !grow.extendSpan(boundary-2, 2, 4, boundary+2) {
+		t.Fatal("logical frame boundary blocked in-place growth")
+	}
+	if len(grow.dirtySegments) != 1 || !grow.allocated(boundary+1) {
+		t.Fatal("growth did not limit copy-on-write to the changed frame")
+	}
+}
+
+func TestNativeUnchangedSpansStillFinalizeRetirement(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	var retired page.ID
+	if err := db.Update(func(tx *Tx) error {
+		data, err := tx.CreateBucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		if err := data.Put([]byte("key"), []byte("old")); err != nil {
+			return err
+		}
+		temporary, err := tx.CreateBucket([]byte("temporary"))
+		if err != nil {
+			return err
+		}
+		retired = temporary.rootNode.PageID()
+		_, err = tx.CreateBucket([]byte("tail"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	last, root := db.meta.LastPage(), db.meta.Root()
+	if err := db.Update(func(tx *Tx) error {
+		if err := tx.DeleteBucket([]byte("temporary")); err != nil {
+			return err
+		}
+		data, err := tx.Bucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		return data.Put([]byte("key"), []byte("new"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if db.allocation.allocated(retired) || db.meta.LastPage() != last || db.meta.Root() != root {
+		t.Fatal("unchanged-span commit lost retirement or moved the live tail")
+	}
+	got, err := db.Get([]byte("data"), []byte("key"))
+	if err != nil || string(got) != "new" {
+		t.Fatalf("updated value=%q error=%v", got, err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeNodeSpanRepairsNestedRootAndKeepsRollbackPrivate(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	var oldHead page.ID
+	if err := db.Update(func(tx *Tx) error {
+		parent, err := tx.CreateBucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.CreateBucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		oldHead = child.rootNode.PageID()
+		if err := child.Put([]byte("key"), []byte("old")); err != nil {
+			return err
+		}
+		_, err = tx.CreateBucket([]byte("blocker"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !db.allocation.allocated(oldHead + 1) {
+		t.Fatal("fixture did not block in-place growth")
+	}
+	original := db.memoryNodes[oldHead]
+	value := bytes.Repeat([]byte{'v'}, int(db.meta.PageSize())*2)
+	change := func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.Bucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		return child.Put([]byte("key"), value)
+	}
+	failure := errors.New("callback rollback")
+	if err := db.Update(func(tx *Tx) error {
+		if err := change(tx); err != nil {
+			return err
+		}
+		return failure
+	}); !errors.Is(err, failure) {
+		t.Fatal(err)
+	}
+	if original.PageID() != oldHead || string(original.EntryAt(0).Value()) != "old" {
+		t.Fatal("failed callback changed committed node")
+	}
+	if err := db.Update(change); err != nil {
+		t.Fatal(err)
+	}
+	if original.PageID() != oldHead || string(original.EntryAt(0).Value()) != "old" {
+		t.Fatal("relocation changed the original node")
+	}
+	if db.allocation.allocated(oldHead) {
+		t.Fatal("old span stayed allocated")
+	}
+	if err := db.View(func(tx *Tx) error {
+		parent, err := tx.Bucket([]byte("parent"))
+		if err != nil {
+			return err
+		}
+		child, err := parent.Bucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		if err := child.loadRootNode(); err != nil {
+			return err
+		}
+		if child.rootNode.PageID() == oldHead {
+			return errors.New("nested root pointer was not repaired")
+		}
+		if child.rootNode.StoragePageCount() != btree.NodePageCount(child.rootNode, tx.meta.PageSize()) {
+			return errors.New("node span count differs")
+		}
+		got, err := child.Get([]byte("key"))
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(got, value) {
+			return errors.New("relocated value differs")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeNodeSpanMovesCatalogRoot(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	oldRoot := db.rootNode
+	name := bytes.Repeat([]byte{'n'}, btree.MaxKeySize)
+	if err := db.Update(func(tx *Tx) error { _, err := tx.CreateBucket(name); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if db.meta.Root() == oldRoot.PageID() || db.rootNode.PageID() != db.meta.Root() {
+		t.Fatal("catalog relocation did not publish its metadata root")
+	}
+	if oldRoot.PageID() != firstAllocationSegmentID+page.AllocationSegmentPages(db.meta.PageSize()) || oldRoot.EntryCount() != 0 {
+		t.Fatal("catalog relocation changed the committed original")
+	}
+	if err := db.View(func(tx *Tx) error { _, err := tx.Bucket(name); return err }); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeNodeSpanBatchParentsStayPrivate(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("key"), []byte("old")); err != nil {
+			return err
+		}
+		_, err = tx.CreateBucket([]byte("blocker"))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := newTx(db, false)
+	bucket, err := first.Bucket([]byte("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldHead := bucket.rootNode.PageID()
+	value := bytes.Repeat([]byte{'a'}, int(db.meta.PageSize())*2)
+	if err := bucket.Put([]byte("key"), value); err != nil {
+		t.Fatal(err)
+	}
+	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, first.allocation)
+	other, err := second.Bucket([]byte("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Put([]byte("key"), bytes.Repeat([]byte{'b'}, len(value))); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.store.dirty[oldHead].final.EntryAt(0).Value(), value) {
+		t.Fatal("later failed callback changed an earlier image")
+	}
+	prepared := &Tx{db: db, meta: first.meta, rootNode: first.rootNode, allocation: first.allocation, allocationOwned: first.allocationOwned}
+	prepared.store.dirty = first.store.dirty
+	if err := prepared.prepareCommit(); err != nil {
+		t.Fatal(err)
+	}
+	probe := newWriteTx(db, prepared.meta, prepared.rootNode, prepared.store.dirty, prepared.allocation)
+	gotBucket, err := probe.Bucket([]byte("data"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := gotBucket.Get([]byte("key"))
+	if err != nil || !bytes.Equal(got, value) {
+		t.Fatalf("prepared batch lost its parent reference: %v", err)
+	}
+	if gotBucket.rootNode.PageID() == oldHead {
+		t.Fatal("fixture did not relocate the bucket root")
+	}
+	if prepared.store.dirty[gotBucket.rootNode.PageID()].original != nil {
+		t.Fatal("relocated node kept a patch base")
+	}
+	if string(db.memoryNodes[oldHead].EntryAt(0).Value()) != "old" {
+		t.Fatal("batch preparation changed committed state")
+	}
+}
+
+func TestNativeNodeSpanRepairsUnchangedBranch(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		for index := range 12 {
+			if err := bucket.Put(fmt.Appendf(nil, "%03d", index), bytes.Repeat([]byte{'s'}, int(tx.meta.PageSize())/2)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var oldHead page.ID
+	var branch *btree.Node
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket([]byte("data"))
+		if err != nil {
+			return err
+		}
+		if err := bucket.loadRootNode(); err != nil {
+			return err
+		}
+		branch = bucket.rootNode
+		if branch.IsLeaf() {
+			return errors.New("fixture has no branch")
+		}
+		oldHead = branch.Children[0]
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !db.allocation.allocated(oldHead + 1) {
+		t.Fatal("fixture did not block the leaf span")
+	}
+	value := bytes.Repeat([]byte{'g'}, int(db.meta.PageSize())*2)
+	if err := db.Put([]byte("data"), []byte("000"), value); err != nil {
+		t.Fatal(err)
+	}
+	if branch.Children[0] != oldHead {
+		t.Fatal("repair changed a committed branch")
+	}
+	got, err := db.Get([]byte("data"), []byte("000"))
+	if err != nil || !bytes.Equal(got, value) {
+		t.Fatalf("branch child after move: %v", err)
+	}
+	if db.allocation.allocated(oldHead) {
+		t.Fatal("moved leaf head remained allocated")
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeNodeSpanGrowsAndShrinksInPlace(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	name, key := []byte("data"), []byte("key")
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		return bucket.Put(key, []byte("old"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var head page.ID
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(name)
+		if err != nil {
+			return err
+		}
+		if err := bucket.loadRootNode(); err != nil {
+			return err
+		}
+		head = bucket.rootNode.PageID()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	original := db.memoryNodes[head]
+	grown := bytes.Repeat([]byte("v"), int(db.meta.PageSize())*2)
+	if err := db.Put(name, key, grown); err != nil {
+		t.Fatal(err)
+	}
+	node := db.memoryNodes[head]
+	if node == nil || node.StoragePageCount() != 3 || db.meta.LastPage() != head+2 {
+		t.Fatal("growth did not extend the existing span")
+	}
+	if string(original.EntryAt(0).Value()) != "old" || original.StoragePageCount() != 1 {
+		t.Fatal("growth changed the committed original")
+	}
+	for offset := page.ID(0); offset < 3; offset++ {
+		if !db.allocation.allocated(head + offset) {
+			t.Fatal("grown span contains a free page")
+		}
+	}
+	if err := db.Put(name, key, []byte("small")); err != nil {
+		t.Fatal(err)
+	}
+	node = db.memoryNodes[head]
+	if node == nil || node.StoragePageCount() != 1 || db.meta.LastPage() != head {
+		t.Fatal("shrink did not retain the head and reclaim the tail")
+	}
+	if db.allocation.allocated(head+1) || db.allocation.allocated(head+2) {
+		t.Fatal("surplus pages remain allocated")
+	}
+	got, err := db.Get(name, key)
+	if err != nil || string(got) != "small" {
+		t.Fatalf("shrunken value=%q error=%v", got, err)
+	}
+	if err := db.validatePageOwnership(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
+	for _, name := range []string{"split", "split-large-keys", "root-collapse", "split-then-delete"} {
+		t.Run(name, func(t *testing.T) {
+			db := OpenMemory()
+			defer db.Close()
+			pageSize := int(db.meta.PageSize())
+			keySize := pageSize / 2
+			if name == "split-large-keys" {
+				keySize = btree.MaxKeySize
+			}
+			key := func(number int) []byte {
+				return append(fmt.Appendf(nil, "%03d", number), bytes.Repeat([]byte{'k'}, keySize-3)...)
+			}
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket([]byte("data"))
+				if err != nil {
+					return err
+				}
+				for _, number := range []int{100, 200, 300} {
+					if err := bucket.Put(key(number), bytes.Repeat([]byte{'s'}, pageSize/4)); err != nil {
+						return err
+					}
+				}
+				_, err = tx.CreateBucket([]byte("blocker"))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			first := newTx(db, false)
+			bucket, err := first.Bucket([]byte("data"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if bucket.rootNode.IsLeaf() || len(bucket.rootNode.Children) != 3 {
+				t.Fatal("fixture needs one branch with three leaf children")
+			}
+			oldHead := bucket.rootNode.Children[2]
+			value := bytes.Repeat([]byte{'v'}, pageSize*2)
+			if err := bucket.Put(key(300), value); err != nil {
+				t.Fatal(err)
+			}
+			oldParent := first.store.dirty[oldHead].parent
+			if oldParent == nil || oldParent.IsLeaf() {
+				t.Fatal("first callback did not retain the leaf's branch parent")
+			}
+
+			second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, first.allocation)
+			other, err := second.Bucket([]byte("data"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if name == "root-collapse" {
+				for _, number := range []int{100, 200} {
+					if err := other.Delete(key(number)); err != nil {
+						t.Fatal(err)
+					}
+				}
+			} else if err := other.Put(key(150), bytes.Repeat([]byte{'n'}, pageSize/4)); err != nil {
+				t.Fatal(err)
+			}
+			parent := second.store.dirty[oldHead].parent
+			if parent == nil || parent.PageID() == oldParent.PageID() {
+				t.Fatal("later callback did not replace the saved parent")
+			}
+			if first.store.dirty[oldHead].parent != oldParent {
+				t.Fatal("later callback changed the earlier callback's parent record")
+			}
+			if parent.IsLeaf() != (name == "root-collapse") {
+				t.Fatal("saved parent has the wrong node type")
+			}
+			updated := bytes.Repeat([]byte{'w'}, len(value))
+			if name == "split-then-delete" {
+				if err := other.Delete(key(300)); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := other.Put(key(300), updated); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(first.store.dirty[oldHead].final.EntryAt(0).Value(), value) {
+				t.Fatal("a write after reparenting changed an earlier callback's image")
+			}
+			for id, change := range second.store.dirty {
+				first.store.dirty[id] = change
+			}
+			prepared := &Tx{db: db, meta: second.meta, rootNode: second.rootNode, allocation: second.allocation, allocationOwned: second.allocationOwned}
+			prepared.store.dirty = first.store.dirty
+			if err := prepared.prepareCommit(); err != nil {
+				t.Fatal(err)
+			}
+			if _, exists := prepared.store.dirty[oldHead]; exists {
+				t.Fatal("fixture did not relocate the changed leaf")
+			}
+			probe := newWriteTx(db, prepared.meta, prepared.rootNode, prepared.store.dirty, prepared.allocation)
+			visible, err := probe.Bucket([]byte("data"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := visible.Get(key(300))
+			if name == "split-then-delete" {
+				if !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("deleted key after reparenting: %v", err)
+				}
+			} else if err != nil || !bytes.Equal(got, updated) {
+				t.Fatalf("relocated leaf through its new parent: %v", err)
+			}
+			view := &DB{meta: prepared.meta, allocation: prepared.allocation.publish()}
+			if err := view.validatePageOwnershipWith(probe.store.ReadNode); err != nil {
+				t.Fatal(err)
+			}
+			if got := db.memoryNodes[oldHead].EntryAt(0).Value(); !bytes.Equal(got, bytes.Repeat([]byte{'s'}, pageSize/4)) {
+				t.Fatal("preparation changed the committed leaf")
+			}
+		})
+	}
+}
+
+func TestNativeNodeSpanBatchCatalogRootCollapse(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	key := func(number, size int) []byte {
+		return append(fmt.Appendf(nil, "%03d", number), bytes.Repeat([]byte{'k'}, size-3)...)
+	}
+	keySize := int(db.meta.PageSize()) / 2
+	if err := db.Update(func(tx *Tx) error {
+		for _, number := range []int{100, 200, 300} {
+			if _, err := tx.CreateBucket(key(number, keySize)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	first := newTx(db, false)
+	remaining := key(250, btree.MaxKeySize)
+	if _, err := first.CreateBucket(remaining); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := first.CreateBucket(key(999, keySize)); err != nil {
+		t.Fatal(err)
+	}
+	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, first.allocation)
+	for _, number := range []int{100, 200, 300, 999} {
+		if err := second.DeleteBucket(key(number, keySize)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRoot := second.meta.Root()
+	if !second.rootNode.IsLeaf() || second.store.dirty[oldRoot].parent != nil {
+		t.Fatal("promoted catalog root kept its old branch parent")
+	}
+	for id, change := range second.store.dirty {
+		first.store.dirty[id] = change
+	}
+	prepared := &Tx{db: db, meta: second.meta, rootNode: second.rootNode, allocation: second.allocation, allocationOwned: second.allocationOwned}
+	prepared.store.dirty = first.store.dirty
+	if err := prepared.prepareCommit(); err != nil {
+		t.Fatal(err)
+	}
+	if prepared.meta.Root() == oldRoot {
+		t.Fatal("fixture did not relocate the promoted catalog root")
+	}
+	probe := newWriteTx(db, prepared.meta, prepared.rootNode, prepared.store.dirty, prepared.allocation)
+	if _, err := probe.Bucket(remaining); err != nil {
+		t.Fatal(err)
+	}
+	view := &DB{meta: prepared.meta, allocation: prepared.allocation.publish()}
+	if err := view.validatePageOwnershipWith(probe.store.ReadNode); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAllocationBitmapOwnsNodeSpanChecksAllBits covers byte and word boundaries.
+func TestAllocationBitmapOwnsNodeSpanChecksAllBits(t *testing.T) {
+	bitmap := newAllocationBitmap(4096)
+	start := page.NewMeta(4096).Root() + 1
+	for _, count := range []int{1, 2, 7, 8, 9, 17, 63, 64, 65, 128, 257} {
+		for offset := page.ID(0); offset < 8; offset++ {
+			head := start + offset
+			for i := 0; i < count; i++ {
+				bitmap.markAllocated(head + page.ID(i))
+			}
+			if !bitmap.ownsNodeSpan(head, count) {
+				t.Fatalf("allocated span %d+%d was rejected", head, count)
+			}
+			for i := 0; i < count; i++ {
+				id := head + page.ID(i)
+				segment := bitmap.writableSegment(bitmap.segmentIndex(id))
+				clearAllocationBit(segment.bitmapBits(), id%bitmap.pagesPerSegment())
+				if bitmap.ownsNodeSpan(head, count) {
+					t.Fatalf("span accepted free tail page %d", id)
+				}
+				setAllocationBit(segment.bitmapBits(), id%bitmap.pagesPerSegment())
+			}
+		}
+	}
+	for _, test := range []struct {
+		head  page.ID
+		count int
+	}{{0, 1}, {firstAllocationSegmentID, 1}, {start, 0}, {^page.ID(0), 2}, {bitmap.pagesPerGroup() - 1, 2}} {
+		if bitmap.ownsNodeSpan(test.head, test.count) {
+			t.Fatalf("invalid span %+v was accepted", test)
+		}
+	}
+}
+
+// Data can cross a logical bitmap frame because all metadata frames stay at the group start.
+func TestAllocationBitmapOwnsNodeSpanAcrossFrames(t *testing.T) {
+	bitmap := newAllocationBitmap(4096)
+	head := bitmap.pagesPerSegment() - 7
+	for i := 0; i < 20; i++ {
+		bitmap.markAllocated(head + page.ID(i))
+	}
+	if !bitmap.ownsNodeSpan(head, 20) {
+		t.Fatal("span across bitmap frames was rejected")
+	}
+	middle := bitmap.pagesPerSegment() + 3
+	segment := bitmap.writableSegment(bitmap.segmentIndex(middle))
+	clearAllocationBit(segment.bitmapBits(), middle%bitmap.pagesPerSegment())
+	if bitmap.ownsNodeSpan(head, 20) {
+		t.Fatal("missing bit in second frame was ignored")
 	}
 }

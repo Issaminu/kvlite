@@ -35,6 +35,8 @@ func (store *memoryTreeStore) ReadNode(pageID page.ID) (*Node, error) {
 	return store.nodes[pageID], nil
 }
 
+func (store *memoryTreeStore) SetParent(page.ID, *Node) {}
+
 func (store *memoryTreeStore) AllocatePage() (page.ID, error) {
 	if store.allocateErr != nil {
 		return 0, store.allocateErr

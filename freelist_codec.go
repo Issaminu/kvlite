@@ -4,14 +4,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/checksum"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
-// pageRecords returns the changed allocation pages that remain after finalization.
+// pageRecords returns one full image per changed allocation segment after finalization.
 // Each payload aliases a private segment. The caller must not change it after commit.
 func (changes *allocationChanges) pageRecords() []wal.AllocationRecord {
 	indexes := make([]int, 0, len(changes.dirtySegments))
@@ -35,13 +37,13 @@ func (changes *allocationChanges) pageRecords() []wal.AllocationRecord {
 	return records
 }
 
-// encodeSegment refreshes the checksum and returns the segment's owned page data.
+// encodeSegment refreshes the checksum and returns one owned bitmap page.
 // The returned slice aliases the bitmap and must not be changed by the caller.
 func (bitmap *allocationBitmap) encodeSegment(index int) []byte {
 	return allocationSegmentImage(&bitmap.segments[index])
 }
 
-// newAllocationSegment creates one zeroed encoded page and sets its memory-only free-bit cursor.
+// newAllocationSegment creates one zeroed bitmap page and its free-bit cursor.
 func newAllocationSegment(pageSize int64, pageID page.ID, firstFreeBit page.ID) *allocationSegment {
 	data := encodeAllocationSegment(pageSize, pageID, nil)
 	return &allocationSegment{
@@ -50,15 +52,15 @@ func newAllocationSegment(pageSize int64, pageID page.ID, firstFreeBit page.ID) 
 	}
 }
 
-// allocationSegmentImage refreshes the checksum and returns the segment's owned page data.
+// allocationSegmentImage refreshes the checksum and returns one owned bitmap page.
 // The returned slice aliases the segment and must not be changed by the caller.
 func allocationSegmentImage(segment *allocationSegment) []byte {
 	sealAllocationPage(segment.data)
 	return segment.data
 }
 
-// encodeAllocationSegment returns one complete allocation page for pageID.
-// Extra bitmap bytes are discarded when bits is larger than the page payload.
+// encodeAllocationSegment returns one complete bitmap page for pageID.
+// Extra bitmap bytes are discarded when bits exceeds the page payload.
 func encodeAllocationSegment(pageSize int64, pageID page.ID, bits []byte) []byte {
 	data := make([]byte, pageSize)
 	binary.LittleEndian.PutUint32(data[allocationMagicOffset:allocationMagicOffset+allocationMagicSize], allocationSegmentMagic)
@@ -81,7 +83,7 @@ func decodeAllocationSegment(data []byte, pageSize int64, pageID page.ID) (alloc
 
 // readAllocationBitmap reads the allocation pages named by meta.
 // A committed WAL image, changed by the byte patches after it, replaces the main-file image of the same page.
-// It reads one page per segment and does not scan tree pages.
+// It reads every bitmap frame in the allocated groups and does not scan tree pages.
 // The records must contain only committed WAL records in file order.
 // The caller must not change records or their payloads while it uses the returned bitmap.
 func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*allocationBitmap, error) {
@@ -99,7 +101,14 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 	}
 	for _, record := range records {
 		if isWALPageRecord(record.Header.Type) {
-			availableLastPage = max(availableLastPage, record.Header.PageID)
+			last := record.Header.PageID
+			if record.Header.Type == wal.RecordTypeAllocation || record.Header.Type == wal.RecordTypeNode {
+				count := (int64(len(record.Payload)) + meta.PageSize() - 1) / meta.PageSize()
+				if count > 0 && page.ID(count)-1 <= ^page.ID(0)-last {
+					last += page.ID(count) - 1
+				}
+			}
+			availableLastPage = max(availableLastPage, last)
 		}
 	}
 	chains := walPageChains(records)
@@ -107,11 +116,28 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 		return nil, fmt.Errorf("metadata last page %d exceeds main-file and WAL page IDs: %w", meta.LastPage(), page.ErrInvalid)
 	}
 
-	bitmap := &allocationBitmap{pageSize: meta.PageSize()}
-	segmentCount := bitmap.segmentIndex(meta.LastPage()) + 1
+	bitmap := &allocationBitmap{pageSize: meta.PageSize(), groupSegments: int(page.AllocationSegmentPages(meta.PageSize()))}
+	segmentCount := int(meta.LastPage()/bitmap.pagesPerGroup()+1) * bitmap.segmentsPerGroup()
 	bitmap.segments = make([]allocationSegment, segmentCount)
+	var groupData []byte
 	for index := range bitmap.segments {
 		pageID := bitmap.segmentPageID(index)
+		if index%bitmap.segmentsPerGroup() == 0 {
+			groupData = nil
+			overlay := false
+			for frame := index; frame < index+bitmap.segmentsPerGroup(); frame++ {
+				if _, found := chains[bitmap.segmentPageID(frame)]; found {
+					overlay = true
+					break
+				}
+			}
+			if !overlay {
+				groupData = make([]byte, int64(bitmap.segmentsPerGroup())*meta.PageSize())
+				if err := fileio.ReadFull(io.NewSectionReader(db.file, int64(pageID)*meta.PageSize(), int64(len(groupData))), groupData); err != nil {
+					return nil, fmt.Errorf("read allocation group at page %d: %w", pageID, err)
+				}
+			}
+		}
 		var data []byte
 		if chain, inWAL := chains[pageID]; inWAL {
 			record, err := db.materializeWALPage(records, chain)
@@ -122,8 +148,13 @@ func (db *DB) readAllocationBitmap(meta *page.Meta, records []wal.WALRecord) (*a
 				return nil, fmt.Errorf("WAL record type %d for allocation page %d: %w", record.Header.Type, pageID, page.ErrInvalid)
 			}
 			data = record.Payload
+		} else if groupData != nil {
+			start := int64(index%bitmap.segmentsPerGroup()) * meta.PageSize()
+			end := start + meta.PageSize()
+			data = groupData[start:end:end]
 		} else {
-			data, err = db.readMainPage(pageID)
+			data = make([]byte, meta.PageSize())
+			err = fileio.ReadFull(io.NewSectionReader(db.file, int64(pageID)*meta.PageSize(), int64(len(data))), data)
 			if err != nil {
 				return nil, fmt.Errorf("read allocation page %d: %w", pageID, err)
 			}
@@ -147,7 +178,7 @@ func sealAllocationPage(data []byte) {
 	binary.LittleEndian.PutUint32(data[allocationChecksumOffset:allocationChecksumOffset+allocationChecksumSize], sum)
 }
 
-// verifyAllocationPage checks the exact page size, checksum, magic value, and expected physical page ID.
+// verifyAllocationPage checks one page's exact size, checksum, magic, and physical ID.
 func verifyAllocationPage(data []byte, pageSize int64, pageID page.ID) error {
 	if int64(len(data)) != pageSize || len(data) < allocationHeaderSize {
 		return fmt.Errorf("decode allocation page size: %w", page.ErrInvalid)

@@ -16,7 +16,7 @@ import (
 //	[12:16] value size
 //
 // The key begins at the data offset. The value follows the key.
-// node_codec.go contains the node header, checksums, and the rules that leaves and branches share. continuation_codec.go reads and writes the pages of a continued node.
+// node_codec.go contains the node header, checksums, and the rules that leaves and branches share. Large nodes use one consecutive span.
 const leafEntryDescriptorSize = 4 * encodedUint32Size
 
 func leafPayloadSize(node *Node) int {
@@ -31,10 +31,6 @@ func leafBodyOffset(node *Node) int {
 	return NodeHeaderSize + len(node.entries)*leafEntryDescriptorSize
 }
 
-func leafDirectorySize(node *Node) int {
-	return len(node.entries) * leafEntryDescriptorSize
-}
-
 // putLeafDescriptor writes the descriptor of entry, whose key starts at offset.
 func putLeafDescriptor(descriptor []byte, entry *Entry, offset int) {
 	binary.LittleEndian.PutUint32(descriptor[:4], entry.flags)
@@ -43,7 +39,7 @@ func putLeafDescriptor(descriptor []byte, entry *Entry, offset int) {
 	binary.LittleEndian.PutUint32(descriptor[12:16], uint32(len(entry.value)))
 }
 
-// putLeafBody writes the descriptors, keys, and values of a leaf that fits in one page.
+// putLeafBody writes the descriptors, keys, and values of one logical leaf.
 // image has the compact size of the node and starts with its header.
 func putLeafBody(image []byte, node *Node) {
 	offset := leafBodyOffset(node)
@@ -52,17 +48,6 @@ func putLeafBody(image []byte, node *Node) {
 		putLeafDescriptor(image[NodeHeaderSize+index*leafEntryDescriptorSize:], entry, offset)
 		offset += copy(image[offset:], entry.key)
 		offset += copy(image[offset:], entry.value)
-	}
-}
-
-// putLeafDirectory writes only the descriptors of a continued leaf into dst.
-// The keys and values follow the directory in entry order.
-func putLeafDirectory(dst []byte, node *Node) {
-	offset := leafBodyOffset(node)
-	for index := range node.entries {
-		entry := &node.entries[index]
-		putLeafDescriptor(dst[index*leafEntryDescriptorSize:], entry, offset)
-		offset += len(entry.key) + len(entry.value)
 	}
 }
 
@@ -202,42 +187,48 @@ func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool
 }
 
 // mappedLeafImage checks the header of a mapped leaf for an ordered scan and returns one contiguous image of the leaf.
-// A one-page leaf returns data. A continued leaf returns a rebuilt image, because the scan returns its values.
-// A rebuilt image gets the full checks of checkLeafBody. A one-page image gets only the shorter checks of each scan.
+// A complete mapped span returns borrowed logical bytes.
+// A head-only input needs a raw-page reader and a temporary span copy.
 // A branch returns ErrNotLeafNode before any other check, so the caller can read it as a branch.
 // It returns only the image: a scan that gets more results from this call is slower.
 func mappedLeafImage(data []byte, id page.ID, checksums bool, readPage func(page.ID) ([]byte, error)) ([]byte, error) {
-	switch mappedNodeType(data) {
-	case NodeTypeBranch, NodeTypeBranch | overflowNodeFlag:
+	kind := mappedNodeType(data)
+	if kind == NodeTypeBranch {
 		return nil, ErrNotLeafNode
-	case NodeTypeLeaf | overflowNodeFlag:
-		image, h, _, err := nodeImage(data, id, int64(len(data)), readPage, false, checksums)
-		if err != nil {
+	}
+	image, _, err := nodeImage(data, id, int64(len(data)), readPage, false, checksums)
+	return image, err
+}
+
+// checkedLeafImage accepts a complete padded span after its header was checked.
+// The caller must first use NodeSpan and CheckNodeChecksumMode.
+func checkedLeafImage(data []byte, checksums bool) ([]byte, error) {
+	kind := mappedNodeType(data)
+	if kind == NodeTypeBranch {
+		return nil, ErrNotLeafNode
+	}
+	if checksums {
+		if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, true); err != nil {
 			return nil, err
 		}
-		if err := checkLeafBody(image, h, true, nil); err != nil {
-			return nil, err
-		}
-		return image, nil
 	}
-	if _, _, ok := plainNodeHeader(data, id, int64(len(data)), false, checksums); ok {
-		return data, nil
-	}
-	if _, err := readNodeHeader(data, id, int64(len(data)), false, checksums); err != nil {
-		return nil, err
-	}
-	return data, nil
+	size := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
+	return data[:size:size], nil
 }
 
 // VisitMappedLeafRange visits entries in the half-open range [start, end).
 // It checks descriptor offsets, byte bounds, and the flags and value rule of validLeaf. checksums selects nonzero checksum checks.
-// Normal leaf results borrow data. Continued leaf results borrow a rebuilt image.
+// Results borrow the complete span. A head-only input first builds that span.
 // readPage supplies continuation pages. Pass nil for a normal leaf.
 func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error, checksums bool, readPage func(page.ID) ([]byte, error)) error {
 	image, err := mappedLeafImage(data, expectedPageID, checksums, readPage)
 	if err != nil {
 		return err
 	}
+	return visitLeafRange(image, start, end, visit)
+}
+
+func visitLeafRange(image, start, end []byte, visit func(uint32, []byte, []byte) error) error {
 	count := binary.LittleEndian.Uint32(image[nodeEntryCountOffset:nodeChecksumOffset])
 	dataStart, err := leafDataStart(uint64(len(image)), count)
 	if err != nil {
@@ -271,7 +262,7 @@ func VisitMappedLeafRange(data []byte, expectedPageID page.ID, start, end []byte
 
 // VisitMappedLeafReverse visits one mapped leaf from its largest key to its smallest key.
 // It checks the same fields as VisitMappedLeafRange.
-// Normal leaf results borrow data. Continued leaf results borrow a rebuilt image.
+// Results borrow the complete span. A head-only input first builds that span.
 // checksums selects nonzero checksum checks. readPage supplies continuation pages.
 // Pass nil for readPage when the leaf has no continuation pages.
 func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint32, []byte, []byte) error, checksums bool, readPage func(page.ID) ([]byte, error)) error {
@@ -279,6 +270,10 @@ func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint
 	if err != nil {
 		return err
 	}
+	return visitLeafReverse(image, visit)
+}
+
+func visitLeafReverse(image []byte, visit func(uint32, []byte, []byte) error) error {
 	count := binary.LittleEndian.Uint32(image[nodeEntryCountOffset:nodeChecksumOffset])
 	dataStart, err := leafDataStart(uint64(len(image)), count)
 	if err != nil || count == 0 {
@@ -305,4 +300,32 @@ func VisitMappedLeafReverse(data []byte, expectedPageID page.ID, visit func(uint
 		}
 	}
 	return nil
+}
+
+// VisitCheckedLeafRange visits entries in [start, end) from a checked complete span.
+// The caller must first check the header with NodeSpan and CheckNodeChecksumMode.
+// The data length must equal the page count times the database page size.
+// It checks the same descriptors as VisitMappedLeafRange. checksums also checks the span checksum.
+// Results borrow data. A callback error stops the visit and is returned unchanged.
+// A branch returns ErrNotLeafNode without a checksum check.
+func VisitCheckedLeafRange(data, start, end []byte, visit func(uint32, []byte, []byte) error, checksums bool) error {
+	image, err := checkedLeafImage(data, checksums)
+	if err != nil {
+		return err
+	}
+	return visitLeafRange(image, start, end, visit)
+}
+
+// VisitCheckedLeafReverse visits a checked complete span from its largest key to its smallest key.
+// The caller must first check the header with NodeSpan and CheckNodeChecksumMode.
+// The data length must equal the page count times the database page size.
+// It checks the same descriptors as VisitMappedLeafReverse. checksums also checks the span checksum.
+// Results borrow data. A callback error stops the visit and is returned unchanged.
+// A branch returns ErrNotLeafNode without a checksum check.
+func VisitCheckedLeafReverse(data []byte, visit func(uint32, []byte, []byte) error, checksums bool) error {
+	image, err := checkedLeafImage(data, checksums)
+	if err != nil {
+		return err
+	}
+	return visitLeafReverse(image, visit)
 }

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -25,9 +26,10 @@ func (db *DB) replayWAL(committed []wal.WALRecord) error {
 	}
 	visible := committed[:0]
 	for _, record := range committed {
-		if record.Header.Type == wal.RecordTypeAllocation && !db.allocation.isSegmentPage(record.Header.PageID) {
-			pagesPerSegment := db.allocation.pagesPerSegment()
-			if record.Header.PageID <= db.meta.LastPage() || record.Header.PageID%pagesPerSegment != 0 || record.Header.TxID >= latestMetaTxID {
+		if record.Header.Type == wal.RecordTypeAllocation && !db.allocation.isSegmentHead(record.Header.PageID) {
+			pagesPerGroup := db.allocation.pagesPerGroup()
+			frames := page.AllocationSegmentPages(db.meta.PageSize())
+			if record.Header.PageID <= db.meta.LastPage() || record.Header.PageID%pagesPerGroup >= frames || record.Header.TxID >= latestMetaTxID {
 				return fmt.Errorf("allocation WAL record targets page %d: %w", record.Header.PageID, page.ErrInvalid)
 			}
 			continue
@@ -228,7 +230,68 @@ func (db *DB) materializeWALPages(records []wal.WALRecord) ([]wal.WALRecord, err
 		}
 		materialized = append(materialized, record)
 	}
-	return materialized, nil
+	return db.visibleWALNodeSpans(materialized)
+}
+
+// visibleWALNodeSpans removes an old node whose head became a newer node's raw
+// trailing page. Allocation bits alone cannot distinguish that reuse. Other
+// overlaps are invalid. No node can overlap allocation metadata or free pages.
+func (db *DB) visibleWALNodeSpans(records []wal.WALRecord) ([]wal.WALRecord, error) {
+	var nodes []wal.WALRecord
+	for _, record := range records {
+		if record.Header.Type == wal.RecordTypeNode {
+			nodes = append(nodes, record)
+		}
+	}
+	slices.SortFunc(nodes, func(left, right wal.WALRecord) int {
+		if left.Header.PageID < right.Header.PageID {
+			return -1
+		}
+		if left.Header.PageID > right.Header.PageID {
+			return 1
+		}
+		return 0
+	})
+	retired := make(map[page.ID]bool)
+	var end page.ID
+	var txid wal.TxID
+	for _, record := range nodes {
+		count, err := wal.ValidateNodeImage(record.Payload, record.Header.PageID, db.meta.PageSize())
+		if err != nil {
+			return nil, err
+		}
+		if record.Header.PageID < end {
+			if record.Header.TxID < txid {
+				retired[record.Header.PageID] = true
+				continue
+			}
+			return nil, fmt.Errorf("overlapping recovered node at page %d: %w", record.Header.PageID, page.ErrInvalid)
+		}
+		end = record.Header.PageID + page.ID(count)
+		txid = record.Header.TxID
+	}
+	visible := records[:0]
+	for _, record := range records {
+		if record.Header.Type == wal.RecordTypeNode {
+			if retired[record.Header.PageID] {
+				continue
+			}
+			if db.allocation != nil {
+				count, _ := btree.NodeSpan(record.Payload, record.Header.PageID, db.meta.PageSize())
+				last := record.Header.PageID + page.ID(count) - 1
+				if last > db.meta.LastPage() {
+					return nil, page.ErrInvalid
+				}
+				for id := record.Header.PageID; id <= last; id++ {
+					if !db.allocation.allocated(id) || db.allocation.isSegmentPage(id) {
+						return nil, fmt.Errorf("recovered node uses unavailable page %d: %w", id, page.ErrInvalid)
+					}
+				}
+			}
+		}
+		visible = append(visible, record)
+	}
+	return visible, nil
 }
 
 // materializeWALPage replays the records of one page, at the chain indexes, from the last complete image of the page.
@@ -250,6 +313,15 @@ func (db *DB) materializeWALPage(records []wal.WALRecord, chain []int) (wal.WALR
 	}
 	base := records[chain[first]]
 	image := base.Payload
+	imageLimit := int64(wal.MaxNodeImageSize)
+	if base.Header.Type == wal.RecordTypeAllocation {
+		imageLimit = db.meta.PageSize()
+		if int64(len(image)) != imageLimit {
+			return wal.WALRecord{}, page.ErrInvalid
+		}
+	} else if _, err := wal.ValidateNodeImage(image, pageID, db.meta.PageSize()); err != nil {
+		return wal.WALRecord{}, err
+	}
 	// After an entry patch, node holds the latest state instead of image. So a series of entry patches decodes the page once.
 	var node *btree.Node
 	for _, index := range chain[first+1:] {
@@ -260,7 +332,7 @@ func (db *DB) materializeWALPage(records []wal.WALRecord, chain []int) (wal.WALR
 				image, node = btree.EncodeWALNode(node), nil
 			}
 			var err error
-			if image, err = wal.ApplyBytePatch(image, record.Payload, db.meta.PageSize()); err != nil {
+			if image, err = wal.ApplyBytePatch(image, record.Payload, imageLimit); err != nil {
 				return wal.WALRecord{}, fmt.Errorf("apply WAL byte patch for page %d: %w", pageID, err)
 			}
 		case wal.RecordTypeEntryPatch:
@@ -276,13 +348,20 @@ func (db *DB) materializeWALPage(records []wal.WALRecord, chain []int) (wal.WALR
 			if err := wal.ApplyEntryPatch(node, record.Payload); err != nil {
 				return wal.WALRecord{}, fmt.Errorf("apply WAL entry patch for page %d: %w", pageID, err)
 			}
-			if int64(btree.WALNodeEncodedSize(node)) > db.meta.PageSize() {
-				return wal.WALRecord{}, fmt.Errorf("WAL entry patch makes page %d larger than one page: %w", pageID, page.ErrInvalid)
+			if int64(btree.WALNodeEncodedSize(node)) > imageLimit || btree.NodePageCount(node, db.meta.PageSize()) != node.StoragePageCount() {
+				return wal.WALRecord{}, fmt.Errorf("WAL entry patch changes the span of node %d: %w", pageID, page.ErrInvalid)
 			}
 		}
 	}
 	if node != nil {
 		image = btree.EncodeWALNode(node)
+	}
+	if base.Header.Type == wal.RecordTypeNode {
+		if _, err := wal.ValidateNodeImage(image, pageID, db.meta.PageSize()); err != nil {
+			return wal.WALRecord{}, err
+		}
+	} else if int64(len(image)) != imageLimit {
+		return wal.WALRecord{}, page.ErrInvalid
 	}
 	last.Header.Type, last.Payload = base.Header.Type, image
 	return last, nil

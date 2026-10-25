@@ -747,21 +747,22 @@ func TestOpenIgnoresDroppedAllocationSegmentInWAL(t *testing.T) {
 
 			bitmap := newAllocationBitmap(meta.PageSize())
 			bitmap.addSegment()
-			segmentPageID := bitmap.segmentPageID(1)
+			firstDropped := bitmap.segmentsPerGroup()
+			segmentPageID := bitmap.segmentPageID(firstDropped)
 			initialLastPage := meta.LastPage()
 			recordPageID := segmentPageID
 			if test.badPage {
-				recordPageID = firstTreePageID + 1
+				recordPageID = meta.Root() + 1
 			}
 			walFile, err := os.OpenFile(path+"-wal", os.O_RDWR|os.O_CREATE, 0600)
 			if err != nil {
 				t.Fatal(err)
 			}
 			log := wal.New(wal.Config{File: walFile, PageSize: meta.PageSize()})
-			meta.SetLastPage(segmentPageID)
+			meta.SetLastPage(bitmap.segmentPageID(len(bitmap.segments) - 1))
 			meta.AdvanceGeneration()
 			meta.RefreshChecksum()
-			if _, err := log.Commit(nil, []wal.AllocationRecord{{PageID: recordPageID, Payload: bitmap.encodeSegment(1)}}, page.EncodeMeta(&meta), nil); err != nil {
+			if _, err := log.Commit(nil, []wal.AllocationRecord{{PageID: recordPageID, Payload: bitmap.encodeSegment(firstDropped)}}, page.EncodeMeta(&meta), nil); err != nil {
 				t.Fatal(err)
 			}
 			meta.SetLastPage(initialLastPage)
@@ -800,23 +801,24 @@ func TestRecoverySkipsOldPatchesAfterFreeOrFullNode(t *testing.T) {
 	}
 	defer db.Close()
 
-	root := btree.NewLeafNode(firstTreePageID)
+	rootID := db.meta.Root()
+	root := btree.NewLeafNode(rootID)
 	fullRoot := btree.EncodeWALNode(root)
 	records := []wal.WALRecord{
-		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID + 1, TxID: 1}, Payload: btree.EncodeWALNode(btree.NewLeafNode(firstTreePageID + 1))},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeBytePatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeEntryPatch, PageID: firstTreePageID + 1, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeBytePatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeEntryPatch, PageID: firstTreePageID, TxID: 1}, Payload: []byte{0xff}},
-		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: firstTreePageID, TxID: 2}, Payload: fullRoot},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: rootID + 1, TxID: 1}, Payload: btree.EncodeWALNode(btree.NewLeafNode(rootID + 1))},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeBytePatch, PageID: rootID + 1, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeEntryPatch, PageID: rootID + 1, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeBytePatch, PageID: rootID, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeEntryPatch, PageID: rootID, TxID: 1}, Payload: []byte{0xff}},
+		{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: rootID, TxID: 2}, Payload: fullRoot},
 	}
 	if err := db.loadCommittedIntoOverlay(records); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := db.wal.CommittedRecord(firstTreePageID + 1); ok {
+	if _, ok := db.wal.CommittedRecord(rootID + 1); ok {
 		t.Fatal("recovery kept a freed page")
 	}
-	got, ok := db.wal.CommittedRecord(firstTreePageID)
+	got, ok := db.wal.CommittedRecord(rootID)
 	if !ok || got.Header.Type != wal.RecordTypeNode || !bytes.Equal(got.Payload, fullRoot) {
 		t.Fatalf("recovered root: found=%t type=%d", ok, got.Header.Type)
 	}
@@ -1272,14 +1274,15 @@ func TestMetaFromCommittedRecords_NoMetadata(t *testing.T) {
 	}
 }
 
-func TestLoadCommittedIntoOverlay_RejectsInvalidNodeDirectory(t *testing.T) {
-	node := btree.NewLeafNode(2)
+func TestLoadCommittedIntoOverlay_RejectsInvalidLeafDescriptor(t *testing.T) {
+	meta := page.NewMeta(4096)
+	node := btree.NewLeafNode(meta.Root())
 	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
 	image := btree.EncodeWALNode(node)
-	const firstLeafEntryOffsetField = btree.NodeHeaderSize + 4
-	binary.LittleEndian.PutUint32(image[firstLeafEntryOffsetField:firstLeafEntryOffsetField+4], ^uint32(0))
+	const firstLeafEntryOffsetField = btree.NodeHeaderSize + 1
+	binary.LittleEndian.PutUint64(image[firstLeafEntryOffsetField:firstLeafEntryOffsetField+8], ^uint64(0))
 	const txID wal.TxID = 1
 	records := []wal.WALRecord{
 		{
@@ -1288,7 +1291,7 @@ func TestLoadCommittedIntoOverlay_RejectsInvalidNodeDirectory(t *testing.T) {
 		},
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
-	db := &DB{wal: wal.New(wal.Config{})}
+	db := &DB{meta: meta, allocation: newAllocationBitmap(4096), wal: wal.New(wal.Config{PageSize: 4096})}
 	committed := committedWALRecords(records)
 
 	if err := db.loadCommittedIntoOverlay(committed); !errors.Is(err, ErrInvalid) {

@@ -13,6 +13,34 @@ import (
 // Each encoded range starts with a four-byte offset and a four-byte size.
 const bytePatchRangeHeaderSize = 8
 
+// appendLimitedByteRanges stops before a dense edit copies a complete value
+// into a temporary patch. The full-image encoder handles that case.
+func appendLimitedByteRanges(patch []byte, offset int, base, target []byte, limit int) ([]byte, bool) {
+	for at := 0; at < len(target); {
+		if at != 0 && bytes.Equal(base[at:], target[at:]) {
+			break
+		}
+		at = nextDifferentByte(base, target, at)
+		if at == len(target) {
+			break
+		}
+		available := limit - len(patch) - bytePatchRangeHeaderSize
+		if available <= 0 {
+			return patch, false
+		}
+		bound := min(len(target), at+available)
+		end := nextLongEqualRun(base[:bound], target[:bound], at, bound)
+		if end-at >= available {
+			return patch, false
+		}
+		patch = binary.LittleEndian.AppendUint32(patch, uint32(offset+at))
+		patch = binary.LittleEndian.AppendUint32(patch, uint32(end-at))
+		patch = append(patch, target[at:end]...)
+		at = end
+	}
+	return patch, true
+}
+
 // appendChangedBytePatchRanges compares one same-size region and appends the byte-patch ranges that change base into target.
 // The region can be a field of a node image, such as a leaf value, a branch separator key, or a child page ID, or a whole page image.
 // baseOffset is the absolute offset of the region in the image. Existing ranges remain in patch.
@@ -118,7 +146,7 @@ func nextLongEqualRun(base, target []byte, index, end int) int {
 }
 
 // ApplyBytePatch applies the payload of a [RecordTypeBytePatch] record to a new same-size copy of base.
-// The patch changes one existing page image: a leaf or branch, one page of a continued node, or an allocation page.
+// The patch changes one complete logical node or allocation segment image.
 // The base is the image that the earlier WAL records of the page give. It is never a main-file page: see [WAL.Commit].
 // A patch does not change the image size. A node image is compact: it has no page padding.
 //
@@ -138,8 +166,8 @@ func nextLongEqualRun(base, target []byte, index, end int) int {
 // It validates the base size, range headers, range order, and range bounds.
 // It returns an error that wraps [page.ErrInvalid] when the patch is invalid.
 // It does not validate the format or checksum of the result.
-func ApplyBytePatch(base, patch []byte, pageSize int64) ([]byte, error) {
-	if int64(len(base)) > pageSize {
+func ApplyBytePatch(base, patch []byte, imageLimit int64) ([]byte, error) {
+	if int64(len(base)) > imageLimit {
 		return nil, fmt.Errorf("read byte patch base size %d: %w", len(base), page.ErrInvalid)
 	}
 	// Start with the base so bytes outside the encoded ranges stay unchanged.
@@ -277,7 +305,7 @@ func entryPatchEntry(node *btree.Node, index int, child *[page.IDSize]byte) ([]b
 }
 
 // ApplyEntryPatch applies the operations of an encoded entry patch to node.
-// A [RecordTypeEntryPatch] payload changes the entries of one leaf or branch that fits in one page.
+// A [RecordTypeEntryPatch] payload changes the entries of one logical leaf or branch.
 // Each operation names an entry by its key. The payload contains operations in ascending key order.
 // Each operation has this layout:
 //
@@ -298,14 +326,11 @@ func entryPatchEntry(node *btree.Node, index int, child *[page.IDSize]byte) ([]b
 // A branch patch cannot change the first child page ID. That change needs a complete image.
 //
 // node must be the image that the earlier WAL records of the page give, because Commit compares that image with the final node.
-// node must be a decoded leaf or branch without continuation pages.
+// node must be a decoded leaf or branch. The caller preserves its span size.
 // Set operations copy their key and value bytes. An empty patch makes no change.
 // It does not limit the size of the result. The caller checks it.
 // It returns an error that wraps [page.ErrInvalid] when the patch is invalid for node. Then node can be partly changed.
 func ApplyEntryPatch(node *btree.Node, patch []byte) error {
-	if len(node.OverflowPages()) != 0 {
-		return fmt.Errorf("apply entry patch to continued page %d: %w", node.PageID(), page.ErrInvalid)
-	}
 	var previous []byte
 	for offset := 0; offset < len(patch); {
 		if len(patch)-offset < entryPatchDeleteHeaderSize {

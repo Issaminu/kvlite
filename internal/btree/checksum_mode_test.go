@@ -28,7 +28,7 @@ func TestMainReaders_DisabledChecksumFields(t *testing.T) {
 				ids := make([]page.ID, NodePageCount(node, pageSize))
 				ids[0] = 7
 				for i := 1; i < len(ids); i++ {
-					ids[i] = page.ID(20 + i)
+					ids[i] = ids[0] + page.ID(i)
 				}
 				images, err := EncodeNodePages(node, pageSize, ids)
 				if err != nil {
@@ -36,15 +36,10 @@ func TestMainReaders_DisabledChecksumFields(t *testing.T) {
 				}
 				pages := make(map[page.ID][]byte)
 				for i, id := range ids {
-					data := images[i]
-					offset := nodeChecksumOffset
-					if i > 0 {
-						offset = continuationChecksumOffset
-					}
-					sum := binary.LittleEndian.Uint32(data[offset : offset+4])
-					binary.LittleEndian.PutUint32(data[offset:offset+4], sum^0x80000000)
-					pages[id] = data
+					pages[id] = images[i]
 				}
+				sum := binary.LittleEndian.Uint32(images[0][14:18])
+				binary.LittleEndian.PutUint32(images[0][14:18], sum^0x80000000)
 				read := func(id page.ID) ([]byte, error) {
 					data, ok := pages[id]
 					if !ok {
@@ -73,11 +68,7 @@ func TestMainReaders_DisabledChecksumFields(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				if continued {
-					if _, err := DecodeContinuationNode(bytes.Clone(images[1]), ids[1], pageSize, false); err != nil {
-						t.Fatal(err)
-					}
-				}
+
 				// Disabled checksums do not permit a wrong page ID.
 				binary.LittleEndian.PutUint64(images[0][2:10], 8)
 				if _, err := DecodeNode(images[0], 7, pageSize, read, false); !errors.Is(err, ErrInvalid) {

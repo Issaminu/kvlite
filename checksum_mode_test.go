@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 func checkpointChecksumTest(t *testing.T, db *DB) {
@@ -30,7 +31,7 @@ func checkDataPageFields(t *testing.T, db *DB, enabled bool) {
 		if !db.allocation.allocated(id) || db.allocation.isSegmentPage(id) {
 			continue
 		}
-		data, err := db.readMainPage(id)
+		data, err := db.readMainNodePage(id)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -40,13 +41,15 @@ func checkDataPageFields(t *testing.T, db *DB, enabled bool) {
 			}
 		} else {
 			offset := 14
-			if btree.NodeType(binary.LittleEndian.Uint16(data[:2])) == btree.NodeTypeContinuation {
-				offset = 10
-			}
 			if sum := binary.LittleEndian.Uint32(data[offset : offset+4]); sum != 0 {
 				t.Fatalf("page %d: checksum %x, want zero", id, sum)
 			}
 		}
+		count, err := btree.NodeSpan(data, id, db.meta.PageSize())
+		if err != nil {
+			t.Fatal(err)
+		}
+		id += page.ID(count - 1)
 	}
 }
 
@@ -117,7 +120,7 @@ func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
 				if !db.allocation.allocated(id) || db.allocation.isSegmentPage(id) {
 					continue
 				}
-				data, err := db.readMainPage(id)
+				data, err := db.readMainNodePage(id)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -126,6 +129,11 @@ func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
 				} else {
 					zero++
 				}
+				count, err := btree.NodeSpan(data, id, db.meta.PageSize())
+				if err != nil {
+					t.Fatal(err)
+				}
+				id += page.ID(count - 1)
 			}
 			if zero == 0 || retained == 0 {
 				t.Fatalf("want mixed fields: zero=%d, retained=%d", zero, retained)
@@ -403,7 +411,7 @@ func TestSetDataPageChecksums_InterruptedBatchRecovery(t *testing.T) {
 		if !db.allocation.allocated(id) || db.allocation.isSegmentPage(id) {
 			continue
 		}
-		data, err := db.readMainPage(id)
+		data, err := db.readMainNodePage(id)
 		if err != nil {
 			t.Fatal(err)
 		}

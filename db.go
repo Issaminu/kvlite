@@ -294,7 +294,10 @@ func (db *DB) initializeNewDatabase() error {
 	db.rootNode = btree.NewLeafNode(db.meta.Root())
 	db.meta.RefreshChecksum()
 	nodes := []wal.NodeRecord{{Final: db.rootNode}}
-	pages := []wal.AllocationRecord{{PageID: allocation.segmentPageID(0), Payload: allocation.encodeSegment(0)}}
+	pages := make([]wal.AllocationRecord, len(allocation.segments))
+	for i := range allocation.segments {
+		pages[i] = wal.AllocationRecord{PageID: allocation.segmentPageID(i), Payload: allocation.encodeSegment(i)}
+	}
 	if _, err := db.wal.Commit(nodes, pages, page.EncodeMeta(db.meta), nil); err != nil {
 		return fmt.Errorf("commit new database: %w", err)
 	}
@@ -534,6 +537,85 @@ func (db *DB) hasMeta() (bool, error) {
 	return fi.Size() > 0, nil
 }
 
+// readMainPage returns one complete main-file page.
+// Mapped bytes stay valid while the caller holds the database operation lock.
+func (db *DB) readMainPage(pageID page.ID) ([]byte, error) {
+	pageSize := db.meta.PageSize()
+	if pageSize <= 0 || uint64(pageID) > uint64(math.MaxInt64)/uint64(pageSize) {
+		return nil, fmt.Errorf("read page %d offset: %w", pageID, page.ErrInvalid)
+	}
+	offset := int64(pageID) * pageSize
+	mappedSize := int64(len(db.mappedFile))
+	if offset <= mappedSize && pageSize <= mappedSize-offset {
+		start := int(offset)
+		end := start + int(pageSize)
+		return db.mappedFile[start:end:end], nil
+	}
+
+	data := make([]byte, int(pageSize))
+	n, err := db.file.ReadAt(data, offset)
+	if err != nil {
+		if errors.Is(err, io.EOF) && n > 0 {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	if n != len(data) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return data, nil
+}
+
+// readMainNodePage returns the complete consecutive span of one node.
+// Mapped spans borrow the main-file mapping. A large unmapped node needs a head read, then one full-span read.
+func (db *DB) readMainNodePage(pageID page.ID) ([]byte, error) {
+	data, err := db.readMainPage(pageID)
+	if err != nil {
+		return nil, err
+	}
+	count, err := btree.NodeSpan(data, pageID, db.meta.PageSize())
+	if err != nil {
+		return nil, fmt.Errorf("read node %d: %w", pageID, err)
+	}
+	if pageID > db.meta.LastPage() || uint64(count) > uint64(db.meta.LastPage())+1-uint64(pageID) {
+		return nil, ErrInvalid
+	}
+	if !db.allocation.ownsNodeSpan(pageID, count) {
+		return nil, fmt.Errorf("node %d has free or reserved storage: %w", pageID, ErrInvalid)
+	}
+	if count > 1 {
+		size := int64(count) * db.meta.PageSize()
+		offset := int64(pageID) * db.meta.PageSize()
+		if offset <= int64(len(db.mappedFile)) && size <= int64(len(db.mappedFile))-offset {
+			data = db.mappedFile[offset : offset+size : offset+size]
+		} else {
+			data = make([]byte, int(size))
+			n, e := db.file.ReadAt(data, offset)
+			if e != nil {
+				if errors.Is(e, io.EOF) && n > 0 {
+					return nil, io.ErrUnexpectedEOF
+				}
+				return nil, e
+			}
+			if n != len(data) {
+				return nil, io.ErrUnexpectedEOF
+			}
+			// Check the returned header too. This read can return different bytes from the head read.
+			actualCount, err := btree.NodeSpan(data, pageID, db.meta.PageSize())
+			if err != nil {
+				return nil, fmt.Errorf("read node %d: %w", pageID, err)
+			}
+			if actualCount != count {
+				return nil, fmt.Errorf("node %d span changed during read: %w", pageID, ErrInvalid)
+			}
+		}
+	}
+	if err := btree.CheckNodeChecksumMode(data, db.meta.DataPageChecksums()); err != nil {
+		return nil, fmt.Errorf("read data node %d: %w", pageID, err)
+	}
+	return data, nil
+}
+
 // readNode returns one committed node. A file database gives the WAL image priority over the main-file image.
 func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
 	if db.memoryNodes != nil {
@@ -701,13 +783,12 @@ func (db *DB) lookupCommittedPage(pageID page.ID, key []byte, includeKey bool) (
 	if db.meta.DataPageChecksums() {
 		return db.lookupCheckedMainPage(pageID, key, includeKey)
 	}
-	// Disabled mode accepts any checksum field, so the first page needs no mode check.
-	// The lookup checks the page type and page ID.
-	data, err := db.readMainPage(pageID)
+	// readMainNodePage checks the complete span before the lookup reads its body.
+	data, err := db.readMainNodePage(pageID)
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey, false)
+	return btree.LookupCheckedNodeSpan(data, key, includeKey, false)
 }
 
 // lookupCheckedMainPage searches one main-file page in a file with data-page checksums.
@@ -717,7 +798,7 @@ func (db *DB) lookupCheckedMainPage(pageID page.ID, key []byte, includeKey bool)
 	if err != nil {
 		return btree.Entry{}, false, 0, err
 	}
-	return btree.LookupMappedNode(data, pageID, key, db.readMainNodePage, includeKey, true)
+	return btree.LookupCheckedNodeSpan(data, key, includeKey, true)
 }
 
 // findCommittedEntry searches one committed tree for Get.

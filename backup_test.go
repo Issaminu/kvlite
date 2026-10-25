@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/Issaminu/kvlite/internal/fileio"
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 func TestBackupLiveSnapshot(t *testing.T) {
@@ -499,6 +500,148 @@ func TestBackupSyncFailure(t *testing.T) {
 				}
 			} else if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("backup became visible before file sync: %v", err)
+			}
+		})
+	}
+}
+
+func TestBackupRawSpanAcrossAllocationFrames(t *testing.T) {
+	path, bucket, entries, _ := writeContinuedReadDatabase(t, true)
+	source, err := Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer source.Close()
+	backupPath := filepath.Join(t.TempDir(), "backup.db")
+	if err := source.Backup(backupPath); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := Open(backupPath, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	for _, entry := range entries {
+		got, err := backup.Get(bucket, entry.Key())
+		if err != nil || !bytes.Equal(got, entry.Value()) {
+			t.Fatalf("backup value after allocation-frame boundary: length %d, error %v", len(got), err)
+		}
+	}
+}
+
+func TestBackupNestedRawSpanChecksums(t *testing.T) {
+	for _, pendingWAL := range []bool{false, true} {
+		t.Run(fmt.Sprintf("WAL=%t", pendingWAL), func(t *testing.T) {
+			dir := t.TempDir()
+			db, err := Open(filepath.Join(dir, "source.db"), 0600, &Options{
+				Synchronous: SyncNormal, DataPageChecksums: true, CheckpointThresholdBytes: 1 << 30,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = db.Close() })
+			key := bytes.Repeat([]byte("k"), int(db.meta.PageSize())+23)
+			marker := []byte("backup-span-nested-value")
+			value := bytes.Repeat(marker, (3*int(db.meta.PageSize())+65536)/len(marker)+1)
+			grandValue := bytes.Repeat([]byte("grandchild-value"), int(db.meta.PageSize())/4+1)
+			if err := db.Update(func(tx *Tx) error {
+				parent, err := tx.CreateBucket([]byte("parent"))
+				if err != nil {
+					return err
+				}
+				child, err := parent.CreateBucket([]byte("child"))
+				if err != nil {
+					return err
+				}
+				if err := child.Put(key, value); err != nil {
+					return err
+				}
+				grandchild, err := child.CreateBucket([]byte("grandchild"))
+				if err != nil {
+					return err
+				}
+				return grandchild.Put([]byte("key"), grandValue)
+			}); err != nil {
+				t.Fatal(err)
+			}
+			db.operationMu.Lock()
+			err = db.checkpointWAL()
+			db.operationMu.Unlock()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if pendingWAL {
+				value[0] ^= 1
+				if err := db.Update(func(tx *Tx) error {
+					parent, err := tx.Bucket([]byte("parent"))
+					if err != nil {
+						return err
+					}
+					child, err := parent.Bucket([]byte("child"))
+					if err != nil {
+						return err
+					}
+					return child.Put(key, value)
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(dir, "backup.db")
+			if err := db.Backup(path); err != nil {
+				t.Fatal(err)
+			}
+			copy, err := Open(path, 0600, &Options{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = copy.View(func(tx *Tx) error {
+				parent, err := tx.Bucket([]byte("parent"))
+				if err != nil {
+					return err
+				}
+				child, err := parent.Bucket([]byte("child"))
+				if err != nil {
+					return err
+				}
+				got, err := child.Get(key)
+				if err != nil || !bytes.Equal(got, value) {
+					return fmt.Errorf("nested value: %v", err)
+				}
+				grandchild, err := child.Bucket([]byte("grandchild"))
+				if err != nil {
+					return err
+				}
+				got, err = grandchild.Get([]byte("key"))
+				if err != nil || !bytes.Equal(got, grandValue) {
+					return fmt.Errorf("grandchild value: %v", err)
+				}
+				return nil
+			})
+			if err := errors.Join(err, copy.Close()); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			at := bytes.Index(data, value)
+			if at < 0 {
+				t.Fatal("backup does not contain a contiguous nested value")
+			}
+			data[at+2*int(db.meta.PageSize())] ^= 1
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			damaged, err := Open(path, 0600, &Options{ReadOnly: true})
+			if err != nil {
+				if !errors.Is(err, page.ErrChecksum) {
+					t.Fatal(err)
+				}
+				return
+			}
+			defer damaged.Close()
+			if err := damaged.Backup(filepath.Join(dir, "damaged-copy.db")); !errors.Is(err, page.ErrChecksum) {
+				t.Fatalf("backup accepted a damaged raw tail: %v", err)
 			}
 		})
 	}

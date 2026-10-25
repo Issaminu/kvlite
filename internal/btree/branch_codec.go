@@ -17,7 +17,7 @@ import (
 // The child IDs start at NodeHeaderSize + N*branchEntryDescriptorSize.
 // Each child ID uses eight bytes. A key starts at its descriptor's data offset.
 // Child i+1 is on the right side of separator key i.
-// node_codec.go contains the node header, checksums, and the rules that leaves and branches share. continuation_codec.go reads and writes the pages of a continued node.
+// node_codec.go contains the shared header, whole-node checksum, and consecutive-page storage rules.
 const branchEntryDescriptorSize = 2 * encodedUint32Size
 
 func branchPayloadSize(node *Node) int {
@@ -54,7 +54,7 @@ func putBranchDirectory(dst []byte, node *Node) {
 	}
 }
 
-// putBranchBody writes the directory and keys of a branch that fits in one page.
+// putBranchBody writes the directory and keys of one logical branch.
 // image has the compact size of the node and starts with its header.
 func putBranchBody(image []byte, node *Node) {
 	offset := NodeHeaderSize + branchDirectorySize(node)

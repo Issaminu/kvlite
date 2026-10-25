@@ -24,11 +24,7 @@ func BenchmarkEncodeTransaction(b *testing.B) {
 				} else if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, size))); err != nil {
 					b.Fatal(err)
 				}
-				ids := make([]page.ID, btree.NodePageCount(node, pageSize)-1)
-				for i := range ids {
-					ids[i] = page.ID(6 + i)
-				}
-				node.SetOverflowPages(ids)
+				node.SetStoragePageCount(btree.NodePageCount(node, pageSize))
 				nodes := []NodeRecord{{Final: node}}
 				log := &WAL{pageSize: pageSize}
 				b.ReportAllocs()

@@ -24,7 +24,7 @@ func TestWALValidationErrors(t *testing.T) {
 	if _, err := log.encodeTransaction([]NodeRecord{{}}, nil, nil, 1); !errors.Is(err, ErrNodeRecordMissingFinal) {
 		t.Fatalf("node without final state: got %v, want ErrNodeRecordMissingFinal", err)
 	}
-	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1, nil); !errors.Is(err, ErrNodePageMismatch) {
+	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1); !errors.Is(err, ErrNodePageMismatch) {
 		t.Fatalf("changed node page ID: got %v, want ErrNodePageMismatch", err)
 	}
 	if _, err := log.CommittedPageToNode(&CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
@@ -1284,7 +1284,7 @@ func TestWAL_EncodesTransactionWithoutDatabase(t *testing.T) {
 	}
 }
 
-func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
+func TestWALCommit_MultiPageNodeSyncFailureAndRetry(t *testing.T) {
 	const pageSize int64 = 64
 	original := btree.NewLeafNode(3)
 	if err := original.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("old"))); err != nil {
@@ -1294,12 +1294,7 @@ func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
 	if err := final.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 200))); err != nil {
 		t.Fatal(err)
 	}
-	ids := make([]page.ID, btree.NodePageCount(final, pageSize))
-	ids[0] = final.PageID()
-	for index := 1; index < len(ids); index++ {
-		ids[index] = page.ID(400 - index*7)
-	}
-	final.SetOverflowPages(ids[1:])
+	final.SetStoragePageCount(btree.NodePageCount(final, pageSize))
 	file, err := os.CreateTemp(t.TempDir(), "wal")
 	if err != nil {
 		t.Fatal(err)
@@ -1323,7 +1318,7 @@ func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
 	if err != nil || after.Size() != before.Size() || log.nextTxid != 2 {
 		t.Fatalf("failed append was not rolled back: %v", err)
 	}
-	if record, ok := log.Lookup(ids[0]); !ok || record.Node != original || len(log.overlay) != 1 {
+	if record, ok := log.Lookup(final.PageID()); !ok || record.Node != original || len(log.overlay) != 1 {
 		t.Fatal("failed commit changed the overlay")
 	}
 	log.SetSyncFileForTesting(nil)
@@ -1340,7 +1335,7 @@ func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	records, err := reopened.ReadRecords()
-	if err != nil || len(records) != len(ids)+3 || reopened.nextTxid != 3 || len(reopened.overlay) != len(ids) {
+	if err != nil || len(records) != 4 || reopened.nextTxid != 3 || len(reopened.overlay) != 1 {
 		t.Fatalf("retry: %d records, %v", len(records), err)
 	}
 	for _, record := range records[2 : len(records)-1] {
@@ -1353,64 +1348,246 @@ func TestWALCommit_ContinuedNodeSyncFailureAndRetry(t *testing.T) {
 	}
 }
 
-func TestCommittedPageToNodeRejectsInvalidContinuationPayloads(t *testing.T) {
-	const pageSize int64 = 64
-	node := btree.NewLeafNode(3)
-	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, 200))); err != nil {
-		t.Fatal(err)
-	}
-	ids := make([]page.ID, btree.NodePageCount(node, pageSize))
-	for i := range ids {
-		ids[i] = page.ID(3 + i*7)
-	}
-	images, err := btree.EncodeWALNodePages(node, pageSize, ids)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, fault := range []string{"missing", "first-short", "middle-short", "last-short", "last-extra", "checksum", "page-id", "page-type"} {
+func TestCommittedPageToNodeRejectsInvalidNodeImage(t *testing.T) {
+	const pageSize = 64
+	node := nativeLeaf(t, 3, 200, pageSize)
+	for _, fault := range []string{"missing", "short", "extra", "checksum", "page-id", "page-type", "body-length"} {
 		t.Run(fault, func(t *testing.T) {
 			log := New(Config{PageSize: pageSize})
-			for i, id := range ids {
-				log.LoadCommittedRecord(WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: id}, Payload: bytes.Clone(images[i])})
-			}
-			lastID := ids[len(ids)-1]
-			record, _ := log.Lookup(lastID)
+			image := btree.EncodeWALNode(node)
 			want := btree.ErrInvalid
 			switch fault {
 			case "missing":
-				delete(log.overlay, lastID)
+				image = nil
 				want = ErrRecordPayloadRequired
-			case "first-short", "middle-short", "last-short":
-				id := lastID
-				if fault == "first-short" {
-					id = ids[0]
-				}
-				if fault == "middle-short" {
-					id = ids[1]
-				}
-				short, _ := log.Lookup(id)
-				short.Payload = short.Payload[:len(short.Payload)-1]
-				log.overlay[id] = short
-			case "last-extra":
-				record.Payload = append(record.Payload, 0)
-				log.overlay[lastID] = record
+			case "short":
+				image = image[:len(image)-1]
+			case "extra":
+				image = append(image, 0)
 			case "checksum":
-				binary.LittleEndian.PutUint32(record.Payload[10:14], 1)
+				binary.LittleEndian.PutUint32(image[14:18], 1)
 			case "page-id":
-				binary.LittleEndian.PutUint64(record.Payload[2:10], uint64(lastID+1))
+				binary.LittleEndian.PutUint64(image[2:10], uint64(node.PageID()+1))
 			case "page-type":
-				binary.LittleEndian.PutUint16(record.Payload[:2], uint16(btree.NodeTypeLeaf))
+				binary.LittleEndian.PutUint16(image[:2], 99)
+			case "body-length":
+				binary.LittleEndian.PutUint32(image[18:22], 0)
 			}
-			first, _ := log.Lookup(ids[0])
-			if _, err := log.CommittedPageToNode(&first); !errors.Is(err, want) {
-				t.Fatalf("%s: got %v, want %v", fault, err, want)
+			record := CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID()}, Payload: image}
+			if _, err := log.CommittedPageToNode(&record); !errors.Is(err, want) {
+				t.Fatalf("decode %s: got %v, want %v", fault, err, want)
 			}
-			if _, _, _, err := log.LookupCommittedPage(&first, []byte("key"), true); !errors.Is(err, want) {
-				t.Fatalf("direct lookup %s: got %v, want %v", fault, err, want)
+			if fault == "missing" {
+				want = btree.ErrInvalid
+			}
+			if _, _, _, err := log.LookupCommittedPage(&record, []byte("key"), true); !errors.Is(err, want) {
+				t.Fatalf("lookup %s: got %v, want %v", fault, err, want)
 			}
 		})
 	}
-	if _, err := btree.DecodeWALNode(images[0], ids[0], pageSize, nil); !errors.Is(err, btree.ErrInvalid) {
-		t.Fatalf("missing continuation reader: %v", err)
+}
+
+func setNativeSpan(node *btree.Node, pageSize int64) {
+	node.SetStoragePageCount(btree.NodePageCount(node, pageSize))
+}
+
+func nativeLeaf(t *testing.T, id page.ID, size int, pageSize int64) *btree.Node {
+	t.Helper()
+	node := btree.NewLeafNode(id)
+	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), bytes.Repeat([]byte{'a'}, size))); err != nil {
+		t.Fatal(err)
 	}
+	setNativeSpan(node, pageSize)
+	return node
+}
+
+func TestNativeSpanOneRecordAndPatchOwnership(t *testing.T) {
+	const pageSize = 4096
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: pageSize})
+	base := nativeLeaf(t, 20, 65536, pageSize)
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	target := base.Clone()
+	value := bytes.Clone(base.EntryAt(0).Value())
+	value[len(value)-1] = 'b'
+	if err := target.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 4 || records[0].Header.Type != RecordTypeNode || records[2].Header.Type != RecordTypeBytePatch {
+		t.Fatalf("one full image then one patch: %+v", records)
+	}
+	if len(records[0].Payload) != base.EncodedSize() || len(log.overlay) != 1 {
+		t.Fatal("node was split into page records")
+	}
+	for id := target.PageID() + 1; id < target.PageID()+page.ID(target.StoragePageCount()); id++ {
+		if _, ok := log.Lookup(id); ok {
+			t.Fatal("raw tail has an overlay record")
+		}
+	}
+	image, err := ApplyBytePatch(records[0].Payload, records[2].Payload, MaxNodeImageSize)
+	if err != nil || !bytes.Equal(image, btree.EncodeWALNode(target)) {
+		t.Fatalf("logical patch replay: %v", err)
+	}
+	clear(log.encodingBuffer[:cap(log.encodingBuffer)])
+	current, _ := log.Lookup(target.PageID())
+	entry, found, _, err := log.LookupCommittedPage(&current, []byte("key"), true)
+	if err != nil || !found || !bytes.Equal(entry.Value(), value) {
+		t.Fatalf("published bytes changed: %v", err)
+	}
+	if base.EntryAt(0).Value()[len(value)-1] != 'a' {
+		t.Fatal("patch changed the old node")
+	}
+}
+
+func TestNativeSpanRecordBounds(t *testing.T) {
+	const pageSize = 4096
+	header := appendRecordHeader(nil, RecordHeader{Type: RecordTypeNode, PageID: 20, TxID: 1}, MaxNodeImageSize+1)
+	if _, err := DecodeWALRecord(bytes.NewReader(header), pageSize, 0); !errors.Is(err, page.ErrChecksum) {
+		t.Fatalf("unbounded node record: %v", err)
+	}
+	header = appendRecordHeader(nil, RecordHeader{Type: RecordTypeNode, PageID: 20, TxID: 1}, 32<<20)
+	if _, err := DecodeWALRecord(bytes.NewReader(header), pageSize, 0); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("missing large payload: %v", err)
+	}
+	node := nativeLeaf(t, 20, 65536, pageSize)
+	image := btree.EncodeWALNode(node)
+	encoded, err := EncodeWALRecord(&WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID(), TxID: 1}, Payload: image}, pageSize, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, reader := range []io.Reader{
+		bytes.NewReader(encoded),
+		io.NewSectionReader(bytes.NewReader(encoded), 0, int64(len(encoded))),
+		struct{ io.Reader }{bytes.NewReader(encoded)},
+	} {
+		decoded, err := DecodeWALRecord(reader, pageSize, 0)
+		if err != nil || !bytes.Equal(decoded.Payload, image) {
+			t.Fatalf("large record round trip: %v", err)
+		}
+	}
+	if _, err := DecodeWALRecord(struct{ io.Reader }{bytes.NewReader(header)}, pageSize, 0); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("short stream payload: %v", err)
+	}
+	binary.LittleEndian.PutUint32(image[18:22], 0)
+	if _, err := ValidateNodeImage(image, node.PageID(), pageSize); err == nil {
+		t.Fatal("image accepted a body length that omits its contents")
+	}
+}
+
+func TestNativeSpanEntryPatchAndSyncFailure(t *testing.T) {
+	const pageSize = 4096
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: pageSize, SyncOnCommit: true, SyncOnCheckpoint: true})
+	base := nativeLeaf(t, 20, 65536, pageSize)
+	if _, err := log.Commit([]NodeRecord{{Final: base}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	target := base.Clone()
+	if err := target.InsertEntry(btree.NewEntry(0, []byte("other"), []byte("new"))); err != nil {
+		t.Fatal(err)
+	}
+	setNativeSpan(target, pageSize)
+	if _, err := log.Commit([]NodeRecord{{Original: base, Final: target}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 4 || records[2].Header.Type != RecordTypeEntryPatch {
+		t.Fatalf("entry insertion did not use a logical patch: %+v", records)
+	}
+	decoded, err := btree.DecodeWALNode(records[0].Payload, 20, pageSize, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ApplyEntryPatch(decoded, records[2].Payload); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(btree.EncodeWALNode(decoded), btree.EncodeWALNode(target)) {
+		t.Fatal("large entry patch replay differs")
+	}
+	failure := errors.New("sync failed")
+	log.SetSyncFileForTesting(func() error { return failure })
+	changed := target.Clone()
+	if err := changed.InsertEntry(btree.NewEntry(0, []byte("other"), []byte("bad"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := log.Commit([]NodeRecord{{Original: target, Final: changed}}, nil, nil, nil); !errors.Is(err, failure) {
+		t.Fatalf("failed native commit: %v", err)
+	}
+	current, _ := log.Lookup(20)
+	if current.Node != target {
+		t.Fatal("failed append published its node")
+	}
+	if _, err := log.Commit([]NodeRecord{{Final: changed}}, nil, nil, nil); !errors.Is(err, ErrWriteFailed) {
+		t.Fatal("failed append did not stop later commits")
+	}
+}
+
+func TestWALCommittedPageCountIncludesNodeTails(t *testing.T) {
+	const pageSize = 64
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: pageSize})
+	if got := log.CommittedPageCount(); got != 0 {
+		t.Fatalf("empty WAL page count: got %d, want 0", got)
+	}
+	leaf := nativeLeaf(t, 20, 3*pageSize, pageSize)
+	branch := btree.NewRootNode(40, btree.NewLeafNode(100), btree.NewLeafNode(101), bytes.Repeat([]byte("k"), 2*pageSize))
+	setNativeSpan(branch, pageSize)
+	if leaf.StoragePageCount() != 4 || branch.StoragePageCount() != 3 {
+		t.Fatal("fixture must contain a four-page leaf and a three-page branch")
+	}
+	if _, err := log.Commit([]NodeRecord{{Final: leaf}, {Final: branch}}, []AllocationRecord{{PageID: 2, Payload: make([]byte, pageSize)}}, []byte("meta"), nil); err != nil {
+		t.Fatal(err)
+	}
+	check := func(want int) {
+		t.Helper()
+		if got := log.Stats().CommittedRecordCount; got != 5 {
+			t.Fatalf("live image count: got %d, want 5", got)
+		}
+		if got := log.CommittedPageCount(); got != want {
+			t.Fatalf("live page count: got %d, want %d", got, want)
+		}
+		records, err := log.ReadRecords()
+		if err != nil {
+			t.Fatal(err)
+		}
+		recovered := New(Config{PageSize: pageSize})
+		for _, record := range records {
+			if record.Header.Type != RecordTypeCommit {
+				recovered.LoadCommittedRecord(record)
+			}
+		}
+		if got := recovered.CommittedPageCount(); got != want {
+			t.Fatalf("encoded page count: got %d, want %d", got, want)
+		}
+	}
+	check(10)
+	small := nativeLeaf(t, leaf.PageID(), 1, pageSize)
+	if _, err := log.Commit([]NodeRecord{{Original: leaf, Final: small}}, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	check(7)
 }

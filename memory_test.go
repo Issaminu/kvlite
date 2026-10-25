@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"testing"
+
+	"github.com/Issaminu/kvlite/internal/page"
 )
 
 func TestOpenMemory_TransactionsAndClose(t *testing.T) {
@@ -203,7 +205,7 @@ func TestStorageModes_LargeEntriesAndStats(t *testing.T) {
 			if err := db.DeleteBucket(testBucketName); err != nil {
 				t.Fatal(err)
 			}
-			if after := readStats(t, db); after.AllocatedPageCount != 4 {
+			if after := readStats(t, db); after.AllocatedPageCount != uint64(page.AllocationSegmentPages(db.meta.PageSize())+3) {
 				t.Fatalf("large bucket deletion kept pages: %+v", after)
 			}
 			if mode == "memory" && len(db.memoryNodes) != 1 {
@@ -369,7 +371,7 @@ func TestOpenMemory_TreeGrowthScansAndPageReuse(t *testing.T) {
 		t.Fatalf("bucket deletion kept %d nodes", len(db.memoryNodes))
 	}
 	stats, err = db.Stats()
-	if err != nil || stats.AllocatedPageCount != 4 || stats.TailPagesReclaimed == 0 || stats.WALBytesWritten != 0 || stats.CheckpointCount != 0 {
+	if err != nil || stats.AllocatedPageCount != uint64(page.AllocationSegmentPages(db.meta.PageSize())+3) || stats.TailPagesReclaimed == 0 || stats.WALBytesWritten != 0 || stats.CheckpointCount != 0 {
 		t.Fatalf("stats after deletion: %+v, %v", stats, err)
 	}
 }

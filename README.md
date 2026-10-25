@@ -278,7 +278,7 @@ db, err := kvlite.Open("app.db", 0o600, &kvlite.Options{
 })
 ```
 
-This option covers leaf, branch, and continuation pages. The file stores the mode. `Open` uses that stored mode for an existing file and ignores this option. Backup preserves the mode. Use `DB.SetDataPageChecksums` to change an existing file:
+This option covers each complete leaf or branch node, including its tail pages and final padding. The file stores the mode. `Open` uses that stored mode for an existing file and ignores this option. Backup preserves the mode. Use `DB.SetDataPageChecksums` to change an existing file:
 
 ```go
 if err := db.SetDataPageChecksums(false); err != nil {
@@ -368,7 +368,7 @@ go run ./internal/blackout/supervisor -workers 2 -out /tmp/blackout
 
 ## Statistics
 
-`DB.Stats()` returns storage state and cumulative write counters for the current open handle. Counters cover work by this handle, including recovery checkpoints during open. They start again with each new handle. Reading statistics scans allocation metadata and checks the main-file and WAL sizes. It does not start a checkpoint or scan tree pages. Do not call it from a transaction callback.
+`DB.Stats()` returns storage state and cumulative write counters for the current open handle. Counters cover work by this handle, including recovery checkpoints during open. They start again with each new handle. Reading statistics scans allocation metadata, counts the pages covered by committed WAL images, and checks the main-file and WAL sizes. It does not start a checkpoint or scan tree pages. Do not call it from a transaction callback.
 
 The result includes page counts, logical database size, main-file size, WAL size, bytes appended since checkpoint, distinct pending WAL pages, and the checkpoint threshold. File sizes are byte lengths. They do not measure file-system block allocation. WAL bytes measure successful log appends, not physical storage writes.
 
@@ -398,7 +398,7 @@ fmt.Printf("WAL bytes: %d, commits: %d\n", work.WALBytesWritten, work.WALCommitC
 
 `CheckpointFailureCount` counts failed checkpoint attempts, including WAL cleanup and mapping failures. `LastCheckpointError` reports the last nonempty attempt. A later successful attempt clears the error but keeps the failure count. An automatic checkpoint failure does not fail a write that already committed. Close returns a checkpoint failure so the caller can retry it.
 
-Inside a callback, use `bucket.Stats()` for page counts, plain entry counts, tree depth, and used bytes. It scans the selected bucket and all nested buckets. It includes earlier writes in the same transaction. A large scan can delay a writer. `KeyN` excludes bucket names. `BucketN` includes the selected bucket. `Depth` is the greatest individual tree depth. Bucket nesting does not add tree levels. `KeyBytes` includes leaf keys and bucket names. `ValueBytes` includes plain values. Page counts exclude continuation pages. Storage byte counts include their headers, page IDs, and required page space. Inside a write callback, these counts include continuation pages needed at commit. Used page bytes include headers and exclude padding. Subtract used bytes from reserved bytes to calculate unused space.
+Inside a callback, use `bucket.Stats()` for page counts, plain entry counts, tree depth, and used bytes. It scans the selected bucket and all nested buckets. It includes earlier writes in the same transaction. A large scan can delay a writer. `KeyN` excludes bucket names. `BucketN` includes the selected bucket. `Depth` is the greatest individual tree depth. Bucket nesting does not add tree levels. `KeyBytes` includes leaf keys and bucket names. `ValueBytes` includes plain values. Page counts exclude continuation pages. Storage byte counts include all required pages. Each node has one header; its tail pages have no separate header or page ID list. Inside a write callback, these counts include continuation pages needed at commit. Used page bytes include headers and exclude padding. Subtract used bytes from reserved bytes to calculate unused space.
 
 ## Concurrency and file locks
 

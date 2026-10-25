@@ -148,7 +148,7 @@ func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
 	// Payload layout: one 16-byte descriptor, then the key and value.
 	want := []byte{
 		0, 0, 0, 0,
-		34, 0, 0, 0,
+		38, 0, 0, 0,
 		1, 0, 0, 0,
 		1, 0, 0, 0,
 		'k', 'v',
@@ -219,7 +219,7 @@ func TestLeafCodec_RejectsBucketEntryWithoutRootID(t *testing.T) {
 		ids := make([]page.ID, NodePageCount(node, pageSize))
 		ids[0] = 8
 		for i := 1; i < len(ids); i++ {
-			ids[i] = page.ID(40 + i*3)
+			ids[i] = ids[0] + page.ID(i)
 		}
 		pages, err := EncodeNodePages(node, pageSize, ids)
 		if err != nil {

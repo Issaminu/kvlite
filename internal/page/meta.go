@@ -45,7 +45,7 @@ type Meta struct {
 }
 
 func NewMeta(pageSize int64) *Meta {
-	const firstNodeID ID = Meta1ID + 2
+	firstNodeID := Meta1ID + 1 + AllocationSegmentPages(pageSize)
 
 	meta := &Meta{
 		magic:    magic,
@@ -56,6 +56,38 @@ func NewMeta(pageSize int64) *Meta {
 	}
 	meta.RefreshChecksum()
 	return meta
+}
+
+// AllocationSegmentPages returns the number of bitmap pages stored together in one group.
+// A bitmap page uses one bit for each database page that it tracks.
+// Keeping bitmap pages together leaves room for a maximum-size node between groups.
+// For example, 4 KiB pages need 17 bitmap pages per group.
+// Another example, for 16 KiB pages, we would need 2 pages per group.
+// It returns zero when pageSize cannot hold a bitmap header and bitmap data.
+func AllocationSegmentPages(pageSize int64) ID {
+	const (
+		bitmapHeaderBytes int64 = 16
+		// Bound the value bytes, key bytes, and node header space.
+		maximumNodeBytes int64 = (1 << 31) + (1 << 16) + 128
+		// Keep the existing layout's allowance for metadata and spare pages.
+		extraGroupPages int64 = 130
+	)
+	if pageSize <= bitmapHeaderBytes {
+		return 0
+	}
+
+	// Round up: even a partly used final page needs a complete database page.
+	maximumNodePages := (maximumNodeBytes + pageSize - 1) / pageSize
+	pagesToCover := maximumNodePages + extraGroupPages
+
+	bitmapBytes := pageSize - bitmapHeaderBytes
+	pagesCoveredPerBitmap := bitmapBytes * 8
+	// Each added bitmap covers more pages but also occupies one page in the group.
+	dataPagesAddedPerBitmap := pagesCoveredPerBitmap - 1
+
+	// Round up so the group has enough bitmap pages to cover the complete node.
+	bitmapPages := (pagesToCover + dataPagesAddedPerBitmap - 1) / dataPagesAddedPerBitmap
+	return ID(bitmapPages)
 }
 
 func EncodeMeta(meta *Meta) []byte {

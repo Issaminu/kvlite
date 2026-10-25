@@ -22,11 +22,11 @@ const (
 	RecordTypeMeta RecordType = 1
 	// RecordTypeAllocation stores one complete allocation page.
 	RecordTypeAllocation RecordType = 2
-	// RecordTypeNode stores one complete node-page image.
+	// RecordTypeNode stores one complete logical node image.
 	RecordTypeNode RecordType = 3
 	// RecordTypeBytePatch stores replacement byte ranges for one existing data or allocation page image. See [ApplyBytePatch].
 	RecordTypeBytePatch RecordType = 4
-	// RecordTypeEntryPatch stores entry changes, addressed by key, for one existing leaf or branch that fits in one page.
+	// RecordTypeEntryPatch stores entry changes, addressed by key, for one existing leaf or branch.
 	RecordTypeEntryPatch RecordType = 5
 
 	recordTypeSize          = 1 // A record type uses one byte.
@@ -35,6 +35,37 @@ const (
 	ChecksumSize            = 4 // A CRC32C checksum uses one uint32 value.
 	HeaderSize              = recordTypeSize + page.IDSize + recordTransactionIDSize + recordPayloadLengthSize
 )
+
+// MaxNodeImageSize bounds a complete logical node or its patch payload.
+const MaxNodeImageSize = btree.MaxNodeImageSize
+
+func recordPayloadLimit(kind RecordType, pageSize int64) int64 {
+	switch kind {
+	case RecordTypeNode, RecordTypeBytePatch, RecordTypeEntryPatch:
+		return MaxNodeImageSize
+	case RecordTypeAllocation:
+		return pageSize
+	default:
+		return pageSize
+	}
+}
+
+// ValidateNodeImage checks the complete compact image and its physical span.
+// The WAL record must already have passed its checksum check.
+func ValidateNodeImage(image []byte, id page.ID, pageSize int64) (int, error) {
+	if err := btree.ValidateWALNode(image, id); err != nil {
+		return 0, err
+	}
+	count, err := btree.NodeSpan(image, id, pageSize)
+	if err != nil {
+		return 0, err
+	}
+	maxPages := uint64(int64(^uint64(0)>>1) / pageSize)
+	if uint64(count) > maxPages || uint64(id) > maxPages-uint64(count) {
+		return 0, page.ErrInvalid
+	}
+	return count, nil
+}
 
 type TxID uint64
 
@@ -48,13 +79,11 @@ type RecordHeader struct {
 // NodeRecord carries one changed data node from a write transaction to [WAL.Commit].
 // Commit writes a complete image for the first change to each page after a checkpoint.
 // Later changes can use a byte patch or an entry patch when it is smaller than the complete final image.
-// A continued node uses a complete image or a byte patch for each page. See [WAL.Commit].
-// Final must have allocated continuation IDs, set with [btree.Node.SetOverflowPages].
-// A single-page image has different offsets from a page with continuation IDs.
+// A multi-page node uses one logical image. Only its head has a WAL record.
 // NodeRecord exists only in memory. The WAL file does not store this structure.
 type NodeRecord struct {
 	// Original is the committed node before the transaction.
-	// It is nil for a new page.
+	// It can be nil for a new page or when the caller requires a complete image.
 	Original *btree.Node
 	// Final is the private node image to commit.
 	Final *btree.Node
@@ -79,7 +108,8 @@ type WALRecord struct {
 
 // EncodeWALRecord returns one encoded WAL record.
 // checksumSeed selects the WAL generation. Use [RecordChecksumSeed] to get it from WAL file bytes.
-// It returns an error when Payload is larger than pageSize.
+// Node images and patches use MaxNodeImageSize. Allocation images use the
+// physical page size. Other payloads must also fit in pageSize.
 func EncodeWALRecord(record *WALRecord, pageSize int64, checksumSeed uint32) ([]byte, error) {
 	size, err := EncodedWALRecordSize(record, pageSize)
 	if err != nil {
@@ -90,11 +120,11 @@ func EncodeWALRecord(record *WALRecord, pageSize int64, checksumSeed uint32) ([]
 }
 
 // EncodedWALRecordSize returns the encoded size of record.
-// It returns an error when Payload is larger than pageSize.
+// It rejects payloads larger than the bounded size for their record type.
 func EncodedWALRecordSize(record *WALRecord, pageSize int64) (int, error) {
 	payloadSize := len(record.Payload)
-	if int64(payloadSize) > pageSize {
-		return 0, fmt.Errorf("record payload %d bytes, page size %d bytes: %w", payloadSize, pageSize, ErrRecordPayloadTooLarge)
+	if pageSize <= 0 || int64(payloadSize) > recordPayloadLimit(record.Header.Type, pageSize) {
+		return 0, fmt.Errorf("record payload %d bytes: %w", payloadSize, ErrRecordPayloadTooLarge)
 	}
 	return HeaderSize + payloadSize + ChecksumSize, nil
 }
@@ -153,14 +183,14 @@ func DecodeWALRecord(r io.Reader, pageSize int64, checksumSeed uint32) (*WALReco
 	record.Header.TxID = TxID(binary.LittleEndian.Uint64(data[:recordTransactionIDSize]))
 	data = data[recordTransactionIDSize:]
 	payloadSize := binary.LittleEndian.Uint32(data[:recordPayloadLengthSize])
-	if int64(payloadSize) > pageSize {
+	if pageSize <= 0 || int64(payloadSize) > recordPayloadLimit(record.Header.Type, pageSize) {
 		// A torn tail can leave a bogus length prefix. Treat it as an integrity
-		// failure so the caller does not allocate more than one page.
-		return nil, fmt.Errorf("record payload size %d exceeds page size %d: %w", payloadSize, pageSize, page.ErrChecksum)
+		// failure before allocating an image.
+		return nil, fmt.Errorf("record payload size %d exceeds its limit: %w", payloadSize, page.ErrChecksum)
 	}
 
-	record.Payload = make([]byte, payloadSize)
-	if err := fileio.ReadFull(r, record.Payload); err != nil {
+	var err error
+	if record.Payload, err = readRecordPayload(r, int64(payloadSize)); err != nil {
 		return nil, err
 	}
 
@@ -174,6 +204,43 @@ func DecodeWALRecord(r io.Reader, pageSize int64, checksumSeed uint32) (*WALReco
 	}
 
 	return record, nil
+}
+
+// readRecordPayload checks the available bytes before a large allocation when
+// the reader reports its length. An unknown stream grows only as bytes arrive.
+func readRecordPayload(r io.Reader, size int64) ([]byte, error) {
+	if size > int64(int(^uint(0)>>1)) {
+		return nil, page.ErrChecksum
+	}
+	available := int64(-1)
+	switch reader := r.(type) {
+	case *io.SectionReader:
+		position, err := reader.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+		available = reader.Size() - position
+	case interface{ Len() int }:
+		available = int64(reader.Len())
+	}
+	if available >= 0 {
+		if size+ChecksumSize > available {
+			return nil, io.ErrUnexpectedEOF
+		}
+		payload := make([]byte, int(size))
+		if err := fileio.ReadFull(r, payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+	}
+	payload, err := io.ReadAll(io.LimitReader(r, size))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(payload)) != size {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return payload, nil
 }
 
 // IsCommitMarker reports whether record ends one WAL transaction.

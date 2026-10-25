@@ -15,7 +15,7 @@ func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
 	}
 	// Payload layout: one 8-byte descriptor, two child page IDs, then the key.
 	want := []byte{
-		42, 0, 0, 0,
+		46, 0, 0, 0,
 		1, 0, 0, 0,
 		2, 0, 0, 0, 0, 0, 0, 0,
 		3, 0, 0, 0, 0, 0, 0, 0,

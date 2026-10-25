@@ -20,8 +20,8 @@ type Stats struct {
 	FileSize int64
 	// WALSize is the current WAL size in bytes, including its file header.
 	WALSize int64
-	// WALPageCount is the number of committed page images waiting for a checkpoint.
-	// It includes tree, allocation, and metadata pages. Repeated writes to one page count once.
+	// WALPageCount is the number of physical pages covered by committed WAL images.
+	// It includes node tail pages, allocation pages, and metadata pages. Repeated writes to one page count once.
 	WALPageCount int
 	// WALBytesSinceCheckpoint is the number of bytes appended since the last completed checkpoint in this handle.
 	// It includes a new WAL file header but excludes bytes recovered during Open.
@@ -62,9 +62,9 @@ type Stats struct {
 // Stats returns storage state and cumulative write counters for this database handle.
 // Stats waits for an active write or checkpoint to finish. Do not call it from a transaction callback.
 // Use [Bucket.Stats] to inspect a bucket inside a callback.
-// Stats scans the allocation bitmap. A file database also reads the main-file and WAL sizes.
+// Stats scans the allocation bitmap. A file database also counts the pages covered by committed WAL images and reads both file sizes.
 // A memory database reports logical page counts and DataSize. DataSize does not measure Go heap use.
-// Its cost grows with the allocation metadata. It does not start a checkpoint or scan tree pages.
+// Its cost grows with the allocation metadata and committed WAL images. It does not start a checkpoint or read tree pages from the file.
 // It returns [ErrDatabaseNotOpen] after close starts, or a file-size read error.
 func (db *DB) Stats() (Stats, error) {
 	if err := db.beginOperation(); err != nil {
@@ -93,7 +93,7 @@ func (db *DB) Stats() (Stats, error) {
 		if err != nil {
 			return Stats{}, err
 		}
-		result.WALPageCount = stats.CommittedRecordCount
+		result.WALPageCount = db.wal.CommittedPageCount()
 		result.WALBytesSinceCheckpoint = stats.BytesSinceCheckpoint
 		result.CheckpointThresholdBytes = stats.CheckpointThresholdBytes
 		result.WALBytesWritten = stats.TotalBytesWritten
@@ -140,11 +140,11 @@ type BucketStats struct {
 	Depth int
 	// BranchAlloc is the number of bytes required for branch storage, including continuation pages.
 	BranchAlloc int
-	// BranchInuse is the number of bytes used by branch headers, keys, and page IDs. It includes continuation headers.
+	// BranchInuse is the number of bytes used by branch headers, descriptors, keys, and child page IDs.
 	BranchInuse int
 	// LeafAlloc is the number of bytes required for leaf storage, including continuation pages.
 	LeafAlloc int
-	// LeafInuse is the number of bytes used by leaf headers, keys, and values. It includes continuation headers and page IDs.
+	// LeafInuse is the number of bytes used by leaf headers, descriptors, keys, and values.
 	LeafInuse int
 	// BucketN is the number of buckets, including this bucket and all nested buckets.
 	BucketN int
@@ -202,10 +202,6 @@ func (tx *Tx) collectBucketStats(root *btree.Node, seen map[page.ID]struct{}) (B
 			return fmt.Errorf("statistics page %d size: %w", node.PageID(), page.ErrInvalid)
 		}
 		inuse := node.EncodedSize()
-		if pages > 1 {
-			// Continued storage adds two uint32 fields, one header per later page, and one ID per later page.
-			inuse += 2*4 + (pages-1)*(btree.ContinuationHeaderSize+page.IDSize)
-		}
 		if !node.IsLeaf() {
 			stats.BranchPageN++
 			stats.BranchAlloc += pages * pageSize

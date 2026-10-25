@@ -1,18 +1,20 @@
 package wal
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"maps"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/checksum"
 	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// checkpointWriteBatchBytes limits temporary checkpoint memory and the size of one main-file write.
-// A database page larger than this limit still requires one complete-page write.
+// checkpointWriteBatchBytes bounds combined writes and retained checkpoint buffers.
+// A larger single node can use temporary storage or several writes.
 const checkpointWriteBatchBytes int64 = 1 << 20
 
 // maxRetainedCheckpointRecords bounds the record array kept between checkpoints.
@@ -36,8 +38,9 @@ type Config struct {
 	SyncDirectory            func() error // SyncDirectory makes the names of the database and WAL files durable. The first successful [WAL.Sync] calls it once. Nil means that the WAL does not sync the directory.
 }
 
-// CommittedPage is the latest committed state of one page that is not yet checkpointed.
-// A data page can hold Node or Payload. An allocation or metadata page holds Payload.
+// CommittedPage is the latest committed image at a node head, allocation page, or metadata page.
+// A node image can cover several consecutive physical pages. It holds Node or Payload.
+// Allocation and metadata pages hold Payload.
 type CommittedPage struct {
 	Header RecordHeader
 	// Payload holds a recovered node image, a complete allocation page, or encoded metadata.
@@ -165,99 +168,177 @@ func (buffers *checkpointBuffers) writeCommittedPages(dst io.WriterAt, pages map
 	return writeCheckpointRecordRuns(dst, records, pageSize, dataPageChecksums, &buffers.data)
 }
 
-// writeCheckpointRecordRuns combines adjacent, page-ID-ordered records into bounded writes.
-// records must contain unique page IDs in ascending order.
-// It pads each WAL image to pageSize because the WAL omits unused page bytes.
-// reusableBuffer can be nil. Otherwise it keeps at most checkpointWriteBatchBytes.
-// The writer must not retain the supplied write buffers after WriteAt returns.
+// checkpointRecordPages validates a complete logical image and its storage range.
+func checkpointRecordPages(record *CommittedPage, pageSize int64) (int, error) {
+	if pageSize <= 0 {
+		return 0, page.ErrInvalid
+	}
+	var count int
+	if record.Node != nil {
+		if record.Header.Type != RecordTypeNode || page.IsMetaID(record.Header.PageID) || record.Header.PageID != record.Node.PageID() || record.Payload != nil ||
+			int64(btree.WALNodeEncodedSize(record.Node)) > MaxNodeImageSize {
+			return 0, page.ErrInvalid
+		}
+		count = btree.NodePageCount(record.Node, pageSize)
+		if count == 0 || record.Node.StoragePageCount() != count {
+			return 0, page.ErrInvalid
+		}
+	} else {
+		switch record.Header.Type {
+		case RecordTypeNode:
+			var err error
+			count, err = ValidateNodeImage(record.Payload, record.Header.PageID, pageSize)
+			if err != nil {
+				return 0, err
+			}
+		case RecordTypeAllocation:
+			if int64(len(record.Payload)) != pageSize {
+				return 0, page.ErrInvalid
+			}
+			count = 1
+		case RecordTypeMeta:
+			if !page.IsMetaID(record.Header.PageID) || int64(len(record.Payload)) > pageSize {
+				return 0, page.ErrInvalid
+			}
+			count = 1
+		default:
+			return 0, page.ErrInvalid
+		}
+	}
+	maxPages := uint64(int64(^uint64(0)>>1) / pageSize)
+	if count <= 0 || uint64(count) > maxPages || uint64(record.Header.PageID) > maxPages-uint64(count) {
+		return 0, page.ErrInvalid
+	}
+	return count, nil
+}
+
+// writeCheckpointRecordRuns combines adjacent complete spans into bounded writes.
+// Every record names its head. Trailing pages have no separate header or record.
+// All ranges are checked before the first write, including overlap after reuse.
 func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pageSize int64, dataPageChecksums bool, reusableBuffer *[]byte) error {
 	if len(records) == 0 {
 		return nil
 	}
+	var previousEnd page.ID
+	var totalBytes, largestBufferedSpan int64
 	for index := range records {
 		record := &records[index]
-		payloadSize := len(record.Payload)
-		if record.Node != nil {
-			if record.Header.Type != RecordTypeNode || record.Header.PageID != record.Node.PageID() || record.Payload != nil {
-				return page.ErrInvalid
-			}
-			payloadSize = btree.WALNodeEncodedSize(record.Node)
+		count, err := checkpointRecordPages(record, pageSize)
+		if err != nil {
+			return err
 		}
-		if int64(payloadSize) > pageSize {
-			return page.ErrInvalid
+		if index != 0 && record.Header.PageID < previousEnd {
+			return fmt.Errorf("overlapping WAL spans at page %d: %w", record.Header.PageID, page.ErrInvalid)
 		}
-		if record.Header.Type == RecordTypeNode && record.Node == nil {
-			if err := btree.ValidateWALNode(record.Payload, record.Header.PageID); err != nil {
-				return err
-			}
+		previousEnd = record.Header.PageID + page.ID(count)
+		size := int64(count) * pageSize
+		totalBytes = min(checkpointWriteBatchBytes, totalBytes+min(size, checkpointWriteBatchBytes))
+		if size <= maxRetainedEncodingBufferBytes {
+			largestBufferedSpan = max(largestBufferedSpan, size)
 		}
 	}
-
-	pagesPerBatch := max(checkpointWriteBatchBytes/pageSize, 1)
-	if pagesPerBatch > int64(len(records)) {
-		pagesPerBatch = int64(len(records))
-	}
-	bufferSize := int(pagesPerBatch * pageSize)
+	bufferSize := max(totalBytes, largestBufferedSpan)
 	var buffer []byte
-	if reusableBuffer != nil && int64(bufferSize) <= checkpointWriteBatchBytes {
-		if cap(*reusableBuffer) < bufferSize {
-			*reusableBuffer = make([]byte, 0, bufferSize)
-		}
-		buffer = (*reusableBuffer)[:0:bufferSize]
-	} else {
-		// A page larger than the write limit needs temporary storage for one page.
-		buffer = make([]byte, 0, bufferSize)
-	}
-	startPageID := records[0].Header.PageID
-	previousPageID := startPageID
-
+	var startPageID page.ID
+	previousEnd = 0
 	flush := func() error {
 		if len(buffer) == 0 {
 			return nil
 		}
-		offset := int64(startPageID) * pageSize
-		if err := fileio.WriteFull(io.NewOffsetWriter(mainFile, offset), buffer); err != nil {
+		if err := fileio.WriteFullAt(mainFile, buffer, int64(startPageID)*pageSize); err != nil {
 			return err
 		}
 		buffer = buffer[:0]
 		return nil
 	}
-
 	for index := range records {
 		record := &records[index]
-		pageID := record.Header.PageID
-		// A page-ID gap ends the run. Writing across the gap would replace unchanged pages with zeros.
-		// The capacity check bounds a long contiguous run without changing its file offsets.
-		if len(buffer) > 0 && (pageID != previousPageID+1 || int64(len(buffer))+pageSize > int64(cap(buffer))) {
+		count, _ := checkpointRecordPages(record, pageSize)
+		size := int64(count) * pageSize
+		if len(buffer) != 0 && (record.Header.PageID != previousEnd || int64(len(buffer))+size > int64(cap(buffer))) {
 			if err := flush(); err != nil {
 				return err
 			}
 		}
-		if len(buffer) == 0 {
-			startPageID = pageID
+		if buffer == nil && size <= bufferSize {
+			if reusableBuffer != nil && bufferSize <= checkpointWriteBatchBytes {
+				if int64(cap(*reusableBuffer)) < bufferSize {
+					*reusableBuffer = make([]byte, 0, int(bufferSize))
+				}
+				buffer = (*reusableBuffer)[:0:int(bufferSize)]
+			} else {
+				buffer = make([]byte, 0, int(bufferSize))
+			}
 		}
-
-		pageStart := len(buffer)
-		pageEnd := pageStart + int(pageSize)
-
-		// Resize the buffer to hold the next page.
-		buffer = buffer[:pageEnd]
-
-		pageData := buffer[pageStart:pageEnd]
-		clear(pageData)
+		previousEnd = record.Header.PageID + page.ID(count)
+		if size > int64(cap(buffer)) {
+			if err := writeLargeCheckpointSpan(mainFile, record, pageSize, size, dataPageChecksums); err != nil {
+				return err
+			}
+			continue
+		}
+		if len(buffer) == 0 {
+			startPageID = record.Header.PageID
+		}
+		start := len(buffer)
+		buffer = buffer[:start+int(size)]
+		span := buffer[start:]
+		clear(span)
 		if record.Node != nil {
-			btree.AppendEncodedWALNode(pageData[:0], record.Node)
+			btree.AppendEncodedWALNode(span[:0], record.Node)
 		} else {
-			copy(pageData, record.Payload)
+			copy(span, record.Payload)
 		}
 		if record.Header.Type == RecordTypeNode {
-			if err := btree.VerifyNodeIDAndSetChecksum(pageData, pageID, dataPageChecksums); err != nil {
+			if err := btree.VerifyNodeIDAndSetChecksum(span, record.Header.PageID, dataPageChecksums); err != nil {
 				return err
 			}
 		}
-		previousPageID = pageID
 	}
 	return flush()
+}
+
+// writeLargeCheckpointSpan keeps padding and checksum storage bounded even for
+// a maximum-size node. The compact image stays private and unchanged.
+func writeLargeCheckpointSpan(dst io.WriterAt, record *CommittedPage, pageSize, spanSize int64, checksums bool) error {
+	image := record.Payload
+	if record.Node != nil {
+		image = btree.EncodeWALNode(record.Node)
+	}
+	if record.Header.Type != RecordTypeNode {
+		return page.ErrInvalid
+	}
+	var header [btree.NodeHeaderSize]byte
+	copy(header[:], image)
+	var zeros [4096]byte
+	var sum uint32
+	if checksums {
+		sum = checksum.Sum32(image[:14], image[18:])
+		for remaining := spanSize - int64(len(image)); remaining > 0; {
+			n := min(remaining, int64(len(zeros)))
+			sum = checksum.Update32(sum, zeros[:n])
+			remaining -= n
+		}
+		if sum == 0 {
+			sum = 1
+		}
+	}
+	binary.LittleEndian.PutUint32(header[14:18], sum)
+	writer := io.NewOffsetWriter(dst, int64(record.Header.PageID)*pageSize)
+	if err := fileio.WriteFull(writer, header[:]); err != nil {
+		return err
+	}
+	if err := fileio.WriteFull(writer, image[btree.NodeHeaderSize:]); err != nil {
+		return err
+	}
+	for remaining := spanSize - int64(len(image)); remaining > 0; {
+		n := min(remaining, int64(len(zeros)))
+		if err := fileio.WriteFull(writer, zeros[:n]); err != nil {
+			return err
+		}
+		remaining -= n
+	}
+	return nil
 }
 
 func (wal *WAL) Lookup(pageID page.ID) (CommittedPage, bool) {
@@ -294,6 +375,27 @@ func (wal *WAL) Stats() Stats {
 		CommittedRecordCount:     len(wal.overlay),
 		NextTxID:                 wal.nextTxid,
 	}
+}
+
+// CommittedPageCount counts the physical pages covered by the latest committed images.
+// A node includes all its tail pages. An allocation or metadata image counts as one page.
+// It scans the committed images without reading the file or decoding node bodies.
+// Stats keeps its constant-cost record count for write and cursor checks.
+func (wal *WAL) CommittedPageCount() int {
+	count := 0
+	for _, record := range wal.overlay {
+		switch record.Header.Type {
+		case RecordTypeNode:
+			if record.Node != nil {
+				count += btree.NodePageCount(record.Node, wal.pageSize)
+			} else if pages, err := btree.NodeSpan(record.Payload, record.Header.PageID, wal.pageSize); err == nil {
+				count += pages
+			}
+		case RecordTypeAllocation, RecordTypeMeta:
+			count++
+		}
+	}
+	return count
 }
 
 // Size returns the current WAL file size in bytes.

@@ -38,11 +38,11 @@
 // # Entry sizes and continuation pages
 //
 // A key can have up to [MaxKeySize] bytes. A value can have up to [MaxValueSize] bytes.
-// An entry can exceed one database page. Large leaf values and branch separator keys use continuation pages. Each logical node keeps one first-page ID. Its continuation IDs come from the normal free-page allocator and need not be consecutive.
+// An entry can exceed one database page. Large leaf values and branch separator keys use consecutive pages. The first page has the node header. Later pages contain the rest of its body, with no separate headers or page ID list.
 //
-// In a file database, point reads search encoded entry offsets and fetch the required continuation pages. They do not decode the complete node. Writes and cursors decode nodes when they need their full contents. Memory use increases with the node size.
-// The WAL stores complete page images for changed continued nodes in a file database. A memory database keeps complete decoded nodes and uses the same logical page-allocation rules.
-// A node keeps the continuation IDs it still needs. Growth adds pages. Shrink and deletion release pages through the same transaction and page-reuse rules.
+// Main-file point reads and ordered scans can search encoded node bytes directly. They use the complete mapped node when available. Otherwise, the reader loads the complete node into a buffer. Writes decode nodes when they need their full contents. Memory use increases with the node size.
+// The WAL stores a compact node image or a patch against an earlier complete WAL image. Compact images omit final page padding. A memory database keeps complete decoded nodes and uses the same logical page-allocation rules.
+// A growing node extends into adjacent free pages when possible. Otherwise, it moves to another consecutive area and its parent pointer changes in the same transaction. Shrink and deletion release pages through the same transaction and page-reuse rules.
 //
 // # Errors
 //

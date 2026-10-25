@@ -21,6 +21,9 @@ type Store interface {
 	// ReadNode returns the node visible to the current operation.
 	// A returned node is read-only. WritableNode and DeleteLeafEntries return its private mutable version.
 	ReadNode(page.ID) (*Node, error)
+	// SetParent records the immediate owner of child. A nil parent selects the metadata root.
+	// The store must keep these links private to the current write operation.
+	SetParent(child page.ID, parent *Node)
 	// WritableNode returns a private mutable version of node with the same page ID.
 	// Repeated calls for that page must return the same private node.
 	WritableNode(*Node) *Node
@@ -63,6 +66,36 @@ func NewTree(store Store) *Tree {
 	return &Tree{store: store}
 }
 
+func (tree *Tree) readChild(parent *Node, index int) (*Node, error) {
+	id := parent.Children[index]
+	child, err := tree.store.ReadNode(id)
+	if err == nil && child != nil {
+		tree.store.SetParent(id, parent)
+	}
+	return child, err
+}
+
+// reparentChildren records links after a split, merge, or redistribution moves entries.
+// It visits only this changed node's references. It does not load the referenced nodes.
+func (tree *Tree) reparentChildren(parent *Node) error {
+	return VisitNodeReferences(parent, func(child page.ID) error {
+		tree.store.SetParent(child, parent)
+		return nil
+	}, nil)
+}
+
+func (tree *Tree) recordBucketParent(parent *Node, entry Entry) error {
+	if entry.Flags()&BucketLeafFlag == 0 {
+		return nil
+	}
+	id, err := page.DecodeID(entry.Value())
+	if err != nil {
+		return err
+	}
+	tree.store.SetParent(id, parent)
+	return nil
+}
+
 // FindEntryRef looks key up without copying the stored key or value.
 // It returns a zero entry with found false when the key is absent.
 // A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
@@ -75,7 +108,11 @@ func (tree *Tree) FindEntryRef(root *Node, key []byte, includeKey bool) (Entry, 
 	}
 
 	if root.IsLeaf() {
-		return root.FindEntryRef(key)
+		entry, found, err := root.FindEntryRef(key)
+		if err == nil && found {
+			err = tree.recordBucketParent(root, entry)
+		}
+		return entry, found, err
 	}
 	_, _, childPageID, err := LookupNode(root, key)
 	if err != nil {
@@ -139,7 +176,7 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 		}
 		path = append(path, treePathStep{parent: node, childIndex: childIndex})
 
-		node, err = tree.store.ReadNode(node.Children[childIndex])
+		node, err = tree.readChild(node, childIndex)
 		if err != nil {
 			return nil, err
 		}
@@ -166,6 +203,9 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 	node = tree.store.WritableNode(node)
 	// The dirty map already holds this pointer, so this change needs no second StageNode call.
 	node.applyInsert(prepared)
+	if err := tree.recordBucketParent(node, entry); err != nil {
+		return nil, err
+	}
 	if node.PageID() == root.PageID() {
 		root = node
 	}
@@ -187,6 +227,8 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 			// node is already staged. Only the new right node and new root need staging.
 			tree.store.StageNode(rightNode)
 			tree.store.StageNode(root)
+			tree.store.SetParent(node.PageID(), root)
+			tree.store.SetParent(rightNode.PageID(), root)
 			// rightNode starts at root.Children[1].
 			// Split it again if one split did not make it small enough.
 			if err := tree.splitChildIntoSiblings(root, rightNode, 1, pageSize); err != nil {
@@ -232,6 +274,9 @@ func (tree *Tree) splitNode(node *Node, pageSize int64) (*Node, []byte, error) {
 	if err != nil {
 		panic(fmt.Sprintf("btree invariant: split node %d: %v", node.PageID(), err))
 	}
+	if err := tree.reparentChildren(rightNode); err != nil {
+		return nil, nil, err
+	}
 	return rightNode, separator, nil
 }
 
@@ -248,6 +293,7 @@ func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pa
 		}
 		tree.store.StageNode(rightNode)
 		parent.InsertSplitChild(childIndex, rightNode, separator)
+		tree.store.SetParent(rightNode.PageID(), parent)
 		// If the right half is still too large, split it at its new index.
 		child = rightNode
 		childIndex++
@@ -294,7 +340,7 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 				return nil, changed, err
 			}
 			path = append(path, treePathStep{parent: node, childIndex: index})
-			node, err = tree.store.ReadNode(node.Children[index])
+			node, err = tree.readChild(node, index)
 			if err != nil {
 				return nil, changed, err
 			}
@@ -378,7 +424,7 @@ func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool,
 			return nil, false, err
 		}
 		path = append(path, treePathStep{parent: node, childIndex: childIndex})
-		node, err = tree.store.ReadNode(node.Children[childIndex])
+		node, err = tree.readChild(node, childIndex)
 		if err != nil {
 			return nil, false, err
 		}
@@ -495,13 +541,13 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 		var left, right *Node
 		var err error
 		if step.childIndex > 0 {
-			left, err = tree.store.ReadNode(parent.Children[step.childIndex-1])
+			left, err = tree.readChild(parent, step.childIndex-1)
 			if err != nil {
 				return nil, err
 			}
 		}
 		if step.childIndex+1 < len(parent.Children) {
-			right, err = tree.store.ReadNode(parent.Children[step.childIndex+1])
+			right, err = tree.readChild(parent, step.childIndex+1)
 			if err != nil {
 				return nil, err
 			}
@@ -515,6 +561,9 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 		if left != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex-1, left, node) <= pageSize) {
 			left = tree.store.WritableNode(left)
 			mergeChildren(parent, step.childIndex-1, left, node)
+			if err := tree.reparentChildren(left); err != nil {
+				return nil, err
+			}
 			if err := tree.store.FreePage(node.PageID()); err != nil {
 				return nil, err
 			}
@@ -527,6 +576,9 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			// This merge changes node.
 			node = tree.store.WritableNode(node)
 			mergeChildren(parent, step.childIndex, node, right)
+			if err := tree.reparentChildren(node); err != nil {
+				return nil, err
+			}
 			if minimumChanged && step.childIndex > 0 {
 				// The delete may have emptied node. Before the merge, it had
 				// no first key for its parent. It now holds right's keys, so
@@ -570,6 +622,12 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 					// work on the pages we now change.
 					return nil, fmt.Errorf("selected right redistribution: %w", ErrRedistributionInvalid)
 				}
+				if err := tree.reparentChildren(node); err != nil {
+					return nil, err
+				}
+				if err := tree.reparentChildren(right); err != nil {
+					return nil, err
+				}
 				// The right page now starts at a different key. Put that key
 				// in the parent so future searches reach the right page.
 				if err := tree.refreshMinimumSeparator(parent, step.childIndex+1, right); err != nil {
@@ -597,6 +655,12 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				// work on the pages we now change.
 				return nil, fmt.Errorf("selected left redistribution: %w", ErrRedistributionInvalid)
 			}
+			if err := tree.reparentChildren(left); err != nil {
+				return nil, err
+			}
+			if err := tree.reparentChildren(node); err != nil {
+				return nil, err
+			}
 			// The changed page got entries from the left page. Use its new
 			// first key in the parent.
 			if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
@@ -610,7 +674,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 	// A branch with one child has no choice to make during a search. Use
 	// that child as the root and return the old root page to the store.
 	if !root.IsLeaf() && len(root.Children) == 1 {
-		child, err := tree.store.ReadNode(root.Children[0])
+		child, err := tree.readChild(root, 0)
 		if err != nil {
 			return nil, err
 		}
@@ -618,6 +682,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			return nil, err
 		}
 		root = child
+		tree.store.SetParent(root.PageID(), nil)
 	}
 	return root, nil
 }
@@ -644,7 +709,7 @@ func (tree *Tree) refreshMinimumSeparator(parent *Node, childIndex int, node *No
 func (tree *Tree) subtreeMinimum(node *Node) ([]byte, error) {
 	for !node.IsLeaf() {
 		var err error
-		node, err = tree.store.ReadNode(node.Children[0])
+		node, err = tree.readChild(node, 0)
 		if err != nil {
 			return nil, err
 		}

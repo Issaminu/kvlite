@@ -54,7 +54,10 @@ func TestStatsStorageAndWriteCounters(t *testing.T) {
 	if initial.WALCommitCount != 0 || initial.WALBytesWritten != 0 || initial.CheckpointFailureCount != 0 || initial.LastCheckpointError != nil {
 		t.Fatalf("initial counters: %+v", initial)
 	}
-	if initial.PageSize != int(db.meta.PageSize()) || initial.DataSize != int64(initial.LastPageID+1)*int64(initial.PageSize) || initial.FileSize != initial.DataSize || initial.AllocationMetadataPageCount != 1 {
+	wantAllocationPages := uint64(page.AllocationSegmentPages(int64(initial.PageSize)))
+	wantLastPage := uint64(2) + wantAllocationPages
+	wantDataSize := int64(wantLastPage+1) * int64(initial.PageSize)
+	if initial.PageSize != int(db.meta.PageSize()) || initial.LastPageID != wantLastPage || initial.AllocatedPageCount != wantLastPage+1 || initial.DataSize != wantDataSize || initial.FileSize != wantDataSize || initial.AllocationMetadataPageCount != wantAllocationPages {
 		t.Fatalf("initial sizes: %+v", initial)
 	}
 	if err := db.Update(func(tx *Tx) error {
@@ -547,8 +550,13 @@ func TestBucketStatsDeletedHandle(t *testing.T) {
 func TestStatsReadOnlyRecoveredWAL(t *testing.T) {
 	source := openStatsDB(t, &Options{Synchronous: SyncNone})
 	createBucket(t, source, []byte("data"))
-	if err := source.Put([]byte("data"), []byte("key"), []byte("value")); err != nil {
+	value := bytes.Repeat([]byte("v"), 3*int(source.meta.PageSize()))
+	if err := source.Put([]byte("data"), []byte("key"), value); err != nil {
 		t.Fatal(err)
+	}
+	// The WAL covers a four-page leaf, its one-page catalog, one bitmap page, and two metadata pages.
+	if stats := readStats(t, source); stats.WALPageCount != 8 {
+		t.Fatalf("live WAL physical pages: got %d, want 8", stats.WALPageCount)
 	}
 	path := filepath.Join(t.TempDir(), "recovered.db")
 	for _, suffix := range []string{"", "-wal"} {
@@ -566,7 +574,7 @@ func TestStatsReadOnlyRecoveredWAL(t *testing.T) {
 	}
 	defer db.Close()
 	current := readStats(t, db)
-	if current.WALSize != fileSize(t, path+"-wal") || current.WALSize == 0 || current.WALPageCount == 0 || current.WALBytesWritten != 0 || current.WALCommitCount != 0 || current.WALBytesSinceCheckpoint != 0 {
+	if current.WALSize != fileSize(t, path+"-wal") || current.WALSize == 0 || current.WALPageCount != 8 || current.WALBytesWritten != 0 || current.WALCommitCount != 0 || current.WALBytesSinceCheckpoint != 0 {
 		t.Fatalf("recovered WAL statistics: %+v", current)
 	}
 	if err := db.View(func(tx *Tx) error {
@@ -578,7 +586,7 @@ func TestStatsReadOnlyRecoveredWAL(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if counts.KeyN != 1 || counts.KeyBytes != 3 || counts.ValueBytes != 5 {
+		if counts.KeyN != 1 || counts.KeyBytes != 3 || counts.ValueBytes != len(value) {
 			return fmt.Errorf("recovered bucket: %+v", counts)
 		}
 		return nil
@@ -635,21 +643,14 @@ func TestBucketStatsIncludesContinuationStorage(t *testing.T) {
 					var branchBytes, leafBytes, branchPages, leafPages int
 					var walk func(*btree.Node) error
 					walk = func(node *btree.Node) error {
-						ids := append([]page.ID{node.PageID()}, node.OverflowPages()...)
-						images, err := btree.EncodeWALNodePages(node, tx.meta.PageSize(), ids)
-						if err != nil {
-							return err
-						}
-						used := 0
-						for _, image := range images {
-							used += len(image)
-						}
+						used := len(btree.EncodeWALNode(node))
+						pages := (used + pageSize - 1) / pageSize
 						if node.IsLeaf() {
 							leafBytes += used
-							leafPages += len(images)
+							leafPages += pages
 						} else {
 							branchBytes += used
-							branchPages += len(images)
+							branchPages += pages
 							for _, id := range node.Children {
 								child, err := tx.store.ReadNode(id)
 								if err != nil {

@@ -33,7 +33,7 @@ type Options struct {
 	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. Because this mode cannot write, [DB.Update], [DB.Put], [DB.Delete], and [DB.DeleteBucket] return [ErrDatabaseReadOnly].
 	ReadOnly bool
 
-	// DataPageChecksums enables checksum calculation and checks for leaf, branch, and continuation pages in a new file.
+	// DataPageChecksums enables a checksum over each complete leaf or branch node, including its tail pages, in a new file.
 	// The default is false. The DB file stores this choice.
 	// Open uses the stored choice for an existing file and ignores this option.
 	// Use [DB.SetDataPageChecksums] to change an existing file.

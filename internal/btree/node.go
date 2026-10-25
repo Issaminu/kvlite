@@ -7,8 +7,8 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// NodeHeaderSize is the 18-byte encoded size of a B+tree node header.
-const NodeHeaderSize = 18
+// NodeHeaderSize is the encoded size of a B+tree node head.
+const NodeHeaderSize = 22
 
 const (
 	nodeTypeOffset       = 0
@@ -18,7 +18,6 @@ const (
 )
 
 // NodeType identifies the 16-bit type field of a tree file page.
-// A large leaf or branch adds overflowNodeFlag.
 type NodeType uint16
 
 const (
@@ -26,74 +25,54 @@ const (
 	NodeTypeLeaf NodeType = 1
 	// NodeTypeBranch identifies a node that stores separator keys and child page IDs.
 	NodeTypeBranch NodeType = 2
-	// NodeTypeContinuation identifies more body bytes of a large leaf or branch.
-	// It is a storage page of the same node, not a tree child.
-	NodeTypeContinuation NodeType = 3
 )
 
-// overflowNodeFlag marks the first page of a large leaf or branch. It is a modifier over the NodeTypeLeaf and NodeTypeBranch identifiers
-// Its type is 0x8001 for a leaf or 0x8002 for a branch.
-const overflowNodeFlag NodeType = 1 << 15
-
-// NodeHeader contains the decoded header fields of a leaf or branch node.
-// All fields use little-endian encoding:
+// NodeHeader identifies one complete leaf or branch span. Fields are little-endian.
 //
-//	[0:2]  node type, uint16
-//	[2:10] page ID, uint64
-//	[10:14] entry count, uint32
-//	[14:18] CRC32C checksum, uint32
-//
-// Checksum covers bytes [0:14] and [18:pageSize]. It includes the node body and zero padding.
-// Zero marks an unchecked main-file page. A calculated CRC of zero is stored as one.
-// A continuation flag adds BodyLength and NextPageCount after the fixed header.
-// See leaf_codec.go and branch_codec.go for the extended layouts.
-// ContinuationNode has its own header.
-// A node change can make Checksum and EntryCount stale. [EncodeNode] and [EncodeWALNode] write the current entry count. [EncodeNode] also calculates a new checksum before it returns encoded bytes.
+// [0:2] type; [2:10] head page ID; [10:14] entry count;
+// [14:18] whole-span CRC32C; [18:22] logical body length.
+// The header and body length determine the number of storage pages.
+// Only the first page has a header. All following pages contain raw body bytes.
+// Zero disables the data checksum. A calculated CRC of zero is stored as one.
 type NodeHeader struct {
 	Type       NodeType
 	PageID     page.ID
 	EntryCount uint32
 	Checksum   uint32
-	// These fields occur only if the node has the continuation flag [overflowNodeFlag]
-	BodyLength    uint32
-	NextPageCount uint32
+	BodyLength uint32
 }
 
-// Node contains one logical B+tree node.
-// Its page ID names the first file page, even when the node spans pages.
-// continuationPageIDs keeps all later page IDs in body order. These are
-// storage pages of this node, not tree children. On disk, page-ID arrays
-// are distributed across the first page and later group-ending pages.
-// The store records the complete list so changes can retire the old pages
-// without reading the arrays again. A node that fits in one page has no list.
+// Node contains one logical B+tree node. PageID names the head of its consecutive span.
+// Its keys and values can borrow a complete immutable encoded image.
 type Node struct {
-	header              NodeHeader
-	entries             []Entry
-	Children            []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
-	continuationPageIDs []page.ID // only for branch/leaf nodes with overflow, or continuation nodes
-	encodedSize         int       // Zero means unknown. Entry-list changes clear the saved size.
+	header           NodeHeader
+	entries          []Entry
+	Children         []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
+	encodedSize      int       // Zero means unknown. Entry-list changes clear the saved size.
+	storageTailPages uint32    // Allocated pages after the head. Memory only; kept until commit preparation.
 }
 
-// OverflowPages returns the IDs of pages after this node's first page.
-// The IDs follow logical body order. They are not child node IDs.
-// The returned slice belongs to n. The caller must not change it.
-func (n *Node) OverflowPages() []page.ID {
-	return n.continuationPageIDs
-}
+// StoragePageCount returns the allocated span length, including the head.
+// A private change keeps its previous span length until commit preparation.
+func (n *Node) StoragePageCount() int { return int(n.storageTailPages) + 1 }
 
-// SetOverflowPages records the IDs of pages after this node's first page.
-// It sets the continuation flag when ids is nonempty. Nil clears the flag
-// and the extended header fields. The caller gives ownership of ids
-// to n and must not change ids after this call.
-func (n *Node) SetOverflowPages(ids []page.ID) {
-	n.continuationPageIDs = ids
-	n.header.Type &^= overflowNodeFlag
-	if len(ids) > 0 {
-		n.header.Type |= overflowNodeFlag
-	} else {
-		n.header.BodyLength = 0
-		n.header.NextPageCount = 0
+// SetStoragePageCount records the allocated consecutive span length.
+// count includes the head and must be positive.
+func (n *Node) SetStoragePageCount(count int) {
+	if count < 1 {
+		panic("btree: empty node span")
 	}
+	n.storageTailPages = uint32(count - 1)
+}
+
+// OverflowPages derives the tail page IDs from the head and count.
+// The returned list is private to the caller. The node stores no ID list.
+func (n *Node) OverflowPages() []page.ID {
+	ids := make([]page.ID, n.StoragePageCount()-1)
+	for i := range ids {
+		ids[i] = n.PageID() + page.ID(i) + 1
+	}
+	return ids
 }
 
 func newNodeHeader(nodeType NodeType, pgid page.ID) NodeHeader {
@@ -108,9 +87,9 @@ func (n *Node) IsLeaf() bool {
 	return n.kind() == NodeTypeLeaf
 }
 
-// kind returns NodeTypeLeaf or NodeTypeBranch without the continuation flag.
+// kind returns NodeTypeLeaf or NodeTypeBranch.
 func (n *Node) kind() NodeType {
-	return n.header.kind()
+	return n.header.Type
 }
 
 func (n *Node) PageID() page.ID {
@@ -135,15 +114,15 @@ func (n *Node) EntryAt(index int) *Entry {
 }
 
 // Clone returns a structural copy of n with the same page ID.
-// The clone owns its entry, child, and continuation page ID lists.
+// The clone owns its entry and child lists.
 // It shares the immutable key and value bytes with n.
 // Node changes must replace an entry or byte slice instead of changing shared bytes in place.
 func (n *Node) Clone() *Node {
 	return &Node{
-		header:              n.header,
-		entries:             slices.Clone(n.entries),
-		Children:            slices.Clone(n.Children),
-		continuationPageIDs: slices.Clone(n.continuationPageIDs),
+		header:           n.header,
+		entries:          slices.Clone(n.entries),
+		Children:         slices.Clone(n.Children),
+		storageTailPages: n.storageTailPages,
 	}
 }
 
@@ -173,11 +152,11 @@ func (n *Node) CloneWithoutLeafEntries(firstIndex int, rest []int, minimumSize i
 	header := n.header
 	header.Checksum = 0
 	return &Node{
-		header:              header,
-		entries:             entries,
-		Children:            slices.Clone(n.Children),
-		continuationPageIDs: slices.Clone(n.continuationPageIDs),
-		encodedSize:         size,
+		header:           header,
+		entries:          entries,
+		Children:         slices.Clone(n.Children),
+		encodedSize:      size,
+		storageTailPages: n.storageTailPages,
 	}
 }
 
@@ -360,7 +339,7 @@ func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
 	}
 
 	rightNode := &Node{
-		header:   newNodeHeader(n.header.Type, newPageID),
+		header:   newNodeHeader(n.kind(), newPageID),
 		Children: []page.ID{},
 	}
 
@@ -526,8 +505,8 @@ func (n *Node) WALBodyOffset() int {
 // Pass nil for visitContinuation when only child references are needed.
 func VisitNodeReferences(node *Node, visit, visitContinuation func(page.ID) error) error {
 	if visitContinuation != nil {
-		for _, id := range node.OverflowPages() {
-			if err := visitContinuation(id); err != nil {
+		for offset := 1; offset < node.StoragePageCount(); offset++ {
+			if err := visitContinuation(node.PageID() + page.ID(offset)); err != nil {
 				return err
 			}
 		}

@@ -120,11 +120,9 @@ func TestMetaFlags_DataPageChecksumsPreservesOtherBits(t *testing.T) {
 }
 
 func TestMeta_TracksRootAndAllocatedPages(t *testing.T) {
-	const pageSize int64 = 4096 // The page size does not affect page ID allocation.
-	const (
-		initialRoot ID = 3 // Metadata uses pages zero and one. The allocator uses page two.
-		nextPage    ID = 4 // The next allocation follows the initial root page.
-	)
+	const pageSize int64 = 4096
+	initialRoot := ID(2) + AllocationSegmentPages(pageSize)
+	nextPage := initialRoot + 1
 
 	meta := NewMeta(pageSize)
 	if got := meta.PageSize(); got != pageSize {

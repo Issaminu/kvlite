@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"encoding/binary"
 	"fmt"
 	"maps"
 	"math/bits"
@@ -10,14 +11,15 @@ import (
 )
 
 const (
-	// The two metadata pages are followed by the first allocation page and the first tree page.
+	// The two metadata pages are followed by the first group of bitmap frames.
 	firstAllocationSegmentID page.ID = page.Meta1ID + 1
-	firstTreePageID          page.ID = firstAllocationSegmentID + 1
+	// firstTreePageID is a lower bound. The first root follows the complete bitmap group.
+	firstTreePageID page.ID = firstAllocationSegmentID + 1
 
 	allocationSegmentMagic uint32 = 0x5246564B // The little-endian bytes spell "KVFR".
 )
 
-// An allocation segment uses one database page. Its header has this layout:
+// Each allocation segment uses one page with its own header and checksum:
 //
 //	[0:4]  magic number
 //	[4:8]  CRC32C checksum
@@ -35,7 +37,7 @@ const (
 	allocationHeaderSize     = allocationPageIDOffset + allocationPageIDSize
 )
 
-// allocationSegment is one encoded allocation page and its memory-only free-page cursor.
+// allocationSegment is one encoded bitmap page and its memory-only free-page cursor.
 // data contains the header and bitmap. firstFreeBit is an offset in this segment, not a database page ID.
 type allocationSegment struct {
 	data         []byte
@@ -52,18 +54,23 @@ func (segment *allocationSegment) bitmapBits() []byte {
 // segments contain the persistent bits. firstFreeSegment is a memory-only search cursor.
 type allocationBitmap struct {
 	pageSize         int64
+	groupSegments    int // independent bitmap frames reserved together in each physical group
 	segments         []allocationSegment
 	firstFreeSegment int
+	spanCount        int     // request size last searched; equal or larger requests can reuse spanCursor
+	spanCursor       page.ID // earlier reusable pages have no fitting run; zero restarts the search
 }
 
 // allocationChanges overlays one committed bitmap with uncommitted allocation work.
-// A missing dirty segment is read from base. A dirty segment is a private complete page.
+// A missing dirty segment is read from base. A dirty segment is one private bitmap page.
 // Retired pages remain allocated until finalize prepares the commit.
 type allocationChanges struct {
 	base             *allocationBitmap          // committed read-only segments
 	dirtySegments    map[int]*allocationSegment // private segments, keyed by segment index
 	segmentCount     int                        // private count after segment additions or removals
 	firstFreeSegment int                        // private search cursor
+	spanCount        int                        // private span search length
+	spanCursor       page.ID                    // private span search cursor
 	retired          map[page.ID]struct{}       // tree pages that become free during commit preparation
 	obsoleteWALPages map[page.ID]struct{}       // allocation pages removed from the file tail
 	pagesReused      uint64
@@ -72,12 +79,14 @@ type allocationChanges struct {
 }
 
 // newAllocationChanges starts an empty transaction overlay on bitmap.
-// It does not copy an allocation page until the transaction changes that page.
+// It copies only the bitmap pages that the transaction changes.
 func newAllocationChanges(bitmap *allocationBitmap) *allocationChanges {
 	return &allocationChanges{
 		base:             bitmap,
 		segmentCount:     len(bitmap.segments),
 		firstFreeSegment: bitmap.firstFreeSegment,
+		spanCount:        bitmap.spanCount,
+		spanCursor:       bitmap.spanCursor,
 	}
 }
 
@@ -93,6 +102,8 @@ func (changes *allocationChanges) clone() *allocationChanges {
 		dirtySegments:    dirtySegments,
 		segmentCount:     changes.segmentCount,
 		firstFreeSegment: changes.firstFreeSegment,
+		spanCount:        changes.spanCount,
+		spanCursor:       changes.spanCursor,
 		retired:          maps.Clone(changes.retired),
 		obsoleteWALPages: maps.Clone(changes.obsoleteWALPages),
 		pagesReused:      changes.pagesReused,
@@ -109,37 +120,149 @@ func cloneAllocationSegment(segment *allocationSegment) *allocationSegment {
 }
 
 // allocate returns the lowest reusable tree page at or below lastPage.
-// It extends the logical file when no reusable page exists. If the extension starts a new segment, that first page stores the segment and the following page is returned.
+// It extends the logical file when no reusable page exists. A new segment reserves its complete storage span before the returned tree page.
 func (changes *allocationChanges) allocate(lastPage page.ID) (page.ID, error) {
-	pagesPerSegment := changes.base.pagesPerSegment()
-	for index := changes.firstFreeSegment; index < changes.segmentCount; index++ {
-		segment := changes.segment(index)
-		firstPage := page.ID(index) * pagesPerSegment
-		candidate := firstPage + segment.firstFreeBit
-		// Clear bits after lastPage describe pages that are not in the logical file. They are not reusable pages.
-		if candidate >= firstTreePageID && candidate <= lastPage {
-			changes.markAllocated(candidate)
-			changes.pagesReused++
-			return candidate, nil
+	return changes.allocateSpan(lastPage, 1)
+}
+
+// allocateSpan reserves consecutive pages without using any allocation storage page.
+// Retired pages remain allocated until every new span has been assigned.
+func (changes *allocationChanges) allocateSpan(lastPage page.ID, count int) (page.ID, error) {
+	pagesPerGroup := changes.base.pagesPerGroup()
+	reserved := page.ID(changes.base.segmentsPerGroup())
+	if count <= 0 || page.ID(count) > pagesPerGroup-reserved-2 {
+		return 0, fmt.Errorf("allocate node span of %d pages: %w", count, page.ErrInvalid)
+	}
+	start := page.ID(0)
+	if count > 1 {
+		// A smaller request can fit in an earlier gap that the previous search skipped.
+		if count < changes.spanCount {
+			changes.spanCursor = 0
 		}
+		changes.spanCount = count
+		start = changes.spanCursor
+	}
+	for {
+		candidate, found := changes.findFreePage(start, lastPage)
+		if !found {
+			break
+		}
+		groupStart := candidate / pagesPerGroup * pagesPerGroup
+		if pagesPerGroup-1 > ^page.ID(0)-groupStart {
+			return 0, page.ErrInvalid
+		}
+		limit := min(lastPage, groupStart+pagesPerGroup-1)
+		if page.ID(count)-1 > limit-candidate {
+			if groupStart+pagesPerGroup-1 == ^page.ID(0) {
+				break
+			}
+			start = groupStart + pagesPerGroup
+			continue
+		}
+		free := true
+		for step := page.ID(0); step < page.ID(count); step++ {
+			if changes.allocated(candidate + step) {
+				start = candidate + step + 1
+				free = false
+				break
+			}
+		}
+		if !free {
+			continue
+		}
+		changes.markSpan(candidate, count, lastPage)
+		if count > 1 {
+			changes.spanCursor = candidate + page.ID(count)
+		}
+		return candidate, nil
 	}
 
 	if lastPage == ^page.ID(0) {
 		return 0, fmt.Errorf("allocate after page %d: %w", lastPage, page.ErrInvalid)
 	}
-	nextPage := lastPage + 1
-	segmentIndex := changes.base.segmentIndex(nextPage)
-	if segmentIndex == changes.segmentCount {
-		// The first page in each later range stores the allocation segment for that range.
-		changes.addSegment()
-		nextPage++
-		segmentIndex = changes.base.segmentIndex(nextPage)
+	candidate := lastPage + 1
+	for {
+		group := candidate / pagesPerGroup
+		groups := page.ID(changes.segmentCount / changes.base.segmentsPerGroup())
+		if group > groups {
+			return 0, page.ErrInvalid
+		}
+		if group == groups {
+			changes.addSegment()
+		}
+		head := group * pagesPerGroup
+		if group == 0 {
+			head = firstAllocationSegmentID
+		}
+		if candidate < head+reserved {
+			candidate = head + reserved
+		}
+		bit := candidate % pagesPerGroup
+		if page.ID(count) <= pagesPerGroup-bit {
+			if page.ID(count)-1 > ^page.ID(0)-candidate {
+				return 0, page.ErrInvalid
+			}
+			changes.markSpan(candidate, count, lastPage)
+			if count > 1 {
+				changes.spanCursor = candidate + page.ID(count)
+			}
+			return candidate, nil
+		}
+		if pagesPerGroup-bit > ^page.ID(0)-candidate {
+			return 0, page.ErrInvalid
+		}
+		candidate += pagesPerGroup - bit
 	}
-	if segmentIndex >= changes.segmentCount {
-		return 0, fmt.Errorf("allocation segment %d is not present: %w", segmentIndex, page.ErrInvalid)
+}
+
+// findFreePage searches logical bitmap frames without treating their boundaries as data gaps.
+func (changes *allocationChanges) findFreePage(start, lastPage page.ID) (page.ID, bool) {
+	pagesPerSegment := changes.base.pagesPerSegment()
+	first := max(changes.firstFreeSegment, changes.base.segmentIndex(start))
+	for index := first; index < changes.segmentCount; index++ {
+		base := page.ID(index) * pagesPerSegment
+		if base > lastPage {
+			break
+		}
+		bit := changes.segment(index).firstFreeBit
+		if start > base {
+			bit = max(bit, start-base)
+		}
+		bit = changes.findFirstFreeBit(index, bit)
+		if bit < pagesPerSegment && base+bit <= lastPage {
+			return base + bit, true
+		}
 	}
-	changes.markAllocated(nextPage)
-	return nextPage, nil
+	return 0, false
+}
+
+func (changes *allocationChanges) markSpan(head page.ID, count int, lastPage page.ID) {
+	for step := page.ID(0); step < page.ID(count); step++ {
+		id := head + step
+		changes.markAllocated(id)
+		if id <= lastPage {
+			changes.pagesReused++
+		}
+	}
+}
+
+// extendSpan keeps a node at its current head when the following pages are free.
+func (changes *allocationChanges) extendSpan(head page.ID, oldCount, count int, lastPage page.ID) bool {
+	if count < oldCount || count <= 0 || page.ID(count)-1 > ^page.ID(0)-head {
+		return false
+	}
+	end := head + page.ID(count) - 1
+	if head/changes.base.pagesPerGroup() != end/changes.base.pagesPerGroup() {
+		return false
+	}
+	for step := oldCount; step < count; step++ {
+		id := head + page.ID(step)
+		if changes.isSegmentPage(id) || changes.allocated(id) {
+			return false
+		}
+	}
+	changes.markSpan(head+page.ID(oldCount), count-oldCount, lastPage)
+	return true
 }
 
 // retire delays reuse of an allocated tree page until finalize prepares the commit.
@@ -171,6 +294,10 @@ func (changes *allocationChanges) changed() bool {
 func (changes *allocationChanges) finalize(meta *page.Meta) bool {
 	for pageID := range changes.retired {
 		changes.release(pageID)
+	}
+	// A live data page at the file end prevents tail reclamation.
+	if changes.allocated(meta.LastPage()) && !changes.isSegmentPage(meta.LastPage()) {
+		return false
 	}
 	segmentCount := changes.segmentCount
 	changes.dropEmptyTailSegments()
@@ -218,7 +345,7 @@ func (changes *allocationChanges) segment(index int) *allocationSegment {
 }
 
 // writableSegment returns a private mutable segment for this transaction.
-// The first write copies the segment visible through segment.
+// The first write copies the one bitmap page visible through segment.
 func (changes *allocationChanges) writableSegment(index int) *allocationSegment {
 	if segment, ok := changes.dirtySegments[index]; ok {
 		return segment
@@ -241,7 +368,7 @@ func (changes *allocationChanges) allocated(pageID page.ID) bool {
 }
 
 func (changes *allocationChanges) isSegmentPage(pageID page.ID) bool {
-	return isAllocationSegmentPage(pageID, changes.base.pagesPerSegment(), page.ID(changes.segmentCount-1))
+	return isAllocationSegmentPage(pageID, changes.base.pagesPerSegment(), page.ID(changes.segmentCount-1), page.ID(changes.base.segmentsPerGroup()))
 }
 
 // markAllocated sets one private allocation bit and advances both free-page cursors when needed.
@@ -277,6 +404,16 @@ func (changes *allocationChanges) release(pageID page.ID) {
 	if index < changes.firstFreeSegment {
 		changes.firstFreeSegment = index
 	}
+	if changes.spanCount > 1 {
+		// Freeing this page can complete a span that starts up to spanCount-1 pages earlier.
+		// Move the search back without checking neighbors; allocateSpan checks the bits.
+		// Keep an earlier saved cursor, and clamp page IDs at zero.
+		earliestStart := page.ID(0)
+		if pageID >= page.ID(changes.spanCount-1) {
+			earliestStart = pageID - page.ID(changes.spanCount-1)
+		}
+		changes.spanCursor = min(changes.spanCursor, earliestStart)
+	}
 }
 
 func (changes *allocationChanges) segmentFull(index int) bool {
@@ -284,7 +421,7 @@ func (changes *allocationChanges) segmentFull(index int) bool {
 }
 
 func (changes *allocationChanges) findFirstFreeBit(index int, start page.ID) page.ID {
-	// Segment zero also describes the reserved metadata and allocation pages. A tree allocation starts at page 3.
+	// Segment zero also describes metadata and its allocation span. Their bits stay set.
 	if index == 0 && start < firstTreePageID {
 		start = firstTreePageID
 	}
@@ -313,19 +450,24 @@ func (changes *allocationChanges) advanceFirstFree() {
 	}
 }
 
-// addSegment creates a private segment and reserves its own database page.
+// addSegment creates a full group of private bitmap frames and reserves their pages.
 func (changes *allocationChanges) addSegment() {
-	index := changes.segmentCount
-	firstFreeBit := page.ID(0)
-	if index == 0 {
-		firstFreeBit = firstTreePageID
-	}
+	first := changes.segmentCount
+	count := changes.base.segmentsPerGroup()
 	if changes.dirtySegments == nil {
 		changes.dirtySegments = make(map[int]*allocationSegment)
 	}
-	changes.dirtySegments[index] = newAllocationSegment(changes.base.pageSize, changes.base.segmentPageID(index), firstFreeBit)
-	changes.segmentCount++
-	changes.markAllocated(changes.base.segmentPageID(index))
+	for index := first; index < first+count; index++ {
+		start := page.ID(0)
+		if index == 0 {
+			start = firstTreePageID
+		}
+		changes.dirtySegments[index] = newAllocationSegment(changes.base.pageSize, changes.base.segmentPageID(index), start)
+	}
+	changes.segmentCount += count
+	for index := first; index < first+count; index++ {
+		changes.markAllocated(changes.base.segmentPageID(index))
+	}
 }
 
 // highestAllocated returns the highest page ID whose allocation bit is set.
@@ -334,30 +476,28 @@ func (changes *allocationChanges) highestAllocated() page.ID {
 	pagesPerSegment := changes.base.pagesPerSegment()
 	for index := changes.segmentCount - 1; index >= 0; index-- {
 		firstPage := page.ID(index) * pagesPerSegment
-		data := changes.segment(index).bitmapBits()
-		for byteIndex := len(data) - 1; byteIndex >= 0; byteIndex-- {
-			value := data[byteIndex]
-			if value != 0 {
-				bit := page.ID(byteIndex*8 + bits.Len8(value) - 1)
-				return firstPage + bit
-			}
+		if bit, found := highestSetBit(changes.segment(index).bitmapBits()); found {
+			return firstPage + page.ID(bit)
 		}
 	}
 	return page.Meta1ID
 }
 
-// dropEmptyTailSegments removes later segments that contain only their own allocation page.
-// The first segment always remains because it describes the reserved pages and the first tree range.
+// dropEmptyTailSegments removes complete tail groups that own only their bitmap frames.
+// The first group always remains.
 func (changes *allocationChanges) dropEmptyTailSegments() {
-	for changes.segmentCount > 1 {
-		last := changes.segmentCount - 1
-		if changes.highestAllocated() != changes.base.segmentPageID(last) {
+	count := changes.base.segmentsPerGroup()
+	for changes.segmentCount > count {
+		first := changes.segmentCount - count
+		if changes.highestAllocated() != changes.base.segmentPageID(first)+page.ID(count)-1 {
 			return
 		}
-		changes.segmentCount--
-		delete(changes.dirtySegments, last)
-		if changes.firstFreeSegment > last {
-			changes.firstFreeSegment = last
+		changes.segmentCount -= count
+		for index := first; index < first+count; index++ {
+			delete(changes.dirtySegments, index)
+		}
+		if changes.firstFreeSegment > first {
+			changes.firstFreeSegment = first
 		}
 	}
 }
@@ -380,47 +520,77 @@ func (changes *allocationChanges) publish() *allocationBitmap {
 		}
 	}
 	bitmap.firstFreeSegment = changes.firstFreeSegment
+	bitmap.spanCount = changes.spanCount
+	bitmap.spanCursor = changes.spanCursor
 	return bitmap
 }
 
-// newAllocationBitmap creates the first segment and reserves both metadata pages, the segment page, and the first tree page.
+// newAllocationBitmap reserves metadata, the first bitmap group, and the initial tree root.
 func newAllocationBitmap(pageSize int64) *allocationBitmap {
-	bitmap := &allocationBitmap{pageSize: pageSize}
+	bitmap := &allocationBitmap{pageSize: pageSize, groupSegments: int(page.AllocationSegmentPages(pageSize))}
 	bitmap.addSegment()
-	for _, pageID := range []page.ID{page.Meta0ID, page.Meta1ID, firstTreePageID} {
+	for _, pageID := range []page.ID{page.Meta0ID, page.Meta1ID, firstAllocationSegmentID + page.AllocationSegmentPages(pageSize)} {
 		bitmap.markAllocated(pageID)
 	}
 	return bitmap
 }
 
-// pagesPerSegment returns the number of database pages described by one allocation page.
+// pagesPerSegment returns the database pages described by one bitmap frame.
 func (bitmap *allocationBitmap) pagesPerSegment() page.ID {
+	if len(bitmap.segments) != 0 && len(bitmap.segments[0].data) > allocationHeaderSize {
+		return page.ID(len(bitmap.segments[0].data)-allocationHeaderSize) * 8
+	}
 	return page.ID((bitmap.pageSize - allocationHeaderSize) * 8)
 }
 
+func (bitmap *allocationBitmap) segmentsPerGroup() int {
+	if bitmap.groupSegments != 0 {
+		return bitmap.groupSegments
+	}
+	return int(page.AllocationSegmentPages(bitmap.pageSize))
+}
+
+func (bitmap *allocationBitmap) pagesPerGroup() page.ID {
+	return bitmap.pagesPerSegment() * page.ID(bitmap.segmentsPerGroup())
+}
+
 // segmentIndex returns the allocation-segment index that describes pageID.
+// Each bitmap covers the next pagesPerSegment page IDs, regardless of where it is stored.
 func (bitmap *allocationBitmap) segmentIndex(pageID page.ID) int {
-	return int(pageID / bitmap.pagesPerSegment())
+	pagesCoveredPerBitmap := bitmap.pagesPerSegment()
+	return int(pageID / pagesCoveredPerBitmap)
 }
 
-// segmentPageID returns the database page that stores one allocation segment.
-// The first segment follows metadata. Each later segment starts the range that it describes.
+// segmentPageID returns the file page that stores bitmap segment index.
+// Each group stores its bitmap pages together, then its data pages.
+// Only the first group starts after the two database metadata pages.
+// With 4 KiB pages, segments 0–16 occupy file pages 2–18.
+// Segment 17 starts the next group at file page 554880.
 func (bitmap *allocationBitmap) segmentPageID(index int) page.ID {
-	if index == 0 {
-		return firstAllocationSegmentID
+	bitmapsPerGroup := bitmap.segmentsPerGroup()
+	groupIndex := index / bitmapsPerGroup
+	bitmapIndexInGroup := index % bitmapsPerGroup
+
+	firstBitmapPage := page.ID(groupIndex) * bitmap.pagesPerGroup()
+	if groupIndex == 0 {
+		firstBitmapPage = firstAllocationSegmentID
 	}
-	return page.ID(index) * bitmap.pagesPerSegment()
+	return firstBitmapPage + page.ID(bitmapIndexInGroup)
 }
 
-// addSegment appends one encoded segment and reserves its own database page.
+// addSegment appends one complete group of independent bitmap frames.
 func (bitmap *allocationBitmap) addSegment() {
-	index := len(bitmap.segments)
-	firstFreeBit := page.ID(0)
-	if index == 0 {
-		firstFreeBit = firstTreePageID
+	first, count := len(bitmap.segments), bitmap.segmentsPerGroup()
+	for index := first; index < first+count; index++ {
+		start := page.ID(0)
+		if index == 0 {
+			start = firstTreePageID
+		}
+		bitmap.segments = append(bitmap.segments, *newAllocationSegment(bitmap.pageSize, bitmap.segmentPageID(index), start))
 	}
-	bitmap.segments = append(bitmap.segments, *newAllocationSegment(bitmap.pageSize, bitmap.segmentPageID(index), firstFreeBit))
-	bitmap.markAllocated(bitmap.segmentPageID(index))
+	for index := first; index < first+count; index++ {
+		bitmap.markAllocated(bitmap.segmentPageID(index))
+	}
 }
 
 func (bitmap *allocationBitmap) writableSegment(index int) *allocationSegment {
@@ -484,7 +654,7 @@ func (bitmap *allocationBitmap) segmentFull(index int) bool {
 }
 
 func (bitmap *allocationBitmap) findFirstFreeBit(index int, start page.ID) page.ID {
-	// Segment zero also describes the reserved metadata and allocation pages. A tree allocation starts at page 3.
+	// Segment zero also describes metadata and its allocation span. Their bits stay set.
 	if index == 0 && start < firstTreePageID {
 		start = firstTreePageID
 	}
@@ -514,17 +684,47 @@ func (bitmap *allocationBitmap) advanceFirstFree() {
 }
 
 func (bitmap *allocationBitmap) isSegmentPage(pageID page.ID) bool {
-	return isAllocationSegmentPage(pageID, bitmap.pagesPerSegment(), page.ID(len(bitmap.segments)-1))
+	return isAllocationSegmentPage(pageID, bitmap.pagesPerSegment(), page.ID(len(bitmap.segments)-1), page.ID(bitmap.segmentsPerGroup()))
 }
 
-// isAllocationSegmentPage reports whether pageID stores an existing allocation segment.
-// Page 2 is the special first segment. Each later segment is stored at the start of its described range.
-func isAllocationSegmentPage(pageID, pagesPerSegment, lastSegment page.ID) bool {
-	if pageID == firstAllocationSegmentID {
-		return true
+func (bitmap *allocationBitmap) isSegmentHead(pageID page.ID) bool {
+	return bitmap.isSegmentPage(pageID)
+}
+
+// isAllocationSegmentPage reports whether pageID stores a bitmap frame in an existing group.
+func isAllocationSegmentPage(pageID, pagesPerSegment, lastSegment, span page.ID) bool {
+	if span == 0 || pagesPerSegment == 0 {
+		return false
 	}
-	index := pageID / pagesPerSegment
-	return index > 0 && index <= lastSegment && pageID%pagesPerSegment == 0
+	groupPages := pagesPerSegment * span
+	group := pageID / groupPages
+	if group >= (lastSegment+1)/span {
+		return false
+	}
+	head := group * groupPages
+	if group == 0 {
+		head = firstAllocationSegmentID
+	}
+	return pageID >= head && pageID-head < span
+}
+
+// highestSetBit returns the index of the last set bit.
+// Whole words let it skip empty trailing bytes with fewer loads.
+func highestSetBit(data []byte) (int, bool) {
+	end := len(data)
+	for end >= 8 {
+		start := end - 8
+		if value := binary.LittleEndian.Uint64(data[start:end]); value != 0 {
+			return start*8 + bits.Len64(value) - 1, true
+		}
+		end = start
+	}
+	for index := end - 1; index >= 0; index-- {
+		if value := data[index]; value != 0 {
+			return index*8 + bits.Len8(value) - 1, true
+		}
+	}
+	return 0, false
 }
 
 // highestAllocated returns the highest page ID whose allocation bit is set.
@@ -532,16 +732,82 @@ func (bitmap *allocationBitmap) highestAllocated() page.ID {
 	pagesPerSegment := bitmap.pagesPerSegment()
 	for index := len(bitmap.segments) - 1; index >= 0; index-- {
 		firstPage := page.ID(index) * pagesPerSegment
-		data := bitmap.segments[index].bitmapBits()
-		for byteIndex := len(data) - 1; byteIndex >= 0; byteIndex-- {
-			value := data[byteIndex]
-			if value != 0 {
-				bit := page.ID(byteIndex*8 + bits.Len8(value) - 1)
-				return firstPage + bit
-			}
+		if bit, found := highestSetBit(bitmap.segments[index].bitmapBits()); found {
+			return firstPage + page.ID(bit)
 		}
 	}
 	return page.Meta1ID
+}
+
+// ownsNodeSpan checks all allocation bits without a page-by-page ID walk.
+// A node must stay within one allocation region and exclude its bitmap span.
+func (bitmap *allocationBitmap) ownsNodeSpan(head page.ID, count int) bool {
+	if count <= 0 || head < firstTreePageID || page.ID(count)-1 > ^page.ID(0)-head {
+		return false
+	}
+	end := head + page.ID(count) - 1
+	capacity := bitmap.pagesPerSegment()
+	index := bitmap.segmentIndex(head)
+	bit := head % capacity
+	if index >= len(bitmap.segments) || bitmap.isSegmentPage(head) {
+		return false
+	}
+	// A range inside one logical frame cannot cross a physical group.
+	if page.ID(count) <= capacity-bit {
+		return allocationRangeIsSet(bitmap.segments[index].bitmapBits(), bit, count)
+	}
+	if head/bitmap.pagesPerGroup() != end/bitmap.pagesPerGroup() {
+		return false
+	}
+	for count > 0 {
+		index := bitmap.segmentIndex(head)
+		if index >= len(bitmap.segments) {
+			return false
+		}
+		bit := head % capacity
+		n := min(count, int(capacity-bit))
+		if !allocationRangeIsSet(bitmap.segments[index].bitmapBits(), bit, n) {
+			return false
+		}
+		head += page.ID(n)
+		count -= n
+	}
+	return true
+}
+
+// allocationRangeIsSet checks a bounded run of bits in one bitmap frame.
+func allocationRangeIsSet(data []byte, bit page.ID, count int) bool {
+	at, shift := int(bit/8), uint(bit%8)
+	if shift != 0 {
+		n := min(count, 8-int(shift))
+		mask := byte(((1 << n) - 1) << shift)
+		if data[at]&mask != mask {
+			return false
+		}
+		count -= n
+		at++
+	}
+	for count >= 64 {
+		if binary.LittleEndian.Uint64(data[at:at+8]) != ^uint64(0) {
+			return false
+		}
+		at += 8
+		count -= 64
+	}
+	for count >= 8 {
+		if data[at] != 0xff {
+			return false
+		}
+		at++
+		count -= 8
+	}
+	if count > 0 {
+		mask := byte((1 << count) - 1)
+		if data[at]&mask != mask {
+			return false
+		}
+	}
+	return true
 }
 
 // allocatedPageCount returns the number of set bits across all allocation segments.
@@ -561,7 +827,7 @@ func (bitmap *allocationBitmap) validate(meta *page.Meta) error {
 	if len(bitmap.segments) == 0 || bitmap.pagesPerSegment() == 0 {
 		return fmt.Errorf("allocation bitmap has no segments: %w", page.ErrInvalid)
 	}
-	wantSegments := bitmap.segmentIndex(meta.LastPage()) + 1
+	wantSegments := int(meta.LastPage()/bitmap.pagesPerGroup()+1) * bitmap.segmentsPerGroup()
 	if len(bitmap.segments) != wantSegments {
 		return fmt.Errorf("allocation bitmap has %d segments, want %d: %w", len(bitmap.segments), wantSegments, page.ErrInvalid)
 	}
@@ -571,6 +837,9 @@ func (bitmap *allocationBitmap) validate(meta *page.Meta) error {
 			return fmt.Errorf("allocation segment page %d is free: %w", segmentPageID, page.ErrInvalid)
 		}
 		bitmap.segments[index].firstFreeBit = bitmap.findFirstFreeBit(index, 0)
+	}
+	if meta.Root() < firstTreePageID || bitmap.isSegmentPage(meta.Root()) {
+		return fmt.Errorf("root uses a reserved page: %w", page.ErrInvalid)
 	}
 	for _, pageID := range []page.ID{page.Meta0ID, page.Meta1ID, meta.Root()} {
 		if !bitmap.allocated(pageID) {
