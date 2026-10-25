@@ -34,6 +34,61 @@ import (
 var testBucketName = []byte("test-data")
 var errDiscardTx = errors.New("discard transaction")
 
+func TestWriteTxMetadataStaysPrivateOnChange(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			original := bytes.Repeat([]byte{1}, 128)
+			if err := db.Put(testBucketName, []byte("key"), original); err != nil {
+				t.Fatal(err)
+			}
+			committed, image := db.meta, *db.meta
+			var ended *Tx
+			if err := db.Update(func(tx *Tx) error {
+				ended = tx
+				if tx.meta != committed || tx.metaOwned {
+					return errors.New("new transaction copied unchanged metadata")
+				}
+				if err := mustBucket(t, tx, testBucketName).Put([]byte("key"), bytes.Repeat([]byte{2}, 128)); err != nil {
+					return err
+				}
+				if tx.meta != committed || tx.metaOwned || tx.metaDirty {
+					return errors.New("stable update copied unchanged metadata")
+				}
+				return errDiscardTx
+			}); !errors.Is(err, errDiscardTx) {
+				t.Fatal(err)
+			}
+			if db.meta != committed || *db.meta != image || ended == nil || !ended.closed {
+				t.Fatal("failed stable update changed committed metadata or kept its handle open")
+			}
+			if err := db.Update(func(tx *Tx) error {
+				if _, err := tx.CreateBucket([]byte("rolled-back")); err != nil {
+					return err
+				}
+				if tx.meta == committed || !tx.metaOwned || *committed != image {
+					return errors.New("structural update changed shared metadata")
+				}
+				return errDiscardTx
+			}); !errors.Is(err, errDiscardTx) {
+				t.Fatal(err)
+			}
+			if db.meta != committed || *db.meta != image {
+				t.Fatal("failed structural update published private metadata")
+			}
+			got, err := db.Get(testBucketName, []byte("key"))
+			if err != nil || !bytes.Equal(got, original) {
+				t.Fatalf("rollback changed the original value: %v", err)
+			}
+		})
+	}
+}
+
 func TestContinuedMainFileReads(t *testing.T) {
 	for _, testCase := range []struct {
 		mapped, fromWAL bool

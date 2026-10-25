@@ -18,6 +18,7 @@ type Tx struct {
 	tree            btree.Tree
 	allocation      *allocationChanges
 	allocationOwned bool
+	metaOwned       bool
 	metaDirty       bool
 	readOnly        bool
 	closed          bool
@@ -41,8 +42,7 @@ func newTx(db *DB, readOnly bool) *Tx {
 
 // newWriteTx starts one private write transaction from the committed state or earlier callbacks in the same write batch.
 func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map[page.ID]dirtyNode, baseAllocation *allocationChanges) *Tx {
-	meta := *baseMeta
-	tx := &Tx{db: db, meta: &meta, rootNode: baseRoot, allocation: baseAllocation}
+	tx := &Tx{db: db, meta: baseMeta, rootNode: baseRoot, allocation: baseAllocation}
 	tx.store = txTreeStore{
 		tx:        tx,
 		baseDirty: baseDirty,
@@ -159,6 +159,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 // writableAllocation gives this callback its own allocation changes.
 // A failed callback cannot change allocation work from an earlier callback in the batch.
 func (tx *Tx) writableAllocation() *allocationChanges {
+	tx.writableMeta()
 	if tx.allocationOwned {
 		return tx.allocation
 	}
@@ -169,6 +170,17 @@ func (tx *Tx) writableAllocation() *allocationChanges {
 	}
 	tx.allocationOwned = true
 	return tx.allocation
+}
+
+// writableMeta copies metadata before this callback can change it.
+// Stable value updates keep the committed metadata without an allocation.
+func (tx *Tx) writableMeta() *page.Meta {
+	if !tx.metaOwned {
+		meta := *tx.meta
+		tx.meta = &meta
+		tx.metaOwned = true
+	}
+	return tx.meta
 }
 
 // makeWALCommitData returns one original and final node pair for each changed data page, in page-ID order.
@@ -241,7 +253,7 @@ func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
 	}
 	tx.rootNode = newRoot
 	if newRoot.PageID() != tx.meta.Root() {
-		tx.meta.SetRoot(newRoot.PageID())
+		tx.writableMeta().SetRoot(newRoot.PageID())
 		tx.metaDirty = true
 	}
 	return nil

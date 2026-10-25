@@ -417,7 +417,7 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 		}
 		tx.rootNode = newRoot
 		if newRoot.PageID() != oldRootPageID {
-			tx.meta.SetRoot(newRoot.PageID())
+			tx.writableMeta().SetRoot(newRoot.PageID())
 			tx.metaDirty = true
 		}
 	} else {

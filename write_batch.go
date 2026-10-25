@@ -192,6 +192,7 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		}
 		tx.store.dirty = state.dirty
 		commitErr = tx.prepareCommit()
+		state.meta = tx.meta
 		state.metaDirty = state.metaDirty || tx.metaDirty
 		state.allocation = tx.allocation
 		if commitErr == nil {

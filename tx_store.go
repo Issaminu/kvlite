@@ -93,7 +93,7 @@ func (store *txTreeStore) AllocatePage() (page.ID, error) {
 		return 0, err
 	}
 	if pageID > store.tx.meta.LastPage() {
-		store.tx.meta.SetLastPage(pageID)
+		store.tx.writableMeta().SetLastPage(pageID)
 		store.tx.metaDirty = true
 	}
 	return pageID, nil
@@ -236,7 +236,7 @@ func (tx *Tx) prepareCommit() error {
 			}
 			ids[i] = id
 			if id > tx.meta.LastPage() {
-				tx.meta.SetLastPage(id)
+				tx.writableMeta().SetLastPage(id)
 				tx.metaDirty = true
 			}
 		}

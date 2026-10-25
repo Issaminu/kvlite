@@ -72,7 +72,7 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 		}
 	}
 	if err := db.updateDirect(func(tx *Tx) error {
-		tx.meta.SetDataPageChecksums(enabled)
+		tx.writableMeta().SetDataPageChecksums(enabled)
 		tx.metaDirty = true
 		return nil
 	}); err != nil {
