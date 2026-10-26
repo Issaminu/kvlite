@@ -46,7 +46,7 @@ type DB struct {
 	mappedBacking     []byte // full writable mapping; mappedFile exposes only the real file length
 	mappedWritable    bool
 	directWriter      directMappedFile
-	mainWriteFailure  error // set after a failed direct main-file write; blocks later data operations
+	mainWriteFailure  error // A failed main-file write or explicit sync stops later data operations.
 	options           *Options
 	wal               *wal.WAL
 	operationMu       sync.RWMutex
@@ -383,6 +383,37 @@ func (db *DB) failOpen(err error) (*DB, error) {
 	return nil, err
 }
 
+// Sync flushes committed database and WAL data to storage without closing the database or forcing a checkpoint. It also syncs their directory, except on Windows.
+// It does not change the synchronization mode for later writes. In SyncNone it makes completed writes durable, but a later direct write can still corrupt earlier data if it crashes halfway through.
+// A memory database has nothing to flush and returns nil.
+//
+// Sync waits for active transaction callbacks. Do not call it from a View or Update callback.
+// Pending writes that have not committed are not covered. A read-only handle returns [ErrDatabaseReadOnly], and a closed handle returns [ErrDatabaseNotOpen].
+// A storage synchronization failure stops later data operations with [ErrWALWriteFailed] or [ErrDatabaseWriteFailed]. Close and reopen the database before using it again.
+func (db *DB) Sync() error {
+	if err := db.beginWriteOperation(); err != nil {
+		return err
+	}
+	defer db.endOperation()
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	if err := db.writeFailure(); err != nil {
+		return err
+	}
+	if db.memoryNodes != nil {
+		return nil
+	}
+	// Persist an empty recovery truncate too, so an older WAL cannot return after main-file writes reach storage.
+	if err := db.wal.ForceSync(); err != nil {
+		return err
+	}
+	if err := db.syncMainFile(); err != nil {
+		db.mainWriteFailure = fmt.Errorf("%w: %w", ErrDatabaseWriteFailed, err)
+		return db.mainWriteFailure
+	}
+	return nil
+}
+
 // Close releases the database resources. For a writable file database in SyncFull or SyncNormal, it first checkpoints committed data and removes the WAL. SyncNone changes the main file during each write and adds no storage synchronization at close. After [ErrWALWriteFailed] or [ErrDatabaseWriteFailed], Close only releases resources. A memory database discards all data without file operations.
 //
 // Close prevents new data operations and waits for active operations to finish. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, the database remains open so the caller can retry, but some cleanup can remain incomplete.
@@ -434,12 +465,13 @@ func (db *DB) close() error {
 		return nil
 	}
 
-	if db.wal != nil {
+	if db.wal != nil && db.wal.Stats().CommittedRecordCount != 0 {
 		if err := db.checkpointWAL(); err != nil {
 			return err
 		}
-	} else {
-		if err := fileio.SyncData(db.file); err != nil {
+	} else if db.options.Synchronous != SyncNone {
+		// An unchanged put can leave no WAL records to checkpoint. Sync data inherited from an earlier SyncNone handle too.
+		if err := db.syncMainFile(); err != nil {
 			return err
 		}
 	}
@@ -453,6 +485,24 @@ func (db *DB) close() error {
 	}
 	if err := db.file.Close(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// syncMainFile flushes a writable mapping before syncing the file and its directory.
+// The caller holds operationMu and handles failures according to its operation.
+func (db *DB) syncMainFile() error {
+	if db.mappedWritable {
+		if err := systemSyncMainFile(db.mappedFile); err != nil {
+			return fmt.Errorf("sync mapped database pages: %w", err)
+		}
+	}
+	if err := fileio.SyncData(db.file); err != nil {
+		return fmt.Errorf("sync database file: %w", err)
+	}
+	// Persist the current names so a removed older WAL cannot return after a power failure.
+	if err := db.fs.SyncDir(filepath.Dir(db.path)); err != nil {
+		return fmt.Errorf("sync database directory: %w", err)
 	}
 	return nil
 }

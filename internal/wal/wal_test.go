@@ -1634,3 +1634,34 @@ func TestReadRecordsAppendsBeforeUnusedFileSpace(t *testing.T) {
 		t.Fatalf("read/append changed allocated length: %d", info.Size())
 	}
 }
+
+func TestWALForceSyncFlushesCleanStateAndStopsOnFailure(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: 4096})
+	calls := 0
+	log.SetSyncFileForTesting(func() error { calls++; return nil })
+	for range 2 {
+		if err := log.ForceSync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if calls != 2 || log.headerSyncNeeded || log.hasUnsyncedWrites {
+		t.Fatalf("explicit sync skipped clean state: calls=%d", calls)
+	}
+	failure := errors.New("forced sync failure")
+	log.SetSyncFileForTesting(func() error { calls++; return failure })
+	stopped := log.ForceSync()
+	if !errors.Is(stopped, ErrWriteFailed) || !errors.Is(stopped, failure) {
+		t.Fatalf("forced sync failure: %v", stopped)
+	}
+	if err := log.ForceSync(); err != stopped || calls != 3 {
+		t.Fatalf("failed log retried storage: %v, calls=%d", err, calls)
+	}
+	if _, err := log.Commit(nil, nil, nil, nil); err != stopped {
+		t.Fatalf("failed log accepted commit: %v", err)
+	}
+}

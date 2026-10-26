@@ -19,6 +19,9 @@ func systemUnmapMainFile([]byte) error {
 	return nil
 }
 
+// There is no writable mapping on these systems; the caller syncs the file.
+func systemSyncMainFile([]byte) error { return nil }
+
 const systemMappingFollowsWrites = false
 
 const systemMappingAllowsWrites = false

@@ -20,6 +20,14 @@ func systemUnmapMainFile(data []byte) error {
 	return unix.Munmap(data)
 }
 
+// systemSyncMainFile flushes writes through a shared mapping before the file is synced.
+func systemSyncMainFile(data []byte) error {
+	if len(data) == 0 {
+		return nil
+	}
+	return unix.Msync(data, unix.MS_SYNC)
+}
+
 // These systems have a unified buffer cache, so a shared mapping of a file shows later writes to that file.
 const systemMappingFollowsWrites = true
 

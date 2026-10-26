@@ -30,7 +30,7 @@ const (
 
 // Options configures [Open]. Open resolves the zero values described below and then copies the result, so callers can reuse or change their Options after Open returns.
 type Options struct {
-	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. Because this mode cannot write, [DB.Update], [DB.Put], [DB.Delete], and [DB.DeleteBucket] return [ErrDatabaseReadOnly].
+	// ReadOnly opens an existing database without creating or modifying its database or write-ahead log files. [DB.Update], [DB.Put], [DB.Delete], [DB.DeleteBucket], and [DB.Sync] return [ErrDatabaseReadOnly].
 	ReadOnly bool
 
 	// DataPageChecksums enables a checksum over each complete leaf or branch node, including its tail pages, in a new file.

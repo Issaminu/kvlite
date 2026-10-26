@@ -2799,7 +2799,7 @@ func TestIdenticalPutCommitDependsOnSyncMode(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := uint64(1)
-			if mode == SyncNone {
+			if mode != SyncFull {
 				want = 0
 			}
 			if got := after.WALCommitCount - before.WALCommitCount; got != want {
@@ -10973,7 +10973,7 @@ func TestPutContinuedReplacementIdenticalPreservesSyncMode(t *testing.T) {
 				t.Fatal(err)
 			}
 			want := uint64(1)
-			if mode == SyncNone {
+			if mode != SyncFull {
 				want = 0
 			}
 			if got := after.WALCommitCount - before.WALCommitCount; got != want {
@@ -12246,4 +12246,279 @@ func TestManagedPutGroupOwnsFinalValue(t *testing.T) {
 		t.Fatalf("group retained application bytes: %v", err)
 	}
 	assertNoBorrowedCommittedNodes(t, db)
+}
+
+func TestIdenticalPutKeepsPrivateStateClean(t *testing.T) {
+	for _, mode := range []string{"None", "Normal", "Full", "Memory"} {
+		for _, size := range []int{0, 128, 64 << 10} {
+			t.Run(fmt.Sprintf("%s/%d", mode, size), func(t *testing.T) {
+				var db *DB
+				if mode == "Memory" {
+					db = OpenMemory()
+				} else {
+					var err error
+					db, err = Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: map[string]Sync{"None": SyncNone, "Normal": SyncNormal, "Full": SyncFull}[mode]})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				defer db.Close()
+				createBucket(t, db, testBucketName)
+				value := bytes.Repeat([]byte{1}, size)
+				if err := db.Put(testBucketName, []byte("key"), value); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Update(func(tx *Tx) error {
+					bucket := mustBucket(t, tx, testBucketName)
+					for range 2 {
+						if err := bucket.Put([]byte("key"), value); err != nil {
+							return err
+						}
+					}
+					if mode != "Full" && len(tx.store.dirty) != 0 {
+						t.Fatal("identical put dirtied a node")
+					}
+					if mode == "Full" && len(tx.store.dirty) == 0 {
+						t.Fatal("Full skipped its existing rewrite")
+					}
+					if _, err := bucket.CreateBucket([]byte("nested")); err != nil {
+						return err
+					}
+					if err := bucket.Put([]byte("nested"), nil); !errors.Is(err, ErrIncompatibleValue) {
+						t.Fatalf("nested bucket overwrite: %v", err)
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				rollback := errors.New("rollback changed and identical puts")
+				if err := db.Update(func(tx *Tx) error {
+					bucket := mustBucket(t, tx, testBucketName)
+					input := bytes.Repeat([]byte{2}, size+1)
+					want := bytes.Clone(input)
+					if err := bucket.Put([]byte("key"), input); err != nil {
+						return err
+					}
+					if err := bucket.Put([]byte("key"), input); err != nil {
+						return err
+					}
+					input[0] = 3
+					got, err := bucket.Get([]byte("key"))
+					if err != nil || !bytes.Equal(got, want) {
+						t.Fatalf("changed input retained: %v", err)
+					}
+					return rollback
+				}); err != rollback {
+					t.Fatalf("rollback: %v", err)
+				}
+				got, err := db.Get(testBucketName, []byte("key"))
+				if err != nil || !bytes.Equal(got, value) {
+					t.Fatalf("rollback changed value: %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestSyncDurabilityAcrossModes(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		for _, inheritNone := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mode=%d/inheritNone=%t", mode, inheritNone), func(t *testing.T) {
+				fsys := disk.New(1, disk.Config{KeepChange: disk.Ratio{Num: 0, Den: 1}})
+				db, err := open(simulatedPath, 0600, &Options{Synchronous: SyncFull}, fsys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				simulatedPut(t, db, "key", "A")
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if inheritNone {
+					db, err = open(simulatedPath, 0600, &Options{Synchronous: SyncNone}, fsys)
+					if err != nil {
+						t.Fatal(err)
+					}
+					simulatedPut(t, db, "key", "B")
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+				}
+				db, err = open(simulatedPath, 0600, &Options{Synchronous: mode}, fsys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !inheritNone {
+					simulatedPut(t, db, "key", "B")
+				}
+				before := db.wal.Stats()
+				if err := db.Sync(); err != nil {
+					t.Fatal(err)
+				}
+				after := db.wal.Stats()
+				if after.CheckpointCount != before.CheckpointCount || after.CommittedRecordCount != before.CommittedRecordCount || after.CommitCount != before.CommitCount {
+					t.Fatal("Sync changed the WAL contents or forced a checkpoint")
+				}
+				simulatedCrash(fsys, db)
+				fsys.Restart(true)
+				if got, err := simulatedGet(t, fsys, mode, "key"); err != nil || got != "B" {
+					t.Fatalf("Sync lost data after power failure: %q, %v", got, err)
+				}
+			})
+		}
+	}
+}
+
+func TestSyncNativeMappedAndWALWrites(t *testing.T) {
+	previous := fileio.SkipDriveCacheFlushForTesting
+	fileio.SkipDriveCacheFlushForTesting = false
+	defer func() { fileio.SkipDriveCacheFlushForTesting = previous }()
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db")
+			db, err := Open(path, 0600, &Options{Synchronous: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			createBucket(t, db, testBucketName)
+			key, value := []byte("key"), bytes.Repeat([]byte{1}, 64<<10)
+			if err := db.Put(testBucketName, key, value); err != nil {
+				t.Fatal(err)
+			}
+			value[0] = 2
+			if err := db.Put(testBucketName, key, value); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(); err != nil {
+				t.Fatal(err)
+			}
+			if mode == SyncNone && db.wal.Stats().CommitCount != 0 {
+				t.Fatal("SyncNone gained WAL commits")
+			}
+			// Close only the descriptors, leaving the durable WAL available for recovery.
+			if err := db.unmapMainFile(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.closeFiles(); err != nil {
+				t.Fatal(err)
+			}
+			db.closed = true
+			db.stopWriteBatcherAndWait()
+			reopened, err := Open(path, 0600, &Options{Synchronous: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			got, err := reopened.Get(testBucketName, key)
+			if err != nil || !bytes.Equal(got, value) {
+				t.Fatalf("reopened Sync data: %v", err)
+			}
+		})
+	}
+}
+
+func TestSyncMemoryReadOnlyAndClosed(t *testing.T) {
+	memory := OpenMemory()
+	if err := memory.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := memory.Sync(); !errors.Is(err, ErrDatabaseNotOpen) {
+		t.Fatalf("closed memory Sync: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "db")
+	db, err := Open(path, 0600, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(); !errors.Is(err, ErrDatabaseNotOpen) {
+		t.Fatalf("closed file Sync: %v", err)
+	}
+	db, err = Open(path, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Sync(); !errors.Is(err, ErrDatabaseReadOnly) {
+		t.Fatalf("read-only Sync: %v", err)
+	}
+}
+
+func TestSyncFailureStopsDataOperations(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		for _, step := range []string{"wal", "main", "directory"} {
+			t.Run(fmt.Sprintf("mode=%d/%s", mode, step), func(t *testing.T) {
+				config := disk.Config{}
+				if step == "main" {
+					config.SyncFault = disk.Ratio{Num: 1, Den: 1}
+				}
+				if step == "directory" {
+					config.SyncDirFault = disk.Ratio{Num: 1, Den: 1}
+				}
+				fsys := disk.New(1, config)
+				fsys.SetFaults(false)
+				db, err := open(simulatedPath, 0600, &Options{Synchronous: mode}, fsys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				simulatedPut(t, db, "key", "value")
+				failure := errors.New("explicit WAL sync failure")
+				if step == "wal" {
+					db.wal.SetSyncFileForTesting(func() error { return failure })
+				}
+				if step == "main" {
+					db.wal.SetSyncFileForTesting(func() error { return nil })
+				}
+				fsys.SetFaults(true)
+				want := ErrDatabaseWriteFailed
+				if step == "wal" {
+					want = ErrWALWriteFailed
+				}
+				err = db.Sync()
+				if !errors.Is(err, want) {
+					t.Fatalf("Sync failure: %v, want %v", err, want)
+				}
+				if step == "wal" && !errors.Is(err, failure) {
+					t.Fatalf("lost underlying failure: %v", err)
+				}
+				fsys.SetFaults(false)
+				if _, got := db.Get(testBucketName, []byte("key")); got != err {
+					t.Fatalf("read accepted after failed Sync: %v", got)
+				}
+				if got := db.Update(func(*Tx) error { t.Fatal("callback ran after failed Sync"); return nil }); got != err {
+					t.Fatalf("update after failed Sync: %v", got)
+				}
+				if got := db.Sync(); got != err {
+					t.Fatalf("repeated Sync changed stopped state: %v", got)
+				}
+			})
+		}
+	}
+}
+
+func TestSyncWaitsForActiveTransaction(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	entered, release, viewDone := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() { viewDone <- db.View(func(*Tx) error { close(entered); <-release; return nil }) }()
+	<-entered
+	done := make(chan error, 1)
+	go func() { done <- db.Sync() }()
+	select {
+	case err := <-done:
+		t.Fatalf("Sync returned during View: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(release)
+	if err := <-viewDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
 }

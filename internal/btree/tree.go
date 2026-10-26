@@ -57,7 +57,7 @@ type Store interface {
 type Tree struct {
 	store Store
 
-	// SkipIdenticalPuts keeps an identical entry clean when the caller requires no durable rewrite (SyncNone).
+	// SkipIdenticalPuts keeps an identical entry clean when the caller requires no durable rewrite.
 	SkipIdenticalPuts bool
 }
 

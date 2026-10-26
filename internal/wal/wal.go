@@ -521,6 +521,21 @@ func (wal *WAL) Sync() error {
 	return nil
 }
 
+// ForceSync flushes the WAL, including an earlier truncate, regardless of the synchronization mode or pending-write flag.
+// A failed sync stops this WAL because earlier commits can then have an unknown storage state.
+// The caller must hold its database operation lock.
+func (wal *WAL) ForceSync() error {
+	if wal.appendFailure != nil {
+		return wal.appendFailure
+	}
+	wal.hasUnsyncedWrites = true
+	if err := wal.Sync(); err != nil {
+		wal.appendFailure = fmt.Errorf("%w: %w", ErrWriteFailed, err)
+		return wal.appendFailure
+	}
+	return nil
+}
+
 // syncData syncs the WAL file data.
 func (wal *WAL) syncData() error {
 	if wal.syncFile != nil {

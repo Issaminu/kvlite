@@ -71,6 +71,9 @@ func systemUnmapMainFile(data []byte) error {
 	return windows.UnmapViewOfFile(uintptr(unsafe.Pointer(&data[0])))
 }
 
+// systemSyncMainFile has no writable mapping to flush on Windows; the caller syncs the file.
+func systemSyncMainFile([]byte) error { return nil }
+
 // Windows does not guarantee that file writes update an existing mapped view.
 const systemMappingFollowsWrites = false
 
