@@ -21,7 +21,7 @@ const (
 	// SyncNormal is a middle ground between write speed and durability. It waits until a checkpoint or close to synchronize the write-ahead log, so [DB.Update] can return success while recent writes remain only in the operating system cache. A system failure can lose those writes. Backup syncs its file and, except on Windows, its parent directory before it returns success.
 	SyncNormal
 
-	// SyncNone writes database, log, and backup files without synchronizing them to storage. It does not synchronize a new database or synchronize after commits, checkpoints, recovery, close, or backup. A system failure can lose committed updates or corrupt the database. Use this mode only when the data can be rebuilt. Use [OpenMemory] to avoid file operations.
+	// SyncNone writes changes directly to the main database file without WAL records or storage synchronization. A failed write or a process or system crash can corrupt the database, including data from earlier successful transactions. Writes wait for active backups. Use this mode only when the data can be rebuilt. Use [OpenMemory] to avoid file operations.
 	SyncNone
 
 	// defaultCheckpointPageCount keeps about 1,000 operating-system pages of data in the write-ahead log before KVLite starts a checkpoint. This limits log growth without running a checkpoint after every update.
@@ -43,13 +43,13 @@ type Options struct {
 	// LockTimeout limits how long [Open] waits for a conflicting database-file lock. A zero value waits until the other handle closes, a positive value returns an error that matches [ErrDatabaseLocked] after that duration, and a negative value is invalid. KVLite holds the lock for the full [DB] lifetime, not for one transaction.
 	LockTimeout time.Duration
 
-	// Synchronous controls when KVLite synchronizes committed write-ahead log data and backup files. A zero value uses SyncFull.
+	// Synchronous selects the write and storage synchronization rules. SyncFull and SyncNormal use the WAL. SyncNone writes directly to the main file. A zero value uses SyncFull.
 	Synchronous Sync
 
 	// MaxWriteBatchSize limits how many SyncFull write callbacks can share one WAL commit. A zero value uses 100. A value of 1 prevents callbacks from sharing a commit.
 	MaxWriteBatchSize int
 
-	// CheckpointThresholdBytes is the number of committed write-ahead log bytes that starts a checkpoint. A zero value uses about 1,000 operating-system pages, while a smaller value keeps the log smaller at the cost of more frequent checkpoints.
+	// CheckpointThresholdBytes is the number of committed write-ahead log bytes that starts a checkpoint. A zero value uses about 1,000 operating-system pages, while a smaller value keeps the log smaller at the cost of more frequent checkpoints. SyncNone ignores this option.
 	CheckpointThresholdBytes uint64
 
 	// pageSize is the page size of a new file. Zero means the operating-system page size.

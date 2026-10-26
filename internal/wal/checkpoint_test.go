@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -417,5 +418,329 @@ func TestNativeSpanCheckpointRejectsInvalidHeadBeforeWrite(t *testing.T) {
 				t.Fatalf("invalid head %d encoded=%t reached storage: error=%v writes=%d", id, encoded, err, len(writer.writes))
 			}
 		}
+	}
+}
+
+type directSizeFile struct {
+	fileio.File
+	stats, truncates               int
+	writeErr, statErr, truncateErr error
+}
+
+func (file *directSizeFile) Stat() (os.FileInfo, error) {
+	file.stats++
+	if file.statErr != nil {
+		return nil, file.statErr
+	}
+	return file.File.Stat()
+}
+
+func (file *directSizeFile) WriteAt(data []byte, offset int64) (int, error) {
+	if file.writeErr != nil {
+		return 0, file.writeErr
+	}
+	return file.File.WriteAt(data, offset)
+}
+
+func (file *directSizeFile) Truncate(size int64) error {
+	file.truncates++
+	if file.truncateErr != nil {
+		return file.truncateErr
+	}
+	return file.File.Truncate(size)
+}
+
+func TestWALWriteDirectChecksSizeChanges(t *testing.T) {
+	const pageSize int64 = 128
+	main, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer main.Close()
+	if err := main.Truncate(9 * pageSize); err != nil {
+		t.Fatal(err)
+	}
+	file := &directSizeFile{File: main}
+	log := New(Config{PageSize: pageSize})
+	log.fileKnownEmpty = true
+	if _, err := log.ReadRecords(); err != nil {
+		t.Fatal(err)
+	}
+	for _, step := range []struct {
+		head             page.ID
+		pages            int64
+		stats, truncates int
+	}{{2, 3, 1, 1}, {2, 3, 1, 1}, {3, 4, 2, 1}, {3, 4, 2, 1}, {2, 3, 3, 2}, {2, 3, 3, 2}} {
+		node := btree.NewLeafNode(step.head)
+		if err := log.WriteDirect(file, step.pages*pageSize, false, []NodeRecord{{Final: node}}, nil, nil); err != nil {
+			t.Fatal(err)
+		}
+		if file.stats != step.stats || file.truncates != step.truncates || log.directTargetSize != step.pages*pageSize {
+			t.Fatalf("target %d: stats=%d truncates=%d saved=%d", step.pages, file.stats, file.truncates, log.directTargetSize)
+		}
+	}
+	if info, err := main.Stat(); err != nil || info.Size() != 3*pageSize {
+		t.Fatalf("final size: %v, %v", info, err)
+	}
+	fresh := New(Config{PageSize: pageSize})
+	fresh.fileKnownEmpty = true
+	if _, err := fresh.ReadRecords(); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.WriteDirect(file, 3*pageSize, false, []NodeRecord{{Final: btree.NewLeafNode(2)}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if file.stats != 4 {
+		t.Fatal("new handle reused a previous file-size assumption")
+	}
+}
+
+func TestWALWriteDirectFailureDropsKnownSize(t *testing.T) {
+	const pageSize int64 = 128
+	for _, fault := range []string{"write", "stat", "truncate"} {
+		t.Run(fault, func(t *testing.T) {
+			main, err := os.CreateTemp(t.TempDir(), "main")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer main.Close()
+			file := &directSizeFile{File: main}
+			log := New(Config{PageSize: pageSize})
+			log.fileKnownEmpty = true
+			if _, err := log.ReadRecords(); err != nil {
+				t.Fatal(err)
+			}
+			if err := log.WriteDirect(file, 4*pageSize, false, []NodeRecord{{Final: btree.NewLeafNode(3)}}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			failure := errors.New("injected " + fault + " failure")
+			head, target := page.ID(3), 4*pageSize
+			switch fault {
+			case "write":
+				file.writeErr = failure
+			case "stat":
+				head, target, file.statErr = 4, 5*pageSize, failure
+			case "truncate":
+				head, target, file.truncateErr = 2, 3*pageSize, failure
+			}
+			if err := log.WriteDirect(file, target, false, []NodeRecord{{Final: btree.NewLeafNode(head)}}, nil, nil); !errors.Is(err, failure) {
+				t.Fatalf("fault error: %v", err)
+			}
+			if log.directTargetSize != 0 {
+				t.Fatal("failed direct write kept a size assumption")
+			}
+			file.writeErr, file.statErr, file.truncateErr = nil, nil, nil
+			before := file.stats
+			if err := log.WriteDirect(file, target, false, []NodeRecord{{Final: btree.NewLeafNode(head)}}, nil, nil); err != nil {
+				t.Fatal(err)
+			}
+			if file.stats != before+1 || log.directTargetSize != target {
+				t.Fatal("retry did not check the file size")
+			}
+		})
+	}
+}
+
+func TestWALWriteDirect(t *testing.T) {
+	const pageSize = 128
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	main, err := os.CreateTemp(t.TempDir(), "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer main.Close()
+	log := New(Config{File: file, PageSize: pageSize})
+	if _, err := log.ReadRecords(); err != nil {
+		t.Fatal(err)
+	}
+	node := btree.NewLeafNode(2)
+	value := bytes.Repeat([]byte("x"), 300)
+	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	node.SetStoragePageCount(btree.NodePageCount(node, pageSize))
+	size := int64(2+node.StoragePageCount()) * pageSize
+	if err := log.WriteDirect(main, size, true, []NodeRecord{{Final: node}}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(main.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := btree.DecodeNode(data[2*pageSize:], 2, pageSize, nil, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decoded.EntryCount() != 1 || !bytes.Equal(decoded.EntryAt(0).Value(), value) {
+		t.Fatal("direct node value differs")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 0 || len(log.overlay) != 0 || log.Stats().TotalBytesWritten != 0 || log.Stats().CommitCount != 0 {
+		t.Fatal("direct write used WAL")
+	}
+	overlap := btree.NewLeafNode(3)
+	if err := log.WriteDirect(main, size, true, []NodeRecord{{Final: node}, {Final: overlap}}, nil, nil); err == nil {
+		t.Fatal("overlapping spans accepted")
+	}
+	after, err := os.ReadFile(main.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(data, after) {
+		t.Fatal("invalid spans changed main file")
+	}
+	log.LoadCommittedRecord(WALRecord{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID()}, Payload: btree.EncodeWALNode(node)})
+	if err := log.WriteDirect(main, size, true, []NodeRecord{{Final: node}}, nil, nil); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("stale overlay accepted: %v", err)
+	}
+}
+
+type handledCheckpointWriter struct {
+	calls int
+	err   error
+}
+
+func (writer *handledCheckpointWriter) WriteNode(*btree.Node, int64, bool) (bool, error) {
+	writer.calls++
+	return true, writer.err
+}
+
+func TestWriteCheckpointRecordRuns_HandledNodesNeedNoBuffer(t *testing.T) {
+	const pageSize int64 = 4096
+	node := nativeLeaf(t, 50, 1<<20, pageSize)
+	node.CacheEncodedSize()
+	records := []CommittedPage{{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID()}, Node: node}}
+	writer := &handledCheckpointWriter{}
+	var reusable []byte
+	if allocations := testing.AllocsPerRun(3, func() {
+		if err := writeCheckpointRecordRuns(writer, records, pageSize, false, &reusable); err != nil {
+			t.Fatal(err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("handled node allocated encoding storage: %.0f allocations", allocations)
+	}
+	if reusable != nil {
+		t.Fatal("handled node grew retained encoding storage")
+	}
+	reusable = make([]byte, 0, 1)
+	before := &reusable[:1][0]
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, false, &reusable); err != nil || cap(reusable) != 1 || &reusable[:1][0] != before {
+		t.Fatal("handled node replaced an unused retained buffer")
+	}
+	writer.err = errors.New("node write failed")
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, false, &reusable); !errors.Is(err, writer.err) || cap(reusable) != 1 {
+		t.Fatal("node error allocated encoding storage or changed the error")
+	}
+	writer.err, writer.calls = nil, 0
+	overlap := append(slices.Clone(records), CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID() + 1}, Node: btree.NewLeafNode(node.PageID() + 1)})
+	if err := writeCheckpointRecordRuns(writer, overlap, pageSize, false, &reusable); err == nil || writer.calls != 0 {
+		t.Fatal("overlap reached the direct node writer")
+	}
+	invalid := slices.Clone(records)
+	invalid[0].Header.PageID++
+	if err := writeCheckpointRecordRuns(writer, invalid, pageSize, false, &reusable); err == nil || writer.calls != 0 {
+		t.Fatal("invalid node reached the direct node writer")
+	}
+}
+
+type mixedCheckpointWriter struct {
+	checkpointWriter
+	handled map[page.ID]bool
+	calls   []page.ID
+}
+
+func TestWriteCheckpointRecordRuns_MixedWritersKeepOrderAndReuseBuffer(t *testing.T) {
+	const pageSize int64 = 64
+	records := []CommittedPage{
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 0}, Payload: []byte("meta zero")},
+		{Header: RecordHeader{Type: RecordTypeMeta, PageID: 1}, Payload: []byte("meta one")},
+		{Header: RecordHeader{Type: RecordTypeAllocation, PageID: 2}, Payload: bytes.Repeat([]byte{2}, int(pageSize))},
+		{Header: RecordHeader{Type: RecordTypeNode, PageID: 3}, Node: btree.NewLeafNode(3)},
+		{Header: RecordHeader{Type: RecordTypeAllocation, PageID: 4}, Payload: bytes.Repeat([]byte{4}, int(pageSize))},
+		{Header: RecordHeader{Type: RecordTypeAllocation, PageID: 5}, Payload: bytes.Repeat([]byte{5}, int(pageSize))},
+		{Header: RecordHeader{Type: RecordTypeNode, PageID: 6}, Node: btree.NewLeafNode(6)},
+		{Header: RecordHeader{Type: RecordTypeNode, PageID: 7}, Node: btree.NewLeafNode(7)},
+		{Header: RecordHeader{Type: RecordTypeAllocation, PageID: 8}, Payload: bytes.Repeat([]byte{8}, int(pageSize))},
+	}
+	plain := &checkpointWriter{}
+	if err := writeCheckpointRecordRuns(plain, records, pageSize, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	var reusable []byte
+	var retained *byte
+	for range 2 {
+		writer := &mixedCheckpointWriter{handled: map[page.ID]bool{3: true, 7: true}}
+		if err := writeCheckpointRecordRuns(writer, records, pageSize, true, &reusable); err != nil {
+			t.Fatal(err)
+		}
+		if retained != nil && &reusable[:1][0] != retained {
+			t.Fatal("mixed writes replaced a reusable buffer")
+		}
+		retained = &reusable[:1][0]
+		var got []byte
+		for _, write := range writer.writes {
+			if write.offset != int64(len(got)) {
+				t.Fatalf("write offset %d does not follow %d", write.offset, len(got))
+			}
+			got = append(got, write.data...)
+		}
+		if len(writer.writes) != 1 || len(writer.writes[0].data) != len(records)*int(pageSize) || len(plain.writes) != 1 || !bytes.Equal(got, plain.writes[0].data) {
+			t.Fatal("mixed writers changed encoded bytes, order, or adjacent-page coalescing")
+		}
+	}
+}
+
+func (*handledCheckpointWriter) WriteAt([]byte, int64) (int, error) {
+	return 0, errors.New("handled node reached buffered writer")
+}
+
+func (writer *mixedCheckpointWriter) WriteNode(node *btree.Node, pageSize int64, checksums bool) (bool, error) {
+	writer.calls = append(writer.calls, node.PageID())
+	if !writer.handled[node.PageID()] {
+		return false, nil
+	}
+	data := make([]byte, int64(btree.NodePageCount(node, pageSize))*pageSize)
+	if err := btree.EncodeNodeInto(data, node, pageSize, checksums); err != nil {
+		return true, err
+	}
+	_, err := writer.WriteAt(data, int64(node.PageID())*pageSize)
+	return true, err
+}
+
+func TestWriteCheckpointRecordRuns_MixesDirectAndBufferedNodes(t *testing.T) {
+	const pageSize int64 = 64
+	var records []CommittedPage
+	for _, id := range []page.ID{3, 4, 5, 7} {
+		records = append(records, CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: id}, Node: btree.NewLeafNode(id)})
+	}
+	plain := &checkpointWriter{}
+	if err := writeCheckpointRecordRuns(plain, records, pageSize, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	writer := &mixedCheckpointWriter{handled: map[page.ID]bool{3: true, 5: true, 7: true}}
+	if err := writeCheckpointRecordRuns(writer, records, pageSize, true, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Node 4 starts a buffered run. Node 5 must stay in that run even though
+	// the direct writer could handle it. The gap before node 7 ends the run.
+	if !slices.Equal(writer.calls, []page.ID{3, 4, 7}) || len(writer.writes) != 3 {
+		t.Fatalf("direct calls=%v, file writes=%d", writer.calls, len(writer.writes))
+	}
+	images := func(writes []checkpointWrite) []byte {
+		image := make([]byte, 8*pageSize)
+		for _, write := range writes {
+			copy(image[write.offset:], write.data)
+		}
+		return image
+	}
+	if !bytes.Equal(images(writer.writes), images(plain.writes)) {
+		t.Fatal("direct and buffered output differ")
 	}
 }

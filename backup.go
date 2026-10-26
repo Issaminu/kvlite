@@ -21,7 +21,7 @@ import (
 // A memory database returns an error that matches [errors.ErrUnsupported] without file operations.
 // An empty path returns [ErrPathRequired]. An existing path or path+"-wal" returns an error that matches [os.ErrExist].
 //
-// Reads and writes can continue during the file copy.
+// SyncFull and SyncNormal can accept writes while the copy runs. SyncNone writes wait for the backup.
 // Checkpointing waits until all backups finish, so the WAL can grow during a backup.
 // Backup retains the committed WAL page images from its start until it returns.
 // Close waits for Backup to finish. Do not call Backup inside a transaction callback.
@@ -69,7 +69,7 @@ func (db *DB) backup(path string, copyFile func(io.Writer, io.Reader) (int64, er
 	}
 
 	db.operationMu.Lock()
-	if err := db.walWriteFailure(); err != nil {
+	if err := db.writeFailure(); err != nil {
 		db.operationMu.Unlock()
 		return err
 	}

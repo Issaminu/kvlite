@@ -22,6 +22,7 @@ type Tx struct {
 	metaDirty       bool
 	readOnly        bool
 	closed          bool
+	borrowedValue   bool               // A managed put retains its input only until the direct write ends.
 	bucket          *Bucket            // most transactions will only interact with a single bucket, we store it here instead of the [Tx.buckets] map attribute
 	buckets         map[string]*Bucket // created after a second top-level bucket so every caller in this tx observes the same in-memory state
 }
@@ -63,19 +64,18 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 //
 // If a write or sync of the write-ahead log fails during the commit, Update returns an error that matches [ErrWALWriteFailed]. The changes can be saved or lost, because the failed write can still reach storage. The DB then stops. Later transactions, reads, writes, and backups return the same error without calling fn. Close the DB and open it again. Then check the data before you repeat a change that is not safe to apply twice.
 //
+// With [SyncNone], Update waits for active backups before it calls fn. A direct main-file commit failure returns [ErrDatabaseWriteFailed] and stops later data operations. The file can be partly changed or corrupt. A process crash during a direct commit can also damage data from earlier successful transactions.
+//
 // Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
 //
 // For a file database in [SyncFull] mode, concurrent Update calls can share one WAL commit. KVLite still runs each callback alone. A later callback can read changes from an earlier successful callback in the same batch before those changes are durable. If the WAL commit fails, Update returns the commit error for each callback that changed data or ran after an earlier change in the batch. That error replaces an error that fn returned, because fn could read changes that the failed commit discards. Act outside the database only after Update returns nil. A memory database commits each callback without a log or file operations.
 //
 // Do not start another transaction from fn. Use the Tx passed to fn. If fn panics, Update discards its changes before the panic continues.
 func (db *DB) Update(transaction func(tx *Tx) error) error {
-	if err := db.beginOperation(); err != nil {
+	if err := db.beginWriteOperation(); err != nil {
 		return err
 	}
 	defer db.endOperation()
-	if db.options.ReadOnly {
-		return ErrDatabaseReadOnly
-	}
 	if db.memoryNodes == nil && db.options.Synchronous == SyncFull {
 		return db.submitDurableUpdate(transaction)
 	}
@@ -84,8 +84,20 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	return db.updateDirect(transaction)
 }
 
+// prepareDirectWrite waits for backups in SyncNone and checks prior write errors.
+// The caller must hold operationMu. The lock is released while a backup finishes.
+func (db *DB) prepareDirectWrite() error {
+	for db.options.Synchronous == SyncNone && db.activeBackups > 0 {
+		done := db.backupsDone
+		db.operationMu.Unlock()
+		<-done
+		db.operationMu.Lock()
+	}
+	return db.writeFailure()
+}
+
 func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
-	if err := db.walWriteFailure(); err != nil {
+	if err := db.prepareDirectWrite(); err != nil {
 		return err
 	}
 	tx := newTx(db, false)
@@ -96,6 +108,9 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	}
 	if err := tx.prepareCommit(); err != nil {
 		return err
+	}
+	if tx.borrowedValue && tx.rootNode.HasBorrowedValues() {
+		return page.ErrInvalid
 	}
 	needsCheckpoint := false
 	var nodes []wal.NodeRecord
@@ -109,7 +124,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		}
 	} else {
 		var retired map[page.ID]struct{}
-		if tx.allocationOwned {
+		if tx.allocationOwned && db.options.Synchronous != SyncNone {
 			retired = tx.allocation.walRetiredPages()
 		}
 		var encodedMeta []byte
@@ -122,7 +137,11 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 			return nil
 		}
 		var err error
-		needsCheckpoint, err = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
+		if db.options.Synchronous == SyncNone {
+			err = db.writeDirectPages(tx.meta, nodes, allocationPages, encodedMeta, tx.meta.DataPageChecksums())
+		} else {
+			needsCheckpoint, err = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
+		}
 		if err != nil {
 			return err
 		}
@@ -142,6 +161,10 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	}
 	// Page-ID order makes cache eviction, and so the later file reads, repeatable.
 	for _, node := range nodes {
+		if tx.borrowedValue && node.Final.HasBorrowedValues() {
+			db.invalidateWriteNode(node.Final.PageID())
+			continue
+		}
 		db.cacheWriteNode(node.Final)
 	}
 	if needsCheckpoint {
@@ -211,7 +234,7 @@ func makeWALCommitData(dirty map[page.ID]dirtyNode, meta *page.Meta, metaDirty b
 //
 // Several View callbacks can run at the same time. A View callback waits while [DB.Update] runs. Update waits for all active View callbacks to return.
 //
-// Do not start another transaction from fn. Use the Tx passed to fn. View returns the error from fn. If fn panics, View closes the transaction before the panic continues. After [ErrWALWriteFailed], View returns that error without calling fn.
+// Do not start another transaction from fn. Use the Tx passed to fn. View returns the error from fn. If fn panics, View closes the transaction before the panic continues. After [ErrWALWriteFailed] or [ErrDatabaseWriteFailed], View returns that error without calling fn.
 func (db *DB) View(transaction func(tx *Tx) error) error {
 	if err := db.beginOperation(); err != nil {
 		return err
@@ -221,7 +244,7 @@ func (db *DB) View(transaction func(tx *Tx) error) error {
 	db.operationMu.RLock()
 	defer db.operationMu.RUnlock()
 
-	if err := db.walWriteFailure(); err != nil {
+	if err := db.writeFailure(); err != nil {
 		return err
 	}
 	tx := newTx(db, true)

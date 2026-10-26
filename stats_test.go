@@ -49,7 +49,7 @@ func readStats(t *testing.T, db *DB) Stats {
 }
 
 func TestStatsStorageAndWriteCounters(t *testing.T) {
-	db := openStatsDB(t, &Options{Synchronous: SyncNone})
+	db := openStatsDB(t, &Options{Synchronous: SyncNormal})
 	initial := readStats(t, db)
 	if initial.WALCommitCount != 0 || initial.WALBytesWritten != 0 || initial.CheckpointFailureCount != 0 || initial.LastCheckpointError != nil {
 		t.Fatalf("initial counters: %+v", initial)
@@ -269,7 +269,7 @@ func TestStatsSubKeepsCurrentState(t *testing.T) {
 }
 
 func TestStatsAutomaticCheckpointFailure(t *testing.T) {
-	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+	for _, mode := range []Sync{SyncNormal, SyncFull} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			db := openStatsDB(t, &Options{Synchronous: mode, CheckpointThresholdBytes: 1})
 			createBucket(t, db, []byte("data"))
@@ -548,7 +548,7 @@ func TestBucketStatsDeletedHandle(t *testing.T) {
 }
 
 func TestStatsReadOnlyRecoveredWAL(t *testing.T) {
-	source := openStatsDB(t, &Options{Synchronous: SyncNone})
+	source := openStatsDB(t, &Options{Synchronous: SyncNormal})
 	createBucket(t, source, []byte("data"))
 	value := bytes.Repeat([]byte("v"), 3*int(source.meta.PageSize()))
 	if err := source.Put([]byte("data"), []byte("key"), value); err != nil {

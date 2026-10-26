@@ -320,7 +320,7 @@ func TestRecovery_IncompleteWALTail(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	committed, err := os.ReadFile(path + "-wal")
+	committed, err := readWALPrefix(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,14 +328,14 @@ func TestRecovery_IncompleteWALTail(t *testing.T) {
 	if err := db.Put(testBucketName, []byte("pending"), pendingValue); err != nil {
 		t.Fatal(err)
 	}
-	complete, err := os.ReadFile(path + "-wal")
+	complete, err := readWALPrefix(db)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Put(testBucketName, []byte("later"), []byte("must be discarded")); err != nil {
 		t.Fatal(err)
 	}
-	following, err := os.ReadFile(path + "-wal")
+	following, err := readWALPrefix(db)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -849,7 +849,7 @@ func TestRecoveryRejectsPatchWithoutCompleteImage(t *testing.T) {
 func TestMixedPatchChainRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,7 +871,7 @@ func TestMixedPatchChainRecoversInReadOnlyAndWritableModes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -938,7 +938,7 @@ func TestMixedPatchChainRecoversInReadOnlyAndWritableModes(t *testing.T) {
 		}
 	}
 	for _, readOnly := range []bool{true, false} {
-		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNormal})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -952,7 +952,7 @@ func TestMixedPatchChainRecoversInReadOnlyAndWritableModes(t *testing.T) {
 func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -978,7 +978,7 @@ func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1051,7 +1051,7 @@ func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 			t.Fatalf("deleted child bucket: got %v, want ErrBucketNotFound", err)
 		}
 	}
-	readOnly, err := Open(path, 0600, &Options{ReadOnly: true, Synchronous: SyncNone})
+	readOnly, err := Open(path, 0600, &Options{ReadOnly: true, Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1059,7 +1059,7 @@ func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	if err := readOnly.Close(); err != nil {
 		t.Fatal(err)
 	}
-	writable, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	writable, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1072,7 +1072,7 @@ func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1093,7 +1093,7 @@ func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1123,7 +1123,7 @@ func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1139,7 +1139,7 @@ func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 func TestEntryPatchWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1160,7 +1160,7 @@ func TestEntryPatchWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1201,7 +1201,7 @@ func TestEntryPatchWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 	if err := db.file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	recovered, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1320,7 +1320,7 @@ func closeWithoutCheckpoint(t *testing.T, db *DB) {
 func TestAllocationBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1328,7 +1328,7 @@ func TestAllocationBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1353,7 +1353,7 @@ func TestAllocationBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	allocated := db.allocation.allocatedPageCount()
 	closeWithoutCheckpoint(t, db)
 	for _, readOnly := range []bool{true, false} {
-		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNormal})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1375,7 +1375,7 @@ func TestAllocationBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
 func TestContinuedNodeBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	name := []byte("bucket")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1387,7 +1387,7 @@ func TestContinuedNodeBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) 
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: 1 << 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1414,7 +1414,7 @@ func TestContinuedNodeBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) 
 	}
 	closeWithoutCheckpoint(t, db)
 	for _, readOnly := range []bool{true, false} {
-		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNone})
+		recovered, err := Open(path, 0600, &Options{ReadOnly: readOnly, Synchronous: SyncNormal})
 		if err != nil {
 			t.Fatal(err)
 		}

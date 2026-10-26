@@ -256,7 +256,7 @@ func LookupCheckedNodeSpan(data, key []byte, includeKey, checksums bool) (entry 
 		child, err = lookupBranchBody(image, count, key)
 		return
 	}
-	found, err = lookupLeafBody(image, count, key, includeKey, &entry)
+	_, found, err = lookupLeafBody(image, count, key, includeKey, &entry)
 	return
 }
 
@@ -277,7 +277,7 @@ func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage fu
 			child, e := lookupBranchBody(image, count, key)
 			return false, child, e
 		}
-		found, e := lookupLeafBody(image, count, key, includeKey, entry)
+		_, found, e := lookupLeafBody(image, count, key, includeKey, entry)
 		return found, 0, e
 	}
 	image, h, err := nodeImage(data, id, pageSize, readPage, forWAL, checksums)
@@ -288,7 +288,7 @@ func lookupNode(data []byte, id page.ID, key []byte, pageSize int64, readPage fu
 		child, e := lookupBranchBody(image, h.EntryCount, key)
 		return false, child, e
 	}
-	found, e := lookupLeafBody(image, h.EntryCount, key, includeKey, entry)
+	_, found, e := lookupLeafBody(image, h.EntryCount, key, includeKey, entry)
 	return found, 0, e
 }
 
@@ -349,6 +349,31 @@ func putNodeHeader(data []byte, node *Node) {
 	binary.LittleEndian.PutUint64(data[2:10], uint64(node.PageID()))
 	binary.LittleEndian.PutUint32(data[10:14], uint32(node.EntryCount()))
 	binary.LittleEndian.PutUint32(data[18:22], uint32(node.EncodedSize()-NodeHeaderSize))
+}
+
+// EncodeNodeInto writes node into a complete padded span in dst.
+// The destination must have exactly NodePageCount(node, pageSize)*pageSize bytes.
+// It must not overlap the node's key or value bytes. The function does not retain dst.
+// The node and its stored page count remain unchanged.
+func EncodeNodeInto(dst []byte, node *Node, pageSize int64, checksums bool) error {
+	if node == nil || pageSize < NodeHeaderSize || page.IsMetaID(node.PageID()) {
+		return ErrInvalid
+	}
+	size := node.EncodedSize()
+	if size < NodeHeaderSize || size > MaxNodeImageSize {
+		return ErrInvalid
+	}
+	count := NodePageCount(node, pageSize)
+	if count <= 0 || page.ID(count)-1 > ^page.ID(0)-node.PageID() ||
+		int64(len(dst))/pageSize != int64(count) || int64(len(dst))%pageSize != 0 {
+		return ErrInvalid
+	}
+	encodeWALNode(dst[:size], node)
+	clear(dst[size:])
+	if checksums {
+		binary.LittleEndian.PutUint32(dst[nodeChecksumOffset:nodeChecksumOffset+encodedUint32Size], pageChecksum(dst, int64(len(dst)), nodeChecksumOffset))
+	}
+	return nil
 }
 
 // EncodeNode returns a compact logical image. Its checksum covers the complete padded span.

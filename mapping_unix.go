@@ -8,8 +8,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func systemMapMainFile(file *os.File, length int) ([]byte, error) {
-	return unix.Mmap(int(file.Fd()), 0, length, unix.PROT_READ, unix.MAP_SHARED)
+func systemMapMainFile(file *os.File, length int, writable bool) ([]byte, error) {
+	protection := unix.PROT_READ
+	if writable {
+		protection |= unix.PROT_WRITE
+	}
+	return unix.Mmap(int(file.Fd()), 0, length, protection, unix.MAP_SHARED)
 }
 
 func systemUnmapMainFile(data []byte) error {
@@ -18,3 +22,6 @@ func systemUnmapMainFile(data []byte) error {
 
 // These systems have a unified buffer cache, so a shared mapping of a file shows later writes to that file.
 const systemMappingFollowsWrites = true
+
+// Shared mappings on these systems can receive direct writes.
+const systemMappingAllowsWrites = true

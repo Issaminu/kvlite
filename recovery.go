@@ -80,6 +80,9 @@ func (db *DB) readOrCreateWal(fsys fileio.FS, path string, pageSize int64, syncD
 		}
 	}
 
+	if !db.options.ReadOnly && db.options.Synchronous != SyncNone {
+		walFile = mapWALWrites(walFile)
+	}
 	log := wal.New(wal.Config{
 		Path:                     walPath,
 		File:                     walFile,

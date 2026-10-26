@@ -150,11 +150,12 @@ func checkLeafBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) e
 
 // lookupLeafBody finds key in a contiguous leaf image with a binary search.
 // It reads only the descriptors and keys on the search path.
+// The index is the position of the key, or where a missing key would be inserted.
 // A found entry is written into entry, which must be zero (see lookupNode). Its key and value borrow image. Set includeKey to false to omit the key.
-func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool, entry *Entry) (bool, error) {
+func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool, entry *Entry) (int, bool, error) {
 	dataStart, err := leafDataStart(uint64(len(image)), entryCount)
 	if err != nil {
-		return false, err
+		return 0, false, err
 	}
 	count, imageSize := int(entryCount), uint64(len(image))
 	low, high := 0, count
@@ -162,7 +163,7 @@ func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool
 		middle := (low + high) / 2
 		flags, start, keyEnd, end := leafSpan(image, middle)
 		if !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) {
-			return false, entryError(middle)
+			return 0, false, entryError(middle)
 		}
 		switch comparison := bytes.Compare(image[start:keyEnd], key); {
 		case comparison < 0:
@@ -174,16 +175,16 @@ func lookupLeafBody(image []byte, entryCount uint32, key []byte, includeKey bool
 			if includeKey {
 				entry.key = image[start:keyEnd:keyEnd]
 			}
-			return true, nil
+			return middle, true, nil
 		}
 	}
 	// A missing key also checks the descriptor at its sorted position.
 	if low < count {
 		if flags, start, keyEnd, end := leafSpan(image, low); !validLeaf(flags, start, keyEnd, end, dataStart, imageSize) {
-			return false, entryError(low)
+			return 0, false, entryError(low)
 		}
 	}
-	return false, nil
+	return low, false, nil
 }
 
 // mappedLeafImage checks the header of a mapped leaf for an ordered scan and returns one contiguous image of the leaf.
@@ -328,4 +329,152 @@ func VisitCheckedLeafReverse(data []byte, visit func(uint32, []byte, []byte) err
 		return err
 	}
 	return visitLeafReverse(image, visit)
+}
+
+// ReplaceMappedLeaf prepares a replacement for a one-entry, multi-page leaf.
+// It validates the old image without decoding or copying its value.
+// The returned node owns the new key and value and retains the old allocation
+// count until commit preparation. It does not change data.
+// With skipIdentical, an unchanged entry returns nil, true, nil.
+func ReplaceMappedLeaf(data []byte, id page.ID, pageSize int64, checksums bool, entry Entry, skipIdentical bool) (*Node, bool, error) {
+	if len(data) < NodeHeaderSize || mappedNodeType(data) != NodeTypeLeaf || binary.LittleEndian.Uint32(data[10:14]) != 1 {
+		return nil, false, nil
+	}
+	if pageSize >= NodeHeaderSize && uint64(binary.LittleEndian.Uint32(data[18:22]))+NodeHeaderSize <= uint64(pageSize) {
+		return nil, false, nil
+	}
+	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := checkLeafBody(image, h, true, nil); err != nil {
+		return nil, false, err
+	}
+	flags, start, keyEnd, end := leafSpan(image, 0)
+	if !bytes.Equal(image[start:keyEnd], entry.key) {
+		return nil, false, nil
+	}
+	if flags&BucketLeafFlag != entry.flags&BucketLeafFlag {
+		return nil, false, ErrIncompatibleValue
+	}
+	if skipIdentical && flags == entry.flags && bytes.Equal(image[keyEnd:end], entry.value) {
+		return nil, true, nil
+	}
+	node := NewLeafNode(id)
+	if err := node.InsertEntry(entry); err != nil {
+		return nil, false, err
+	}
+	node.SetStoragePageCount((len(image) + int(pageSize) - 1) / int(pageSize))
+	return node, true, nil
+}
+
+// MappedLeafNeighbor checks whether a new key can use a separate leaf beside data.
+// A neighbor is adjacent in key order, not necessarily in the file.
+// data must hold a complete one-entry leaf with a multi-page plain value.
+// The old leaf stays unchanged. A left neighbor needs an owned copy of the old
+// key as its separator. A right neighbor uses its own new key instead.
+func MappedLeafNeighbor(data []byte, id page.ID, pageSize int64, checksums bool, key []byte) (separator []byte, before, eligible bool, err error) {
+	if err := validateLookupKey(key); err != nil {
+		return nil, false, false, err
+	}
+	if len(data) < NodeHeaderSize || mappedNodeType(data) != NodeTypeLeaf || binary.LittleEndian.Uint32(data[10:14]) != 1 {
+		return nil, false, false, nil
+	}
+	if pageSize >= NodeHeaderSize && uint64(binary.LittleEndian.Uint32(data[18:22]))+NodeHeaderSize <= uint64(pageSize) {
+		return nil, false, false, nil
+	}
+	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
+	if err != nil {
+		return nil, false, false, err
+	}
+	if err := checkLeafBody(image, h, true, nil); err != nil {
+		return nil, false, false, err
+	}
+	flags, start, keyEnd, end := leafSpan(image, 0)
+	order := bytes.Compare(key, image[start:keyEnd])
+	if flags != 0 || end-keyEnd <= uint64(pageSize) || order == 0 {
+		return nil, false, false, nil
+	}
+	if order < 0 {
+		return bytes.Clone(image[start:keyEnd]), true, true, nil
+	}
+	return nil, false, true, nil
+}
+
+// PutMappedEntry changes a plain entry without changing the first key or page span.
+// It replaces a same-size value or inserts a small entry into a one-page leaf.
+// data must be writable and excluded from readers. A branch returns its next child.
+// Unsupported leaves return false without changes. All checks precede the write.
+// Input bytes can overlap data.
+func PutMappedEntry(data []byte, id page.ID, pageSize int64, checksums bool, key, value []byte) (handled bool, child page.ID, err error) {
+	if err := validateLookupKey(key); err != nil {
+		return false, 0, err
+	}
+	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
+	if err != nil {
+		return false, 0, err
+	}
+	if h.Type == NodeTypeBranch {
+		child, err := lookupBranchBody(image, h.EntryCount, key)
+		return false, child, err
+	}
+	if int64(len(data)) > pageSize && (h.EntryCount != 1 || int64(len(value)) <= pageSize) {
+		return false, 0, nil
+	}
+	if err := checkLeafBody(image, h, true, nil); err != nil {
+		return false, 0, err
+	}
+	var entry Entry
+	index, found, err := lookupLeafBody(image, h.EntryCount, key, false, &entry)
+	if err != nil {
+		return false, 0, err
+	}
+	if found {
+		if entry.flags != 0 || len(value) != len(entry.value) {
+			return false, 0, nil
+		}
+		if bytes.Equal(entry.value, value) {
+			return true, 0, nil
+		}
+		copy(entry.value, value)
+	} else {
+		// Keep borrowed input bytes intact while the packed body moves.
+		var input [256]byte
+		added := leafEntryDescriptorSize + len(key) + len(value)
+		if index == 0 || int64(len(data)) != pageSize || len(key) > len(input) || len(value) > len(input)-len(key) || added > len(data)-len(image) {
+			return false, 0, nil
+		}
+		keySize, valueSize := len(key), len(value)
+		copy(input[:], key)
+		copy(input[keySize:], value)
+		count := int(h.EntryCount)
+		dataStart := NodeHeaderSize + count*leafEntryDescriptorSize
+		position := len(image)
+		if index < count {
+			_, start, _, _ := leafSpan(image, index)
+			position = int(start)
+		}
+		newSize := len(image) + added
+		copy(data[position+added:newSize], data[position:len(image)])
+		copy(data[dataStart+leafEntryDescriptorSize:position+leafEntryDescriptorSize], data[dataStart:position])
+		copy(data[NodeHeaderSize+(index+1)*leafEntryDescriptorSize:dataStart+leafEntryDescriptorSize], data[NodeHeaderSize+index*leafEntryDescriptorSize:dataStart])
+		for slot := 0; slot <= count; slot++ {
+			at := NodeHeaderSize + slot*leafEntryDescriptorSize
+			if slot == index {
+				putLeafDescriptor(data[at:], &Entry{key: input[:keySize], value: input[keySize : keySize+valueSize]}, position+leafEntryDescriptorSize)
+				continue
+			}
+			offset := int(binary.LittleEndian.Uint32(data[at+4:at+8])) + leafEntryDescriptorSize
+			if slot > index {
+				offset += keySize + valueSize
+			}
+			binary.LittleEndian.PutUint32(data[at+4:at+8], uint32(offset))
+		}
+		position += leafEntryDescriptorSize
+		copy(data[position:], input[:keySize+valueSize])
+		binary.LittleEndian.PutUint32(data[10:14], h.EntryCount+1)
+		binary.LittleEndian.PutUint32(data[18:22], uint32(newSize-NodeHeaderSize))
+	}
+	// The header length and page ID were checked above and remain unchanged.
+	return true, 0, VerifyNodeIDAndSetChecksum(data, id, checksums)
 }

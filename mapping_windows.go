@@ -20,7 +20,7 @@ import (
 // This function closes the mapping handle before it returns.
 // The view then holds the last reference.
 // [systemUnmapMainFile] releases that reference.
-func systemMapMainFile(file *os.File, length int) ([]byte, error) {
+func systemMapMainFile(file *os.File, length int, _ bool) ([]byte, error) {
 	if length <= 0 {
 		return nil, os.ErrInvalid
 	}
@@ -73,3 +73,6 @@ func systemUnmapMainFile(data []byte) error {
 
 // Windows does not guarantee that file writes update an existing mapped view.
 const systemMappingFollowsWrites = false
+
+// Direct writes use the file on Windows.
+const systemMappingAllowsWrites = false

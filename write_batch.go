@@ -134,7 +134,7 @@ func (db *DB) drainWriteRequests(requests []*writeRequest) []*writeRequest {
 
 // executeWriteBatch runs callbacks in request order and commits their combined successful changes as one WAL transaction. The caller must hold operationMu.
 func (db *DB) executeWriteBatch(requests []*writeRequest) {
-	if err := db.walWriteFailure(); err != nil {
+	if err := db.writeFailure(); err != nil {
 		// Requests that waited behind a failed commit must not run on the stopped handle.
 		for _, request := range requests {
 			request.result <- writeResult{err: err}

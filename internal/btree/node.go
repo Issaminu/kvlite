@@ -173,14 +173,33 @@ const (
 )
 
 type Entry struct {
-	flags      uint32
-	valueOwned bool
-	key        []byte
-	value      []byte
+	flags       uint32
+	valueOwned  bool
+	borrowValue bool
+	key         []byte
+	value       []byte
 }
 
 func NewEntry(flags uint32, key, value []byte) Entry {
 	return Entry{flags: flags, key: key, value: value}
+}
+
+// NewEntryBorrowingValue makes an entry that keeps value without a copy on insertion.
+// Insertion still copies the key.
+// The caller must keep value unchanged until the node is written.
+// A node with such a value must not enter committed memory state.
+func NewEntryBorrowingValue(key, value []byte) Entry {
+	return Entry{key: key, value: value, borrowValue: true}
+}
+
+// HasBorrowedValues reports whether a node retains values owned by its caller.
+func (n *Node) HasBorrowedValues() bool {
+	for _, entry := range n.entries {
+		if entry.borrowValue {
+			return true
+		}
+	}
+	return false
 }
 
 func (e Entry) Flags() uint32 {

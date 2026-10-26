@@ -230,7 +230,7 @@ func TestDataPageChecksums_ControlPagesStayProtected(t *testing.T) {
 		for _, target := range []string{"metadata", "allocation", "WAL"} {
 			t.Run(fmt.Sprintf("enabled=%t/%s", enabled, target), func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "database")
-				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: enabled, CheckpointThresholdBytes: 1 << 30})
+				db, err := Open(path, 0600, &Options{Synchronous: SyncNormal, DataPageChecksums: enabled, CheckpointThresholdBytes: 1 << 30})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -295,7 +295,7 @@ func TestDataPageChecksums_RecoveryUsesWALMetadata(t *testing.T) {
 		for _, readOnly := range []bool{false, true} {
 			t.Run(fmt.Sprintf("enabled=%t/readOnly=%t", enabled, readOnly), func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "database")
-				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: enabled, CheckpointThresholdBytes: 1 << 30})
+				db, err := Open(path, 0600, &Options{Synchronous: SyncNormal, DataPageChecksums: enabled, CheckpointThresholdBytes: 1 << 30})
 				if err != nil {
 					t.Fatal(err)
 				}

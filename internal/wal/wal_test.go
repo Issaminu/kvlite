@@ -1591,3 +1591,46 @@ func TestWALCommittedPageCountIncludesNodeTails(t *testing.T) {
 	}
 	check(7)
 }
+
+func TestReadRecordsAppendsBeforeUnusedFileSpace(t *testing.T) {
+	file, err := os.CreateTemp(t.TempDir(), "wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	log := New(Config{File: file, PageSize: 64})
+	if _, err = log.Commit(nil, nil, []byte("first"), nil); err != nil {
+		t.Fatal(err)
+	}
+	prefix := log.appendOffset
+	if err = file.Truncate(16 << 20); err != nil {
+		t.Fatal(err)
+	}
+	records, err := log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 3 || log.appendOffset != prefix {
+		t.Fatalf("records=%d, appendOffset=%d, want %d", len(records), log.appendOffset, prefix)
+	}
+	if _, err = log.Commit(nil, nil, []byte("second"), nil); err != nil {
+		t.Fatal(err)
+	}
+	records, err = log.ReadRecords()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 6 {
+		t.Fatalf("recovered %d records, want both transactions", len(records))
+	}
+	if string(records[3].Payload) != "second" {
+		t.Fatal("later transaction was lost behind unused file space")
+	}
+	info, err := file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Size() != 16<<20 {
+		t.Fatalf("read/append changed allocated length: %d", info.Size())
+	}
+}

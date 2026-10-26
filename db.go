@@ -25,7 +25,7 @@ const (
 )
 
 type writeNodeCacheEntry struct {
-	node *btree.Node
+	node *btree.Node // Nil means the decoded image was invalidated.
 	// referenced is the CLOCK bit. Read-only lookups set it while they hold only the read lock of writeNodesMu, so it is atomic.
 	referenced atomic.Bool
 }
@@ -43,6 +43,10 @@ type DB struct {
 	writeNodeSlots    []page.ID
 	nextWriteNodeSlot int
 	mappedFile        []byte
+	mappedBacking     []byte // full writable mapping; mappedFile exposes only the real file length
+	mappedWritable    bool
+	directWriter      directMappedFile
+	mainWriteFailure  error // set after a failed direct main-file write; blocks later data operations
 	options           *Options
 	wal               *wal.WAL
 	operationMu       sync.RWMutex
@@ -76,14 +80,30 @@ func (db *DB) beginOperation() error {
 	return nil
 }
 
+// beginWriteOperation starts an operation and rejects read-only handles.
+// A successful caller must call endOperation.
+func (db *DB) beginWriteOperation() error {
+	if err := db.beginOperation(); err != nil {
+		return err
+	}
+	if db.options.ReadOnly {
+		db.endOperation()
+		return ErrDatabaseReadOnly
+	}
+	return nil
+}
+
 func (db *DB) endOperation() {
 	db.activeOperations.Done()
 }
 
-// walWriteFailure returns the [ErrWALWriteFailed] error that stopped this handle, or nil.
-// After that failure, memory no longer matches what the files can recover, so data operations must not continue.
+// writeFailure returns the WAL or main-file error that stopped this handle, or nil.
+// After that failure, data operations must stop because the saved state is unknown.
 // The caller must hold operationMu.
-func (db *DB) walWriteFailure() error {
+func (db *DB) writeFailure() error {
+	if db.mainWriteFailure != nil {
+		return db.mainWriteFailure
+	}
 	if db.wal == nil {
 		return nil
 	}
@@ -93,7 +113,8 @@ func (db *DB) walWriteFailure() error {
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions.
-// Open commits the pages of a new database to the write-ahead log and then checkpoints them, so a crash during the creation leaves an empty file or a database that the next Open recovers.
+// With [SyncFull] or [SyncNormal], Open commits a new database to the WAL and checkpoints it. A crash during creation leaves an empty file or a database that the next Open recovers.
+// With [SyncNone], Open writes the new database directly. A process crash during creation can leave a corrupt file. Existing WAL data is recovered before direct writes start.
 // A read-only Open requires an existing database and does not create either file. An empty file returns an error that matches [os.ErrNotExist].
 // With [SyncFull] or [SyncNormal], the first write-ahead log sync of a writable handle also syncs the parent directory.
 // That sync runs before a commit or a checkpoint depends on the file names, so a handle that does not write does not sync the directory.
@@ -285,10 +306,9 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	return db, nil
 }
 
-// initializeNewDatabase commits the pages of an empty database to the WAL, and then checkpoints them into the main file.
-// The commit marker makes the creation atomic.
-// A crash before it leaves an empty main file, and the next Open creates the database again.
-// A crash after it leaves a committed WAL, and recovery copies its pages into the main file again.
+// initializeNewDatabase writes the metadata, bitmap, and root of an empty database.
+// SyncFull and SyncNormal commit them to the WAL before the main file.
+// SyncNone writes the main file directly and can leave partial data after a crash.
 func (db *DB) initializeNewDatabase() error {
 	allocation := newAllocationBitmap(db.meta.PageSize())
 	db.rootNode = btree.NewLeafNode(db.meta.Root())
@@ -297,6 +317,16 @@ func (db *DB) initializeNewDatabase() error {
 	pages := make([]wal.AllocationRecord, len(allocation.segments))
 	for i := range allocation.segments {
 		pages[i] = wal.AllocationRecord{PageID: allocation.segmentPageID(i), Payload: allocation.encodeSegment(i)}
+	}
+	if db.options.Synchronous == SyncNone {
+		size, err := db.logicalFileSize()
+		if err != nil {
+			return err
+		}
+		if err := db.wal.WriteDirect(db.file, size, db.meta.DataPageChecksums(), nodes, pages, page.EncodeMeta(db.meta)); err != nil {
+			return fmt.Errorf("%w: initialize database: %w", ErrDatabaseWriteFailed, err)
+		}
+		return nil
 	}
 	if _, err := db.wal.Commit(nodes, pages, page.EncodeMeta(db.meta), nil); err != nil {
 		return fmt.Errorf("commit new database: %w", err)
@@ -353,7 +383,7 @@ func (db *DB) failOpen(err error) (*DB, error) {
 	return nil, err
 }
 
-// Close releases the database resources. For a writable file database, it first checkpoints committed data into the database file and removes the write-ahead log. A read-only file database only closes its files, and so does a database that returned [ErrWALWriteFailed]: the next Open recovers its write-ahead log. A memory database discards all data without file operations.
+// Close releases the database resources. For a writable file database in SyncFull or SyncNormal, it first checkpoints committed data and removes the WAL. SyncNone changes the main file during each write and adds no storage synchronization at close. After [ErrWALWriteFailed] or [ErrDatabaseWriteFailed], Close only releases resources. A memory database discards all data without file operations.
 //
 // Close prevents new data operations and waits for active operations to finish. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, the database remains open so the caller can retry, but some cleanup can remain incomplete.
 func (db *DB) Close() error {
@@ -392,9 +422,9 @@ func (db *DB) close() error {
 		return nil
 	}
 	// A read-only handle only closes its files.
-	// After a failed WAL write or sync, the WAL file content is unknown, so a checkpoint could write main pages that no WAL can repair.
-	// Then Close keeps the WAL, and the next Open recovers what storage holds.
-	if db.options.ReadOnly || db.walWriteFailure() != nil {
+	// After a failed WAL or direct main-file write, the saved state is unknown, so Close must not write more pages.
+	// A retained WAL can be recovered on the next Open. A direct write has no repair log.
+	if db.options.ReadOnly || db.writeFailure() != nil {
 		if err := db.unmapMainFile(); err != nil {
 			return err
 		}
@@ -444,13 +474,74 @@ func (db *DB) Path() string {
 // empty value. If key names a nested bucket, Put returns
 // [ErrIncompatibleValue] instead of replacing the bucket.
 func (db *DB) Put(bucketName, key, value []byte) error {
-	return db.Update(func(tx *Tx) error {
-		bucket, err := tx.Bucket(bucketName)
-		if err != nil {
+	if db.options != nil && db.options.Synchronous == SyncNone && db.memoryNodes == nil {
+		return db.putMappedValue(bucketName, key, value)
+	}
+	return db.Update(func(tx *Tx) error { return tx.putManaged(bucketName, key, value) })
+}
+
+// putMappedValue keeps the normal operation lifetime, lock, and backup exclusion.
+// Only SyncNone uses this path. Layout changes use a private transaction.
+func (db *DB) putMappedValue(bucketName, key, value []byte) error {
+	if err := db.beginWriteOperation(); err != nil {
+		return err
+	}
+	defer db.endOperation()
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	if err := db.prepareDirectWrite(); err != nil {
+		return err
+	}
+	if _, osFile := db.file.(*os.File); osFile && db.mappedWritable && len(key) != 0 && len(key) <= MaxKeySize && len(value) <= MaxValueSize && db.wal.Stats().CommittedRecordCount == 0 {
+		if handled, err := db.putMappedEntry(bucketName, key, value); handled || err != nil {
 			return err
 		}
-		return bucket.Put(key, value)
-	})
+	}
+	return db.updateDirect(func(tx *Tx) error { return tx.putManaged(bucketName, key, value) })
+}
+
+// putMappedEntry changes one entry without changing parent separators or node spans.
+// The caller excludes readers and active backups with the operation write lock.
+func (db *DB) putMappedEntry(bucketName, key, value []byte) (bool, error) {
+	if len(bucketName) == 0 {
+		return true, ErrBucketNameRequired
+	}
+	bucketEntry, found, err := db.findCommittedEntry(db.meta.Root(), bucketName)
+	if err != nil {
+		return true, err
+	}
+	if !found {
+		return true, ErrBucketNotFound
+	}
+	if bucketEntry.ValueIsOwned() {
+		return false, nil
+	}
+	id, err := decodeBucketRootPageID(bucketEntry)
+	if err != nil {
+		return true, err
+	}
+	for {
+		data, err := db.readMainNodePage(id)
+		if err != nil {
+			return true, err
+		}
+		offset := int64(id) * db.meta.PageSize()
+		if offset > int64(len(db.mappedFile)) || int64(len(data)) > int64(len(db.mappedFile))-offset || &data[0] != &db.mappedFile[offset] {
+			return false, nil
+		}
+		handled, child, err := btree.PutMappedEntry(data, id, db.meta.PageSize(), db.meta.DataPageChecksums(), key, value)
+		if err != nil {
+			return true, err
+		}
+		if child != 0 {
+			id = child
+			continue
+		}
+		if handled {
+			db.invalidateWriteNode(id)
+		}
+		return handled, nil
+	}
 }
 
 // Delete removes one plain key from an existing top-level bucket in one write transaction. Other database operations see the change after this method returns successfully.
@@ -495,7 +586,7 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 	db.operationMu.RLock()
 	defer db.operationMu.RUnlock()
 
-	if err := db.walWriteFailure(); err != nil {
+	if err := db.writeFailure(); err != nil {
 		return nil, err
 	}
 	if len(bucketName) == 0 {
@@ -669,7 +760,7 @@ func (db *DB) readOnlyNode(pageID page.ID) (*btree.Node, error) {
 		return db.wal.CommittedPageToNode(&record)
 	}
 	db.writeNodesMu.RLock()
-	if entry, ok := db.writeNodes[pageID]; ok {
+	if entry, ok := db.writeNodes[pageID]; ok && entry.node != nil {
 		node := entry.node
 		// Mark the hit so eviction skips this node once. A load first keeps hits from writing a shared cache line again and again.
 		if !entry.referenced.Load() {
@@ -727,11 +818,20 @@ func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuat
 // The caller must hold the database operation write lock, or its read lock with writeNodesMu locked for writing. Open can call this before other goroutines can use the handle.
 func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {
 	entry, ok := db.writeNodes[pageID]
-	if !ok {
+	if !ok || entry.node == nil {
 		return nil, false
 	}
 	entry.referenced.Store(true)
 	return entry.node, true
+}
+
+// invalidateWriteNode discards the decoded image and keeps its existing clock slot.
+// The caller must hold the database operation write lock.
+func (db *DB) invalidateWriteNode(id page.ID) {
+	if cached := db.writeNodes[id]; cached != nil {
+		cached.node = nil
+		cached.referenced.Store(false)
+	}
 }
 
 // cacheWriteNode keeps an immutable committed node for later write transactions. It keeps at most [maxCachedWriteNodePages] nodes.
@@ -942,4 +1042,44 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 		fmt.Errorf("metadata page %d: %w", page.Meta0ID, meta0Err),
 		fmt.Errorf("metadata page %d: %w", page.Meta1ID, meta1Err),
 	)
+}
+
+// putManaged borrows large input values during a SyncNone main-file write.
+// It runs without caller callbacks. Commit must not cache nodes that retain the input.
+func (tx *Tx) putManaged(bucketName, key, value []byte) error {
+	db := tx.db
+	borrowValue := db.options.Synchronous == SyncNone && db.memoryNodes == nil && int64(len(value)) > tx.meta.PageSize()
+	if borrowValue && len(bucketName) != 0 && len(key) != 0 && len(key) <= MaxKeySize && len(value) <= MaxValueSize {
+		catalogEntry, found, err := tx.tree.FindEntryRef(tx.rootNode, bucketName, true)
+		if err != nil {
+			return err
+		}
+		if !found {
+			return ErrBucketNotFound
+		}
+		rootID, err := decodeBucketRootPageID(catalogEntry)
+		if err != nil {
+			return err
+		}
+		replaced, err := tx.store.ReplaceLeafEntry(rootID, btree.NewEntryBorrowingValue(key, value), tx.tree.SkipIdenticalPuts)
+		if err != nil {
+			return err
+		}
+		if replaced {
+			tx.borrowedValue = true
+			if node := tx.store.nodes[rootID].node; node != nil {
+				tx.cacheBucket(&Bucket{tx: tx, name: catalogEntry.Key(), rootNode: node})
+			}
+			return nil
+		}
+	}
+	bucket, err := tx.Bucket(bucketName)
+	if err != nil {
+		return err
+	}
+	if borrowValue {
+		tx.borrowedValue = true
+		return bucket.putBucketEntry(btree.NewEntryBorrowingValue(key, value))
+	}
+	return bucket.Put(key, value)
 }

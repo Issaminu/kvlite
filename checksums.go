@@ -50,7 +50,7 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 		db.operationMu.Lock()
 	}
 	// A conversion checkpoints before it commits, so it must stop before that work too.
-	if err := db.walWriteFailure(); err != nil {
+	if err := db.writeFailure(); err != nil {
 		return err
 	}
 	if db.meta.DataPageChecksums() == enabled {
@@ -87,9 +87,9 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 	return nil
 }
 
-// enableDataPageChecksums writes complete redo images in batches before sealing pages.
+// enableDataPageChecksums protects complete nodes in batches.
 // The mode stays disabled until the caller commits the final metadata change.
-// Recovery can replay an interrupted batch under disabled mode and retry later.
+// SyncFull and SyncNormal write redo images first. SyncNone writes directly without recovery protection.
 // The caller must hold operationMu and have no active backups.
 func (db *DB) enableDataPageChecksums() error {
 	// Resolve old changes before checking retained sums. A failed conversion can
@@ -104,11 +104,17 @@ func (db *DB) enableDataPageChecksums() error {
 		if len(nodes) == 0 {
 			return nil
 		}
-		if _, err := db.wal.Commit(nodes, nil, nil, nil); err != nil {
-			return err
-		}
-		if err := db.checkpointWALWithChecksums(true); err != nil {
-			return err
+		if db.options.Synchronous == SyncNone {
+			if err := db.writeDirectPages(db.meta, nodes, nil, nil, true); err != nil {
+				return err
+			}
+		} else {
+			if _, err := db.wal.Commit(nodes, nil, nil, nil); err != nil {
+				return err
+			}
+			if err := db.checkpointWALWithChecksums(true); err != nil {
+				return err
+			}
 		}
 		clear(nodes)
 		nodes = nodes[:0]

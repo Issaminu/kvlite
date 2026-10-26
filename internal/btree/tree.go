@@ -21,6 +21,14 @@ type Store interface {
 	// ReadNode returns the node visible to the current operation.
 	// A returned node is read-only. WritableNode and DeleteLeafEntries return its private mutable version.
 	ReadNode(page.ID) (*Node, error)
+	// ReplaceLeafEntry stages a replacement without decoding the old leaf.
+	// skipIdentical permits an identical entry to remain unchanged.
+	// A false result keeps the ordinary read-and-update path.
+	ReplaceLeafEntry(pageID page.ID, entry Entry, skipIdentical bool) (bool, error)
+	// InsertLeafNeighbor stages a separate leaf beside an unchanged large leaf.
+	// before places the neighbor before the old leaf in key order.
+	// A nil neighbor keeps the ordinary insertion path.
+	InsertLeafNeighbor(pageID page.ID, entry Entry) (neighbor *Node, separator []byte, before bool, err error)
 	// SetParent records the immediate owner of child. A nil parent selects the metadata root.
 	// The store must keep these links private to the current write operation.
 	SetParent(child page.ID, parent *Node)
@@ -176,6 +184,38 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 		}
 		path = append(path, treePathStep{parent: node, childIndex: childIndex})
 
+		child := node.Children[childIndex]
+		replaced, err := tree.store.ReplaceLeafEntry(child, entry, tree.SkipIdenticalPuts)
+		if err != nil {
+			return nil, err
+		}
+		if replaced {
+			// Commit preparation can move the replacement if it grows.
+			// Keep its immediate parent without decoding the old child.
+			tree.store.SetParent(child, node)
+			return root, nil
+		}
+
+		neighbor, separator, before, err := tree.store.InsertLeafNeighbor(child, entry)
+		if err != nil {
+			return nil, err
+		}
+		if neighbor != nil {
+			parent := tree.store.WritableNode(node)
+			if before {
+				parent.Children[childIndex] = neighbor.PageID()
+				parent.InsertSplitChild(childIndex, NewLeafNode(child), separator)
+			} else {
+				parent.InsertSplitChild(childIndex, neighbor, separator)
+			}
+			tree.store.SetParent(child, parent)
+			tree.store.SetParent(neighbor.PageID(), parent)
+			if parent.PageID() == root.PageID() {
+				root = parent
+			}
+			return tree.finishPut(root, parent, path[:len(path)-1])
+		}
+
 		node, err = tree.readChild(node, childIndex)
 		if err != nil {
 			return nil, err
@@ -210,6 +250,11 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 		root = node
 	}
 
+	return tree.finishPut(root, node, path)
+}
+
+// finishPut splits the changed node and its ancestors as needed.
+func (tree *Tree) finishPut(root, node *Node, path []treePathStep) (*Node, error) {
 	pageSize := tree.store.PageSize()
 	for node.NeedsSplit(pageSize) {
 		if len(path) == 0 {

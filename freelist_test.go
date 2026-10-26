@@ -275,14 +275,14 @@ func TestReadAllocationBitmapRejectsMissingTail(t *testing.T) {
 
 func TestReadAllocationBitmapAcceptsCommittedWALTail(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
 	meta := page.NewMeta(db.meta.PageSize())
-	meta.SetLastPage(firstTreePageID + 1)
+	meta.SetLastPage(meta.Root() + 1)
 	meta.RefreshChecksum()
 	oldBitmap := newAllocationBitmap(meta.PageSize())
 	bitmap := newAllocationBitmap(meta.PageSize())
@@ -342,7 +342,7 @@ func TestAllocationBitmapSurvivesPutAndReopen(t *testing.T) {
 
 func TestAllocationBitmapUsesCommittedWALOnReadOnlyOpen(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -418,7 +418,7 @@ func TestDeleteReusesRetiredPageAfterReopen(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		mode Sync
-	}{{"SyncNone", SyncNone}, {"SyncFull", SyncFull}} {
+	}{{"SyncNone", SyncNone}, {"SyncNormal", SyncNormal}, {"SyncFull", SyncFull}} {
 		t.Run(test.name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "database")
 			db, err := Open(path, 0600, &Options{Synchronous: test.mode})
@@ -482,7 +482,7 @@ func TestDeleteReusesRetiredPageAfterReopen(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if test.mode == SyncNone {
+			if test.mode == SyncNormal {
 				if db.wal.Stats().CommittedRecordCount == 0 {
 					t.Fatal("delete did not leave committed WAL pages for recovery")
 				}

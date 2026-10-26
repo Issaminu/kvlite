@@ -90,13 +90,20 @@ func (n *Node) applyInsert(prepared leafInsert) {
 	n.header.Checksum = 0
 	if prepared.found {
 		n.entries[prepared.index].flags = prepared.entry.flags
-		n.entries[prepared.index].value = cloneValue(prepared.entry.value)
+		n.entries[prepared.index].borrowValue = prepared.entry.borrowValue
+		if prepared.entry.borrowValue {
+			n.entries[prepared.index].value = prepared.entry.value
+		} else {
+			n.entries[prepared.index].value = cloneValue(prepared.entry.value)
+		}
 		return
 	}
 
 	entry := prepared.entry
 	entry.key = slices.Clone(entry.key)
-	entry.value = cloneValue(entry.value)
+	if !entry.borrowValue {
+		entry.value = cloneValue(entry.value)
+	}
 
 	n.entries = append(n.entries, Entry{})
 	copy(n.entries[prepared.index+1:], n.entries[prepared.index:])

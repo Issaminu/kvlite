@@ -107,8 +107,11 @@ func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.Equal(beforeMain, afterMain) {
+			if syncMode != SyncNone && !bytes.Equal(beforeMain, afterMain) {
 				t.Fatal("disable changed the main file without a checkpoint")
+			}
+			if syncMode == SyncNone && bytes.Equal(beforeMain, afterMain) {
+				t.Fatal("SyncNone did not write the checksum mode to the main file")
 			}
 			// A changed leaf becomes unchecked. Untouched pages retain sums.
 			if err := db.Put([]byte("bucket"), []byte("key/000"), bytes.Repeat([]byte("b"), 128)); err != nil {
@@ -287,10 +290,14 @@ func TestSetDataPageChecksums_Errors(t *testing.T) {
 }
 
 func TestSetDataPageChecksums_BackupWait(t *testing.T) {
-	for _, initial := range []bool{false, true} {
-		t.Run(fmt.Sprint(initial), func(t *testing.T) {
+	for _, test := range []struct {
+		mode    Sync
+		initial bool
+	}{{SyncNormal, false}, {SyncNormal, true}, {SyncNone, false}, {SyncNone, true}} {
+		mode, initial := test.mode, test.initial
+		t.Run(fmt.Sprintf("sync=%d/initial=%t", mode, initial), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "database")
-			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: initial})
+			db, err := Open(path, 0600, &Options{Synchronous: mode, DataPageChecksums: initial})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -315,7 +322,7 @@ func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 			<-started
 			modeDone := make(chan error, 1)
 			go func() { modeDone <- db.SetDataPageChecksums(!initial) }()
-			if initial {
+			if initial && mode != SyncNone {
 				select {
 				case err := <-modeDone:
 					if err != nil {
@@ -327,7 +334,7 @@ func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 			} else {
 				select {
 				case err := <-modeDone:
-					t.Fatalf("enable did not wait: %v", err)
+					t.Fatalf("checksum change did not wait: %v", err)
 				case <-time.After(25 * time.Millisecond):
 				}
 			}
@@ -340,14 +347,14 @@ func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("backup did not finish")
 			}
-			if !initial {
+			if !initial || mode == SyncNone {
 				select {
 				case err := <-modeDone:
 					if err != nil {
 						t.Fatal(err)
 					}
 				case <-time.After(5 * time.Second):
-					t.Fatal("enable did not finish")
+					t.Fatal("checksum change did not finish")
 				}
 			}
 			copy, err := Open(backup, 0600, &Options{ReadOnly: true})

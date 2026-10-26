@@ -35,6 +35,15 @@ func (store *memoryTreeStore) ReadNode(pageID page.ID) (*Node, error) {
 	return store.nodes[pageID], nil
 }
 
+// This store keeps decoded nodes, so puts use the ordinary tree path.
+func (*memoryTreeStore) ReplaceLeafEntry(page.ID, Entry, bool) (bool, error) {
+	return false, nil
+}
+
+func (*memoryTreeStore) InsertLeafNeighbor(page.ID, Entry) (*Node, []byte, bool, error) {
+	return nil, nil, false, nil
+}
+
 func (store *memoryTreeStore) SetParent(page.ID, *Node) {}
 
 func (store *memoryTreeStore) AllocatePage() (page.ID, error) {

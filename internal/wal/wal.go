@@ -63,8 +63,9 @@ type WAL struct {
 	encodingBuffer           []byte                    // reusable transaction encoding buffer; capacity may be cleared after large commits
 	largeEncodingBuffers     sync.Pool                 // *[]byte encoding buffers larger than maxRetainedEncodingBufferBytes
 	checkpointBuffers        checkpointBuffers         // reusable checkpoint storage; never shared with backup
+	directTargetSize         int64                     // last complete direct-write file size; zero means unknown
 	patchBuffer              []byte                    // reusable byte patch or entry patch; copied into encodingBuffer before reuse
-	pending                  []CommittedPage           // pages of the encoded transaction, in record order; Commit publishes them after the append succeeds
+	pending                  []CommittedPage           // temporary page images for Commit and WriteDirect; cleared on return
 	appendFailure            error                     // set when an append fails after it starts to write; blocks every later commit on this WAL
 	salt                     uint64                    // salt of the current generation; written in the file header
 	checksumSeed             uint32                    // CRC32C checksum of salt; every record checksum starts from it
@@ -144,7 +145,7 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 	return needsCheckpoint, nil
 }
 
-// releaseEncodingBuffer clears the pending pages and moves an oversized transaction encoding buffer to the pool after Commit returns.
+// releaseEncodingBuffer clears the pending pages and moves an oversized transaction encoding buffer to the pool after Commit or WriteDirect returns.
 // The overlay holds the published pages, and a failed append publishes none, so the list keeps only its storage.
 func (wal *WAL) releaseEncodingBuffer() {
 	clear(wal.pending)
@@ -409,7 +410,8 @@ func (wal *WAL) rollbackAppend(offset int64, bytesSinceCheckpoint uint64, hasUns
 // Such a header holds no durable commit (see parseFileHeader).
 // It stops at the first invalid record, including a record from an earlier generation.
 // File I/O failures still return an error.
-// After header validation it sets [WAL.appendOffset] to the file size.
+// After header validation it sets [WAL.appendOffset] to the end of the valid record prefix.
+// The file can have an unused allocated suffix, which must not become an append gap.
 // The caller must clear an incomplete tail before a later [WAL.Commit].
 func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 	if wal.file == nil {
@@ -420,6 +422,7 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 		return nil, err
 	}
 	if info.Size() == 0 {
+		wal.appendOffset = 0
 		wal.fileKnownEmpty = true
 		return nil, nil
 	}
@@ -434,10 +437,11 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 		return nil, err
 	}
 	if !complete {
+		wal.appendOffset = 0
 		return nil, nil
 	}
 	wal.salt, wal.checksumSeed = salt, saltChecksumSeed(salt)
-	wal.appendOffset = info.Size()
+	wal.appendOffset = walFileHeaderSize
 	// Recovered bytes can still be in the operating system cache.
 	wal.hasUnsyncedWrites = true
 
@@ -456,6 +460,7 @@ func (wal *WAL) ReadRecords() ([]WALRecord, error) {
 			break
 		}
 		records = append(records, *record)
+		wal.appendOffset += int64(HeaderSize + len(record.Payload) + ChecksumSize)
 		if record.Header.TxID >= wal.nextTxid {
 			wal.nextTxid = record.Header.TxID + 1
 		}

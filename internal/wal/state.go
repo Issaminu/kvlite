@@ -135,6 +135,78 @@ func WriteCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageS
 	return buffers.writeCommittedPages(dst, pages, pageSize, dataPageChecksums)
 }
 
+// WriteDirect writes complete node spans directly to the main file.
+// It appends no WAL records and keeps no committed overlay.
+// The caller excludes backups and stops its database handle after an error.
+// Recovery must have cleared the WAL before this method can run.
+// Each call on a WAL must use the same main file. No other code can change its size.
+func (wal *WAL) WriteDirect(mainFile fileio.File, targetSize int64, checksums bool, nodes []NodeRecord, allocationPages []AllocationRecord, encodedMeta []byte) error {
+	if wal.appendFailure != nil {
+		return wal.appendFailure
+	}
+	if wal.syncOnCommit || wal.syncOnCheckpoint || len(wal.overlay) != 0 || wal.appendOffset != 0 || !wal.fileKnownEmpty || wal.pageSize <= 0 || targetSize < 0 || targetSize%wal.pageSize != 0 {
+		return page.ErrInvalid
+	}
+	defer wal.releaseEncodingBuffer()
+	wal.pending = wal.pending[:0]
+	for _, change := range nodes {
+		if change.Final == nil {
+			return ErrNodeRecordMissingFinal
+		}
+		wal.pending = append(wal.pending, CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: change.Final.PageID()}, Node: change.Final})
+	}
+	for _, frame := range allocationPages {
+		wal.pending = append(wal.pending, CommittedPage{Header: RecordHeader{Type: RecordTypeAllocation, PageID: frame.PageID}, Payload: frame.Payload})
+	}
+	if len(encodedMeta) != 0 {
+		for _, id := range []page.ID{page.Meta0ID, page.Meta1ID} {
+			wal.pending = append(wal.pending, CommittedPage{Header: RecordHeader{Type: RecordTypeMeta, PageID: id}, Payload: encodedMeta})
+		}
+	}
+	if len(wal.pending) == 0 {
+		return nil
+	}
+	slices.SortFunc(wal.pending, func(left, right CommittedPage) int {
+		if left.Header.PageID < right.Header.PageID {
+			return -1
+		}
+		if left.Header.PageID > right.Header.PageID {
+			return 1
+		}
+		return 0
+	})
+	for index := range wal.pending {
+		count, err := checkpointRecordPages(&wal.pending[index], wal.pageSize)
+		if err != nil {
+			return err
+		}
+		if uint64(wal.pending[index].Header.PageID)+uint64(count) > uint64(targetSize/wal.pageSize) {
+			return page.ErrInvalid
+		}
+	}
+	knownSize := wal.directTargetSize
+	wal.directTargetSize = 0
+	if err := writeCheckpointRecordRuns(mainFile, wal.pending, wal.pageSize, checksums, &wal.checkpointBuffers.data); err != nil {
+		return err
+	}
+	if knownSize != targetSize || knownSize == 0 {
+		info, err := mainFile.Stat()
+		if err != nil {
+			return err
+		}
+		if info.Size() < targetSize {
+			return page.ErrInvalid
+		}
+		if info.Size() > targetSize {
+			if err := mainFile.Truncate(targetSize); err != nil {
+				return err
+			}
+		}
+	}
+	wal.directTargetSize = targetSize
+	return nil
+}
+
 func (buffers *checkpointBuffers) writeCommittedPages(dst io.WriterAt, pages map[page.ID]CommittedPage, pageSize int64, dataPageChecksums bool) error {
 	if pageSize <= 0 {
 		return page.ErrInvalid
@@ -212,6 +284,13 @@ func checkpointRecordPages(record *CommittedPage, pageSize int64) (int, error) {
 	return count, nil
 }
 
+// NodeWriter can encode a prepared node directly into its final file span.
+// The node's input bytes must stay separate from that destination.
+// A false result must write nothing and selects the ordinary buffered writer.
+type NodeWriter interface {
+	WriteNode(node *btree.Node, pageSize int64, checksums bool) (bool, error)
+}
+
 // writeCheckpointRecordRuns combines adjacent complete spans into bounded writes.
 // Every record names its head. Trailing pages have no separate header or record.
 // All ranges are checked before the first write, including overlap after reuse.
@@ -251,6 +330,7 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pa
 		buffer = buffer[:0]
 		return nil
 	}
+	nodeWriter, canWriteNode := mainFile.(NodeWriter)
 	for index := range records {
 		record := &records[index]
 		count, _ := checkpointRecordPages(record, pageSize)
@@ -258,6 +338,18 @@ func writeCheckpointRecordRuns(mainFile io.WriterAt, records []CommittedPage, pa
 		if len(buffer) != 0 && (record.Header.PageID != previousEnd || int64(len(buffer))+size > int64(cap(buffer))) {
 			if err := flush(); err != nil {
 				return err
+			}
+		}
+		// Keep an unhandled run buffered until a gap or the size limit.
+		// Retrying the node writer would split adjacent pages into separate writes.
+		if canWriteNode && record.Node != nil && len(buffer) == 0 {
+			handled, err := nodeWriter.WriteNode(record.Node, pageSize, dataPageChecksums)
+			if err != nil {
+				return err
+			}
+			if handled {
+				previousEnd = 0
+				continue
 			}
 		}
 		if buffer == nil && size <= bufferSize {

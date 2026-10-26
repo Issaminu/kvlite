@@ -76,7 +76,7 @@ The program prints:
 Ada
 ```
 
-Always check the error from `DB.Close`. A writable file close moves committed data into the main database file and removes the write-ahead log.
+Always check the error from `DB.Close`. With `SyncFull` or `SyncNormal`, a writable close moves committed data into the main file and removes the WAL. `SyncNone` applies changes to the main file during each write.
 
 ## Memory storage
 
@@ -298,7 +298,7 @@ KVLite records which database pages are in use. A later transaction can reuse a 
 | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `SyncFull`   | Default. A non-empty update returns after KVLite synchronizes its log data to storage. Concurrent updates can share this work.                            |
 | `SyncNormal` | Synchronizes at a checkpoint or clean close. A system failure can lose recent committed updates from the operating-system cache.                          |
-| `SyncNone`   | Writes files without synchronization, including during recovery. A system failure can lose updates or damage the database. Use it only for data that can be rebuilt. |
+| `SyncNone`   | Writes directly to the main file without WAL records or storage synchronization. A failed write or a process or system crash can damage earlier data. Writes wait for backups. Use it only for data that can be rebuilt. |
 
 These modes select when operations synchronize committed data to storage.
 
@@ -497,7 +497,7 @@ To restore, copy `backup.db` to a new path, such as `restored.db`, and open that
 
 The source handle's `Synchronous` option also controls the backup. With `SyncFull` or `SyncNormal`, Backup syncs the backup file and, except on Windows, its parent directory before it returns success. With `SyncNone`, it skips both sync calls. A system failure can then lose or damage the backup.
 
-A checkpoint moves committed WAL data into the main database file. Backup pauses checkpoints until all active backups finish. The WAL can grow during that time. Saved WAL page data also remains in memory until the backup finishes. `Close` waits for active backups. Do not call `Backup` inside a transaction callback.
+A checkpoint moves committed WAL data into the main database file. Backup pauses checkpoints until all active backups finish. The WAL can grow during that time. Saved WAL page data also remains in memory until the backup finishes. `Close` waits for active backups. `SyncNone` writes also wait for active backups before their callbacks run. Do not call `Backup` inside a transaction callback.
 
 The destination and its `-wal` path must not exist. The parent directory must exist. Keep both paths unused by other processes until `Backup` returns. The file system must support hard links. Except on Windows, `SyncFull` and `SyncNormal` also require directory sync.
 

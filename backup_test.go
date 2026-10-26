@@ -18,7 +18,7 @@ import (
 )
 
 func TestBackupLiveSnapshot(t *testing.T) {
-	for _, mode := range []Sync{SyncFull, SyncNormal, SyncNone} {
+	for _, mode := range []Sync{SyncFull, SyncNormal} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "source.db"), 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30})
@@ -95,8 +95,11 @@ func TestBackupLiveSnapshot(t *testing.T) {
 				if err != nil {
 					return 0, err
 				}
-				if walDuring.Size() <= walBefore.Size() {
-					t.Fatal("WAL did not grow")
+				if stats.WALBytesSinceCheckpoint <= before.WALBytesSinceCheckpoint {
+					t.Fatal("WAL record prefix did not grow")
+				}
+				if walDuring.Size() < walBefore.Size() {
+					t.Fatal("WAL file shrank during backup")
 				}
 				return io.Copy(dst, src)
 			}, fileio.Sync)
@@ -181,7 +184,7 @@ func TestBackupReadOnlyWAL(t *testing.T) {
 }
 
 func TestBackupContinuedTree(t *testing.T) {
-	for _, mode := range []Sync{SyncNone, SyncFull} {
+	for _, mode := range []Sync{SyncNormal, SyncFull} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "source.db"), 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30})

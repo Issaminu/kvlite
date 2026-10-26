@@ -18,13 +18,13 @@ type Stats struct {
 	DataSize int64
 	// FileSize is the current main-file size in bytes. A checkpoint can change it.
 	FileSize int64
-	// WALSize is the current WAL size in bytes, including its file header.
+	// WALSize is the current WAL file length in bytes, including its header and unused allocated space.
 	WALSize int64
 	// WALPageCount is the number of physical pages covered by committed WAL images.
 	// It includes node tail pages, allocation pages, and metadata pages. Repeated writes to one page count once.
 	WALPageCount int
 	// WALBytesSinceCheckpoint is the number of bytes appended since the last completed checkpoint in this handle.
-	// It includes a new WAL file header but excludes bytes recovered during Open.
+	// It includes a new WAL file header but excludes unused allocated space and bytes recovered during Open.
 	WALBytesSinceCheckpoint uint64
 	// CheckpointThresholdBytes is the WAL byte limit that starts a checkpoint.
 	CheckpointThresholdBytes uint64
@@ -32,7 +32,7 @@ type Stats struct {
 	WALBytesWritten uint64
 	// WALCommitCount counts successful nonempty WAL commits since this handle opened.
 	// Several Update callbacks can share one commit. Failed commits and recovered transactions do not count.
-	// The handle that creates a database counts the commit of the new database, and its checkpoint in CheckpointCount.
+	// In SyncFull and SyncNormal, the creating handle counts the new database commit and checkpoint. SyncNone creation adds neither count.
 	WALCommitCount uint64
 	// CheckpointCount is the number of checkpoints that wrote all committed pages and cleared the WAL.
 	CheckpointCount uint64

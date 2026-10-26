@@ -2012,3 +2012,108 @@ func TestNodeSpanReaderRejectsInvalidHeader(t *testing.T) {
 		t.Fatalf("damaged final padding accepted: %v", err)
 	}
 }
+
+func TestEncodeNodeInto_ReplacesPoisonedSpan(t *testing.T) {
+	const pageSize int64 = 4096
+	for _, test := range []struct {
+		name string
+		node *Node
+	}{
+		{"empty leaf", NewLeafNode(50)},
+		{"small leaf", &Node{header: newNodeHeader(NodeTypeLeaf, 50), entries: []Entry{{key: []byte("key"), value: []byte("value")}}}},
+		{"large leaf", &Node{header: newNodeHeader(NodeTypeLeaf, 50), entries: []Entry{{key: []byte("key"), value: bytes.Repeat([]byte{0x3c}, 65536)}}}},
+		{"small branch", &Node{header: newNodeHeader(NodeTypeBranch, 50), entries: []Entry{{key: []byte("middle")}}, Children: []page.ID{80, 90}}},
+		{"large branch", &Node{header: newNodeHeader(NodeTypeBranch, 50), entries: []Entry{{key: bytes.Repeat([]byte("m"), MaxKeySize)}}, Children: []page.ID{80, 90}}},
+	} {
+		for _, checksums := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/checksums=%t", test.name, checksums), func(t *testing.T) {
+				node := test.node.Clone()
+				oldHeader := node.header
+				var expected bytes.Buffer
+				if err := WriteNode(&expected, node, pageSize, true, checksums); err != nil {
+					t.Fatal(err)
+				}
+				node.header = oldHeader
+				storage := bytes.Repeat([]byte{0xa5}, expected.Len()+22)
+				dst := storage[11 : len(storage)-11]
+				if err := EncodeNodeInto(dst, node, pageSize, checksums); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(dst, expected.Bytes()) {
+					t.Fatal("supplied span differs from the regular writer")
+				}
+				if !bytes.Equal(storage[:11], bytes.Repeat([]byte{0xa5}, 11)) || !bytes.Equal(storage[len(storage)-11:], bytes.Repeat([]byte{0xa5}, 11)) {
+					t.Fatal("encoder changed bytes outside its destination")
+				}
+				if node.header != oldHeader {
+					t.Fatal("encoder changed the node header")
+				}
+				if _, err := DecodeNode(dst, node.PageID(), pageSize, nil, checksums); err != nil {
+					t.Fatal(err)
+				}
+				if checksums {
+					dst[len(dst)-1] ^= 1
+					if err := CheckNodeChecksum(dst, node.PageID()); !errors.Is(err, page.ErrChecksum) {
+						t.Fatalf("padding corruption: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestEncodeNodeInto_RejectsInvalidSpan(t *testing.T) {
+	node := NewLeafNode(50)
+	for _, test := range []struct {
+		name     string
+		node     *Node
+		size     int
+		pageSize int64
+	}{
+		{"nil node", nil, 4096, 4096},
+		{"short page", node, NodeHeaderSize - 1, NodeHeaderSize - 1},
+		{"empty destination", node, 0, 4096},
+		{"short span", node, 4095, 4096},
+		{"long span", node, 4097, 4096},
+		{"extra page", node, 8192, 4096},
+		{"metadata head", NewLeafNode(page.Meta0ID), 4096, 4096},
+		{"overflowing span", &Node{header: newNodeHeader(NodeTypeLeaf, ^page.ID(0)), entries: []Entry{{key: []byte("k"), value: make([]byte, 4096)}}}, 8192, 4096},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			dst := bytes.Repeat([]byte{0xa5}, test.size)
+			if err := EncodeNodeInto(dst, test.node, test.pageSize, false); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("invalid destination: %v", err)
+			}
+			if !bytes.Equal(dst, bytes.Repeat([]byte{0xa5}, test.size)) {
+				t.Fatal("invalid span changed before rejection")
+			}
+		})
+	}
+}
+
+func TestNodeBorrowedValueInsertion(t *testing.T) {
+	node := NewLeafNode(2)
+	key, value := []byte("key"), bytes.Repeat([]byte("a"), 8192)
+	if err := node.InsertEntry(NewEntryBorrowingValue(key, value)); err != nil {
+		t.Fatal(err)
+	}
+	if !node.HasBorrowedValues() || &node.EntryAt(0).Value()[0] != &value[0] {
+		t.Fatal("borrowed insertion copied the value")
+	}
+	key[0] = 'z'
+	if string(node.EntryAt(0).Key()) != "key" {
+		t.Fatal("borrowed insertion retained the key")
+	}
+	if err := node.InsertEntry(NewEntry(0, []byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	if node.HasBorrowedValues() || &node.EntryAt(0).Value()[0] == &value[0] {
+		t.Fatal("ordinary replacement retained borrowed storage")
+	}
+	if err := node.InsertEntry(NewEntryBorrowingValue([]byte("key"), value)); err != nil {
+		t.Fatal(err)
+	}
+	if !node.HasBorrowedValues() || &node.EntryAt(0).Value()[0] != &value[0] {
+		t.Fatal("borrowed replacement copied the value")
+	}
+}

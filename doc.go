@@ -52,7 +52,7 @@
 //
 // KVLite locks the database file while a file [DB] is open. A writable DB prevents another KVLite DB from opening the same file. Read-only DBs can open the same file together. A memory database has no file lock.
 //
-// In a file database, committed writes first go to a write-ahead log beside the database file. [DB.Close] moves committed data into the database file and removes the log. [SyncNone] still writes these files, but it does not synchronize them to storage, including during recovery. A memory database has no log and loses its data when closed or when the process ends. Always check the error from Close.
+// In a file database, [SyncFull] and [SyncNormal] write committed changes to a WAL beside the database file. [DB.Close] moves them into the main file and removes the log. [SyncNone] writes changes directly to the main file without WAL records or storage synchronization. A failed write or a process crash can damage earlier data. Existing committed WAL data is recovered before direct writes start. A memory database has no log and loses its data when closed or when the process ends. Always check the error from Close.
 //
 // Data-page checksum calculation and checks are off by default. Set [Options.DataPageChecksums] when creating a file to enable them.
 // The file keeps this mode on reopen and backup.
