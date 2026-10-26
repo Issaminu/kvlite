@@ -113,6 +113,13 @@ func (wal *WAL) Commit(nodes []NodeRecord, allocationPages []AllocationRecord, e
 		// Record checksums depend on the salt, so select it before encoding.
 		wal.startGeneration()
 	}
+	// Copy only borrowed values that remain after batch preparation.
+	// The committed overlay keeps these nodes after Commit returns.
+	for _, record := range nodes {
+		if record.Final != nil {
+			record.Final.OwnBorrowedValues()
+		}
+	}
 	transaction, err := wal.encodeTransaction(nodes, allocationPages, encodedMeta, wal.nextTxid)
 	if err != nil {
 		return false, err

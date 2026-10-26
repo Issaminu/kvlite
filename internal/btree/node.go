@@ -535,3 +535,13 @@ func VisitNodeReferences(node *Node, visit, visitContinuation func(page.ID) erro
 	}
 	return visitBranchReferences(node, visit)
 }
+
+// OwnBorrowedValues copies temporary values so the node can enter committed memory.
+func (n *Node) OwnBorrowedValues() {
+	for i := range n.entries {
+		if n.entries[i].borrowValue {
+			n.entries[i].value = cloneValue(n.entries[i].value)
+			n.entries[i].borrowValue = false
+		}
+	}
+}

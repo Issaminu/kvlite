@@ -22,7 +22,7 @@ type Tx struct {
 	metaDirty       bool
 	readOnly        bool
 	closed          bool
-	borrowedValue   bool               // A managed put retains its input only until the direct write ends.
+	borrowedValue   bool               // A managed put can retain its input until commit.
 	bucket          *Bucket            // most transactions will only interact with a single bucket, we store it here instead of the [Tx.buckets] map attribute
 	buckets         map[string]*Bucket // created after a second top-level bucket so every caller in this tx observes the same in-memory state
 }

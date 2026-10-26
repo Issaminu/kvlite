@@ -1044,11 +1044,12 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 	)
 }
 
-// putManaged borrows large input values during a SyncNone main-file write.
-// It runs without caller callbacks. Commit must not cache nodes that retain the input.
+// putManaged borrows large input values until the main-file write or WAL commit.
+// It runs without caller callbacks. A WAL commit copies values that it retains.
+// A direct commit keeps borrowed values out of the shared cache.
 func (tx *Tx) putManaged(bucketName, key, value []byte) error {
 	db := tx.db
-	borrowValue := db.options.Synchronous == SyncNone && db.memoryNodes == nil && int64(len(value)) > tx.meta.PageSize()
+	borrowValue := db.memoryNodes == nil && int64(len(value)) > tx.meta.PageSize()
 	if borrowValue && len(bucketName) != 0 && len(key) != 0 && len(key) <= MaxKeySize && len(value) <= MaxValueSize {
 		catalogEntry, found, err := tx.tree.FindEntryRef(tx.rootNode, bucketName, true)
 		if err != nil {

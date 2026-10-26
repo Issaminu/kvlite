@@ -11971,11 +11971,17 @@ func TestManagedPutBorrowsOnlyUntilMainWrite(t *testing.T) {
 }
 
 func TestManagedPutValueLifetime(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) { testManagedPutValueLifetime(t, mode) })
+	}
+}
+
+func testManagedPutValueLifetime(t *testing.T, mode Sync) {
 	for _, cached := range []bool{false, true} {
 		for _, checksums := range []bool{false, true} {
 			t.Run(fmt.Sprintf("cached=%t/checksums=%t", cached, checksums), func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "db")
-				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+				db, err := Open(path, 0600, &Options{Synchronous: mode, DataPageChecksums: checksums})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -12113,6 +12119,131 @@ func TestManagedPutKeepsPublicCallbackCopyRules(t *testing.T) {
 	got, err := db.Get(testBucketName, []byte("key"))
 	if err != nil || got[0] != 'a' {
 		t.Fatalf("rollback: %v", err)
+	}
+	assertNoBorrowedCommittedNodes(t, db)
+}
+
+// BenchmarkManagedPutGroup measures queued SyncFull writes to shared or separate keys.
+func BenchmarkManagedPutGroup(b *testing.B) {
+	// Use the production drive-cache flush, not the test suite's fsync shortcut.
+	previous := fileio.SkipDriveCacheFlushForTesting
+	fileio.SkipDriveCacheFlushForTesting = false
+	b.Cleanup(func() { fileio.SkipDriveCacheFlushForTesting = previous })
+
+	for _, sameKey := range []bool{false, true} {
+		b.Run(fmt.Sprintf("Full/sameKey=%t", sameKey), func(b *testing.B) {
+			db, err := Open(filepath.Join(b.TempDir(), "db"), 0600, &Options{Synchronous: SyncFull, CheckpointThresholdBytes: 16 << 20})
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() {
+				if err := db.Close(); err != nil {
+					b.Error(err)
+				}
+			})
+			var keys [16][]byte
+			var values [16][2][]byte
+			for i := range keys {
+				keys[i] = fmt.Appendf(nil, "key-%04d", i)
+				for j := range 2 {
+					values[i][j] = bytes.Repeat([]byte{byte(i*2 + j + 1)}, 128<<10)
+				}
+			}
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket([]byte("bench"))
+				if err != nil {
+					return err
+				}
+				for i, key := range keys {
+					if err := bucket.Put(key, values[i][0]); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+			var workers atomic.Uint32
+			b.ReportAllocs()
+			b.SetBytes(128 << 10)
+			b.SetParallelism(2)
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				id := int(workers.Add(1)-1) % len(keys)
+				key := keys[id]
+				if sameKey {
+					key = keys[0]
+				}
+				i := 0
+				for pb.Next() {
+					i++
+					if err := db.Put([]byte("bench"), key, values[id][i&1]); err != nil {
+						b.Error(err)
+						return
+					}
+				}
+			})
+			b.StopTimer()
+			if err := db.View(func(tx *Tx) error {
+				bucket, err := tx.Bucket([]byte("bench"))
+				if err != nil {
+					return err
+				}
+				for _, key := range keys {
+					got, err := bucket.Get(key)
+					if err != nil {
+						return err
+					}
+					if len(got) != 128<<10 {
+						return fmt.Errorf("wrong value size")
+					}
+					for _, v := range got {
+						if v != got[0] {
+							return fmt.Errorf("mixed stored bytes")
+						}
+					}
+				}
+				return nil
+			}); err != nil {
+				b.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestManagedPutGroupOwnsFinalValue(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncFull})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+	key := []byte("key")
+	if err := db.Put(testBucketName, key, bytes.Repeat([]byte("a"), 64<<10)); err != nil {
+		t.Fatal(err)
+	}
+	var values [][]byte
+	var requests []*writeRequest
+	for index := range 8 {
+		value := bytes.Repeat([]byte{byte(index + 1)}, 64<<10)
+		values = append(values, value)
+		requests = append(requests, &writeRequest{transaction: func(tx *Tx) error { return tx.putManaged(testBucketName, key, value) }, result: make(chan writeResult, 1)})
+	}
+	want := bytes.Clone(values[len(values)-1])
+	db.operationMu.Lock()
+	db.executeWriteBatch(requests)
+	db.operationMu.Unlock()
+	for _, request := range requests {
+		if result := <-request.result; result.err != nil {
+			t.Fatal(result.err)
+		}
+	}
+	for _, value := range values {
+		clear(value)
+	}
+	got, err := db.Get(testBucketName, key)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("group retained application bytes: %v", err)
 	}
 	assertNoBorrowedCommittedNodes(t, db)
 }
