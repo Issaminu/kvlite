@@ -1,5 +1,7 @@
 package btree
 
+import "bytes"
+
 // cursorFrame records one branch-to-child move in a cursor path.
 // A branch is a node that points to child nodes.
 // A leaf is a node that stores ordered entries.
@@ -122,6 +124,26 @@ func (cursor *Cursor) Seek(target []byte) (*Entry, bool, error) {
 	// target sorts after this leaf. Use the saved path to find the first entry in the next leaf.
 	cursor.leaf = nil
 	return cursor.moveToNextLeaf()
+}
+
+// SeekForward searches like Seek and reuses the current leaf when target is inside it.
+// Ordered batch reads benefit from this check; ordinary Seek keeps its root-search path.
+// Targets outside the current leaf use Seek, including targets that move backward.
+func (cursor *Cursor) SeekForward(target []byte) (*Entry, bool, error) {
+	if leaf := cursor.leaf; leaf != nil && leaf.EntryCount() != 0 &&
+		bytes.Compare(target, leaf.entries[0].key) >= 0 && bytes.Compare(target, leaf.entries[len(leaf.entries)-1].key) <= 0 {
+		index, _, err := leaf.findKeyIndex(target)
+		if err != nil {
+			cursor.leaf = nil
+			return nil, false, err
+		}
+		return cursor.position(leaf, index)
+	}
+	entry, found, err := cursor.Seek(target)
+	if err != nil {
+		cursor.leaf = nil
+	}
+	return entry, found, err
 }
 
 // Next moves to the next entry in key order.

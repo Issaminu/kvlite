@@ -170,3 +170,33 @@ func TestCursor_ReturnsPageReadError(t *testing.T) {
 		t.Fatalf("page read error: found=%t err=%v", found, err)
 	}
 }
+
+func TestCursorSeekForwardReusesLeafAndRetainsPath(t *testing.T) {
+	tree, root := newCursorTestTree(t, 100)
+	cursor := tree.Cursor(root)
+	entry, found, err := cursor.SeekForward([]byte("key-050"))
+	requireCursorEntry(t, entry, found, err, []byte("key-050"), []byte("value-050"))
+	leaf := cursor.leaf
+	original := tree.store
+	failure := errors.New("unexpected child read")
+	tree.store = &cursorErrorStore{readErr: failure}
+	for _, index := range []int{0, len(leaf.entries) - 1, 0} {
+		entry, found, err := cursor.SeekForward(leaf.entries[index].key)
+		requireCursorEntry(t, entry, found, err, leaf.entries[index].key, leaf.entries[index].value)
+	}
+	if _, _, err := cursor.SeekForward([]byte("zzzz")); !errors.Is(err, failure) {
+		t.Fatalf("cross-leaf seek did not read its path: %v", err)
+	}
+	if _, found, err := cursor.Next(); err != nil || found {
+		t.Fatalf("failed seek retained a stale position: %t %v", found, err)
+	}
+	tree.store = original
+	entry, found, err = cursor.SeekForward([]byte("key-050"))
+	requireCursorEntry(t, entry, found, err, []byte("key-050"), []byte("value-050"))
+	entry, found, err = cursor.Next()
+	requireCursorEntry(t, entry, found, err, []byte("key-051"), []byte("value-051"))
+	entry, found, err = cursor.Prev()
+	requireCursorEntry(t, entry, found, err, []byte("key-050"), []byte("value-050"))
+	entry, found, err = cursor.Prev()
+	requireCursorEntry(t, entry, found, err, []byte("key-049"), []byte("value-049"))
+}

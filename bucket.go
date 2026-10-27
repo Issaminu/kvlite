@@ -39,6 +39,11 @@ type Bucket struct {
 	deleted      bool
 }
 
+// KeyValue is one key and value supplied to [Bucket.PutBatch] or [DB.PutBatch].
+// A nil Value stores an empty value.
+// An empty Key is invalid.
+type KeyValue struct{ Key, Value []byte }
+
 // liveError rejects a handle after this bucket or one of its parents is removed.
 func (bucket *Bucket) liveError() error {
 	if bucket.tx.closed {
@@ -310,6 +315,63 @@ func (bucket *Bucket) Put(key, value []byte) error {
 	return bucket.putBucketEntry(btree.NewEntry(0, key, value))
 }
 
+// PutBatch stores entries in this bucket in the current write transaction.
+// Later reads in the transaction see the changes.
+// For repeated keys, the last entry supplies the stored value.
+// A nil value stores an empty value, and an empty batch has no effect.
+//
+// PutBatch copies keys and values before it returns and does not change the input order.
+// The caller must keep entries and their bytes unchanged until it returns.
+// Key, value, bucket-conflict and transaction errors match [Bucket.Put].
+// If an error occurs after changes begin, earlier entries can already be changed in the private transaction.
+// Return the error from [DB.Update] to discard those changes.
+func (bucket *Bucket) PutBatch(entries []KeyValue) error {
+	return bucket.putBatch(entries, false)
+}
+
+// putBatch shares ordering and insertion between callback-owned and managed batches.
+// Only a managed call can borrow large values because it commits before caller code resumes.
+func (bucket *Bucket) putBatch(entries []KeyValue, managed bool) error {
+	if err := bucket.tx.writableError(); err != nil {
+		return err
+	}
+	if err := bucket.liveError(); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if len(entry.Key) == 0 {
+			return ErrKeyRequired
+		}
+		if len(entry.Key) > MaxKeySize {
+			return ErrKeyTooLarge
+		}
+		if len(entry.Value) > MaxValueSize {
+			return ErrValueTooLarge
+		}
+	}
+	ordered := entries
+	compare := func(a, b KeyValue) int { return bytes.Compare(a.Key, b.Key) }
+	if !slices.IsSortedFunc(entries, compare) {
+		ordered = slices.Clone(entries)
+		// Stable ordering leaves the last caller-supplied value last for each key.
+		slices.SortStableFunc(ordered, compare)
+	}
+	for index, pair := range ordered {
+		if index+1 < len(ordered) && bytes.Equal(pair.Key, ordered[index+1].Key) {
+			continue
+		}
+		entry := btree.NewEntry(0, pair.Key, pair.Value)
+		if managed && bucket.tx.db.memoryNodes == nil && int64(len(pair.Value)) > bucket.tx.meta.PageSize() {
+			entry = btree.NewEntryBorrowingValue(pair.Key, pair.Value)
+			bucket.tx.borrowedValue = true
+		}
+		if err := bucket.putBucketEntry(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 	newRoot, err := bucket.tx.tree.PutEntry(bucket.rootNode, entry)
 	if err != nil {
@@ -339,6 +401,9 @@ func (bucket *Bucket) Delete(key []byte) error {
 
 // DeleteBatch removes plain keys from this bucket in the current write transaction.
 // A missing key has no effect. A repeated key has the same effect as one key.
+// An empty batch has no effect.
+// DeleteBatch does not change the input order or retain caller bytes after it returns.
+// The caller must keep keys and their bytes unchanged until it returns.
 // It returns the same key and bucket errors as [Bucket.Delete].
 // If it returns an error, the caller must return that error from [DB.Update].
 func (bucket *Bucket) DeleteBatch(keys [][]byte) error {
@@ -506,6 +571,80 @@ func (bucket *Bucket) Get(key []byte) ([]byte, error) {
 		return nil, err
 	}
 	return valueFromEntry(entry, found)
+}
+
+// GetBatch returns the values for keys from this bucket, in the input order.
+// It sees earlier writes in the owning transaction. A missing key has a nil result; a stored empty value has a non-nil result of length zero.
+// Empty input returns an empty result slice. Invalid keys and nested-bucket names return the same errors as [Bucket.Get], with no results.
+//
+// Keep keys and their bytes unchanged until GetBatch returns; the function does not retain them or change their order.
+// Returned value bytes are read-only and valid until the transaction callback returns, as with Get. Repeated keys can share the same value bytes.
+func (bucket *Bucket) GetBatch(keys [][]byte) ([][]byte, error) {
+	if err := bucket.liveError(); err != nil {
+		return nil, err
+	}
+	for _, key := range keys {
+		if len(key) == 0 {
+			return nil, ErrKeyRequired
+		}
+		if len(key) > MaxKeySize {
+			return nil, ErrKeyTooLarge
+		}
+	}
+	values := make([][]byte, len(keys))
+	// One or two reads do not repay sorting and page grouping.
+	if len(keys) <= 2 {
+		for i, key := range keys {
+			value, err := bucket.Get(key)
+			if err == ErrKeyNotFound {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			values[i] = value
+		}
+		return values, nil
+	}
+	// Sort positions rather than caller keys, then place each result back in its original slot.
+	order := make([]int, len(keys))
+	for i := range order {
+		order[i] = i
+	}
+	if !slices.IsSortedFunc(keys, bytes.Compare) {
+		slices.SortFunc(order, func(a, b int) int { return bytes.Compare(keys[a], keys[b]) })
+	}
+	if db := bucket.tx.db; bucket.tx.readOnly && db.wal != nil && db.wal.Stats().CommittedRecordCount == 0 {
+		root := bucket.rootPageID
+		if bucket.rootNode != nil {
+			root = bucket.rootNode.PageID()
+		}
+		if err := db.readMainBatch(root, keys, order, values); err != nil {
+			return nil, err
+		}
+		return values, nil
+	}
+	cursor, err := bucket.Cursor()
+	if err != nil {
+		return nil, err
+	}
+	for position, index := range order {
+		if position > 0 && bytes.Equal(keys[index], keys[order[position-1]]) {
+			values[index] = values[order[position-1]]
+			continue
+		}
+		key, value, err := cursor.result(cursor.treeCursor.SeekForward(keys[index]))
+		if err != nil {
+			return nil, err
+		}
+		if bytes.Equal(key, keys[index]) {
+			if value == nil {
+				return nil, ErrIncompatibleValue
+			}
+			values[index] = value
+		}
+	}
+	return values, nil
 }
 
 // findEntry finds key in bucket. includeKey has the same meaning as in [btree.Tree.FindEntryRef].

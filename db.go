@@ -384,6 +384,7 @@ func (db *DB) failOpen(err error) (*DB, error) {
 }
 
 // Sync flushes committed database and WAL data to storage without closing the database or forcing a checkpoint. It also syncs their directory, except on Windows.
+// Sync works in [SyncFull], [SyncNormal], and [SyncNone], regardless of when the configured mode normally synchronizes writes.
 // It does not change the synchronization mode for later writes. In SyncNone it makes completed writes durable, but a later direct write can still corrupt earlier data if it crashes halfway through.
 // A memory database has nothing to flush and returns nil.
 //
@@ -530,6 +531,29 @@ func (db *DB) Put(bucketName, key, value []byte) error {
 	return db.Update(func(tx *Tx) error { return tx.putManaged(bucketName, key, value) })
 }
 
+// PutBatch stores entries in an existing top-level bucket in one write transaction.
+// For repeated keys, the last entry supplies the stored value.
+// A nil value stores an empty value, and an empty batch has no effect.
+// The bucket must exist even when entries is empty.
+//
+// PutBatch does not change the input order or retain caller bytes after it returns.
+// The caller must keep bucketName, entries and their bytes unchanged until it returns.
+// Bucket, key and value errors match [DB.Put].
+// An error discards the transaction, subject to the commit-failure rules of [DB.Update].
+// Use [Bucket.PutBatch] inside a transaction callback.
+func (db *DB) PutBatch(bucketName []byte, entries []KeyValue) error {
+	if len(entries) == 1 {
+		return db.Put(bucketName, entries[0].Key, entries[0].Value)
+	}
+	return db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.putBatch(entries, true)
+	})
+}
+
 // putMappedValue keeps the normal operation lifetime, lock, and backup exclusion.
 // Only SyncNone uses this path. Layout changes use a private transaction.
 func (db *DB) putMappedValue(bucketName, key, value []byte) error {
@@ -607,6 +631,25 @@ func (db *DB) Delete(bucketName, key []byte) error {
 	})
 }
 
+// DeleteBatch removes plain keys from an existing top-level bucket in one write transaction.
+// Missing and repeated keys have no additional effect, and an empty batch has no effect.
+// The bucket must exist even when keys is empty.
+//
+// DeleteBatch does not change the input order or retain caller bytes after it returns.
+// The caller must keep bucketName, keys and their bytes unchanged until it returns.
+// Bucket and key errors match [DB.Delete].
+// An error discards the transaction, subject to the commit-failure rules of [DB.Update].
+// Use [Bucket.DeleteBatch] inside a transaction callback.
+func (db *DB) DeleteBatch(bucketName []byte, keys [][]byte) error {
+	return db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.DeleteBatch(keys)
+	})
+}
+
 // DeleteBucket removes an existing top-level bucket and all of its contents in one write transaction.
 // It removes nested buckets and releases their pages after the transaction commits.
 // A missing bucket returns [ErrBucketNotFound]. An empty name returns [ErrBucketNameRequired]. A read-only database returns [ErrDatabaseReadOnly].
@@ -666,6 +709,108 @@ func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
 		return value, nil
 	}
 	return slices.Clone(value), nil
+}
+
+// GetBatch returns copies of the values for keys from one committed state of the named top-level bucket.
+// Results follow the input order. Missing keys have nil results; stored empty values have non-nil results of length zero.
+// Repeated keys have independent copies, so the caller can retain and change every returned value.
+//
+// The bucket must exist even when keys is empty. Empty input returns an empty result slice.
+// Bucket and key errors match [DB.Get], except that missing keys cause no error. Any error returns no results.
+// The caller must keep bucketName, keys and their bytes unchanged until GetBatch returns; their order is not modified.
+// Reads wait for active writes. Do not call GetBatch inside a transaction callback; use [Bucket.GetBatch] there.
+func (db *DB) GetBatch(bucketName []byte, keys [][]byte) ([][]byte, error) {
+	if len(keys) == 1 {
+		value, err := db.Get(bucketName, keys[0])
+		if err != nil && err != ErrKeyNotFound {
+			return nil, err
+		}
+		return [][]byte{value}, nil
+	}
+	var values [][]byte
+	err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		values, err = bucket.GetBatch(keys)
+		if err != nil {
+			return err
+		}
+		for i := range values {
+			values[i] = bytes.Clone(values[i])
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return values, nil
+}
+
+// readMainBatch reads sorted request positions from the main-file tree without decoding leaf entry lists.
+// Each leaf checksum is checked once for its request group. Branch separators partition the requests before recursion.
+// The caller holds the operation lock and has excluded WAL overlays and private transaction changes.
+// Result bytes borrow the page; DB.GetBatch copies them before ending its View.
+func (db *DB) readMainBatch(id page.ID, keys [][]byte, order []int, values [][]byte) error {
+	data, err := db.readMainNodePage(id)
+	if err != nil {
+		return err
+	}
+	entry, found, child, err := btree.LookupCheckedNodeSpan(data, keys[order[0]], false, db.meta.DataPageChecksums())
+	if err != nil {
+		return err
+	}
+	// checking if this node is a leaf
+	if child == 0 {
+		if found {
+			values[order[0]], err = valueFromEntry(entry, true)
+			if err != nil {
+				return err
+			}
+		}
+		for position := 1; position < len(order); position++ {
+			index, previous := order[position], order[position-1]
+			if bytes.Equal(keys[index], keys[previous]) {
+				values[index] = values[previous]
+				continue
+			}
+			entry, found, _, err := btree.LookupCheckedNodeSpan(data, keys[index], false, false)
+			if err != nil {
+				return err
+			}
+			if found {
+				values[index], err = valueFromEntry(entry, true)
+				if err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	branch, err := db.readOnlyNode(id)
+	if err != nil {
+		return err
+	}
+	for start := 0; start < len(order); {
+		index, err := branch.FindChildIndex(keys[order[start]])
+		if err != nil {
+			return err
+		}
+		end := len(order)
+		if index < branch.EntryCount() {
+			separator := branch.EntryAt(index).Key()
+			end = start + 1
+			for end < len(order) && bytes.Compare(keys[order[end]], separator) < 0 {
+				end++
+			}
+		}
+		if err := db.readMainBatch(branch.Children[index], keys, order[start:end], values); err != nil {
+			return err
+		}
+		start = end
+	}
+	return nil
 }
 
 // hasMeta reports whether the main file holds data.

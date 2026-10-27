@@ -12490,6 +12490,15 @@ func TestSyncFailureStopsDataOperations(t *testing.T) {
 				if _, got := db.Get(testBucketName, []byte("key")); got != err {
 					t.Fatalf("read accepted after failed Sync: %v", got)
 				}
+				if _, got := db.GetBatch(testBucketName, [][]byte{[]byte("key"), []byte("key")}); got != err {
+					t.Fatalf("batch read accepted after failed Sync: %v", got)
+				}
+				if got := db.PutBatch(testBucketName, []KeyValue{{Key: []byte("key"), Value: []byte("new")}, {Key: []byte("other")}}); got != err {
+					t.Fatalf("batch put accepted after failed Sync: %v", got)
+				}
+				if got := db.DeleteBatch(testBucketName, [][]byte{[]byte("key")}); got != err {
+					t.Fatalf("batch delete accepted after failed Sync: %v", got)
+				}
 				if got := db.Update(func(*Tx) error { t.Fatal("callback ran after failed Sync"); return nil }); got != err {
 					t.Fatalf("update after failed Sync: %v", got)
 				}
@@ -12521,4 +12530,562 @@ func TestSyncWaitsForActiveTransaction(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestGetBatchOrderAndOwnedResults(t *testing.T) {
+	for _, mode := range []string{"None", "Normal", "Full", "Memory"} {
+		for _, checkpoint := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/checkpoint=%t", mode, checkpoint), func(t *testing.T) {
+				var db *DB
+				if mode == "Memory" {
+					db = OpenMemory()
+				} else {
+					var err error
+					db, err = Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: map[string]Sync{"None": SyncNone, "Normal": SyncNormal, "Full": SyncFull}[mode], DataPageChecksums: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				defer db.Close()
+				largeKey := bytes.Repeat([]byte("k"), MaxKeySize)
+				largeValue := bytes.Repeat([]byte("v"), 64<<10)
+				if err := db.Update(func(tx *Tx) error {
+					bucket, err := tx.CreateBucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					for i := 0; i < 128; i++ {
+						if err := bucket.Put([]byte(fmt.Sprintf("key%04d", i)), []byte(fmt.Sprintf("value%04d", i))); err != nil {
+							return err
+						}
+					}
+					if err := bucket.Put([]byte("empty"), nil); err != nil {
+						return err
+					}
+					if err := bucket.Put(largeKey, largeValue); err != nil {
+						return err
+					}
+					if err := bucket.Put([]byte("large"), largeValue); err != nil {
+						return err
+					}
+					_, err = bucket.CreateBucket([]byte("nested"))
+					return err
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if checkpoint && mode != "Memory" {
+					db.operationMu.Lock()
+					err := db.checkpointWAL()
+					db.operationMu.Unlock()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				keys := [][]byte{[]byte("key0127"), []byte("missing"), []byte("key0001"), []byte("empty"), []byte("key0001"), largeKey, []byte("large")}
+				original := make([][]byte, len(keys))
+				for i := range keys {
+					original[i] = bytes.Clone(keys[i])
+				}
+				got, err := db.GetBatch(testBucketName, keys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := [][]byte{[]byte("value0127"), nil, []byte("value0001"), {}, []byte("value0001"), largeValue, largeValue}
+				for i := range keys {
+					if !bytes.Equal(keys[i], original[i]) {
+						t.Fatalf("input %d reordered or changed", i)
+					}
+					if !bytes.Equal(got[i], want[i]) || (got[i] == nil) != (want[i] == nil) {
+						t.Fatalf("result %d: %q, want %q", i, got[i], want[i])
+					}
+				}
+				got[2][0] = 'X'
+				got[5][0] = 'X'
+				if string(got[4]) != "value0001" || got[6][0] != 'v' {
+					t.Fatal("duplicate results share mutable memory")
+				}
+				stored, err := db.Get(testBucketName, []byte("key0001"))
+				if err != nil || string(stored) != "value0001" {
+					t.Fatalf("result mutation changed DB: %q %v", stored, err)
+				}
+				for _, keys := range [][][]byte{nil, {}, {[]byte("key0001")}, {[]byte("missing")}, {[]byte("empty")}} {
+					values, err := db.GetBatch(testBucketName, keys)
+					if err != nil || values == nil || len(values) != len(keys) {
+						t.Fatalf("empty/single batch: %v, %v", values, err)
+					}
+				}
+				for _, tc := range []struct {
+					keys [][]byte
+					err  error
+				}{{[][]byte{nil}, ErrKeyRequired}, {[][]byte{make([]byte, MaxKeySize+1)}, ErrKeyTooLarge}, {[][]byte{[]byte("key0001"), []byte("nested"), []byte("key0002")}, ErrIncompatibleValue}} {
+					if values, err := db.GetBatch(testBucketName, tc.keys); values != nil || !errors.Is(err, tc.err) {
+						t.Fatalf("batch error: %v %v, want %v", values, err, tc.err)
+					}
+				}
+				if values, err := db.GetBatch(nil, nil); values != nil || !errors.Is(err, ErrBucketNameRequired) {
+					t.Fatalf("empty bucket: %v %v", values, err)
+				}
+				if values, err := db.GetBatch([]byte("absent"), nil); values != nil || !errors.Is(err, ErrBucketNotFound) {
+					t.Fatalf("missing bucket: %v %v", values, err)
+				}
+				if mode != "Memory" {
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					readOnly, err := Open(db.Path(), 0600, &Options{ReadOnly: true})
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer readOnly.Close()
+					values, err := readOnly.GetBatch(testBucketName, keys)
+					if err != nil || string(values[0]) != "value0127" || !bytes.Equal(values[5], largeValue) {
+						t.Fatalf("read-only batch: %v", err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestBucketGetBatchSeesWritesAndPreservesRollback(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+	if err := db.Put(testBucketName, []byte("a"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Put(testBucketName, []byte("b"), []byte("old")); err != nil {
+		t.Fatal(err)
+	}
+	var ended *Bucket
+	discard := errors.New("discard batch reads")
+	err := db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		ended = bucket
+		if err := bucket.Put([]byte("a"), []byte("new")); err != nil {
+			return err
+		}
+		if err := bucket.Delete([]byte("b")); err != nil {
+			return err
+		}
+		values, err := bucket.GetBatch([][]byte{[]byte("b"), []byte("a"), []byte("a")})
+		if err != nil {
+			return err
+		}
+		if values[0] != nil || string(values[1]) != "new" || string(values[2]) != "new" {
+			t.Fatalf("batch missed private writes: %v", values)
+		}
+		return discard
+	})
+	if err != discard {
+		t.Fatal(err)
+	}
+	if values, err := ended.GetBatch(nil); values != nil || !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("closed bucket: %v %v", values, err)
+	}
+	values, err := db.GetBatch(testBucketName, [][]byte{[]byte("a"), []byte("b")})
+	if err != nil || string(values[0]) != "old" || string(values[1]) != "old" {
+		t.Fatalf("rollback: %v %v", values, err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		if err := tx.DeleteBucket(testBucketName); err != nil {
+			return err
+		}
+		if values, err := bucket.GetBatch(nil); values != nil || !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted bucket: %v %v", values, err)
+		}
+		return discard
+	}); err != discard {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if values, err := db.GetBatch(testBucketName, nil); values != nil || !errors.Is(err, ErrDatabaseNotOpen) {
+		t.Fatalf("closed DB: %v %v", values, err)
+	}
+}
+
+func TestGetBatchReadsOneCommittedState(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+	if err := db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		if err := bucket.Put([]byte("a"), []byte("0")); err != nil {
+			return err
+		}
+		return bucket.Put([]byte("b"), []byte("0"))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		for i := 1; i <= 200; i++ {
+			value := fmt.Appendf(nil, "%d", i)
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				if err := bucket.Put([]byte("a"), value); err != nil {
+					return err
+				}
+				return bucket.Put([]byte("b"), value)
+			}); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	for range 200 {
+		values, err := db.GetBatch(testBucketName, [][]byte{[]byte("b"), []byte("a"), []byte("b")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(values[0], values[1]) || !bytes.Equal(values[0], values[2]) {
+			t.Fatalf("mixed committed states: %v", values)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestGetBatchGroupsDeepMainTreeWithAndWithoutMapping(t *testing.T) {
+	for _, disableMap := range []bool{false, true} {
+		t.Run(fmt.Sprintf("disableMap=%t", disableMap), func(t *testing.T) {
+			fsys := disk.New(1, disk.Config{DisableMap: disableMap})
+			db, err := open(simulatedPath, 0600, &Options{Synchronous: SyncNormal, DataPageChecksums: true}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				for i := 0; i < 8192; i++ {
+					key := fmt.Appendf(nil, "key%08d", i)
+					if err := bucket.Put(key, bytes.Repeat([]byte{byte(i % 251)}, 128)); err != nil {
+						return err
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			keys := make([][]byte, 259)
+			for i := 0; i < 257; i++ {
+				keys[i] = fmt.Appendf(nil, "key%08d", (i*31)%8192)
+			}
+			keys[257] = []byte("missing")
+			keys[258] = keys[0]
+			for _, checkpoint := range []bool{false, true} {
+				if checkpoint {
+					db.operationMu.Lock()
+					err := db.checkpointWAL()
+					db.operationMu.Unlock()
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				values, err := db.GetBatch(testBucketName, keys)
+				if err != nil {
+					t.Fatal(err)
+				}
+				for i, key := range keys {
+					value, err := db.Get(testBucketName, key)
+					if err == ErrKeyNotFound {
+						if values[i] != nil {
+							t.Fatal("missing key has a value")
+						}
+						continue
+					}
+					if err != nil || !bytes.Equal(value, values[i]) {
+						t.Fatalf("checkpoint=%t/result=%d: %v", checkpoint, i, err)
+					}
+				}
+			}
+			if err := db.View(func(tx *Tx) error {
+				bucket := mustBucket(t, tx, testBucketName)
+				if err := bucket.loadRootNode(); err != nil {
+					return err
+				}
+				if bucket.rootNode.IsLeaf() {
+					t.Fatal("fixture has no branches")
+				}
+				child, err := db.readOnlyNode(bucket.rootNode.Children[0])
+				if err != nil {
+					return err
+				}
+				if child.IsLeaf() {
+					t.Fatal("fixture does not exercise multiple branch levels")
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func ExampleDB_GetBatch() {
+	db := OpenMemory()
+	defer db.Close()
+	name := []byte("users")
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(name)
+		if err != nil {
+			return err
+		}
+		if err := bucket.Put([]byte("a"), []byte("first")); err != nil {
+			return err
+		}
+		return bucket.Put([]byte("b"), []byte("second"))
+	}); err != nil {
+		panic(err)
+	}
+	values, err := db.GetBatch(name, [][]byte{[]byte("b"), []byte("a"), []byte("missing")})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s %s %t\n", values[0], values[1], values[2] == nil)
+	// Output: second first true
+}
+
+func TestPutAndDeleteBatchContracts(t *testing.T) {
+	for _, mode := range []string{"None", "Normal", "Full", "Memory"} {
+		t.Run(mode, func(t *testing.T) {
+			var db *DB
+			path := filepath.Join(t.TempDir(), "batch.db")
+			options := &Options{Synchronous: map[string]Sync{"None": SyncNone, "Normal": SyncNormal, "Full": SyncFull}[mode]}
+			if mode == "Memory" {
+				db = OpenMemory()
+			} else {
+				var err error
+				db, err = Open(path, 0600, options)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			defer func() { db.Close() }()
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				_, err = bucket.CreateBucket([]byte("nested"))
+				return err
+			}); err != nil {
+				t.Fatal(err)
+			}
+			entries := make([]KeyValue, 600)
+			for i := range entries {
+				entries[i] = KeyValue{Key: fmt.Appendf(nil, "key%04d", 599-i), Value: fmt.Appendf(nil, "value%04d", 599-i)}
+			}
+			largeKey, largeValue := bytes.Repeat([]byte("x"), MaxKeySize), bytes.Repeat([]byte("v"), 64<<10)
+			entries = append(entries, KeyValue{[]byte("key0001"), []byte("last")}, KeyValue{[]byte("empty"), nil}, KeyValue{largeKey, largeValue})
+			if err := db.PutBatch(testBucketName, entries); err != nil {
+				t.Fatal(err)
+			}
+			if string(entries[0].Key) != "key0599" || string(entries[600].Value) != "last" {
+				t.Fatal("PutBatch reordered or changed caller entries")
+			}
+			entries[0].Key[0], entries[0].Value[0], largeValue[0] = '!', '!', '!'
+			for _, item := range []KeyValue{{[]byte("key0599"), []byte("value0599")}, {[]byte("key0001"), []byte("last")}, {[]byte("empty"), []byte{}}, {largeKey, bytes.Repeat([]byte("v"), 64<<10)}} {
+				got, err := db.Get(testBucketName, item.Key)
+				if err != nil || !bytes.Equal(got, item.Value) || got == nil {
+					t.Fatalf("stored %q: value length %d, error %v", item.Key[:min(len(item.Key), 12)], len(got), err)
+				}
+			}
+			if err := db.PutBatch(testBucketName, nil); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.DeleteBatch(testBucketName, nil); err != nil {
+				t.Fatal(err)
+			}
+			for _, write := range []func() error{
+				func() error { return db.PutBatch([]byte("missing"), nil) },
+				func() error { return db.DeleteBatch([]byte("missing"), nil) },
+			} {
+				if err := write(); !errors.Is(err, ErrBucketNotFound) {
+					t.Fatalf("empty batch accepted missing bucket: %v", err)
+				}
+			}
+			if err := db.PutBatch(testBucketName, []KeyValue{{[]byte("a"), []byte("discard")}, {[]byte("nested"), []byte("conflict")}}); !errors.Is(err, ErrIncompatibleValue) {
+				t.Fatalf("put bucket conflict: %v", err)
+			}
+			if _, err := db.Get(testBucketName, []byte("a")); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("failed batch put was not rolled back: %v", err)
+			}
+			if err := db.DeleteBatch(testBucketName, [][]byte{[]byte("key0001"), []byte("nested")}); !errors.Is(err, ErrIncompatibleValue) {
+				t.Fatalf("delete bucket conflict: %v", err)
+			}
+			if got, err := db.Get(testBucketName, []byte("key0001")); err != nil || string(got) != "last" {
+				t.Fatalf("failed batch delete was not rolled back: %q %v", got, err)
+			}
+			for _, bad := range []KeyValue{{nil, []byte("bad")}, {make([]byte, MaxKeySize+1), nil}} {
+				want := ErrKeyRequired
+				if len(bad.Key) != 0 {
+					want = ErrKeyTooLarge
+				}
+				if err := db.PutBatch(testBucketName, []KeyValue{{[]byte("a"), []byte("discard")}, bad}); !errors.Is(err, want) {
+					t.Fatalf("invalid batch put: %v", err)
+				}
+				if err := db.DeleteBatch(testBucketName, [][]byte{[]byte("key0001"), bad.Key}); !errors.Is(err, want) {
+					t.Fatalf("invalid batch delete: %v", err)
+				}
+			}
+			keys := [][]byte{[]byte("key0599"), []byte("missing"), []byte("key0001"), []byte("key0599")}
+			if err := db.DeleteBatch(testBucketName, keys); err != nil {
+				t.Fatal(err)
+			}
+			if string(keys[0]) != "key0599" || string(keys[1]) != "missing" {
+				t.Fatal("DeleteBatch reordered caller keys")
+			}
+			for _, key := range keys {
+				if _, err := db.Get(testBucketName, key); !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("deleted %q: %v", key, err)
+				}
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.PutBatch(testBucketName, nil); !errors.Is(err, ErrDatabaseNotOpen) {
+				t.Fatalf("closed batch put: %v", err)
+			}
+			if err := db.DeleteBatch(testBucketName, nil); !errors.Is(err, ErrDatabaseNotOpen) {
+				t.Fatalf("closed batch delete: %v", err)
+			}
+			if mode == "Memory" {
+				return
+			}
+			var err error
+			db, err = Open(path, 0600, &Options{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := db.Get(testBucketName, []byte("key0002")); err != nil || string(got) != "value0002" {
+				t.Fatalf("reopened value: %q %v", got, err)
+			}
+			if err := db.PutBatch(testBucketName, nil); !errors.Is(err, ErrDatabaseReadOnly) {
+				t.Fatalf("read-only batch put: %v", err)
+			}
+			if err := db.DeleteBatch(testBucketName, nil); !errors.Is(err, ErrDatabaseReadOnly) {
+				t.Fatalf("read-only batch delete: %v", err)
+			}
+		})
+	}
+}
+
+func TestBucketPutBatchOwnershipAndTransactionErrors(t *testing.T) {
+	db := OpenMemory()
+	defer db.Close()
+	var ended *Bucket
+	rollback := errors.New("discard callback batch")
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.CreateBucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		ended = bucket
+		key, value := []byte("key"), bytes.Repeat([]byte("v"), 64<<10)
+		if err := bucket.PutBatch([]KeyValue{{key, value}, {[]byte("empty"), nil}}); err != nil {
+			return err
+		}
+		key[0], value[0] = '!', '!'
+		got, err := bucket.GetBatch([][]byte{[]byte("key"), []byte("empty"), []byte("missing")})
+		if err != nil || len(got[0]) != 64<<10 || got[0][0] != 'v' || got[1] == nil || got[2] != nil {
+			t.Fatalf("callback input not owned or private write invisible: %v", err)
+		}
+		child, err := bucket.CreateBucket([]byte("child"))
+		if err != nil {
+			return err
+		}
+		return child.PutBatch([]KeyValue{{[]byte("b"), []byte("2")}, {[]byte("a"), []byte("1")}})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ended.PutBatch(nil); !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("closed bucket batch put: %v", err)
+	}
+	if err := ended.DeleteBatch(nil); !errors.Is(err, ErrTxClosed) {
+		t.Fatalf("closed bucket batch delete: %v", err)
+	}
+	if err := db.View(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		if err := bucket.PutBatch(nil); !errors.Is(err, ErrTxNotWritable) {
+			t.Fatalf("read-only bucket batch put: %v", err)
+		}
+		if err := bucket.DeleteBatch(nil); !errors.Is(err, ErrTxNotWritable) {
+			t.Fatalf("read-only bucket batch delete: %v", err)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		if err := bucket.PutBatch([]KeyValue{{[]byte("key"), []byte("discard")}, {[]byte("new"), []byte("discard")}}); err != nil {
+			return err
+		}
+		if err := bucket.DeleteBatch([][]byte{[]byte("empty")}); err != nil {
+			return err
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatalf("callback rollback: %v", err)
+	}
+	if value, err := db.Get(testBucketName, []byte("key")); err != nil || len(value) != 64<<10 {
+		t.Fatalf("put rollback: value length %d, error %v", len(value), err)
+	}
+	if value, err := db.Get(testBucketName, []byte("empty")); err != nil || value == nil {
+		t.Fatalf("delete rollback: %v", err)
+	}
+	if _, err := db.Get(testBucketName, []byte("new")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("insert rollback: %v", err)
+	}
+	if err := db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		if err := tx.DeleteBucket(testBucketName); err != nil {
+			return err
+		}
+		if err := bucket.PutBatch(nil); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted bucket batch put: %v", err)
+		}
+		if err := bucket.DeleteBatch(nil); !errors.Is(err, ErrBucketNotFound) {
+			t.Fatalf("deleted bucket batch delete: %v", err)
+		}
+		return rollback
+	}); !errors.Is(err, rollback) {
+		t.Fatal(err)
+	}
+}
+
+func ExampleDB_PutBatch() {
+	db := OpenMemory()
+	defer db.Close()
+	name := []byte("users")
+	if err := db.Update(func(tx *Tx) error {
+		_, err := tx.CreateBucket(name)
+		return err
+	}); err != nil {
+		panic(err)
+	}
+	if err := db.PutBatch(name, []KeyValue{{Key: []byte("a"), Value: []byte("Ada")}, {Key: []byte("b"), Value: []byte("Bob")}}); err != nil {
+		panic(err)
+	}
+	if err := db.DeleteBatch(name, [][]byte{[]byte("b")}); err != nil {
+		panic(err)
+	}
+	values, err := db.GetBatch(name, [][]byte{[]byte("a"), []byte("b")})
+	if err != nil {
+		panic(err)
+	}
+	fmt.Printf("%s %t\n", values[0], values[1] == nil)
+	// Output: Ada true
 }

@@ -123,6 +123,36 @@ if err != nil {
 fmt.Println(string(value))
 ```
 
+## Batch operations
+
+Use `DB.GetBatch`, `DB.PutBatch`, and `DB.DeleteBatch` for several keys in one existing top-level bucket.
+Each call uses one transaction.
+Batch reads return owned values in the input order, with nil for missing keys and non-nil empty slices for stored empty values.
+For repeated put keys, the last entry supplies the stored value.
+
+```go
+bucket := []byte("users")
+if err := db.PutBatch(bucket, []kvlite.KeyValue{
+    {Key: []byte("42"), Value: []byte("Ada")},
+    {Key: []byte("43"), Value: []byte("Grace")},
+}); err != nil {
+    return err
+}
+values, err := db.GetBatch(bucket, [][]byte{[]byte("43"), []byte("42")})
+if err != nil {
+    return err
+}
+fmt.Println(string(values[0]), string(values[1]))
+if err := db.DeleteBatch(bucket, [][]byte{[]byte("42"), []byte("43")}); err != nil {
+    return err
+}
+```
+
+Inside an existing `View` or `Update` callback, use the corresponding `Bucket` methods.
+`Bucket.GetBatch` returns read-only values borrowed until the callback ends.
+`Bucket.PutBatch` and `Bucket.DeleteBatch` require `Update`; return their errors from the callback to discard the transaction.
+Batch methods preserve caller input order and do not retain inputs after returning.
+
 ## Data model
 
 A database contains named top-level buckets. A bucket can contain key/value pairs and nested buckets. A user value always belongs to a bucket.
@@ -301,6 +331,10 @@ KVLite records which database pages are in use. A later transaction can reuse a 
 | `SyncNone`   | Writes directly to the main file without WAL records or storage synchronization. A failed write or a process or system crash can damage earlier data. Writes wait for backups. Use it only for data that can be rebuilt. |
 
 These modes select when operations synchronize committed data to storage.
+
+Use `DB.Sync` to flush committed main-file and WAL data without closing the database or forcing a checkpoint. It works in `SyncFull`, `SyncNormal`, and `SyncNone`, so you can explicitly request a storage sync regardless of the configured mode. It does not change the synchronization mode for later writes, although please call it outside transaction callbacks. Also, it is a no-op for memory databases.
+
+Use `DB.Checkpoint` to move committed WAL data into the main file and clear the WAL without closing the database. In `SyncFull` and `SyncNormal`, it synchronizes the WAL and main file before clearing the WAL, even below the automatic checkpoint threshold. It waits for active transactions and backups, and blocks database operations during the checkpoint. Call it outside transaction callbacks. It is a no-op in `SyncNone` (as SyncNone doesn't use the WAL), and memory storage (this one is pretty self explanatory) ; use `DB.Sync` when you need an explicit storage sync.
 
 Select the durability mode in the open options:
 

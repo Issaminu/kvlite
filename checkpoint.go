@@ -10,6 +10,39 @@ import (
 	"github.com/Issaminu/kvlite/internal/wal"
 )
 
+// Checkpoint moves committed WAL data into the main database file and clears the WAL without closing the database.
+// In [SyncFull] and [SyncNormal], it synchronizes the WAL and main file before clearing the WAL, regardless of the automatic checkpoint threshold.
+// A [SyncNone] or memory database has no WAL changes to move and returns nil. Use [DB.Sync] to force storage synchronization in SyncNone.
+//
+// Checkpoint waits for active transaction callbacks. A WAL checkpoint also waits for active backups and blocks database operations while it runs.
+// Do not call it from a View or Update callback. Writes that have not committed when checkpointing begins are not covered.
+// A read-only handle returns [ErrDatabaseReadOnly], and a closed handle returns [ErrDatabaseNotOpen].
+// A checkpoint error is returned and recorded in [DB.Stats]. Main-file write and sync failures can be retried; a WAL sync failure stops later data operations with [ErrWALWriteFailed].
+func (db *DB) Checkpoint() error {
+	if err := db.beginWriteOperation(); err != nil {
+		return err
+	}
+	defer db.endOperation()
+	db.operationMu.Lock()
+	defer db.operationMu.Unlock()
+	if err := db.writeFailure(); err != nil {
+		return err
+	}
+	if db.memoryNodes != nil || db.options.Synchronous == SyncNone {
+		return nil
+	}
+	for db.activeBackups > 0 {
+		done := db.backupsDone
+		db.operationMu.Unlock()
+		<-done
+		db.operationMu.Lock()
+	}
+	if err := db.writeFailure(); err != nil {
+		return err
+	}
+	return db.checkpointWAL()
+}
+
 // checkpointWAL copies committed WAL pages into the main file.
 // SyncFull and SyncNormal make the WAL and main file durable before WAL cleanup.
 // SyncNone does not issue storage sync calls.
@@ -31,15 +64,17 @@ func (db *DB) checkpointWALWithChecksums(enabled bool) (err error) {
 	if db.activeBackups > 0 {
 		return nil
 	}
-	if db.wal.Stats().CommittedRecordCount == 0 {
-		return nil
-	}
 	defer func() {
 		db.stats.LastCheckpointError = err
 		if err != nil {
 			db.stats.CheckpointFailureCount++
 		}
 	}()
+	if db.wal.Stats().CommittedRecordCount == 0 {
+		// A failed WAL truncate can leave the main file current and the overlay empty.
+		// Retry that cleanup; Truncate does no file work when the WAL is already empty.
+		return db.wal.Truncate()
+	}
 	targetSize, err := db.logicalFileSize()
 	if err != nil {
 		return err
