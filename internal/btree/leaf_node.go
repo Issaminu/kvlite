@@ -86,7 +86,15 @@ func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
 
 // applyInsert changes a leaf after prepareInsert has accepted the operation.
 func (n *Node) applyInsert(prepared leafInsert) {
-	n.encodedSize = 0
+	// Keep a known size exact so a batch does not rescan the leaf after each put.
+	// A replacement keeps its key and descriptor; only its value length changes.
+	if n.encodedSize != 0 {
+		if prepared.found {
+			n.encodedSize += len(prepared.entry.value) - len(n.entries[prepared.index].value)
+		} else {
+			n.encodedSize += prepared.entry.EncodedSize(true)
+		}
+	}
 	n.header.Checksum = 0
 	if prepared.found {
 		n.entries[prepared.index].flags = prepared.entry.flags

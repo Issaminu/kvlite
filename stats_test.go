@@ -192,13 +192,17 @@ func TestStatsFailedCommit(t *testing.T) {
 		t.Fatalf("commit error: %v", err)
 	}
 	db.wal.SetSyncFileForTesting(nil)
-	if got := readStats(t, db); got != before {
+	// Rollback removes the failed append and any unused preallocated suffix.
+	// Logical state and counters stay unchanged; WALSize reports physical bytes.
+	afterFailure := before
+	afterFailure.WALSize = int64(before.WALBytesSinceCheckpoint)
+	if got := readStats(t, db); got != afterFailure {
 		t.Fatalf("failed commit changed statistics: %+v", got)
 	}
 	if err := db.Put([]byte("data"), []byte("failed"), []byte("value")); !errors.Is(err, ErrWALWriteFailed) {
 		t.Fatalf("Put on the stopped handle: got %v, want ErrWALWriteFailed", err)
 	}
-	if got := readStats(t, db); got != before {
+	if got := readStats(t, db); got != afterFailure {
 		t.Fatalf("rejected Put changed statistics: %+v", got)
 	}
 

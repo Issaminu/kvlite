@@ -284,7 +284,10 @@ func (store *txTreeStore) SetParent(child page.ID, parent *btree.Node) {
 	if store.tx.readOnly {
 		return
 	}
-	view := store.nodes[child]
+	view, cached := store.nodes[child]
+	if cached && view.parent == parent {
+		return
+	}
 	view.parent = parent
 	if change, ok := store.dirty[child]; ok {
 		change.parent = parent

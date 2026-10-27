@@ -48,7 +48,7 @@ type Node struct {
 	header           NodeHeader
 	entries          []Entry
 	Children         []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
-	encodedSize      int       // Zero means unknown. Entry-list changes clear the saved size.
+	encodedSize      int       // Encoded bytes, or zero when the current size has not been calculated.
 	storageTailPages uint32    // Allocated pages after the head. Memory only; kept until commit preparation.
 }
 
@@ -304,7 +304,7 @@ func (n *Node) computeEncodedSize() int {
 
 // CacheEncodedSize saves the current size for page counting and encoding.
 // The caller must have exclusive access to n. Readers use EncodedSize, which changes no state.
-// Node mutations clear the saved size. Clone starts without a saved size.
+// Mutations update the saved size or clear it when the layout changes. Clone starts without a saved size.
 func (n *Node) CacheEncodedSize() int {
 	n.encodedSize = n.EncodedSize()
 	return n.encodedSize

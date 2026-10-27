@@ -631,8 +631,10 @@ func writeEmptyDatabaseWithPageSize(t *testing.T, path string, pageSize int64) {
 		}
 	}
 	allocation := newAllocationBitmap(pageSize)
-	if _, err := file.WriteAt(allocation.encodeSegment(0), int64(firstAllocationSegmentID)*pageSize); err != nil {
-		t.Fatal(err)
+	for index := range allocation.segments {
+		if _, err := file.WriteAt(allocation.encodeSegment(index), int64(allocation.segmentPageID(index))*pageSize); err != nil {
+			t.Fatal(err)
+		}
 	}
 	root := btree.NewLeafNode(meta.Root())
 	if err := btree.WriteNode(io.NewOffsetWriter(file, int64(root.PageID())*pageSize), root, pageSize, true, false); err != nil {
@@ -9261,6 +9263,8 @@ func TestRecovery_ContinuedDeletesAndReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The mapped WAL can have an unused suffix after its last commit marker.
+	logEnd := db.wal.Stats().BytesSinceCheckpoint
 	// Keep the WAL after writing main-file pages to test interrupted cleanup.
 	if err := db.wal.Close(); err != nil {
 		t.Fatal(err)
@@ -9294,7 +9298,7 @@ func TestRecovery_ContinuedDeletesAndReuse(t *testing.T) {
 					crash := filepath.Join(t.TempDir(), "database")
 					replay := log
 					if !committed {
-						replay = log[:len(log)-wal.HeaderSize-wal.ChecksumSize]
+						replay = log[:logEnd-wal.HeaderSize-wal.ChecksumSize]
 					}
 					if err := os.WriteFile(crash, main, 0600); err != nil {
 						t.Fatal(err)
@@ -11338,7 +11342,22 @@ func TestNeighborInsertBatchRepairsCurrentParent(t *testing.T) {
 					return nil
 				},
 				func(tx *Tx) error {
-					return mustBucket(t, tx, testBucketName).Put([]byte("a"), replacement)
+					bucket := mustBucket(t, tx, testBucketName)
+					for range 2 {
+						if _, err := bucket.Get([]byte("a")); err != nil {
+							return err
+						}
+					}
+					if err := bucket.Put([]byte("a"), replacement); err != nil {
+						return err
+					}
+					for range 2 {
+						got, err := bucket.Get([]byte("a"))
+						if err != nil || !bytes.Equal(got, replacement) {
+							return fmt.Errorf("read replacement through cached parent: %v", err)
+						}
+					}
+					return nil
 				},
 				func(tx *Tx) error {
 					if err := mustBucket(t, tx, testBucketName).Delete([]byte(key)); err != nil {
@@ -13088,4 +13107,182 @@ func ExampleDB_PutBatch() {
 	}
 	fmt.Printf("%s %t\n", values[0], values[1] == nil)
 	// Output: Ada true
+}
+
+func TestCloseWaitsForBlockedGet(t *testing.T) {
+	for _, readOnly := range []bool{false, true} {
+		t.Run(fmt.Sprintf("readOnly=%t", readOnly), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db")
+			db, err := Open(path, 0600, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			createBucket(t, db, testBucketName)
+			want := bytes.Repeat([]byte("v"), 64<<10)
+			if err := db.Put(testBucketName, []byte("key"), want); err != nil {
+				t.Fatal(err)
+			}
+			root := mustBucketRoot(t, db, testBucketName).PageID()
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			db, err = Open(path, 0600, &Options{ReadOnly: readOnly})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			if err := db.unmapMainFile(); err != nil {
+				t.Fatal(err)
+			}
+			readStarted := make(chan struct{})
+			releaseRead := make(chan struct{})
+			var release, block sync.Once
+			defer release.Do(func() { close(releaseRead) })
+			db.file = &changedSpanHeaderFile{
+				File: db.file, offset: int64(root) * db.meta.PageSize(), pageSize: db.meta.PageSize(),
+				change: func([]byte) { block.Do(func() { close(readStarted); <-releaseRead }) },
+			}
+			getDone := make(chan error, 1)
+			go func() {
+				got, err := db.Get(testBucketName, []byte("key"))
+				if err == nil && !bytes.Equal(got, want) {
+					err = fmt.Errorf("Get returned a different value")
+				}
+				getDone <- err
+			}()
+			select {
+			case <-readStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Get did not reach the blocked file read")
+			}
+			closeStarted := make(chan struct{})
+			closeDone := make(chan error, 1)
+			go func() { close(closeStarted); closeDone <- db.Close() }()
+			<-closeStarted
+			select {
+			case err := <-closeDone:
+				t.Fatalf("Close returned during Get's file read: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+			release.Do(func() { close(releaseRead) })
+			if err := <-getDone; err != nil {
+				t.Fatal(err)
+			}
+			if err := <-closeDone; err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Get(testBucketName, []byte("key")); !errors.Is(err, ErrDatabaseNotOpen) {
+				t.Fatalf("Get after Close: %v", err)
+			}
+		})
+	}
+}
+
+func TestCloseQueuedBehindGetWaitingForAdmittedUpdate(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: mode})
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeRequested := false
+			defer func() {
+				if !closeRequested {
+					db.Close()
+				}
+			}()
+			createBucket(t, db, testBucketName)
+			if err := db.Put(testBucketName, []byte("key"), []byte("old")); err != nil {
+				t.Fatal(err)
+			}
+			want := bytes.Repeat([]byte("new"), 1024)
+			updateStarted := make(chan struct{})
+			releaseUpdate := make(chan struct{})
+			var release sync.Once
+			defer release.Do(func() { close(releaseUpdate) })
+			updateDone := make(chan error, 1)
+			go func() {
+				updateDone <- db.Update(func(tx *Tx) error {
+					close(updateStarted)
+					<-releaseUpdate
+					bucket, err := tx.Bucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					return bucket.Put([]byte("key"), want)
+				})
+			}()
+			select {
+			case <-updateStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("Update did not reach its admitted callback")
+			}
+			type getResult struct {
+				value []byte
+				err   error
+			}
+			getDone := make(chan getResult, 1)
+			go func() {
+				value, err := db.Get(testBucketName, []byte("key"))
+				getDone <- getResult{value, err}
+			}()
+			deadline := time.Now().Add(5 * time.Second)
+			// No other goroutine takes lifecycleMu here. A failed exclusive probe proves
+			// Get holds lifecycle R while the admitted Update still holds operation W.
+			for db.lifecycleMu.TryLock() {
+				db.lifecycleMu.Unlock()
+				if time.Now().After(deadline) {
+					t.Fatal("Get did not retain its lifecycle read lock behind Update")
+				}
+				runtime.Gosched()
+			}
+			closeDone := make(chan error, 1)
+			closeRequested = true
+			go func() { closeDone <- db.Close() }()
+			// Get prevents Close from taking lifecycle W. A failed shared probe proves
+			// Close has queued its writer, so both sides of the lock order are exercised.
+			deadline = time.Now().Add(5 * time.Second)
+			for db.lifecycleMu.TryRLock() {
+				db.lifecycleMu.RUnlock()
+				if time.Now().After(deadline) {
+					t.Fatal("Close did not queue behind Get's lifecycle lock")
+				}
+				runtime.Gosched()
+			}
+			release.Do(func() { close(releaseUpdate) })
+			select {
+			case err := <-updateDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("admitted Update could not finish with Get and Close queued")
+			}
+			var got getResult
+			select {
+			case got = <-getDone:
+				if got.err != nil || !bytes.Equal(got.value, want) {
+					t.Fatalf("queued Get: value bytes=%d error=%v", len(got.value), got.err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Get could not finish after its admitted writer completed")
+			}
+			select {
+			case err := <-closeDone:
+				if err != nil {
+					t.Fatal(err)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("Close could not finish after the admitted writer and Get completed")
+			}
+			// The returned copy remains usable after Close releases every mapped byte.
+			if !bytes.Equal(got.value, want) {
+				t.Fatal("Get's owned result changed after Close")
+			}
+			got.value[0] ^= 0xff
+			if got.value[0] == want[0] {
+				t.Fatal("Get retained the caller's original value bytes")
+			}
+		})
+	}
 }

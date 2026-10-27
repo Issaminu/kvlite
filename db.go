@@ -670,15 +670,23 @@ func (db *DB) DeleteBucket(bucketName []byte) error {
 // The caller can retain and change the returned slice.
 // A stored empty value returns a non-nil slice with length zero.
 func (db *DB) Get(bucketName, key []byte) ([]byte, error) {
-	if err := db.beginOperation(); err != nil {
+	// Get has no callback: this lock keeps the handle open until its owned result is ready.
+	db.lifecycleMu.RLock()
+	defer db.lifecycleMu.RUnlock()
+	if err := db.ensureOpen(); err != nil {
 		return nil, err
 	}
-	defer db.endOperation()
 
 	// Keep the root, WAL pages, and mapped bytes unchanged during both lookups.
 	db.operationMu.RLock()
 	defer db.operationMu.RUnlock()
 
+	return db.getCommittedValue(bucketName, key)
+}
+
+// getCommittedValue returns an owned value while the caller holds operationMu
+// for reading and keeps the database open through the result copy.
+func (db *DB) getCommittedValue(bucketName, key []byte) ([]byte, error) {
 	if err := db.writeFailure(); err != nil {
 		return nil, err
 	}

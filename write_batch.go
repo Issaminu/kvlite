@@ -108,8 +108,7 @@ func (db *DB) runWriteBatcher() {
 // It yields once when the limit is greater than one. The yield lets concurrent
 // callers enter the queue.
 func (db *DB) collectWriteBatch(first *writeRequest) []*writeRequest {
-	requests := make([]*writeRequest, 1, db.options.MaxWriteBatchSize)
-	requests[0] = first
+	requests := []*writeRequest{first}
 	if db.options.MaxWriteBatchSize == 1 {
 		return requests
 	}

@@ -2117,3 +2117,66 @@ func TestNodeBorrowedValueInsertion(t *testing.T) {
 		t.Fatal("borrowed replacement copied the value")
 	}
 }
+
+func TestNodeInsertEntryMaintainsKnownEncodedSize(t *testing.T) {
+	for _, cached := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cached=%t", cached), func(t *testing.T) {
+			node := NewLeafNode(7)
+			for _, value := range []string{"a", "b", "c"} {
+				if err := node.InsertEntry(NewEntry(0, []byte(value), []byte("initial"))); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if cached {
+				node.CacheEncodedSize()
+			}
+			for _, update := range []struct {
+				key   string
+				value []byte
+			}{
+				{key: "b", value: bytes.Repeat([]byte("g"), 128)},
+				{key: "b", value: []byte("short")},
+				{key: "b", value: nil},
+				{key: "d", value: bytes.Repeat([]byte("d"), 256)},
+				{key: "aa", value: []byte("middle")},
+			} {
+				if err := node.InsertEntry(NewEntry(0, []byte(update.key), update.value)); err != nil {
+					t.Fatal(err)
+				}
+				want := node.computeEncodedSize()
+				if got := node.EncodedSize(); got != want {
+					t.Fatalf("encoded size after %q: got %d, want %d", update.key, got, want)
+				}
+				if cached && node.encodedSize != want {
+					t.Fatalf("saved size after %q: got %d, want %d", update.key, node.encodedSize, want)
+				}
+				if !cached && node.encodedSize != 0 {
+					t.Fatalf("unknown size was changed to %d", node.encodedSize)
+				}
+			}
+			// Clone and split clear the cache; their next put must still size correctly.
+			cloned := node.Clone()
+			if err := cloned.InsertEntry(NewEntry(0, []byte("z"), []byte("clone"))); err != nil {
+				t.Fatal(err)
+			}
+			if got, want := cloned.EncodedSize(), cloned.computeEncodedSize(); got != want {
+				t.Fatalf("clone size: got %d, want %d", got, want)
+			}
+			node.CacheEncodedSize()
+			right, _, err := node.Split(8, 128)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, half := range []*Node{node, right} {
+				half.CacheEncodedSize()
+				entry := half.EntryAt(0)
+				if err := half.InsertEntry(NewEntry(entry.Flags(), entry.Key(), []byte("after split"))); err != nil {
+					t.Fatal(err)
+				}
+				if got, want := half.EncodedSize(), half.computeEncodedSize(); got != want || half.encodedSize != want {
+					t.Fatalf("split size: got %d, saved %d, want %d", got, half.encodedSize, want)
+				}
+			}
+		})
+	}
+}

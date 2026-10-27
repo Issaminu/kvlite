@@ -2002,7 +2002,7 @@ func TestAllocationBitmapOwnsNodeSpanChecksAllBits(t *testing.T) {
 	for _, test := range []struct {
 		head  page.ID
 		count int
-	}{{0, 1}, {firstAllocationSegmentID, 1}, {start, 0}, {^page.ID(0), 2}, {bitmap.pagesPerGroup() - 1, 2}} {
+	}{{0, 1}, {firstAllocationSegmentID, 1}, {firstAllocationSegmentID + 1, 1}, {bitmap.pagesPerGroup(), 1}, {start, 0}, {^page.ID(0), 1}, {^page.ID(0), 2}, {bitmap.pagesPerGroup() - 1, 2}} {
 		if bitmap.ownsNodeSpan(test.head, test.count) {
 			t.Fatalf("invalid span %+v was accepted", test)
 		}

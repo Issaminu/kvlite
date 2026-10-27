@@ -747,10 +747,13 @@ func (bitmap *allocationBitmap) ownsNodeSpan(head page.ID, count int) bool {
 	}
 	end := head + page.ID(count) - 1
 	capacity := bitmap.pagesPerSegment()
-	index := bitmap.segmentIndex(head)
+	index := int(head / capacity)
 	bit := head % capacity
-	if index >= len(bitmap.segments) || bitmap.isSegmentPage(head) {
+	if index >= len(bitmap.segments) || isAllocationSegmentPage(head, capacity, page.ID(len(bitmap.segments)-1), page.ID(bitmap.segmentsPerGroup())) {
 		return false
+	}
+	if count == 1 {
+		return allocationBitIsSet(bitmap.segments[index].bitmapBits(), bit)
 	}
 	// A range inside one logical frame cannot cross a physical group.
 	if page.ID(count) <= capacity-bit {
@@ -760,7 +763,7 @@ func (bitmap *allocationBitmap) ownsNodeSpan(head page.ID, count int) bool {
 		return false
 	}
 	for count > 0 {
-		index := bitmap.segmentIndex(head)
+		index := int(head / capacity)
 		if index >= len(bitmap.segments) {
 			return false
 		}
