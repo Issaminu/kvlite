@@ -350,7 +350,7 @@ func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
 }
 
 // Split changes n into the left node and returns a new right node and its read-only separator key.
-// A leaf keeps the separator as the first entry of the right node.
+// A leaf keeps all entry keys in the two resulting leaves.
 // A branch promotes the separator and removes it from both child nodes.
 // If n has too few entries to split, Split returns [ErrNodeNotSaturated] without changing n.
 func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
@@ -366,6 +366,7 @@ func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
 
 	separator := n.entries[separatorIndex].key
 	if n.IsLeaf() {
+		separator = leafSeparator(n.entries[separatorIndex-1].key, separator)
 		n.splitLeaf(rightNode, separatorIndex)
 	} else {
 		n.splitBranch(rightNode, separatorIndex)

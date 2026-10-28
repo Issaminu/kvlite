@@ -1817,7 +1817,7 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 				keySize = btree.MaxKeySize
 			}
 			key := func(number int) []byte {
-				return append(fmt.Appendf(nil, "%03d", number), bytes.Repeat([]byte{'k'}, keySize-3)...)
+				return fmt.Appendf(bytes.Repeat([]byte{'k'}, keySize-3), "%03d", number)
 			}
 			if err := db.Update(func(tx *Tx) error {
 				bucket, err := tx.CreateBucket([]byte("data"))

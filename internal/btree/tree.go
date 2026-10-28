@@ -331,7 +331,7 @@ func (tree *Tree) splitNode(node *Node, pageSize int64, tailInsert bool) (*Node,
 	last := node.EntryCount() - 1
 	if tailInsert && node.IsLeaf() && (last == 1 || node.EncodedSize()-node.entries[last].EncodedSize(true) <= int(pageSize)) {
 		// A global append leaves the earlier keys in their already-fitting page.
-		separator = node.entries[last].key
+		separator = leafSeparator(node.entries[last-1].key, node.entries[last].key)
 		rightNode = NewLeafNode(pageID)
 		node.splitLeaf(rightNode, last)
 		node.header.Checksum = 0
@@ -457,7 +457,7 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 				root = leaf
 			}
 			var err error
-			root, err = tree.repairAfterDelete(root, leaf, path, firstIndex == 0)
+			root, err = tree.repairAfterDelete(root, leaf, path)
 			if err != nil {
 				return nil, changed, err
 			}
@@ -509,9 +509,8 @@ func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool,
 		root = leaf
 	}
 
-	// A branch separator stores the smallest key of each non-leftmost child.
-	// Deleting entry zero can therefore make an ancestor separator stale.
-	root, err = tree.repairAfterDelete(root, leaf, path, deleteIndex == 0)
+	// Retain valid lower boundaries and repair nodes that became under-full.
+	root, err = tree.repairAfterDelete(root, leaf, path)
 	if err != nil {
 		return nil, false, err
 	}
@@ -545,74 +544,27 @@ func (tree *Tree) findDeleteLeaf(root *Node, key []byte, bucket bool) (*Node, []
 	return node, path, false, nil
 }
 
-// repairAfterDelete fixes the tree after DeleteEntry removes a key from a leaf.
-//
-// A leaf holds keys and values. A branch holds the page IDs of its children.
-// For each child after the first, the branch also holds that child's first key.
-// This key helps a search choose the right child. For example, leaves [a, b]
-// and [m, n] need "m" in their parent. If we delete "m", the parent must use
-// "n" instead. The first child has no key in its parent. When its first key
-// changes, we must check the next parent up the tree.
-//
-// A delete can also leave a page with little data. This function first tries
-// to put its data into an adjacent page. That lets the store reuse the empty
-// page. If the data will not fit, it tries to move some entries between the two
-// pages. It starts at the changed leaf and moves up when a merge makes a parent
-// smaller. path holds those parents in root-to-leaf order. minimumChanged says
-// that the first key in the current subtree may have changed.
-func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minimumChanged bool) (*Node, error) {
+// repairAfterDelete merges or redistributes under-full nodes after a deletion.
+// Separators are lower bounds: deleting a minimum key leaves its old boundary valid.
+// Redistribution writes the boundary that moves. Merges carry a parent boundary
+// into the combined branch, so they also preserve the same routing invariant.
+func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep) (*Node, error) {
 	pageSize := tree.store.PageSize()
-	// Try to save space when a node uses less than a quarter of a page.
-	// For a 256-byte page, this starts below 64 bytes (25%). We do not move
-	// entries after every small delete. If no move works, we keep the node.
+	// Repair below one quarter of a page rather than moving entries after every delete.
 	minimumSize := pageSize / 4
-	var minimum []byte
 	for len(path) > 0 {
-		// Start with the leaf's parent. A merge removes a child from that
-		// parent, so the next loop can repair the parent in turn.
 		last := len(path) - 1
 		step := path[last]
 		path = path[:last]
-
-		// When the node has enough data, only its first key can require a
-		// change higher in the tree.
 		if node.EntryCount() != 0 && int64(node.EncodedSize()) >= minimumSize {
-			if !minimumChanged {
-				return root, nil
-			}
-			if step.childIndex == 0 {
-				// This is the parent's first child. There is no key for it in
-				// this parent. Pass the changed first key to the next parent.
-				node = step.parent
-				continue
-			}
-
-			// This child has a key in its parent. Fix that key here. The
-			// parent's own first key did not change, so we can stop.
-			parent := tree.store.WritableNode(step.parent)
-			if parent.PageID() == root.PageID() {
-				root = parent
-			}
-			if minimum != nil {
-				parent.setSeparator(step.childIndex-1, minimum)
-			} else if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
-				return nil, err
-			}
 			return root, nil
 		}
-
-		// Changes to a parent must use the store's private copy.
 		parent := tree.store.WritableNode(step.parent)
 		if parent.PageID() == root.PageID() {
 			root = parent
 		}
-		// An empty leaf contributes no data to its neighbor.
-		// Remove its parent link without changing or decoding that neighbor.
+		// Remove an empty leaf without decoding or changing its neighbor.
 		if node.IsLeaf() && node.EntryCount() == 0 && len(parent.Children) > 1 {
-			if step.childIndex == 0 {
-				// The next child's exact minimum is already in this parent.
-				minimum = parent.entries[0].key
-			}
 			separatorIndex := max(step.childIndex-1, 0)
 			parent.entries = slices.Delete(parent.entries, separatorIndex, separatorIndex+1)
 			parent.Children = slices.Delete(parent.Children, step.childIndex, step.childIndex+1)
@@ -622,20 +574,8 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				return nil, err
 			}
 			node = parent
-			minimumChanged = step.childIndex == 0
 			continue
 		}
-		// Merging or redistributing children can change the known minimum.
-		minimum = nil
-		if minimumChanged && step.childIndex > 0 {
-			// Fix the child's key before a merge. For branch nodes, the merge
-			// can move that key down into a child.
-			if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
-				return nil, err
-			}
-		}
-
-		// Only adjacent children have neighboring key ranges.
 		var left, right *Node
 		var err error
 		if step.childIndex > 0 {
@@ -650,12 +590,8 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				return nil, err
 			}
 		}
-
-		// Try the left neighbor first. Either merge returns one page, so
-		// choosing left when both fit gives a predictable result. Count
-		// bytes because entries can have different sizes. An empty node
-		// must merge even with a large neighbor. The result can use
-		// continuation pages; the empty page can then be released.
+		// Prefer a merge with the left neighbor when both fit. An empty branch must
+		// merge even if the combined image needs more than one storage page.
 		if left != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex-1, left, node) <= pageSize) {
 			left = tree.store.WritableNode(left)
 			mergeChildren(parent, step.childIndex-1, left, node)
@@ -666,58 +602,31 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				return nil, err
 			}
 			node = parent
-			// The left page stays in the tree. It still holds the parent's
-			// first key, so no earlier parent needs a new key.
-			minimumChanged = false
 		} else if right != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex, node, right) <= pageSize) {
-			// node can be a committed parent that a first-key change reached without a copy.
-			// This merge changes node.
+			// A parent reached after a merge can still be a committed node.
 			node = tree.store.WritableNode(node)
 			mergeChildren(parent, step.childIndex, node, right)
 			if err := tree.reparentChildren(node); err != nil {
 				return nil, err
 			}
-			if minimumChanged && step.childIndex > 0 {
-				// The delete may have emptied node. Before the merge, it had
-				// no first key for its parent. It now holds right's keys, so
-				// the parent can use its new first key.
-				if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
-					return nil, err
-				}
-			}
 			if err := tree.store.FreePage(right.PageID()); err != nil {
 				return nil, err
 			}
 			node = parent
-			// Only a change to the first child can change the first key of
-			// the whole parent. Carry that change upward if it occurred.
-			minimumChanged = minimumChanged && step.childIndex == 0
 		} else {
-			// Neither merge fits. Try to share the entries across two pages.
 			if left == nil && right == nil {
-				// The parent has only this child. There is no page to share
-				// with at this level. Try to repair the parent instead.
 				node = parent
-				minimumChanged = minimumChanged && step.childIndex == 0
 				continue
 			}
-
-			// Test each neighbor before changing it. Choose the one that
-			// gives the fuller pair of pages.
 			useLeft, canRedistribute := chooseSiblingRedistribution(parent, step.childIndex, left, node, right, pageSize, minimumSize)
 			if !canRedistribute {
-				// No way of dividing these entries fits both pages. Keep
-				// the smaller page and stop.
 				return root, nil
 			}
-			// node can be a committed parent that a first-key change reached without a copy.
-			// Redistribution changes both pages.
+			// Trials use copies. Apply the same rule only to private nodes.
 			node = tree.store.WritableNode(node)
 			if !useLeft {
 				right = tree.store.WritableNode(right)
 				if !redistributeChildren(parent, step.childIndex, node, right, pageSize, minimumSize) {
-					// The trial used the same rule on copies. It must also
-					// work on the pages we now change.
 					return nil, fmt.Errorf("selected right redistribution: %w", ErrRedistributionInvalid)
 				}
 				if err := tree.reparentChildren(node); err != nil {
@@ -726,51 +635,22 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 				if err := tree.reparentChildren(right); err != nil {
 					return nil, err
 				}
-				// The right page now starts at a different key. Put that key
-				// in the parent so future searches reach the right page.
-				if err := tree.refreshMinimumSeparator(parent, step.childIndex+1, right); err != nil {
+			} else {
+				left = tree.store.WritableNode(left)
+				if !redistributeChildren(parent, step.childIndex-1, left, node, pageSize, minimumSize) {
+					return nil, fmt.Errorf("selected left redistribution: %w", ErrRedistributionInvalid)
+				}
+				if err := tree.reparentChildren(left); err != nil {
 					return nil, err
 				}
-				if minimumChanged && step.childIndex > 0 {
-					// The changed page also has its own key in this parent.
-					if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
-						return nil, err
-					}
+				if err := tree.reparentChildren(node); err != nil {
+					return nil, err
 				}
-				if minimumChanged && step.childIndex == 0 {
-					// The first child has no key here. Pass its changed first
-					// key to the next parent.
-					node = parent
-					continue
-				}
-				// Both pages still exist. The parent did not get smaller.
-				return root, nil
 			}
-
-			left = tree.store.WritableNode(left)
-			if !redistributeChildren(parent, step.childIndex-1, left, node, pageSize, minimumSize) {
-				// The trial used the same rule on copies. It must also
-				// work on the pages we now change.
-				return nil, fmt.Errorf("selected left redistribution: %w", ErrRedistributionInvalid)
-			}
-			if err := tree.reparentChildren(left); err != nil {
-				return nil, err
-			}
-			if err := tree.reparentChildren(node); err != nil {
-				return nil, err
-			}
-			// The changed page got entries from the left page. Use its new
-			// first key in the parent.
-			if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
-				return nil, err
-			}
-			// The left page still holds the parent's first key.
 			return root, nil
 		}
 	}
-
-	// A branch with one child has no choice to make during a search. Use
-	// that child as the root and return the old root page to the store.
+	// A branch with one child no longer needs to be a root.
 	if !root.IsLeaf() && len(root.Children) == 1 {
 		child, err := tree.readChild(root, 0)
 		if err != nil {
@@ -783,34 +663,4 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 		tree.store.SetParent(root.PageID(), nil)
 	}
 	return root, nil
-}
-
-// refreshMinimumSeparator gives a child its current key in the parent.
-// For example, if a child once started with "m" and now starts with "n", its
-// parent must store "n" to send later searches to the right child. The first
-// child has no such key, so childIndex must be greater than zero. An empty
-// child gives no new key. setSeparator copies a key from a read page.
-func (tree *Tree) refreshMinimumSeparator(parent *Node, childIndex int, node *Node) error {
-	minimum, err := tree.subtreeMinimum(node)
-	if err != nil {
-		return err
-	}
-	if minimum != nil {
-		parent.setSeparator(childIndex-1, minimum)
-	}
-	return nil
-}
-
-// subtreeMinimum finds the first key below node. The search follows the first
-// child until it reaches a leaf. The returned key belongs to that leaf and
-// remains valid while the leaf remains valid. An empty leaf returns nil.
-func (tree *Tree) subtreeMinimum(node *Node) ([]byte, error) {
-	for !node.IsLeaf() {
-		var err error
-		node, err = tree.readChild(node, 0)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return node.firstKey(), nil
 }

@@ -2,8 +2,10 @@ package btree
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/rand"
 	"slices"
 	"testing"
 
@@ -619,9 +621,9 @@ func TestTreeDeleteEntryDoesNotDirtyUnchangedParent(t *testing.T) {
 	}
 }
 
-// TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace builds the exact path:
-// delete the first key of a first child that stays large enough, so the first-key change moves up to the committed parent P.
-// P is under-full, so the repair merges it with its sibling Q. The merge must change a private copy of P, not the committed P.
+// TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace checks a parent merge.
+// Removing an empty first leaf forces repair of its under-full parent.
+// The merge must change a private parent, not its committed image.
 func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 	leaf := func(pageID page.ID, keys ...string) *Node {
 		node := NewLeafNode(pageID)
@@ -639,8 +641,12 @@ func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 		}
 		return node
 	}
+	firstKeys := []string{"a", "b", "c", "d"}
+
+	firstKeys = []string{"a"}
+
 	nodes := []*Node{
-		leaf(10, "a", "b", "c", "d"), leaf(11, "e", "f", "g", "h"),
+		leaf(10, firstKeys...), leaf(11, "e", "f", "g", "h"),
 		leaf(12, "i", "j", "k", "l"), leaf(13, "m", "n", "o", "p"), leaf(14, "q", "r", "s", "t"),
 		branch(4, []string{"e"}, 10, 11),
 		branch(5, []string{"m", "q"}, 12, 13, 14),
@@ -666,8 +672,11 @@ func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 			t.Errorf("delete changed committed node %d in place", node.PageID())
 		}
 	}
-	if _, dirty := store.dirty[4]; !dirty && len(store.freed) == 0 {
-		t.Fatalf("test setup: the delete did not repair the under-full parent (root %d)", root.PageID())
+	if _, dirty := store.dirty[4]; !dirty {
+		t.Fatal("the parent merge did not stage a private parent")
+	}
+	if root.PageID() != 4 || !slices.Contains(store.freed, page.ID(5)) {
+		t.Fatalf("the parent merge did not collapse the root: root=%d, freed=%v", root.PageID(), store.freed)
 	}
 }
 
@@ -777,8 +786,21 @@ func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("delete: found=%t error=%v", found, err)
 	}
-	if string(gotRoot.entries[0].key) != "n" {
-		t.Fatalf("ancestor separator: got %q, want n", gotRoot.entries[0].key)
+	wantSeparator := "n"
+
+	wantSeparator = "m"
+	if gotRoot != root {
+		t.Fatal("removing the first leaf copied an unchanged ancestor")
+	}
+	if _, dirty := store.dirty[root.PageID()]; dirty {
+		t.Fatal("removing the first leaf staged an unchanged ancestor")
+	}
+
+	if string(gotRoot.entries[0].key) != wantSeparator {
+		t.Fatalf("ancestor separator: got %q, want %q", gotRoot.entries[0].key, wantSeparator)
+	}
+	if string(root.entries[0].key) != "m" {
+		t.Fatal("delete changed the committed ancestor in place")
 	}
 	for _, id := range []page.ID{10, 11, 12, 21, 22, 30, 31, 32, 40, 41, 42} {
 		if _, dirty := store.dirty[id]; dirty {
@@ -940,9 +962,333 @@ func assertTreeSeparators(t *testing.T, store *memoryTreeStore, node *Node) []by
 	minimum := assertTreeSeparators(t, store, store.nodes[node.Children[0]])
 	for index := 1; index < len(node.Children); index++ {
 		childMinimum := assertTreeSeparators(t, store, store.nodes[node.Children[index]])
-		if !bytes.Equal(node.entries[index-1].key, childMinimum) {
-			t.Fatalf("branch %d separator %d: got %q, want %q", node.PageID(), index-1, node.entries[index-1].key, childMinimum)
+
+		left := store.nodes[node.Children[index-1]]
+		for !left.IsLeaf() {
+			left = store.nodes[left.Children[len(left.Children)-1]]
 		}
+		separator := node.entries[index-1].key
+		if bytes.Compare(left.entries[len(left.entries)-1].key, separator) >= 0 || bytes.Compare(separator, childMinimum) > 0 {
+			t.Fatalf("branch %d separator %d does not divide its child ranges", node.PageID(), index-1)
+		}
+
 	}
 	return minimum
+}
+
+func TestLeafSeparator(t *testing.T) {
+	for _, pair := range [][2][]byte{
+		{[]byte("account/apple"), []byte("account/banana")},
+		{{0}, {0, 0}},
+		{{0, 0xff}, {1, 0}},
+		{{1, 0}, {1, 0, 0}},
+		{{1, 2, 3}, {1, 3}},
+		{bytes.Repeat([]byte{1}, 4096), append(bytes.Repeat([]byte{1}, 4096), 0)},
+	} {
+		left, right := pair[0], pair[1]
+		separator := leafSeparator(left, right)
+		if bytes.Compare(left, separator) >= 0 || bytes.Compare(separator, right) > 0 {
+			t.Fatalf("%x does not divide %x and %x", separator, left, right)
+		}
+		if len(separator) > 1 && bytes.Compare(left, separator[:len(separator)-1]) < 0 {
+			t.Fatalf("separator %x has an unnecessary byte", separator)
+		}
+
+	}
+}
+
+func TestAppendSplitSeparator(t *testing.T) {
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	root := NewLeafNode(2)
+	store.StageNode(root)
+	keys := [][]byte{
+		append([]byte{'a'}, bytes.Repeat([]byte{'x'}, 64)...),
+		append([]byte{'b'}, bytes.Repeat([]byte{'x'}, 64)...),
+		append([]byte{'c'}, bytes.Repeat([]byte{'x'}, 64)...),
+	}
+	for _, key := range keys {
+		var err error
+		root, err = tree.PutEntry(root, NewEntry(0, key, bytes.Repeat([]byte{'v'}, 16)))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if root.IsLeaf() || store.nodes[root.Children[0]].EntryCount() != 2 || store.nodes[root.Children[1]].EntryCount() != 1 {
+		t.Fatal("fixture did not use the append split")
+	}
+	want := keys[2]
+
+	want = []byte{'c'}
+
+	if !bytes.Equal(root.entries[0].key, want) {
+		t.Fatalf("append separator: got %q, want %q", root.entries[0].key, want)
+	}
+	assertTreeSeparators(t, store, root)
+}
+
+func TestSeparatorBoundsAndGapInserts(t *testing.T) {
+	for _, pageSize := range []int64{128, 512, 4096} {
+		t.Run(fmt.Sprint(pageSize), func(t *testing.T) {
+			store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
+			tree := NewTree(store)
+			root := NewLeafNode(2)
+			store.StageNode(root)
+			reference := make(map[string][]byte)
+			keys := separatorTestKeys("mixed", 512)
+			random := rand.New(rand.NewSource(718))
+			put := func(key []byte) {
+				t.Helper()
+				var err error
+				root, err = tree.PutEntry(root, NewEntry(0, key, key))
+				if err != nil {
+					t.Fatal(err)
+				}
+				reference[string(key)] = slices.Clone(key)
+				store.dirty = nil
+			}
+			for _, i := range random.Perm(len(keys)) {
+				put(keys[i])
+			}
+			assertTreeSeparators(t, store, root)
+
+			// Insert the artificial boundaries and keys beside them. This tests
+			// the gaps that exact minimum separators did not expose before.
+			var boundaries [][]byte
+			for _, node := range store.nodes {
+				if !node.IsLeaf() {
+					for _, entry := range node.entries {
+						boundaries = append(boundaries, slices.Clone(entry.key))
+					}
+				}
+			}
+			for _, key := range boundaries {
+				put(key)
+				put(append(slices.Clone(key), 0))
+				put(append(slices.Clone(key), 0xff))
+			}
+			checkSeparatorTree(t, tree, store, root, reference)
+			for step := range 1800 {
+				key := keys[random.Intn(len(keys))]
+				if random.Intn(3) == 0 {
+					put(key)
+				} else {
+					var found bool
+					var err error
+					root, found, err = tree.DeleteEntry(root, key)
+					_, want := reference[string(key)]
+					if err != nil || found != want {
+						t.Fatalf("delete %x: found %t, want %t, error %v", key, found, want, err)
+					}
+					delete(reference, string(key))
+					store.dirty = nil
+				}
+				if step%32 == 0 {
+					checkSeparatorTree(t, tree, store, root, reference)
+				}
+			}
+			checkSeparatorTree(t, tree, store, root, reference)
+		})
+	}
+}
+
+func checkSeparatorTree(t *testing.T, tree *Tree, store *memoryTreeStore, root *Node, reference map[string][]byte) {
+	t.Helper()
+	assertTreeSeparators(t, store, root)
+	keys := make([]string, 0, len(reference))
+	for key := range reference {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	cursor := tree.Cursor(root)
+	entry, found, err := cursor.First()
+	for i, key := range keys {
+		if err != nil || !found || !bytes.Equal(entry.key, []byte(key)) || !bytes.Equal(entry.value, reference[key]) {
+			t.Fatalf("scan entry %d: found %t, error %v", i, found, err)
+		}
+		entry, found, err = cursor.Next()
+	}
+	if err != nil || found {
+		t.Fatalf("scan end: found %t, error %v", found, err)
+	}
+	for _, key := range keys {
+		entry, found, err := tree.FindEntryRef(root, []byte(key), true)
+		if err != nil || !found || !bytes.Equal(entry.value, reference[key]) {
+			t.Fatalf("lookup %x: found %t, error %v", key, found, err)
+		}
+		got, found, err := cursor.Seek([]byte(key))
+		if err != nil || !found || !bytes.Equal(got.key, []byte(key)) {
+			t.Fatalf("seek %x: found %t, error %v", key, found, err)
+		}
+	}
+}
+
+func separatorTestKeys(kind string, count int) [][]byte {
+	keys := make([][]byte, count)
+	for i := range keys {
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, uint64(i)*3+1)
+		switch kind {
+		case "long":
+			key = append(key, bytes.Repeat([]byte{byte(i)}, 120)...)
+		case "prefix":
+			key = append(bytes.Repeat([]byte("account/"), 15), key...)
+		case "mixed":
+			key = append([]byte{0, byte(i % 4)}, key...)
+			key = append(key, bytes.Repeat([]byte{byte(i)}, i%70)...)
+		}
+		keys[i] = key
+	}
+	return keys
+}
+
+func TestFenceKeepsParentCleanAfterMinimumDelete(t *testing.T) {
+	store := &memoryTreeStore{pageSize: 512, nextID: 5, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	left, right := NewLeafNode(2), NewLeafNode(3)
+	for i := range 4 {
+		for _, item := range []struct {
+			node *Node
+			side string
+		}{{left, "a"}, {right, "b"}} {
+			key := fmt.Appendf(nil, "account/%s/%03d", item.side, i)
+			if err := item.node.InsertEntry(NewEntry(0, key, key)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	separator := leafSeparator(left.entries[len(left.entries)-1].key, right.entries[0].key)
+	root := NewRootNode(4, left, right, separator)
+	store.StageNode(left)
+	store.StageNode(right)
+	store.StageNode(root)
+	store.dirty = nil
+	oldRoot := root
+	oldSeparator := slices.Clone(root.entries[0].key)
+	var err error
+	root, found, err := tree.DeleteEntry(root, []byte("account/b/000"))
+	if err != nil || !found {
+		t.Fatalf("delete minimum: found=%t, error=%v", found, err)
+	}
+	assertTreeSeparators(t, store, root)
+
+	if root != oldRoot || !bytes.Equal(root.entries[0].key, oldSeparator) {
+		t.Fatal("a minimum-only delete changed the saved parent fence")
+	}
+	if _, dirty := store.dirty[root.PageID()]; dirty {
+		t.Fatal("a minimum-only delete made the parent dirty")
+	}
+
+}
+
+func TestFenceDeletesAndRefillsOldGaps(t *testing.T) {
+	for _, pageSize := range []int64{128, 512} {
+		t.Run(fmt.Sprint(pageSize), func(t *testing.T) {
+			store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
+			tree := NewTree(store)
+			root := NewLeafNode(2)
+			store.StageNode(root)
+			reference := make(map[string][]byte)
+			keys := separatorTestKeys("mixed", 1024)
+			put := func(key []byte) {
+				t.Helper()
+				var err error
+				root, err = tree.PutEntry(root, NewEntry(0, key, key))
+				if err != nil {
+					t.Fatal(err)
+				}
+				reference[string(key)] = slices.Clone(key)
+				store.dirty = nil
+			}
+			remove := func(key []byte) {
+				t.Helper()
+				var found bool
+				var err error
+				root, found, err = tree.DeleteEntry(root, key)
+				_, want := reference[string(key)]
+				if err != nil || found != want {
+					t.Fatalf("delete %x: found=%t, want=%t, error=%v", key, found, want, err)
+				}
+				delete(reference, string(key))
+				store.dirty = nil
+			}
+			for _, index := range rand.New(rand.NewSource(519)).Perm(len(keys)) {
+				put(keys[index])
+			}
+			if root.IsLeaf() || store.nodes[root.Children[0]].IsLeaf() {
+				t.Fatal("fixture did not force at least three tree levels")
+			}
+			var oldFences, rightMinima [][]byte
+			for _, node := range store.nodes {
+				if node.IsLeaf() {
+					continue
+				}
+				for i, child := range node.Children[1:] {
+					oldFences = append(oldFences, slices.Clone(node.entries[i].key))
+					minimum, err := tree.subtreeMinimum(store.nodes[child])
+					if err != nil {
+						t.Fatal(err)
+					}
+					rightMinima = append(rightMinima, slices.Clone(minimum))
+				}
+			}
+			for i, key := range rightMinima {
+				remove(key)
+				if i%32 == 0 {
+					checkSeparatorTree(t, tree, store, root, reference)
+				}
+			}
+			// Remove most keys from each range. This forces sibling moves,
+			// first-child removal, branch merging, and ancestor repair.
+			for i, key := range keys {
+				if i%4 != 1 {
+					remove(key)
+				}
+				if i%32 == 0 {
+					checkSeparatorTree(t, tree, store, root, reference)
+				}
+			}
+			for _, key := range keys {
+				put(key)
+			}
+			for _, key := range oldFences {
+				put(key)
+				put(append(slices.Clone(key), 0))
+				put(append(slices.Clone(key), 0xff))
+			}
+			checkSeparatorTree(t, tree, store, root, reference)
+			remaining := make([]string, 0, len(reference))
+			for key := range reference {
+				remaining = append(remaining, key)
+			}
+			slices.Sort(remaining)
+			for i := len(remaining) - 1; i >= 0; i-- {
+				remove([]byte(remaining[i]))
+				if i%32 == 0 {
+					checkSeparatorTree(t, tree, store, root, reference)
+				}
+			}
+			if !root.IsLeaf() || root.EntryCount() != 0 {
+				t.Fatal("deleting all keys did not collapse to an empty leaf root")
+			}
+			for _, key := range oldFences {
+				put(key)
+			}
+			checkSeparatorTree(t, tree, store, root, reference)
+		})
+	}
+}
+
+// subtreeMinimum finds the first key below node. The search follows the first
+// child until it reaches a leaf. The returned key belongs to that leaf and
+// remains valid while the leaf remains valid. An empty leaf returns nil.
+func (tree *Tree) subtreeMinimum(node *Node) ([]byte, error) {
+	for !node.IsLeaf() {
+		var err error
+		node, err = tree.readChild(node, 0)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return node.firstKey(), nil
 }

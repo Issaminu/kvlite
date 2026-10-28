@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -1286,12 +1287,10 @@ func TestSplit_Cascades(t *testing.T) {
 
 	pageBytes := int(db.meta.PageSize())
 	keySize := pageBytes / 16 // safely < pageSize/2 (no oversized-entry edge), fat enough to fill branches fast
+	// Put the varying bytes last. A short separator must still keep the
+	// shared prefix, so both separator forms force a branch split.
 	mkKey := func(i int) []byte {
-		k := fmt.Appendf(nil, "key-%08d-", i)
-		for len(k) < keySize {
-			k = append(k, 'x')
-		}
-		return k
+		return fmt.Appendf(bytes.Repeat([]byte("x"), keySize-12), "%012d", i)
 	}
 
 	const n = 400
@@ -8481,7 +8480,10 @@ func TestPut_ContinuedTree(t *testing.T) {
 			values := make([][]byte, len(keys))
 			// The last value spans hundreds of continuation pages.
 			for i := range keys {
-				keys[i] = bytes.Repeat([]byte{byte('a' + i)}, MaxKeySize)
+				// A differing final byte keeps every separator large, even
+				// when the tree uses the shortest valid key prefix.
+				keys[i] = bytes.Repeat([]byte("k"), MaxKeySize)
+				keys[i][MaxKeySize-1] = byte('a' + i)
 				values[i] = bytes.Repeat([]byte{byte(i)}, 3*int(db.meta.PageSize())+i)
 			}
 			values[len(values)-1] = bytes.Repeat([]byte("v"), 520*int(db.meta.PageSize()))
@@ -8544,7 +8546,8 @@ func TestPut_ContinuedTree(t *testing.T) {
 				}
 			})
 			// Another leaf split grows a committed branch with large separator keys.
-			key := bytes.Repeat([]byte("z"), MaxKeySize)
+			key := bytes.Repeat([]byte("k"), MaxKeySize)
+			key[MaxKeySize-1] = 'z'
 			value := []byte("last")
 			if err := db.Put(testBucketName, key, value); err != nil {
 				t.Fatal(err)
@@ -13845,4 +13848,231 @@ func TestGetBatchAcrossCleanAndDirtyWriteViews(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestSeparatorRecoveryAndMappedReads(t *testing.T) {
+	for _, checksums := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNormal, CheckpointThresholdBytes: math.MaxUint64, DataPageChecksums: checksums, pageSize: 512})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			keys := separatorFileKeys("mixed", 1024)
+			random := rand.New(rand.NewSource(41))
+			reference := make(map[string][]byte)
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.CreateBucket([]byte("b"))
+				if err != nil {
+					return err
+				}
+				for _, i := range random.Perm(len(keys)) {
+					if err := bucket.Put(keys[i], keys[i]); err != nil {
+						return err
+					}
+					reference[string(keys[i])] = slices.Clone(keys[i])
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Artificial boundaries can become real keys later. Include their
+			// zero-byte extensions to test insertion into the resulting gaps.
+			if err := db.Update(func(tx *Tx) error {
+				bucket, err := tx.Bucket([]byte("b"))
+				if err != nil {
+					return err
+				}
+				var boundaries, rightMinima [][]byte
+				var walk func(*btree.Node) error
+				walk = func(node *btree.Node) error {
+					if node.IsLeaf() {
+						return nil
+					}
+					for i := range node.EntryCount() {
+						boundaries = append(boundaries, slices.Clone(node.EntryAt(i).Key()))
+					}
+					for childIndex, id := range node.Children {
+						child, err := tx.store.ReadNode(id)
+						if err != nil {
+							return err
+						}
+						if childIndex > 0 {
+							first := child
+							for !first.IsLeaf() {
+								first, err = tx.store.ReadNode(first.Children[0])
+								if err != nil {
+									return err
+								}
+							}
+							rightMinima = append(rightMinima, slices.Clone(first.EntryAt(0).Key()))
+						}
+						if err := walk(child); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				if err := walk(bucket.rootNode); err != nil {
+					return err
+				}
+				for _, key := range rightMinima {
+					if err := bucket.Delete(key); err != nil {
+						return err
+					}
+					delete(reference, string(key))
+				}
+				for _, boundary := range boundaries {
+					for _, key := range [][]byte{boundary, append(slices.Clone(boundary), 0)} {
+						if err := bucket.Put(key, key); err != nil {
+							return err
+						}
+						reference[string(key)] = slices.Clone(key)
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			for range 32 {
+				if err := db.Update(func(tx *Tx) error {
+					bucket, err := tx.Bucket([]byte("b"))
+					if err != nil {
+						return err
+					}
+					for range 24 {
+						key := keys[random.Intn(len(keys))]
+						if random.Intn(3) == 0 {
+							if err := bucket.Put(key, key); err != nil {
+								return err
+							}
+							reference[string(key)] = slices.Clone(key)
+						} else {
+							if err := bucket.Delete(key); err != nil {
+								return err
+							}
+							delete(reference, string(key))
+						}
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			separatorFileCheck(t, db, reference)
+
+			// Copy the committed main file and WAL before close. Recovery must
+			// reproduce this process-crash image, with all entry patches applied.
+			if db.wal.Stats().CommittedRecordCount == 0 {
+				t.Fatal("recovery fixture has no committed WAL records")
+			}
+			crashPath := filepath.Join(t.TempDir(), "crash-image")
+			for _, suffix := range []string{"", "-wal"} {
+				image, err := os.ReadFile(path + suffix)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(crashPath+suffix, image, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			recovered, err := Open(crashPath, 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			separatorFileCheck(t, recovered, reference)
+			if err := recovered.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			mapped, err := Open(path, 0600, &Options{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mapped.Close()
+			separatorFileCheck(t, mapped, reference)
+		})
+	}
+}
+
+func separatorFileCheck(t *testing.T, db *DB, reference map[string][]byte) {
+	t.Helper()
+	keys := make([]string, 0, len(reference))
+	for key := range reference {
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	for _, key := range keys {
+		value, err := db.Get([]byte("b"), []byte(key))
+		if err != nil || !bytes.Equal(value, reference[key]) {
+			t.Fatalf("point read %x: got %x, error %v", key, value, err)
+		}
+	}
+	if err := db.View(func(tx *Tx) error {
+		bucket, err := tx.Bucket([]byte("b"))
+		if err != nil {
+			return err
+		}
+		cursor, err := bucket.Cursor()
+		if err != nil {
+			return err
+		}
+		key, _, err := cursor.First()
+		for i, want := range keys {
+			if err != nil || !bytes.Equal(key, []byte(want)) {
+				return fmt.Errorf("forward entry %d: got %x, want %x, error %v", i, key, want, err)
+			}
+			key, _, err = cursor.Next()
+		}
+		if err != nil || key != nil {
+			return fmt.Errorf("forward end: got %x, error %v", key, err)
+		}
+		key, _, err = cursor.Last()
+		for i := len(keys) - 1; i >= 0; i-- {
+			if err != nil || !bytes.Equal(key, []byte(keys[i])) {
+				return fmt.Errorf("reverse entry %d: got %x, error %v", i, key, err)
+			}
+			key, _, err = cursor.Prev()
+		}
+		start, end := len(keys)/3, 2*len(keys)/3
+		i := start
+		if err := bucket.ScanRange([]byte(keys[start]), []byte(keys[end]), func(key, value []byte) error {
+			if i >= end || !bytes.Equal(key, []byte(keys[i])) || !bytes.Equal(value, reference[keys[i]]) {
+				return fmt.Errorf("range entry %d: got %x", i, key)
+			}
+			i++
+			return nil
+		}); err != nil {
+			return err
+		}
+		if i != end {
+			return fmt.Errorf("range ended at %d, want %d", i, end)
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func separatorFileKeys(kind string, count int) [][]byte {
+	keys := make([][]byte, count)
+	for i := range keys {
+		key := make([]byte, 8)
+		binary.BigEndian.PutUint64(key, uint64(i)*3+1)
+		switch kind {
+		case "long":
+			key = append(key, bytes.Repeat([]byte{byte(i)}, 120)...)
+		case "prefix":
+			key = append(bytes.Repeat([]byte("account/"), 15), key...)
+		case "mixed":
+			key = append([]byte{0, byte(i % 4)}, key...)
+			key = append(key, bytes.Repeat([]byte{byte(i)}, i%70)...)
+		}
+		keys[i] = key
+	}
+	return keys
 }

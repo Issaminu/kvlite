@@ -219,6 +219,17 @@ func chooseLeafRedistribution(entries []Entry, pageSize, minimumSize int64) int 
 	return best
 }
 
+// leafSeparator returns the shortest prefix of rightMinimum above leftMaximum.
+// Both inputs must be nonempty and leftMaximum must sort before rightMinimum.
+// The result borrows rightMinimum. Leaf keys stay unchanged.
+func leafSeparator(leftMaximum, rightMinimum []byte) []byte {
+	common := 0
+	for common < len(leftMaximum) && common < len(rightMinimum) && leftMaximum[common] == rightMinimum[common] {
+		common++
+	}
+	return rightMinimum[:common+1]
+}
+
 // redistributeLeaves changes the entry lists and the parent separator if both pages fit.
 func redistributeLeaves(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) bool {
 	entries := make([]Entry, 0, len(left.entries)+len(right.entries))
@@ -232,13 +243,13 @@ func redistributeLeaves(parent *Node, separatorIndex int, left, right *Node, pag
 	// changing entries in the other page.
 	left.entries = entries[:split:split]
 	right.entries = entries[split:len(entries):len(entries)]
-	parent.entries[separatorIndex] = Entry{key: slices.Clone(right.entries[0].key)}
+	parent.entries[separatorIndex] = Entry{key: slices.Clone(leafSeparator(left.entries[len(left.entries)-1].key, right.entries[0].key))}
 	left.encodedSize, right.encodedSize, parent.encodedSize = 0, 0, 0
 
 	return true
 }
 
-// splitLeaf keeps the separator as the first key of the new right leaf.
+// splitLeaf moves entries from index onward into the new right leaf.
 func (n *Node) splitLeaf(right *Node, index int) {
 	n.encodedSize, right.encodedSize = 0, 0
 	right.entries = slices.Clone(n.entries[index:])
