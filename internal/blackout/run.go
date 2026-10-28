@@ -169,8 +169,7 @@ func (runner *runner) run() (err error) {
 	}()
 	runner.event("config %s", runner.config)
 	runner.guard(func() { runner.openAndVerify(false) })
-	runner.faults = runner.config.IOFaults
-	runner.fsys.SetFaults(runner.faults)
+	runner.configureSessionFaults()
 	for step := 0; step < runner.settings.Steps && runner.failure == nil; step++ {
 		runner.step = step
 		runner.event("step %d", step)
@@ -185,16 +184,18 @@ func (runner *runner) run() (err error) {
 // safetyStep runs one step of the safety phase: a crash now, or one operation with an optional crash inside it.
 func (runner *runner) safetyStep() {
 	runner.readCorruptions = runner.fsys.Stats().ReadCorruptions
-	switch event, calls := runner.crash.beforeStep(); event {
-	case crashNow:
-		runner.stats.CrashesNow++
-		runner.event("crash now")
-		runner.fsys.Crash()
-		runner.afterStep()
-		return
-	case crashSchedule:
-		runner.event("schedule a crash after %d mutating calls", calls)
-		runner.fsys.ScheduleCrash(calls)
+	if runner.session.sync != kvlite.SyncNone {
+		switch event, calls := runner.crash.beforeStep(); event {
+		case crashNow:
+			runner.stats.CrashesNow++
+			runner.event("crash now")
+			runner.fsys.Crash()
+			runner.afterStep()
+			return
+		case crashSchedule:
+			runner.event("schedule a crash after %d mutating calls", calls)
+			runner.fsys.ScheduleCrash(calls)
+		}
 	}
 	runner.runOperation(runner.work.nextOperation(runner.config.OperationWeights))
 	runner.afterStep()
@@ -391,7 +392,7 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 			runner.fsys.SetFaults(false)
 			runner.fsys.CancelCrash()
 			defer runner.fsys.SetFaults(runner.faults)
-		} else if afterCrash {
+		} else if afterCrash && runner.session.sync != kvlite.SyncNone {
 			if crash, calls := runner.crash.duringRecovery(); crash {
 				runner.fsys.ScheduleCrash(calls)
 			}

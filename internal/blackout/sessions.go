@@ -13,8 +13,10 @@ import (
 // An application can change its options between opens, for example after an upgrade.
 // With Config.OptionChanges, each open of the main handle starts a session with new options from the options generator.
 //
-// SyncNone promises nothing after a power failure: "a system failure can lose committed updates or corrupt the database".
-// So a SyncNone session taints the storage.
+// SyncNone can corrupt the main file after a failed write or a process or system crash.
+// Its sessions therefore run with healthy storage and no injected crashes.
+// Their successful operations still have to match the model.
+// A SyncNone session also taints the storage until its writes become durable.
 // While the storage is tainted, no power failure happens, the floor does not move, and no sync fails.
 // A failed sync is a storage failure too: it can drop the unsynced pages of the SyncNone session, even from the cache of the running process.
 // The taint ends when a syncing session has made everything durable, which the disk reports ([disk.FS.Durable]).
@@ -112,7 +114,22 @@ func (runner *runner) startSession() {
 		runner.tainted = true
 		runner.fsys.SetSyncFaults(false)
 	}
+	if runner.sessions > 1 {
+		// The first Open is fault-free. Later opens use the new session's policy.
+		runner.configureSessionFaults()
+	}
 	runner.event("options: %s", runner.session)
+}
+
+// configureSessionFaults keeps recovery checks within the selected mode's guarantees.
+// SyncNone uses healthy storage here because it has no recovery guarantee after failed writes.
+// TestSyncNonePartialWriteStopsHandle covers its stopped handle.
+func (runner *runner) configureSessionFaults() {
+	runner.faults = runner.config.IOFaults && runner.crash.enabled && runner.session.sync != kvlite.SyncNone
+	runner.fsys.SetFaults(runner.faults)
+	if runner.session.sync == kvlite.SyncNone {
+		runner.fsys.CancelCrash()
+	}
 }
 
 // options returns the Options of the current session.

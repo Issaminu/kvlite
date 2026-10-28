@@ -118,9 +118,11 @@ func (n *Node) EntryAt(index int) *Entry {
 // It shares the immutable key and value bytes with n.
 // Node changes must replace an entry or byte slice instead of changing shared bytes in place.
 func (n *Node) Clone() *Node {
+	entries := make([]Entry, len(n.entries), max(len(n.entries)+1, cap(n.entries)))
+	copy(entries, n.entries)
 	return &Node{
 		header:           n.header,
-		entries:          slices.Clone(n.entries),
+		entries:          entries,
 		Children:         slices.Clone(n.Children),
 		storageTailPages: n.storageTailPages,
 	}

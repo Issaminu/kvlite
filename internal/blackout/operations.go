@@ -233,6 +233,9 @@ func (runner *runner) finishCommit(op string, mark int, err error, mutations []t
 		runner.uncertainOpen = true
 		runner.model.uncertain(mark, mutations)
 		runner.event("%s: WAL write failed, result unknown: %v", op, err)
+	case errors.Is(err, kvlite.ErrDatabaseWriteFailed):
+		runner.model.rollback(mark)
+		runner.fail("%s: main-file write failed: %v", op, err)
 	case runner.explained(err):
 		// The failure happened before the WAL append, so nothing was written.
 		runner.stats.Aborts++

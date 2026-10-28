@@ -5,8 +5,10 @@
 // A model holds the expected state and every older state that recovery can still return.
 //
 // One run has two phases, like TigerBeetle's VOPR:
-//   - The safety phase runs random operations with crashes and power failures.
+//   - The safety phase runs random operations with crashes and power failures in SyncFull and SyncNormal.
 //     Every read must match the model, and every recovery must return exactly one state that the model allows.
+//     SyncNone runs with healthy storage because it permits corruption after failed writes or crashes.
+//     Its successful writes, callback rollback, and clean reopens still have to match the model.
 //   - The liveness phase turns every fault off and requires progress: every operation must succeed, and a clean close and reopen must keep the latest state.
 //
 // Four random generators come from the seed:
