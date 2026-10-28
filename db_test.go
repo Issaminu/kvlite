@@ -13712,3 +13712,97 @@ func TestCloseQueuedBehindGetWaitingForAdmittedUpdate(t *testing.T) {
 		})
 	}
 }
+
+func TestGetBatchAcrossCleanAndDirtyWriteViews(t *testing.T) {
+	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+		for _, rollback := range []bool{false, true} {
+			t.Run(fmt.Sprintf("mode=%d/rollback=%t", mode, rollback), func(t *testing.T) {
+				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: mode, DataPageChecksums: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				createBucket(t, db, testBucketName)
+				old := bytes.Repeat([]byte("v"), 128)
+				pairs := make([]KeyValue, 800)
+				for i := range pairs {
+					pairs[i] = KeyValue{Key: []byte(fmt.Sprintf("key%04d", i)), Value: old}
+				}
+				if err := db.PutBatch(testBucketName, pairs); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Checkpoint(); err != nil {
+					t.Fatal(err)
+				}
+				keys := [][]byte{pairs[799].Key, []byte("missing"), pairs[0].Key, pairs[0].Key}
+				large := bytes.Repeat([]byte("n"), 16<<10)
+				discard := errors.New("discard clean-read transaction")
+				err = db.Update(func(tx *Tx) error {
+					bucket := mustBucket(t, tx, testBucketName)
+					before, err := bucket.GetBatch(keys)
+					if err != nil {
+						return err
+					}
+					if !bytes.Equal(before[0], old) || before[1] != nil || !bytes.Equal(before[2], old) || !bytes.Equal(before[3], old) {
+						t.Fatal("clean read differs")
+					}
+					if err := bucket.Put(pairs[0].Key, large); err != nil {
+						return err
+					}
+					if err := bucket.Delete(pairs[799].Key); err != nil {
+						return err
+					}
+					for i := 800; i < 1000; i++ {
+						if err := bucket.Put([]byte(fmt.Sprintf("key%04d", i)), old); err != nil {
+							return err
+						}
+					}
+					if !bytes.Equal(before[0], old) || !bytes.Equal(before[2], old) {
+						t.Fatal("later writes invalidated earlier read bytes")
+					}
+					after, err := bucket.GetBatch(keys)
+					if err != nil {
+						return err
+					}
+					if after[0] != nil || after[1] != nil || !bytes.Equal(after[2], large) || !bytes.Equal(after[3], large) {
+						t.Fatal("dirty read missed private writes")
+					}
+					// Model the next grouped callback: its own dirty map is empty, but it must see the prior callback's private image.
+					next := newWriteTx(db, tx.meta, tx.rootNode, tx.store.dirty, tx.allocation)
+					defer func() { next.closed = true }()
+					inherited, err := mustBucket(t, next, testBucketName).GetBatch(keys)
+					if err != nil {
+						return err
+					}
+					if inherited[0] != nil || !bytes.Equal(inherited[2], large) {
+						t.Fatal("next callback missed earlier private writes")
+					}
+					if rollback {
+						return discard
+					}
+					return nil
+				})
+				if rollback && err != discard || !rollback && err != nil {
+					t.Fatal(err)
+				}
+				// A new clean callback must also honor any committed WAL overlay.
+				if err := db.Update(func(tx *Tx) error {
+					values, err := mustBucket(t, tx, testBucketName).GetBatch(keys)
+					if err != nil {
+						return err
+					}
+					if rollback {
+						if !bytes.Equal(values[0], old) || !bytes.Equal(values[2], old) {
+							t.Fatal("rollback changed committed values")
+						}
+					} else if values[0] != nil || !bytes.Equal(values[2], large) {
+						t.Fatal("clean callback missed committed values")
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}

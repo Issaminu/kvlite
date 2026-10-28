@@ -614,7 +614,10 @@ func (bucket *Bucket) GetBatch(keys [][]byte) ([][]byte, error) {
 	if !slices.IsSortedFunc(keys, bytes.Compare) {
 		slices.SortFunc(order, func(a, b int) int { return bytes.Compare(keys[a], keys[b]) })
 	}
-	if db := bucket.tx.db; bucket.tx.readOnly && db.wal != nil && db.wal.Stats().CommittedRecordCount == 0 {
+	// A clean write transaction still reads committed pages. Its later writes stay private until the callback returns.
+	mainOnly := bucket.tx.readOnly || (len(bucket.tx.store.dirty) == 0 && len(bucket.tx.store.baseDirty) == 0 &&
+		!bucket.tx.metaDirty && (bucket.tx.allocation == nil || !bucket.tx.allocation.changed()))
+	if db := bucket.tx.db; mainOnly && db.wal != nil && db.wal.Stats().CommittedRecordCount == 0 {
 		root := bucket.rootPageID
 		if bucket.rootNode != nil {
 			root = bucket.rootNode.PageID()
