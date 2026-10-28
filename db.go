@@ -526,7 +526,7 @@ func (db *DB) Path() string {
 // [ErrIncompatibleValue] instead of replacing the bucket.
 func (db *DB) Put(bucketName, key, value []byte) error {
 	if db.options != nil && db.options.Synchronous == SyncNone && db.memoryNodes == nil {
-		return db.putMappedValue(bucketName, key, value)
+		return db.putMapped(bucketName, []KeyValue{{Key: key, Value: value}})
 	}
 	return db.Update(func(tx *Tx) error { return tx.putManaged(bucketName, key, value) })
 }
@@ -545,6 +545,9 @@ func (db *DB) PutBatch(bucketName []byte, entries []KeyValue) error {
 	if len(entries) == 1 {
 		return db.Put(bucketName, entries[0].Key, entries[0].Value)
 	}
+	if db.options != nil && db.options.Synchronous == SyncNone && db.memoryNodes == nil {
+		return db.putMapped(bucketName, entries)
+	}
 	return db.Update(func(tx *Tx) error {
 		bucket, err := tx.Bucket(bucketName)
 		if err != nil {
@@ -554,9 +557,9 @@ func (db *DB) PutBatch(bucketName []byte, entries []KeyValue) error {
 	})
 }
 
-// putMappedValue keeps the normal operation lifetime, lock, and backup exclusion.
-// Only SyncNone uses this path. Layout changes use a private transaction.
-func (db *DB) putMappedValue(bucketName, key, value []byte) error {
+// putMapped owns the operation lifetime, write lock and backup exclusion for scalar and batch writes.
+// Scalar writes retain their existing mapped insert support; batches preflight every replacement before changing bytes.
+func (db *DB) putMapped(bucketName []byte, entries []KeyValue) error {
 	if err := db.beginWriteOperation(); err != nil {
 		return err
 	}
@@ -566,41 +569,174 @@ func (db *DB) putMappedValue(bucketName, key, value []byte) error {
 	if err := db.prepareDirectWrite(); err != nil {
 		return err
 	}
-	if _, osFile := db.file.(*os.File); osFile && db.mappedWritable && len(key) != 0 && len(key) <= MaxKeySize && len(value) <= MaxValueSize && db.wal.Stats().CommittedRecordCount == 0 {
-		if handled, err := db.putMappedEntry(bucketName, key, value); handled || err != nil {
+	if _, osFile := db.file.(*os.File); len(entries) != 0 && osFile && db.mappedWritable && db.wal.Stats().CommittedRecordCount == 0 {
+		var handled bool
+		var err error
+		if len(entries) == 1 {
+			entry := entries[0]
+			if len(entry.Key) != 0 && len(entry.Key) <= MaxKeySize && len(entry.Value) <= MaxValueSize {
+				handled, err = db.putMappedEntry(bucketName, entry.Key, entry.Value)
+			}
+		} else {
+			handled, err = db.replaceMappedBatch(bucketName, entries)
+		}
+		if handled || err != nil {
 			return err
 		}
 	}
-	return db.updateDirect(func(tx *Tx) error { return tx.putManaged(bucketName, key, value) })
+	return db.updateDirect(func(tx *Tx) error {
+		if len(entries) == 1 {
+			return tx.putManaged(bucketName, entries[0].Key, entries[0].Value)
+		}
+		bucket, err := tx.Bucket(bucketName)
+		if err != nil {
+			return err
+		}
+		return bucket.putBatch(entries, true)
+	})
+}
+
+// replaceMappedBatch checks every request before the first mapped value changes.
+// Same-size replacements keep every key, descriptor, separator and page span in place.
+// The copy pass uses the checked destinations in caller order, so repeated keys keep their last value.
+func (db *DB) replaceMappedBatch(bucketName []byte, entries []KeyValue) (bool, error) {
+	root, err := db.mappedBucketRoot(bucketName)
+	if err != nil {
+		return true, err
+	}
+	if root == 0 {
+		return false, nil
+	}
+	for _, entry := range entries {
+		if len(entry.Key) == 0 {
+			return true, ErrKeyRequired
+		}
+		if len(entry.Key) > MaxKeySize {
+			return true, ErrKeyTooLarge
+		}
+		if len(entry.Value) > MaxValueSize {
+			return true, ErrValueTooLarge
+		}
+	}
+	// Group nearby destinations without changing the order in which caller values are applied.
+	order := make([]int, len(entries))
+	for index := range order {
+		order[index] = index
+	}
+	if !slices.IsSortedFunc(entries, func(a, b KeyValue) int { return bytes.Compare(a.Key, b.Key) }) {
+		slices.SortFunc(order, func(a, b int) int { return bytes.Compare(entries[a].Key, entries[b].Key) })
+	}
+	pageSize, checksums := db.meta.PageSize(), db.meta.DataPageChecksums()
+	// Retain checked destinations, not decoded nodes. The operation lock keeps every span stable.
+	values := make([][]byte, len(entries))
+	spans := make([][]byte, len(entries))
+	ids := make([]page.ID, len(entries))
+	var lastSpan []byte
+	var lastID page.ID
+	for _, index := range order {
+		entry := entries[index]
+		if lastSpan != nil {
+			// Nearby requests often share a leaf. Its complete body and checksum are already checked.
+			current, found, _, err := btree.LookupCheckedNodeSpan(lastSpan, entry.Key, false, false)
+			if err != nil {
+				return true, err
+			}
+			if found {
+				if current.Flags() != 0 || len(current.Value()) != len(entry.Value) {
+					return false, nil
+				}
+				values[index], spans[index], ids[index] = current.Value(), lastSpan, lastID
+				continue
+			}
+		}
+		id := root
+		for {
+			data, err := db.readMainNodePage(id)
+			if err != nil {
+				return true, err
+			}
+			if !db.nodeIsMapped(data, id) {
+				return false, nil
+			}
+			var current btree.Entry
+			_, found, child, err := btree.PrepareMappedPut(data, pageSize, entry.Key, len(entry.Value), &current)
+			if err != nil {
+				return true, err
+			}
+			if child != 0 {
+				id = child
+				continue
+			}
+			if !found || current.Flags() != 0 || len(current.Value()) != len(entry.Value) {
+				return false, nil
+			}
+			values[index], spans[index], ids[index] = current.Value(), data, id
+			lastSpan, lastID = data, id
+			break
+		}
+	}
+	// Every request is valid before the first copy. No tree lookup, allocation or mapping change follows.
+	for index, entry := range entries {
+		if !bytes.Equal(values[index], entry.Value) {
+			copy(values[index], entry.Value)
+		}
+	}
+	// Sorted key ranges put each leaf's requests together, so seal and invalidate it once.
+	for position, index := range order {
+		if position+1 < len(order) && ids[index] == ids[order[position+1]] {
+			continue
+		}
+		if err := btree.VerifyNodeIDAndSetChecksum(spans[index], ids[index], checksums); err != nil {
+			// Preflight checked the unchanged header. Treat an unexpected failure after copying as a write failure.
+			db.mainWriteFailure = fmt.Errorf("%w: %w", ErrDatabaseWriteFailed, err)
+			return true, db.mainWriteFailure
+		}
+		db.invalidateWriteNode(ids[index])
+	}
+	return true, nil
+}
+
+// mappedBucketRoot returns the root of a bucket backed by mapped bytes.
+// A zero root requests the normal transaction path when the bucket value is owned memory.
+func (db *DB) mappedBucketRoot(bucketName []byte) (page.ID, error) {
+	if len(bucketName) == 0 {
+		return 0, ErrBucketNameRequired
+	}
+	entry, found, err := db.findCommittedEntry(db.meta.Root(), bucketName)
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, ErrBucketNotFound
+	}
+	if entry.ValueIsOwned() {
+		return 0, nil
+	}
+	return decodeBucketRootPageID(entry)
+}
+
+// nodeIsMapped reports whether checked node bytes alias the main-file mapping.
+func (db *DB) nodeIsMapped(data []byte, id page.ID) bool {
+	offset := int64(id) * db.meta.PageSize()
+	return offset <= int64(len(db.mappedFile)) && int64(len(data)) <= int64(len(db.mappedFile))-offset && &data[0] == &db.mappedFile[offset]
 }
 
 // putMappedEntry changes one entry without changing parent separators or node spans.
 // The caller excludes readers and active backups with the operation write lock.
 func (db *DB) putMappedEntry(bucketName, key, value []byte) (bool, error) {
-	if len(bucketName) == 0 {
-		return true, ErrBucketNameRequired
-	}
-	bucketEntry, found, err := db.findCommittedEntry(db.meta.Root(), bucketName)
+	id, err := db.mappedBucketRoot(bucketName)
 	if err != nil {
 		return true, err
 	}
-	if !found {
-		return true, ErrBucketNotFound
-	}
-	if bucketEntry.ValueIsOwned() {
+	if id == 0 {
 		return false, nil
-	}
-	id, err := decodeBucketRootPageID(bucketEntry)
-	if err != nil {
-		return true, err
 	}
 	for {
 		data, err := db.readMainNodePage(id)
 		if err != nil {
 			return true, err
 		}
-		offset := int64(id) * db.meta.PageSize()
-		if offset > int64(len(db.mappedFile)) || int64(len(data)) > int64(len(db.mappedFile))-offset || &data[0] != &db.mappedFile[offset] {
+		if !db.nodeIsMapped(data, id) {
 			return false, nil
 		}
 		handled, child, err := btree.PutMappedEntry(data, id, db.meta.PageSize(), db.meta.DataPageChecksums(), key, value)

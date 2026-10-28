@@ -13109,6 +13109,343 @@ func ExampleDB_PutBatch() {
 	// Output: Ada true
 }
 
+func TestDBPutBatchMappedReplacements(t *testing.T) {
+	if !systemMappingAllowsWrites {
+		t.Skip("mapped writes are unavailable")
+	}
+	for _, checksums := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			entries := []KeyValue{{Key: []byte("a"), Value: bytes.Repeat([]byte("a"), 128)}, {Key: []byte("b"), Value: bytes.Repeat([]byte("b"), 128)}}
+			if err := db.PutBatch(testBucketName, entries); err != nil {
+				t.Fatal(err)
+			}
+			var id page.ID
+			if err := db.View(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				if err := bucket.loadRootNode(); err != nil {
+					return err
+				}
+				id = bucket.rootNode.PageID()
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if cached := db.writeNodes[id]; cached == nil || cached.node == nil {
+				t.Fatal("fixture has no cached leaf")
+			}
+			writes := []KeyValue{{Key: entries[1].Key, Value: bytes.Repeat([]byte("c"), 128)}, {Key: entries[0].Key, Value: bytes.Repeat([]byte("d"), 128)}, {Key: entries[1].Key, Value: bytes.Repeat([]byte("e"), 128)}}
+			if err := db.PutBatch(testBucketName, writes); err != nil {
+				t.Fatal(err)
+			}
+			if cached := db.writeNodes[id]; cached != nil && cached.node != nil {
+				t.Fatal("mapped batch retained a stale decoded leaf")
+			}
+			for _, pair := range []KeyValue{writes[1], writes[2]} {
+				got, err := db.Get(testBucketName, pair.Key)
+				if err != nil || !bytes.Equal(got, pair.Value) {
+					t.Fatalf("replacement %q: %v", pair.Key, err)
+				}
+			}
+			before, err := db.Get(testBucketName, entries[0].Key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, bad := range []KeyValue{{Key: nil, Value: nil}, {Key: bytes.Repeat([]byte("x"), MaxKeySize+1)}, {Key: []byte("nested"), Value: []byte("conflict")}} {
+				if string(bad.Key) == "nested" {
+					if err := db.Update(func(tx *Tx) error {
+						bucket, err := tx.Bucket(testBucketName)
+						if err != nil {
+							return err
+						}
+						_, err = bucket.CreateBucket(bad.Key)
+						return err
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := db.PutBatch(testBucketName, []KeyValue{{Key: entries[0].Key, Value: bytes.Repeat([]byte("z"), 128)}, bad}); err == nil {
+					t.Fatal("invalid batch succeeded")
+				}
+				got, err := db.Get(testBucketName, entries[0].Key)
+				if err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("failed batch changed earlier value: %v", err)
+				}
+			}
+			// A missing key or size change uses the private transaction path for the entire batch.
+			if err := db.PutBatch(testBucketName, []KeyValue{{Key: []byte("a"), Value: []byte("short")}, {Key: []byte("new"), Value: bytes.Repeat([]byte("n"), 64<<10)}}); err != nil {
+				t.Fatal(err)
+			}
+			if got, err := db.Get(testBucketName, []byte("a")); err != nil || string(got) != "short" {
+				t.Fatalf("fallback replacement: %q %v", got, err)
+			}
+			if got, err := db.Get(testBucketName, []byte("new")); err != nil || len(got) != 64<<10 {
+				t.Fatalf("fallback insertion: %d %v", len(got), err)
+			}
+		})
+	}
+}
+
+func TestDBPutBatchMappedPreflightChecksLaterLeaves(t *testing.T) {
+	if !systemMappingAllowsWrites {
+		t.Skip("mapped writes are unavailable")
+	}
+	for _, checksums := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			setup := make([]KeyValue, 200)
+			for i := range setup {
+				setup[i] = KeyValue{Key: fmt.Appendf(nil, "key%04d", i), Value: bytes.Repeat([]byte("a"), 128)}
+			}
+			if err := db.PutBatch(testBucketName, setup); err != nil {
+				t.Fatal(err)
+			}
+			bucketEntry, found, err := db.findCommittedEntry(db.meta.Root(), testBucketName)
+			if err != nil || !found {
+				t.Fatalf("bucket: %v", err)
+			}
+			id, err := decodeBucketRootPageID(bucketEntry)
+			if err != nil {
+				t.Fatal(err)
+			}
+			last := setup[len(setup)-1]
+			for {
+				_, _, child, err := db.lookupCommittedPage(id, last.Key, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if child == 0 {
+					break
+				}
+				id = child
+			}
+			span, err := db.readMainNodePage(id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			original := bytes.Clone(span)
+			span[0] = 255
+			defer copy(span, original)
+			if err := db.PutBatch(testBucketName, []KeyValue{{Key: setup[0].Key, Value: bytes.Repeat([]byte("z"), 128)}, {Key: last.Key, Value: bytes.Repeat([]byte("z"), 128)}}); err == nil {
+				t.Fatal("corrupt later leaf was accepted")
+			}
+			got, err := db.Get(testBucketName, setup[0].Key)
+			if err != nil || !bytes.Equal(got, setup[0].Value) {
+				t.Fatalf("preflight failure changed an earlier leaf: %v", err)
+			}
+		})
+	}
+}
+
+func TestDBPutBatchMappedWaitsForBackup(t *testing.T) {
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+	value := bytes.Repeat([]byte("a"), 128)
+	if err := db.PutBatch(testBucketName, []KeyValue{{Key: []byte("key"), Value: value}, {Key: []byte("other"), Value: value}}); err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	releaseCopy := sync.OnceFunc(func() { close(release) })
+	defer releaseCopy()
+	backupPath := filepath.Join(t.TempDir(), "backup")
+	backupDone := make(chan error, 1)
+	go func() {
+		backupDone <- db.backup(backupPath, func(dst io.Writer, src io.Reader) (int64, error) { close(entered); <-release; return io.Copy(dst, src) }, func(*os.File) error { return nil })
+	}()
+	<-entered
+	value[len(value)-1] = 'b'
+	putDone := make(chan error, 1)
+	go func() {
+		putDone <- db.PutBatch(testBucketName, []KeyValue{{Key: []byte("key"), Value: value}, {Key: []byte("other"), Value: value}})
+	}()
+	select {
+	case err := <-putDone:
+		t.Fatalf("PutBatch returned during backup: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	releaseCopy()
+	if err := <-backupDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-putDone; err != nil {
+		t.Fatal(err)
+	}
+	backup, err := Open(backupPath, 0600, &Options{ReadOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer backup.Close()
+	got, err := backup.Get(testBucketName, []byte("key"))
+	if err != nil || got[len(got)-1] != 'a' {
+		t.Fatalf("backup changed: %v", err)
+	}
+}
+
+func TestDBPutBatchMappedContinuedReplacements(t *testing.T) {
+	if !systemMappingAllowsWrites {
+		t.Skip("mapped writes are unavailable")
+	}
+	for _, size := range []int{64 << 10, 1 << 20} {
+		for _, checksums := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size=%d/checksums=%t", size, checksums), func(t *testing.T) {
+				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				createBucket(t, db, testBucketName)
+				setup := []KeyValue{{Key: []byte("a"), Value: bytes.Repeat([]byte("a"), size)}, {Key: []byte("b"), Value: bytes.Repeat([]byte("b"), size)}}
+				if err := db.PutBatch(testBucketName, setup); err != nil {
+					t.Fatal(err)
+				}
+				bucketEntry, found, err := db.findCommittedEntry(db.meta.Root(), testBucketName)
+				if err != nil || !found {
+					t.Fatalf("bucket: %v", err)
+				}
+				root, err := decodeBucketRootPageID(bucketEntry)
+				if err != nil {
+					t.Fatal(err)
+				}
+				leafID := func(key []byte) page.ID {
+					id := root
+					for {
+						_, _, child, err := db.lookupCommittedPage(id, key, false)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if child == 0 {
+							return id
+						}
+						id = child
+					}
+				}
+				firstID, lastID := leafID(setup[0].Key), leafID(setup[1].Key)
+				if firstID == lastID {
+					t.Fatal("large fixture has only one leaf")
+				}
+				if _, err := db.readNode(firstID); err != nil {
+					t.Fatal(err)
+				}
+				writes := []KeyValue{{Key: setup[1].Key, Value: bytes.Repeat([]byte("c"), size)}, {Key: setup[0].Key, Value: bytes.Repeat([]byte("d"), size)}, {Key: setup[1].Key, Value: bytes.Repeat([]byte("e"), size)}}
+				if err := db.PutBatch(testBucketName, writes); err != nil {
+					t.Fatal(err)
+				}
+				if cached := db.writeNodes[firstID]; cached != nil && cached.node != nil {
+					t.Fatal("continued batch retained a stale decoded leaf")
+				}
+				for _, pair := range []KeyValue{writes[1], writes[2]} {
+					got, err := db.Get(testBucketName, pair.Key)
+					if err != nil || !bytes.Equal(got, pair.Value) {
+						t.Fatalf("continued replacement %q: %v", pair.Key, err)
+					}
+				}
+				writes[2].Value[0] = '!'
+				if got, err := db.Get(testBucketName, setup[1].Key); err != nil || got[0] != 'e' {
+					t.Fatalf("continued batch retained caller bytes: %v", err)
+				}
+				before, err := db.Get(testBucketName, setup[0].Key)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.PutBatch(testBucketName, []KeyValue{{Key: setup[0].Key, Value: bytes.Repeat([]byte("z"), size)}, {Key: nil}}); !errors.Is(err, ErrKeyRequired) {
+					t.Fatalf("invalid large batch: %v", err)
+				}
+				if got, err := db.Get(testBucketName, setup[0].Key); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("invalid large batch changed earlier value: %v", err)
+				}
+				// Corruption in a later continued leaf must be found before any earlier value is copied.
+				span, err := db.readMainNodePage(lastID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				original := bytes.Clone(span)
+				binary.LittleEndian.PutUint32(span[btree.NodeHeaderSize+4:btree.NodeHeaderSize+8], ^uint32(0))
+				if err := db.PutBatch(testBucketName, []KeyValue{{Key: setup[0].Key, Value: bytes.Repeat([]byte("z"), size)}, {Key: setup[1].Key, Value: bytes.Repeat([]byte("z"), size)}}); err == nil {
+					t.Fatal("corrupt continued leaf was accepted")
+				}
+				copy(span, original)
+				if got, err := db.Get(testBucketName, setup[0].Key); err != nil || !bytes.Equal(got, before) {
+					t.Fatalf("continued preflight failure changed an earlier leaf: %v", err)
+				}
+				// Shrinking changes the span layout and uses the private transaction fallback for the complete batch.
+				if err := db.PutBatch(testBucketName, []KeyValue{{Key: setup[0].Key, Value: []byte("short")}, {Key: setup[1].Key, Value: bytes.Repeat([]byte("f"), size)}}); err != nil {
+					t.Fatal(err)
+				}
+				if got, err := db.Get(testBucketName, setup[0].Key); err != nil || string(got) != "short" {
+					t.Fatalf("continued fallback shrink: %q %v", got, err)
+				}
+				if got, err := db.Get(testBucketName, setup[1].Key); err != nil || got[0] != 'f' || len(got) != size {
+					t.Fatalf("continued fallback replacement: %d %v", len(got), err)
+				}
+			})
+		}
+	}
+}
+
+func TestDBPutBatchMappedDuplicateOrder(t *testing.T) {
+	if !systemMappingAllowsWrites {
+		t.Skip("mapped writes are unavailable")
+	}
+	for _, size := range []int{128, 64 << 10} {
+		for _, checksums := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size=%d/checksums=%t", size, checksums), func(t *testing.T) {
+				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				createBucket(t, db, testBucketName)
+				setup := make([]KeyValue, 8)
+				for index := range setup {
+					setup[index] = KeyValue{Key: fmt.Appendf(nil, "key%d", index), Value: bytes.Repeat([]byte("x"), size)}
+				}
+				if err := db.PutBatch(testBucketName, setup); err != nil {
+					t.Fatal(err)
+				}
+				writes := make([]KeyValue, 256)
+				want := make([][]byte, len(setup))
+				for index := range writes {
+					keyIndex := (index*5 + 3) % len(setup)
+					// Equal keys have independent backing arrays and different values at every occurrence.
+					writes[index] = KeyValue{Key: bytes.Clone(setup[keyIndex].Key), Value: bytes.Repeat([]byte{byte(index)}, size)}
+					want[keyIndex] = writes[index].Value
+				}
+				if err := db.PutBatch(testBucketName, writes); err != nil {
+					t.Fatal(err)
+				}
+				for index, entry := range setup {
+					got, err := db.Get(testBucketName, entry.Key)
+					if err != nil || !bytes.Equal(got, want[index]) {
+						t.Fatalf("last caller value for %q: %v", entry.Key, err)
+					}
+				}
+				for index, entry := range writes {
+					if !bytes.Equal(entry.Key, setup[(index*5+3)%len(setup)].Key) || len(entry.Value) != size || entry.Value[0] != byte(index) {
+						t.Fatalf("caller entry %d changed", index)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestCloseWaitsForBlockedGet(t *testing.T) {
 	for _, readOnly := range []bool{false, true} {
 		t.Run(fmt.Sprintf("readOnly=%t", readOnly), func(t *testing.T) {

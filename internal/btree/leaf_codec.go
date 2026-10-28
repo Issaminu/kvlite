@@ -401,6 +401,28 @@ func MappedLeafNeighbor(data []byte, id page.ID, pageSize int64, checksums bool,
 	return nil, false, true, nil
 }
 
+// PrepareMappedPut checks a mapped leaf and looks up key without changing bytes.
+// data must hold a complete node with a checked header and checksum; key must be valid.
+// A branch returns its next child. A leaf returns the key's position, whether it exists, and its borrowed entry.
+// Unsupported continued leaves return found=false and index=0, which also prevents mapped insertion.
+// entry must be zero before the call. Its bytes remain valid while the caller excludes writes.
+func PrepareMappedPut(data []byte, pageSize int64, key []byte, valueSize int, entry *Entry) (index int, found bool, child page.ID, err error) {
+	count := binary.LittleEndian.Uint32(data[10:14])
+	image := data[:NodeHeaderSize+int(binary.LittleEndian.Uint32(data[18:22]))]
+	if mappedNodeType(data) == NodeTypeBranch {
+		child, err = lookupBranchBody(image, count, key)
+		return 0, false, child, err
+	}
+	if int64(len(data)) > pageSize && (count != 1 || int64(valueSize) <= pageSize) {
+		return 0, false, 0, nil
+	}
+	if err := checkLeafBody(image, NodeHeader{EntryCount: count}, true, nil); err != nil {
+		return 0, false, 0, err
+	}
+	index, found, err = lookupLeafBody(image, count, key, false, entry)
+	return index, found, 0, err
+}
+
 // PutMappedEntry changes a plain entry without changing the first key or page span.
 // It replaces a same-size value or inserts a small entry into a one-page leaf.
 // data must be writable and excluded from readers. A branch returns its next child.
@@ -410,24 +432,13 @@ func PutMappedEntry(data []byte, id page.ID, pageSize int64, checksums bool, key
 	if err := validateLookupKey(key); err != nil {
 		return false, 0, err
 	}
-	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
-	if err != nil {
-		return false, 0, err
-	}
-	if h.Type == NodeTypeBranch {
-		child, err := lookupBranchBody(image, h.EntryCount, key)
-		return false, child, err
-	}
-	if int64(len(data)) > pageSize && (h.EntryCount != 1 || int64(len(value)) <= pageSize) {
-		return false, 0, nil
-	}
-	if err := checkLeafBody(image, h, true, nil); err != nil {
+	if _, _, err := nodeImage(data, id, pageSize, nil, false, checksums); err != nil {
 		return false, 0, err
 	}
 	var entry Entry
-	index, found, err := lookupLeafBody(image, h.EntryCount, key, false, &entry)
-	if err != nil {
-		return false, 0, err
+	index, found, child, err := PrepareMappedPut(data, pageSize, key, len(value), &entry)
+	if err != nil || child != 0 {
+		return false, child, err
 	}
 	if found {
 		if entry.flags != 0 || len(value) != len(entry.value) {
@@ -441,21 +452,22 @@ func PutMappedEntry(data []byte, id page.ID, pageSize int64, checksums bool, key
 		// Keep borrowed input bytes intact while the packed body moves.
 		var input [256]byte
 		added := leafEntryDescriptorSize + len(key) + len(value)
-		if index == 0 || int64(len(data)) != pageSize || len(key) > len(input) || len(value) > len(input)-len(key) || added > len(data)-len(image) {
+		imageSize := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
+		if index == 0 || int64(len(data)) != pageSize || len(key) > len(input) || len(value) > len(input)-len(key) || added > len(data)-imageSize {
 			return false, 0, nil
 		}
 		keySize, valueSize := len(key), len(value)
 		copy(input[:], key)
 		copy(input[keySize:], value)
-		count := int(h.EntryCount)
+		count := int(binary.LittleEndian.Uint32(data[10:14]))
 		dataStart := NodeHeaderSize + count*leafEntryDescriptorSize
-		position := len(image)
+		position := imageSize
 		if index < count {
-			_, start, _, _ := leafSpan(image, index)
+			_, start, _, _ := leafSpan(data[:imageSize], index)
 			position = int(start)
 		}
-		newSize := len(image) + added
-		copy(data[position+added:newSize], data[position:len(image)])
+		newSize := imageSize + added
+		copy(data[position+added:newSize], data[position:imageSize])
 		copy(data[dataStart+leafEntryDescriptorSize:position+leafEntryDescriptorSize], data[dataStart:position])
 		copy(data[NodeHeaderSize+(index+1)*leafEntryDescriptorSize:dataStart+leafEntryDescriptorSize], data[NodeHeaderSize+index*leafEntryDescriptorSize:dataStart])
 		for slot := 0; slot <= count; slot++ {
@@ -472,7 +484,7 @@ func PutMappedEntry(data []byte, id page.ID, pageSize int64, checksums bool, key
 		}
 		position += leafEntryDescriptorSize
 		copy(data[position:], input[:keySize+valueSize])
-		binary.LittleEndian.PutUint32(data[10:14], h.EntryCount+1)
+		binary.LittleEndian.PutUint32(data[10:14], uint32(count+1))
 		binary.LittleEndian.PutUint32(data[18:22], uint32(newSize-NodeHeaderSize))
 	}
 	// The header length and page ID were checked above and remain unchanged.

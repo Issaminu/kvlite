@@ -522,3 +522,38 @@ func TestInsertMappedLeafEntryPreflight(t *testing.T) {
 		t.Fatalf("overlapping input: handled=%t error=%v", handled, err)
 	}
 }
+
+func TestPrepareMappedPutDoesNotChangeLeaf(t *testing.T) {
+	const pageSize int64 = 4096
+	node := NewLeafNode(50)
+	for _, key := range []string{"a", "c"} {
+		if err := node.InsertEntry(NewEntry(0, []byte(key), []byte("value"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := make([]byte, pageSize)
+	if err := EncodeNodeInto(data, node, pageSize, false); err != nil {
+		t.Fatal(err)
+	}
+	before := bytes.Clone(data)
+	for _, test := range []struct {
+		key   string
+		index int
+		found bool
+	}{{"c", 1, true}, {"b", 1, false}, {"0", 0, false}} {
+		var entry Entry
+		index, found, child, err := PrepareMappedPut(data, pageSize, []byte(test.key), 5, &entry)
+		if err != nil || index != test.index || found != test.found || child != 0 {
+			t.Fatalf("preflight %q: index=%d found=%t child=%d error=%v", test.key, index, found, child, err)
+		}
+		if !bytes.Equal(data, before) {
+			t.Fatal("preflight changed the leaf")
+		}
+	}
+	binary.LittleEndian.PutUint32(data[NodeHeaderSize+4:NodeHeaderSize+8], ^uint32(0))
+	before = bytes.Clone(data)
+	var entry Entry
+	if _, _, _, err := PrepareMappedPut(data, pageSize, []byte("c"), 5, &entry); err == nil || !bytes.Equal(data, before) {
+		t.Fatalf("preflight accepted or changed a malformed leaf: %v", err)
+	}
+}
