@@ -105,24 +105,12 @@ func (store *txTreeStore) ReadNode(pageID page.ID) (*btree.Node, error) {
 // A page without a WAL image needs a complete first image. Commit preparation
 // therefore needs its old allocation count, but not a decoded original node.
 func (store *txTreeStore) ReplaceLeafEntry(pageID page.ID, entry btree.Entry, skipIdentical bool) (bool, error) {
-	if store.tx.readOnly || store.tx.db.memoryNodes != nil || entry.Flags() != 0 {
-		return false, nil
-	}
-	if store.nodes[pageID].node != nil {
-		return false, nil
-	}
-	if _, ok := store.baseDirty[pageID]; ok {
+	if entry.Flags() != 0 {
 		return false, nil
 	}
 	db := store.tx.db
-	if _, ok := db.wal.Lookup(pageID); ok {
-		return false, nil
-	}
-	if _, ok := db.cachedWriteNode(pageID); ok {
-		return false, nil
-	}
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
+	data, err := store.uncachedMainNode(pageID)
+	if err != nil || data == nil {
 		return false, err
 	}
 	node, replaced, err := btree.ReplaceMappedLeaf(data, pageID, store.PageSize(), db.meta.DataPageChecksums(), entry, skipIdentical)
@@ -135,6 +123,21 @@ func (store *txTreeStore) ReplaceLeafEntry(pageID page.ID, entry btree.Entry, sk
 	return true, nil
 }
 
+// DeleteLeafEntry stages an empty uncached main-file leaf without copying its old value.
+// Its full empty image and old allocation count are sufficient for commit or retirement.
+// Cached, WAL-backed and earlier callback images use the ordinary private-copy path.
+func (store *txTreeStore) DeleteLeafEntry(pageID page.ID, key []byte) (*btree.Node, error) {
+	data, err := store.uncachedMainNode(pageID)
+	if err != nil || data == nil {
+		return nil, err
+	}
+	node, err := btree.DeleteMappedLeaf(data, pageID, store.PageSize(), store.tx.meta.DataPageChecksums(), key)
+	if err == nil && node != nil {
+		store.StageNode(node)
+	}
+	return node, err
+}
+
 // InsertLeafNeighbor stages a new leaf without decoding the unchanged old value.
 // Only an uncached plain leaf in the mapped main file can use this path.
 func (store *txTreeStore) InsertLeafNeighbor(id page.ID, entry btree.Entry) (*btree.Node, []byte, bool, error) {
@@ -142,20 +145,8 @@ func (store *txTreeStore) InsertLeafNeighbor(id page.ID, entry btree.Entry) (*bt
 	if store.tx.readOnly || db.memoryNodes != nil || len(db.mappedFile) == 0 || entry.Flags() != 0 {
 		return nil, nil, false, nil
 	}
-	if store.nodes[id].node != nil {
-		return nil, nil, false, nil
-	}
-	if _, ok := store.baseDirty[id]; ok {
-		return nil, nil, false, nil
-	}
-	if _, ok := db.wal.Lookup(id); ok {
-		return nil, nil, false, nil
-	}
-	if _, ok := db.cachedWriteNode(id); ok {
-		return nil, nil, false, nil
-	}
-	data, err := db.readMainNodePage(id)
-	if err != nil {
+	data, err := store.uncachedMainNode(id)
+	if err != nil || data == nil {
 		return nil, nil, false, err
 	}
 	separator, before, eligible, err := btree.MappedLeafNeighbor(data, id, store.PageSize(), db.meta.DataPageChecksums(), entry.Key())
@@ -175,6 +166,25 @@ func (store *txTreeStore) InsertLeafNeighbor(id page.ID, entry btree.Entry) (*bt
 	}
 	store.StageNode(neighbor)
 	return neighbor, separator, before, nil
+}
+
+// uncachedMainNode selects a committed main image without a transaction or cache owner.
+// Nil means that an existing owner must supply the node through the ordinary path.
+func (store *txTreeStore) uncachedMainNode(id page.ID) ([]byte, error) {
+	db := store.tx.db
+	if store.tx.readOnly || db.memoryNodes != nil || store.nodes[id].node != nil {
+		return nil, nil
+	}
+	if _, ok := store.baseDirty[id]; ok {
+		return nil, nil
+	}
+	if _, ok := db.wal.Lookup(id); ok {
+		return nil, nil
+	}
+	if _, ok := db.cachedWriteNode(id); ok {
+		return nil, nil
+	}
+	return db.readMainNodePage(id)
 }
 
 // VisitNodeReferences visits one node without decoding a committed main page.

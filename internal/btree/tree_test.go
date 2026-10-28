@@ -40,6 +40,10 @@ func (*memoryTreeStore) ReplaceLeafEntry(page.ID, Entry, bool) (bool, error) {
 	return false, nil
 }
 
+func (*memoryTreeStore) DeleteLeafEntry(page.ID, []byte) (*Node, error) {
+	return nil, nil
+}
+
 func (*memoryTreeStore) InsertLeafNeighbor(page.ID, Entry) (*Node, []byte, bool, error) {
 	return nil, nil, false, nil
 }
@@ -690,6 +694,10 @@ func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
 	}
 	left := branch(3, "abc", 10)
 	right := branch(4, "mno", 20)
+	left = NewRootNode(5, left, branch(6, "ghi", 30), []byte("g"))
+	right = NewRootNode(7, right, branch(8, "stu", 40), []byte("s"))
+	store.nodes[left.PageID()] = left
+	store.nodes[right.PageID()] = right
 	root := NewRootNode(2, left, right, []byte("m"))
 	store.nodes[root.PageID()] = root
 	gotRoot, found, err := NewTree(store).DeleteEntry(root, []byte("m"))
@@ -699,7 +707,7 @@ func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
 	if string(gotRoot.entries[0].key) != "n" {
 		t.Fatalf("ancestor separator: got %q, want n", gotRoot.entries[0].key)
 	}
-	for _, id := range []page.ID{10, 11, 12, 21, 22} {
+	for _, id := range []page.ID{10, 11, 12, 21, 22, 30, 31, 32, 40, 41, 42} {
 		if _, dirty := store.dirty[id]; dirty {
 			t.Fatalf("unchanged leaf %d is dirty", id)
 		}

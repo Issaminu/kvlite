@@ -25,6 +25,9 @@ type Store interface {
 	// skipIdentical permits an identical entry to remain unchanged.
 	// A false result keeps the ordinary read-and-update path.
 	ReplaceLeafEntry(pageID page.ID, entry Entry, skipIdentical bool) (bool, error)
+	// DeleteLeafEntry stages an empty replacement for a leaf containing only key.
+	// The empty leaf retains its old allocation count for repair. Nil keeps the ordinary deletion path.
+	DeleteLeafEntry(pageID page.ID, key []byte) (*Node, error)
 	// InsertLeafNeighbor stages a separate leaf beside an unchanged large leaf.
 	// before places the neighbor before the old leaf in key order.
 	// A nil neighbor keeps the ordinary insertion path.
@@ -377,21 +380,12 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 	}
 	changed := false
 	for first := 0; first < len(ordered); {
-		node := root
-		var path []treePathStep
-		for !node.IsLeaf() {
-			index, err := node.FindChildIndex(ordered[first])
-			if err != nil {
-				return nil, changed, err
-			}
-			path = append(path, treePathStep{parent: node, childIndex: index})
-			node, err = tree.readChild(node, index)
-			if err != nil {
-				return nil, changed, err
-			}
-			if node == nil {
-				return nil, changed, ErrKeyNotFound
-			}
+		node, path, deleted, err := tree.findDeleteLeaf(root, ordered[first], false)
+		if err != nil {
+			return nil, changed, err
+		}
+		if node == nil {
+			return nil, changed, ErrKeyNotFound
 		}
 		var upper []byte
 		for index := len(path) - 1; index >= 0; index-- {
@@ -407,7 +401,13 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 		}
 		firstIndex, previousIndex := -1, -1
 		var rest []int
+		if deleted {
+			firstIndex = 0
+		}
 		for _, key := range ordered[first:last] {
+			if deleted {
+				break
+			}
 			index, found, err := node.prepareDelete(key, false)
 			if err != nil {
 				return root, changed, err
@@ -430,7 +430,10 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 			if len(path) > 0 {
 				minimumSize = tree.store.PageSize() / 4
 			}
-			leaf := tree.store.DeleteLeafEntries(node, firstIndex, rest, minimumSize)
+			leaf := node
+			if !deleted {
+				leaf = tree.store.DeleteLeafEntries(node, firstIndex, rest, minimumSize)
+			}
 			if leaf.PageID() == root.PageID() {
 				root = leaf
 			}
@@ -461,33 +464,28 @@ func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool,
 		return nil, false, ErrKeyTooLarge
 	}
 
-	node := root
-	var path []treePathStep
-	for !node.IsLeaf() {
-		childIndex, err := node.FindChildIndex(key)
-		if err != nil {
-			return nil, false, err
-		}
-		path = append(path, treePathStep{parent: node, childIndex: childIndex})
-		node, err = tree.readChild(node, childIndex)
-		if err != nil {
-			return nil, false, err
-		}
-		if node == nil {
-			return root, false, nil
-		}
+	node, path, deleted, err := tree.findDeleteLeaf(root, key, bucket)
+	if err != nil || node == nil {
+		return root, false, err
 	}
 
-	deleteIndex, found, err := node.prepareDelete(key, bucket)
-	if err != nil || !found {
-		return root, found, err
+	deleteIndex := 0
+	if !deleted {
+		var found bool
+		deleteIndex, found, err = node.prepareDelete(key, bucket)
+		if err != nil || !found {
+			return root, found, err
+		}
 	}
 
 	var minimumSize int64
 	if len(path) > 0 {
 		minimumSize = tree.store.PageSize() / 4
 	}
-	leaf := tree.store.DeleteLeafEntries(node, deleteIndex, nil, minimumSize)
+	leaf := node
+	if !deleted {
+		leaf = tree.store.DeleteLeafEntries(node, deleteIndex, nil, minimumSize)
+	}
 	if leaf.PageID() == root.PageID() {
 		root = leaf
 	}
@@ -499,6 +497,33 @@ func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool,
 		return nil, false, err
 	}
 	return root, true, nil
+}
+
+// findDeleteLeaf shares traversal and parent tracking for scalar and batch deletes.
+// deleted identifies an already-staged empty leaf that only needs ordinary repair.
+func (tree *Tree) findDeleteLeaf(root *Node, key []byte, bucket bool) (*Node, []treePathStep, bool, error) {
+	node := root
+	var path []treePathStep
+	for !node.IsLeaf() {
+		index, err := node.FindChildIndex(key)
+		if err != nil {
+			return nil, path, false, err
+		}
+		path = append(path, treePathStep{parent: node, childIndex: index})
+		if !bucket {
+			id := node.Children[index]
+			tree.store.SetParent(id, node)
+			leaf, err := tree.store.DeleteLeafEntry(id, key)
+			if err != nil || leaf != nil {
+				return leaf, path, leaf != nil, err
+			}
+		}
+		node, err = tree.readChild(node, index)
+		if err != nil || node == nil {
+			return node, path, false, err
+		}
+	}
+	return node, path, false, nil
 }
 
 // repairAfterDelete fixes the tree after DeleteEntry removes a key from a leaf.
@@ -522,6 +547,7 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 	// For a 256-byte page, this starts below 64 bytes (25%). We do not move
 	// entries after every small delete. If no move works, we keep the node.
 	minimumSize := pageSize / 4
+	var minimum []byte
 	for len(path) > 0 {
 		// Start with the leaf's parent. A merge removes a child from that
 		// parent, so the next loop can repair the parent in turn.
@@ -548,7 +574,9 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			if parent.PageID() == root.PageID() {
 				root = parent
 			}
-			if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
+			if minimum != nil {
+				parent.setSeparator(step.childIndex-1, minimum)
+			} else if err := tree.refreshMinimumSeparator(parent, step.childIndex, node); err != nil {
 				return nil, err
 			}
 			return root, nil
@@ -562,6 +590,10 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 		// An empty leaf contributes no data to its neighbor.
 		// Remove its parent link without changing or decoding that neighbor.
 		if node.IsLeaf() && node.EntryCount() == 0 && len(parent.Children) > 1 {
+			if step.childIndex == 0 {
+				// The next child's exact minimum is already in this parent.
+				minimum = parent.entries[0].key
+			}
 			separatorIndex := max(step.childIndex-1, 0)
 			parent.entries = slices.Delete(parent.entries, separatorIndex, separatorIndex+1)
 			parent.Children = slices.Delete(parent.Children, step.childIndex, step.childIndex+1)
@@ -574,6 +606,8 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep, minim
 			minimumChanged = step.childIndex == 0
 			continue
 		}
+		// Merging or redistributing children can change the known minimum.
+		minimum = nil
 		if minimumChanged && step.childIndex > 0 {
 			// Fix the child's key before a merge. For branch nodes, the merge
 			// can move that key down into a child.

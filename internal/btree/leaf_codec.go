@@ -337,17 +337,8 @@ func VisitCheckedLeafReverse(data []byte, visit func(uint32, []byte, []byte) err
 // count until commit preparation. It does not change data.
 // With skipIdentical, an unchanged entry returns nil, true, nil.
 func ReplaceMappedLeaf(data []byte, id page.ID, pageSize int64, checksums bool, entry Entry, skipIdentical bool) (*Node, bool, error) {
-	if len(data) < NodeHeaderSize || mappedNodeType(data) != NodeTypeLeaf || binary.LittleEndian.Uint32(data[10:14]) != 1 {
-		return nil, false, nil
-	}
-	if pageSize >= NodeHeaderSize && uint64(binary.LittleEndian.Uint32(data[18:22]))+NodeHeaderSize <= uint64(pageSize) {
-		return nil, false, nil
-	}
-	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
-	if err != nil {
-		return nil, false, err
-	}
-	if err := checkLeafBody(image, h, true, nil); err != nil {
+	image, err := singleLargeLeafImage(data, id, pageSize, checksums)
+	if err != nil || image == nil {
 		return nil, false, err
 	}
 	flags, start, keyEnd, end := leafSpan(image, 0)
@@ -366,6 +357,41 @@ func ReplaceMappedLeaf(data []byte, id page.ID, pageSize int64, checksums bool, 
 	}
 	node.SetStoragePageCount((len(image) + int(pageSize) - 1) / int(pageSize))
 	return node, true, nil
+}
+
+// DeleteMappedLeaf prepares an empty private replacement for a multi-page leaf containing only key.
+// It validates the old image without copying or retaining its bytes.
+// The empty node keeps the old allocation count until repair or commit releases the pages.
+// Nil selects the ordinary deletion path.
+func DeleteMappedLeaf(data []byte, id page.ID, pageSize int64, checksums bool, key []byte) (*Node, error) {
+	image, err := singleLargeLeafImage(data, id, pageSize, checksums)
+	if err != nil || image == nil {
+		return nil, err
+	}
+	flags, start, keyEnd, _ := leafSpan(image, 0)
+	if flags != 0 || !bytes.Equal(image[start:keyEnd], key) {
+		return nil, nil
+	}
+	node := NewLeafNode(id)
+	node.SetStoragePageCount((len(image) + int(pageSize) - 1) / int(pageSize))
+	return node, nil
+}
+
+func singleLargeLeafImage(data []byte, id page.ID, pageSize int64, checksums bool) ([]byte, error) {
+	if len(data) < NodeHeaderSize || mappedNodeType(data) != NodeTypeLeaf || binary.LittleEndian.Uint32(data[10:14]) != 1 {
+		return nil, nil
+	}
+	if pageSize >= NodeHeaderSize && uint64(binary.LittleEndian.Uint32(data[18:22]))+NodeHeaderSize <= uint64(pageSize) {
+		return nil, nil
+	}
+	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkLeafBody(image, h, true, nil); err != nil {
+		return nil, err
+	}
+	return image, nil
 }
 
 // MappedLeafNeighbor checks whether a new key can use a separate leaf beside data.
