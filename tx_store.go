@@ -219,14 +219,11 @@ func (store *txTreeStore) FreePage(pageID page.ID) error {
 		return err
 	}
 	allocation := store.tx.writableAllocation()
+	count := 1
 	if node != nil {
-		for offset := 1; offset < node.StoragePageCount(); offset++ {
-			if err := allocation.retire(pageID + page.ID(offset)); err != nil {
-				return err
-			}
-		}
+		count = node.StoragePageCount()
 	}
-	if err := allocation.retire(pageID); err != nil {
+	if err := allocation.retireSpan(pageID, count); err != nil {
 		return err
 	}
 	delete(store.nodes, pageID)
@@ -318,9 +315,7 @@ func (store *txTreeStore) SetParent(child page.ID, parent *btree.Node) {
 // Moved nodes and their reference changes stay private until commit.
 func (tx *Tx) prepareCommit() error {
 	if tx.allocation != nil {
-		for id := range tx.allocation.retired {
-			delete(tx.store.dirty, id)
-		}
+		tx.allocation.forEachRetired(func(id page.ID) { delete(tx.store.dirty, id) })
 	}
 	if len(tx.store.dirty) == 0 {
 		if tx.allocation != nil && len(tx.allocation.retired) != 0 {

@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -2024,5 +2025,180 @@ func TestAllocationBitmapOwnsNodeSpanAcrossFrames(t *testing.T) {
 	clearAllocationBit(segment.bitmapBits(), middle%bitmap.pagesPerSegment())
 	if bitmap.ownsNodeSpan(head, 20) {
 		t.Fatal("missing bit in second frame was ignored")
+	}
+}
+
+func TestReleaseWordMatchesIndividualPages(t *testing.T) {
+	for _, size := range []int64{128, 4096} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			base := newAllocationBitmap(size)
+			base.addSegment()
+			checkReleaseWords(t, base)
+		})
+	}
+	// A component fixture with a 72-bit frame exercises the scalar boundary fallback.
+	t.Run("unaligned-frame", func(t *testing.T) {
+		base := &allocationBitmap{pageSize: 25, groupSegments: 1}
+		base.addSegment()
+		base.addSegment()
+		base.markAllocated(page.Meta0ID)
+		base.markAllocated(page.Meta1ID)
+		checkReleaseWords(t, base)
+	})
+}
+
+func checkReleaseWords(t *testing.T, base *allocationBitmap) {
+	t.Helper()
+	width := base.pagesPerSegment()
+	coverage := width * page.ID(len(base.segments))
+	dataStart := firstAllocationSegmentID + page.ID(base.segmentsPerGroup())
+	heads := []page.ID{0, 64, (dataStart + 63) / 64 * 64, (width - 1) / 64 * 64,
+		width / 64 * 64, base.pagesPerGroup() / 64 * 64, (coverage - 1) / 64 * 64, (coverage + 63) / 64 * 64}
+	for _, head := range heads {
+		for bit := page.ID(0); bit < 64; bit++ {
+			id := head + bit
+			if id < coverage && bit%3 != 0 && !base.isSegmentPage(id) {
+				base.markAllocated(id)
+			}
+		}
+	}
+	snapshot := make([]string, len(base.segments))
+	for i := range base.segments {
+		snapshot[i] = string(base.segments[i].data)
+	}
+	for _, head := range heads {
+		for _, mask := range []uint64{0, ^uint64(0), 0x8000000000000001, 0x5555555555555555} {
+			start := newAllocationChanges(base)
+			start.spanCount, start.spanCursor = 17, coverage-1
+			left, right := start.clone(), start.clone()
+			for repeat := 0; repeat < 2; repeat++ {
+				left.releaseWord(head/64, mask)
+				for bit := page.ID(0); bit < 64; bit++ {
+					if mask&(uint64(1)<<bit) != 0 {
+						right.release(head + bit)
+					}
+				}
+				if !reflect.DeepEqual(left, right) {
+					t.Fatalf("release differs at head=%d mask=%x repeat=%d", head, mask, repeat)
+				}
+			}
+			metaLeft, metaRight := page.NewMeta(4096), page.NewMeta(4096)
+			metaLeft.SetLastPage(coverage - 1)
+			metaRight.SetLastPage(coverage - 1)
+			for repeat := 0; repeat < 2; repeat++ {
+				left.finalize(metaLeft)
+				right.finalize(metaRight)
+				if !reflect.DeepEqual(left, right) || !reflect.DeepEqual(metaLeft, metaRight) ||
+					!reflect.DeepEqual(left.walRetiredPages(), right.walRetiredPages()) {
+					t.Fatalf("finalization differs at head=%d mask=%x repeat=%d", head, mask, repeat)
+				}
+			}
+		}
+	}
+	for i := range base.segments {
+		if string(base.segments[i].data) != snapshot[i] {
+			t.Fatalf("release changed shared bitmap frame %d", i)
+		}
+	}
+}
+
+func retirementFixture(highest page.ID) *allocationBitmap {
+	bitmap := newAllocationBitmap(4096)
+	for id := page.NewMeta(4096).Root(); id <= highest; id++ {
+		bitmap.markAllocated(id)
+	}
+	return bitmap
+}
+
+func TestRetirementSpanRoundTrip(t *testing.T) {
+	for _, test := range []struct{ head, count int }{{63, 2}, {64, 64}, {126, 5}, {192, 130}} {
+		t.Run(fmt.Sprintf("%d/%d", test.head, test.count), func(t *testing.T) {
+			head, end := page.ID(test.head), page.ID(test.head+test.count)
+			base := retirementFixture(end)
+			changes := newAllocationChanges(base)
+			if err := changes.retireSpan(head, test.count); err != nil {
+				t.Fatal(err)
+			}
+			if changes.pagesRetired != uint64(test.count) {
+				t.Fatalf("retirement count: %d", changes.pagesRetired)
+			}
+			seen := make(map[page.ID]bool)
+			changes.forEachRetired(func(id page.ID) {
+				if id < head || id >= end || seen[id] {
+					t.Fatalf("invalid or repeated page: %d", id)
+				}
+				seen[id] = true
+			})
+			if len(seen) != test.count {
+				t.Fatalf("visited %d pages", len(seen))
+			}
+			raw := changes.walRetiredPages()
+			for id := head; id < end; id++ {
+				if _, ok := raw[id]; !ok || !changes.allocated(id) || !changes.isRetired(id) {
+					t.Fatalf("retirement lost ownership or raw page %d", id)
+				}
+			}
+			if err := changes.retire(head); !errors.Is(err, page.ErrInvalid) {
+				t.Fatalf("duplicate accepted: %v", err)
+			}
+			meta := page.NewMeta(4096)
+			meta.SetLastPage(end)
+			changes.finalize(meta)
+			changes.finalize(meta)
+			for id := head; id < end; id++ {
+				if changes.allocated(id) || !base.allocated(id) {
+					t.Fatalf("private release changed base or retained %d", id)
+				}
+			}
+			published := newAllocationChanges(changes.publish())
+			if id, err := published.allocate(meta.LastPage()); err != nil || id != head {
+				t.Fatalf("reuse after publication: %d, %v", id, err)
+			}
+		})
+	}
+}
+
+func TestRetirementCloneAndFailureIsolation(t *testing.T) {
+	changes := newAllocationChanges(retirementFixture(100))
+	if err := changes.retire(65); err != nil {
+		t.Fatal(err)
+	}
+	trial := changes.clone()
+	if err := trial.retireSpan(60, 10); !errors.Is(err, page.ErrInvalid) {
+		t.Fatalf("overlap in later word accepted: %v", err)
+	}
+	if changes.isRetired(60) || changes.pagesRetired != 1 || len(changes.walRetiredPages()) != 1 {
+		t.Fatal("failed private retirement changed earlier callback")
+	}
+	clone := changes.clone()
+	if err := clone.retire(66); err != nil {
+		t.Fatal(err)
+	}
+	if err := changes.retire(67); err != nil {
+		t.Fatal(err)
+	}
+	if changes.isRetired(66) || clone.isRetired(67) {
+		t.Fatal("same-word updates escaped their callback")
+	}
+	clone.obsoleteWALPages = map[page.ID]struct{}{firstAllocationSegmentID: {}}
+	if raw := clone.walRetiredPages(); len(raw) != 3 {
+		t.Fatalf("combined WAL retirement: %+v", raw)
+	}
+	empty := newAllocationChanges(retirementFixture(100))
+	if empty.walRetiredPages() != nil {
+		t.Fatal("empty WAL retirement is not nil")
+	}
+	empty.obsoleteWALPages = map[page.ID]struct{}{firstAllocationSegmentID: {}}
+	if raw := empty.walRetiredPages(); len(raw) != 1 {
+		t.Fatalf("allocation-only WAL retirement: %+v", raw)
+	}
+	invalid := newAllocationChanges(newAllocationBitmap(4096))
+	for _, span := range []struct {
+		head  page.ID
+		count int
+	}{{firstAllocationSegmentID, 1}, {63, 3}, {64, 0}, {^page.ID(0), 2}} {
+		if err := invalid.retireSpan(span.head, span.count); !errors.Is(err, page.ErrInvalid) {
+			t.Fatalf("invalid span accepted: %+v, %v", span, err)
+		}
 	}
 }

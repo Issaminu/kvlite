@@ -71,7 +71,7 @@ type allocationChanges struct {
 	firstFreeSegment int                        // private search cursor
 	spanCount        int                        // private span search length
 	spanCursor       page.ID                    // private span search cursor
-	retired          map[page.ID]struct{}       // tree pages that become free during commit preparation
+	retired          map[page.ID]uint64         // masks of retired tree pages, keyed by 64-page word
 	obsoleteWALPages map[page.ID]struct{}       // allocation pages removed from the file tail
 	pagesReused      uint64
 	pagesRetired     uint64
@@ -268,21 +268,55 @@ func (changes *allocationChanges) extendSpan(head page.ID, oldCount, count int, 
 // retire delays reuse of an allocated tree page until finalize prepares the commit.
 // It rejects reserved pages, free pages, allocation pages, and repeated retirement.
 func (changes *allocationChanges) retire(pageID page.ID) error {
-	if pageID < firstTreePageID || changes.isSegmentPage(pageID) {
-		return fmt.Errorf("retire reserved page %d: %w", pageID, page.ErrInvalid)
+	return changes.retireSpan(pageID, 1)
+}
+
+// retireSpan records consecutive pages without changing their allocation bits.
+// Every page retains retire's ownership checks; word masks combine their membership.
+func (changes *allocationChanges) retireSpan(head page.ID, count int) error {
+	if count <= 0 || page.ID(count)-1 > ^page.ID(0)-head {
+		return fmt.Errorf("retire invalid span %d/%d: %w", head, count, page.ErrInvalid)
 	}
-	if !changes.allocated(pageID) {
-		return fmt.Errorf("retire free page %d: %w", pageID, page.ErrInvalid)
+	for offset := 0; offset < count; offset++ {
+		id := head + page.ID(offset)
+		if id < firstTreePageID || changes.isSegmentPage(id) {
+			return fmt.Errorf("retire reserved page %d: %w", id, page.ErrInvalid)
+		}
+		if !changes.allocated(id) {
+			return fmt.Errorf("retire free page %d: %w", id, page.ErrInvalid)
+		}
 	}
 	if changes.retired == nil {
-		changes.retired = make(map[page.ID]struct{})
+		changes.retired = make(map[page.ID]uint64)
 	}
-	if _, exists := changes.retired[pageID]; exists {
-		return fmt.Errorf("retire page %d twice: %w", pageID, page.ErrInvalid)
+	for remaining := count; remaining > 0; {
+		word, offset := head/64, head%64
+		width := min(remaining, 64-int(offset))
+		mask := (^uint64(0) >> (64 - width)) << offset
+		if overlap := changes.retired[word] & mask; overlap != 0 {
+			id := word*64 + page.ID(bits.TrailingZeros64(overlap))
+			return fmt.Errorf("retire page %d twice: %w", id, page.ErrInvalid)
+		}
+		changes.retired[word] |= mask
+		changes.pagesRetired += uint64(width)
+		head += page.ID(width)
+		remaining -= width
 	}
-	changes.retired[pageID] = struct{}{}
-	changes.pagesRetired++
 	return nil
+}
+
+func (changes *allocationChanges) isRetired(id page.ID) bool {
+	return changes.retired[id/64]&(uint64(1)<<(id%64)) != 0
+}
+
+// forEachRetired visits raw page IDs while keeping word masks private to allocation changes.
+func (changes *allocationChanges) forEachRetired(visit func(page.ID)) {
+	for word, mask := range changes.retired {
+		for mask != 0 {
+			visit(word*64 + page.ID(bits.TrailingZeros64(mask)))
+			mask &= mask - 1
+		}
+	}
 }
 
 func (changes *allocationChanges) changed() bool {
@@ -292,8 +326,8 @@ func (changes *allocationChanges) changed() bool {
 // finalize releases retired pages and lowers metadata when the allocated tail shrinks.
 // It returns true when it changes metadata's last page ID.
 func (changes *allocationChanges) finalize(meta *page.Meta) bool {
-	for pageID := range changes.retired {
-		changes.release(pageID)
+	for word, mask := range changes.retired {
+		changes.releaseWord(word, mask)
 	}
 	// A live data page at the file end prevents tail reclamation.
 	if changes.allocated(meta.LastPage()) && !changes.isSegmentPage(meta.LastPage()) {
@@ -322,13 +356,11 @@ func (changes *allocationChanges) finalize(meta *page.Meta) bool {
 // walRetiredPages names tree and allocation pages that must leave the WAL view at commit.
 // A removed tail segment can still have an older WAL image even though it is no longer in the bitmap.
 func (changes *allocationChanges) walRetiredPages() map[page.ID]struct{} {
-	if len(changes.obsoleteWALPages) == 0 {
-		return changes.retired
+	if len(changes.retired) == 0 && len(changes.obsoleteWALPages) == 0 {
+		return nil
 	}
-	retired := maps.Clone(changes.retired)
-	if retired == nil {
-		retired = make(map[page.ID]struct{}, len(changes.obsoleteWALPages))
-	}
+	retired := make(map[page.ID]struct{}, int(changes.pagesRetired)+len(changes.obsoleteWALPages))
+	changes.forEachRetired(func(id page.ID) { retired[id] = struct{}{} })
 	for pageID := range changes.obsoleteWALPages {
 		retired[pageID] = struct{}{}
 	}
@@ -398,6 +430,34 @@ func (changes *allocationChanges) release(pageID page.ID) {
 	segment := changes.writableSegment(index)
 	bit := pageID % changes.base.pagesPerSegment()
 	clearAllocationBit(segment.bitmapBits(), bit)
+	changes.rewindFreeCursors(segment, index, pageID)
+}
+
+// releaseWord combines ordinary retired pages while retaining release's boundary guards.
+func (changes *allocationChanges) releaseWord(word page.ID, mask uint64) {
+	head := word * 64
+	pagesPerSegment := changes.base.pagesPerSegment()
+	index := changes.base.segmentIndex(head)
+	if pagesPerSegment%64 != 0 || head < firstTreePageID || index >= changes.segmentCount || changes.isSegmentPage(head) || changes.isSegmentPage(head+63) {
+		for mask != 0 {
+			changes.release(head + page.ID(bits.TrailingZeros64(mask)))
+			mask &= mask - 1
+		}
+		return
+	}
+	at := int((head % pagesPerSegment) / 8)
+	current := binary.LittleEndian.Uint64(changes.segment(index).bitmapBits()[at : at+8])
+	mask &= current
+	if mask == 0 {
+		return
+	}
+	segment := changes.writableSegment(index)
+	binary.LittleEndian.PutUint64(segment.bitmapBits()[at:at+8], current&^mask)
+	changes.rewindFreeCursors(segment, index, head+page.ID(bits.TrailingZeros64(mask)))
+}
+
+func (changes *allocationChanges) rewindFreeCursors(segment *allocationSegment, index int, pageID page.ID) {
+	bit := pageID % changes.base.pagesPerSegment()
 	if bit < segment.firstFreeBit {
 		segment.firstFreeBit = bit
 	}

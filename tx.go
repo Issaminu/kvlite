@@ -118,9 +118,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		// Update holds the write lock until all node and allocation changes are visible.
 		// Retired nodes must leave memory before a later transaction can reuse their page IDs.
 		if tx.allocationOwned {
-			for pageID := range tx.allocation.retired {
-				delete(db.memoryNodes, pageID)
-			}
+			tx.allocation.forEachRetired(func(id page.ID) { delete(db.memoryNodes, id) })
 		}
 	} else {
 		var retired map[page.ID]struct{}

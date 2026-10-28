@@ -534,7 +534,7 @@ func (tx *Tx) collectBucketPages(root page.ID) ([]page.ID, error) {
 		if pageID < firstTreePageID || allocation.isSegmentPage(pageID) || !allocation.allocated(pageID) {
 			return fmt.Errorf("bucket page %d is not allocated tree data: %w", pageID, ErrInvalid)
 		}
-		if _, retired := allocation.retired[pageID]; retired {
+		if allocation.isRetired(pageID) {
 			return fmt.Errorf("bucket page %d is already retired: %w", pageID, ErrInvalid)
 		}
 		seen[pageID] = struct{}{}
