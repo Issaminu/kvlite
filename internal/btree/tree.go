@@ -216,7 +216,7 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 			if parent.PageID() == root.PageID() {
 				root = parent
 			}
-			return tree.finishPut(root, parent, path[:len(path)-1])
+			return tree.finishPut(root, parent, path[:len(path)-1], false)
 		}
 
 		node, err = tree.readChild(node, childIndex)
@@ -253,17 +253,25 @@ func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
 		root = node
 	}
 
-	return tree.finishPut(root, node, path)
+	return tree.finishPut(root, node, path, !prepared.found && prepared.index == node.EntryCount()-1)
 }
 
 // finishPut splits the changed node and its ancestors as needed.
-func (tree *Tree) finishPut(root, node *Node, path []treePathStep) (*Node, error) {
+func (tree *Tree) finishPut(root, node *Node, path []treePathStep, tailInsert bool) (*Node, error) {
 	pageSize := tree.store.PageSize()
+	if tailInsert && node.NeedsSplit(pageSize) {
+		for _, step := range path {
+			if step.childIndex != len(step.parent.Children)-1 {
+				tailInsert = false
+				break
+			}
+		}
+	}
 	for node.NeedsSplit(pageSize) {
 		if len(path) == 0 {
 			// No saved parent remains, so node is the current root.
-			// Keep the left half in node and create a new root above both halves.
-			rightNode, separator, err := tree.splitNode(node, pageSize)
+			// Keep the left result in node and create a new root above both children.
+			rightNode, separator, err := tree.splitNode(node, pageSize, tailInsert)
 			if err != nil {
 				return nil, err
 			}
@@ -279,7 +287,7 @@ func (tree *Tree) finishPut(root, node *Node, path []treePathStep) (*Node, error
 			tree.store.SetParent(rightNode.PageID(), root)
 			// rightNode starts at root.Children[1].
 			// Split it again if one split did not make it small enough.
-			if err := tree.splitChildIntoSiblings(root, rightNode, 1, pageSize); err != nil {
+			if err := tree.splitChildIntoSiblings(root, rightNode, 1, pageSize, false); err != nil {
 				return nil, err
 			}
 			node = root
@@ -301,8 +309,8 @@ func (tree *Tree) finishPut(root, node *Node, path []treePathStep) (*Node, error
 		}
 
 		// node is at parent.Children[parentStep.childIndex].
-		// Keep its left half in that slot and insert each new right sibling after it.
-		if err := tree.splitChildIntoSiblings(parent, node, parentStep.childIndex, pageSize); err != nil {
+		// Keep its left result in that slot and insert each new right sibling after it.
+		if err := tree.splitChildIntoSiblings(parent, node, parentStep.childIndex, pageSize, tailInsert); err != nil {
 			return nil, err
 		}
 		// New separators can make the parent too large, so check the parent next.
@@ -313,12 +321,23 @@ func (tree *Tree) finishPut(root, node *Node, path []treePathStep) (*Node, error
 
 // splitNode splits a private node that is known to be larger than one page.
 // It returns a page allocation error. Entry validation and the NeedsSplit check guarantee that the node can split, so a Split error is an internal tree invariant failure.
-func (tree *Tree) splitNode(node *Node, pageSize int64) (*Node, []byte, error) {
+func (tree *Tree) splitNode(node *Node, pageSize int64, tailInsert bool) (*Node, []byte, error) {
 	pageID, err := tree.store.AllocatePage()
 	if err != nil {
 		return nil, nil, err
 	}
-	rightNode, separator, err := node.Split(pageID, pageSize)
+	var rightNode *Node
+	var separator []byte
+	last := node.EntryCount() - 1
+	if tailInsert && node.IsLeaf() && (last == 1 || node.EncodedSize()-node.entries[last].EncodedSize(true) <= int(pageSize)) {
+		// A global append leaves the earlier keys in their already-fitting page.
+		separator = node.entries[last].key
+		rightNode = NewLeafNode(pageID)
+		node.splitLeaf(rightNode, last)
+		node.header.Checksum = 0
+	} else {
+		rightNode, separator, err = node.Split(pageID, pageSize)
+	}
 	if err != nil {
 		panic(fmt.Sprintf("btree invariant: split node %d: %v", node.PageID(), err))
 	}
@@ -331,11 +350,11 @@ func (tree *Tree) splitNode(node *Node, pageSize int64) (*Node, []byte, error) {
 // splitChildIntoSiblings splits one child until the right result fits or cannot split.
 // A leaf with one large entry or a branch with fewer than three keys uses continuation pages.
 // child must be the private node at parent.Children[childIndex].
-// Each split keeps the left half at the current index and inserts the right half at the next index.
+// Each split keeps the left result at the current index and inserts the right result at the next index.
 // parent must also be private because each split adds one separator and one child page ID to it.
-func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pageSize int64) error {
+func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pageSize int64, tailInsert bool) error {
 	for child.NeedsSplit(pageSize) {
-		rightNode, separator, err := tree.splitNode(child, pageSize)
+		rightNode, separator, err := tree.splitNode(child, pageSize, tailInsert)
 		if err != nil {
 			return err
 		}

@@ -664,13 +664,14 @@ func TestAllocationStatsCountCommittedDeleteAndReuse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// An interior range guarantees reusable pages independently of leaf fill policy.
 	wantErr := errors.New("discard delete")
 	err = db.Update(func(tx *Tx) error {
 		bucket, err := tx.Bucket(testBucketName)
 		if err != nil {
 			return err
 		}
-		for index := 0; index < count; index += 2 {
+		for index := count / 4; index < 3*count/4; index++ {
 			if err := bucket.Delete(fmt.Appendf(nil, "old-%04d", index)); err != nil {
 				return err
 			}
@@ -692,7 +693,7 @@ func TestAllocationStatsCountCommittedDeleteAndReuse(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for index := 0; index < count; index += 2 {
+		for index := count / 4; index < 3*count/4; index++ {
 			if err := bucket.Delete(fmt.Appendf(nil, "old-%04d", index)); err != nil {
 				return err
 			}
@@ -863,12 +864,13 @@ func TestCheckRejectsAllocatedPageWithoutOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// An interior range guarantees reusable pages independently of leaf fill policy.
 	if err := db.Update(func(tx *Tx) error {
 		bucket, err := tx.Bucket(testBucketName)
 		if err != nil {
 			return err
 		}
-		for index := 0; index < entryCount; index += 2 {
+		for index := entryCount / 4; index < 3*entryCount/4; index++ {
 			if err := bucket.Delete(fmt.Appendf(nil, "key-%04d", index)); err != nil {
 				return err
 			}

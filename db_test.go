@@ -13001,6 +13001,95 @@ func TestPutAndDeleteBatchContracts(t *testing.T) {
 	}
 }
 
+func TestTailAppendSplitsPreserveRollbackOwnershipAndReopen(t *testing.T) {
+	for _, mode := range []string{"None", "Normal", "Full", "Memory"} {
+		for _, checksums := range []bool{false, true} {
+			if mode == "Memory" && checksums {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/checksums=%t", mode, checksums), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "append.db")
+				options := &Options{Synchronous: map[string]Sync{"None": SyncNone, "Normal": SyncNormal, "Full": SyncFull}[mode], DataPageChecksums: checksums}
+				var db *DB
+				var err error
+				if mode == "Memory" {
+					db = OpenMemory()
+				} else {
+					db, err = Open(path, 0600, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				defer func() { _ = db.Close() }()
+				createBucket(t, db, testBucketName)
+				entries := make([]KeyValue, 2000)
+				for index := range entries {
+					entries[index] = KeyValue{Key: fmt.Appendf(nil, "k%05d", index), Value: bytes.Repeat([]byte("v"), 128)}
+				}
+				if err := db.PutBatch(testBucketName, entries[:1000]); err != nil {
+					t.Fatal(err)
+				}
+				before := page.EncodeMeta(db.meta)
+				if err := db.Update(func(tx *Tx) error {
+					bucket, err := tx.Bucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					if err := bucket.PutBatch(entries[1000:]); err != nil {
+						return err
+					}
+					return errDiscardTx
+				}); !errors.Is(err, errDiscardTx) || !bytes.Equal(before, page.EncodeMeta(db.meta)) {
+					t.Fatalf("append rollback changed metadata: %v", err)
+				}
+				if mode == "Full" && !checksums {
+					db.wal.SetSyncFileForTesting(func() error { return errDiscardTx })
+					err = db.PutBatch(testBucketName, entries[1000:])
+					if !errors.Is(err, errDiscardTx) {
+						t.Fatalf("append sync failure: %v", err)
+					}
+					db = reopenAfterWALWriteFailure(t, db, path, options)
+				}
+				if _, err := db.Get(testBucketName, entries[1000].Key); !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("failed append became visible: %v", err)
+				}
+				if err := db.PutBatch(testBucketName, entries[1000:]); err != nil {
+					t.Fatal(err)
+				}
+				large := []KeyValue{
+					{bytes.Repeat([]byte{0xf0}, MaxKeySize), bytes.Repeat([]byte("a"), 64<<10)},
+					{bytes.Repeat([]byte{0xff}, MaxKeySize), bytes.Repeat([]byte("b"), 128<<10)},
+				}
+				if err := db.PutBatch(testBucketName, large); err != nil {
+					t.Fatal(err)
+				}
+				large[0].Value[0], large[1].Value[0] = '!', '!'
+				if mode != "Memory" {
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					db, err = Open(path, 0600, options)
+					if err != nil {
+						t.Fatal(err)
+					}
+				}
+				for _, entry := range entries {
+					got, err := db.Get(testBucketName, entry.Key)
+					if err != nil || !bytes.Equal(got, entry.Value) {
+						t.Fatalf("reopen %q: %v", entry.Key, err)
+					}
+				}
+				for index, entry := range large {
+					got, err := db.Get(testBucketName, entry.Key)
+					if err != nil || !bytes.Equal(got, bytes.Repeat([]byte{byte('a' + index)}, len(entry.Value))) {
+						t.Fatalf("continued append ownership/reopen %d: %v", index, err)
+					}
+				}
+			})
+		}
+	}
+}
+
 func TestBucketPutBatchOwnershipAndTransactionErrors(t *testing.T) {
 	db := OpenMemory()
 	defer db.Close()

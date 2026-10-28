@@ -110,6 +110,79 @@ func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
 	}
 }
 
+func TestTreeAppendSplitKeepsCompletedLeavesFull(t *testing.T) {
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
+	tree := NewTree(store)
+	root := NewLeafNode(2)
+	store.StageNode(root)
+	value := bytes.Repeat([]byte("v"), 8)
+	for index := range 200 {
+		var err error
+		root, err = tree.PutEntry(root, NewEntry(0, fmt.Appendf(nil, "k%04d", index), value))
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	rightmost := root
+	for !rightmost.IsLeaf() {
+		rightmost = store.nodes[rightmost.Children[len(rightmost.Children)-1]]
+	}
+	nextSize := NewEntry(0, []byte("k0200"), value).EncodedSize(true)
+	for _, node := range store.nodes {
+		if node.IsLeaf() && node != rightmost && node.EncodedSize()+nextSize <= int(store.pageSize) {
+			t.Fatalf("completed leaf %d leaves room for another entry", node.PageID())
+		}
+	}
+	assertTreeSeparators(t, store, root)
+	for index := range 200 {
+		entry, found, err := tree.FindEntryRef(root, fmt.Appendf(nil, "k%04d", index), true)
+		if err != nil || !found || !bytes.Equal(entry.Value(), value) {
+			t.Fatalf("find %d: found=%v error=%v", index, found, err)
+		}
+	}
+}
+
+func TestTreeAppendSplitRequiresNewGlobalMaximum(t *testing.T) {
+	leaf := func(id page.ID, keys string) *Node {
+		node := NewLeafNode(id)
+		for _, key := range []byte(keys) {
+			if err := node.InsertEntry(NewEntry(0, []byte{key}, bytes.Repeat([]byte("v"), 8))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return node
+	}
+	t.Run("local maximum", func(t *testing.T) {
+		left, right := leaf(2, "abcd"), leaf(3, "z")
+		root := NewRootNode(1, left, right, []byte("z"))
+		store := &memoryTreeStore{pageSize: 128, nextID: 4, nodes: map[page.ID]*Node{1: root, 2: left, 3: right}}
+		got, err := NewTree(store).PutEntry(root, NewEntry(0, []byte("e"), bytes.Repeat([]byte("v"), 8)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(got.Children) != 3 || store.nodes[got.Children[0]].EntryCount() != 2 || store.nodes[got.Children[1]].EntryCount() != 3 {
+			t.Fatal("a non-rightmost leaf used an append split")
+		}
+		assertTreeSeparators(t, store, got)
+	})
+	t.Run("replacement", func(t *testing.T) {
+		root := leaf(2, "abcdefgh")
+		before := EncodeNode(root, testNodePageSize)
+		store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: map[page.ID]*Node{2: root}}
+		got, err := NewTree(store).PutEntry(root, NewEntry(0, []byte("h"), bytes.Repeat([]byte("r"), 48)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.IsLeaf() || store.nodes[got.Children[0]].EntryCount() != 5 || store.nodes[got.Children[1]].EntryCount() != 3 {
+			t.Fatal("a replacement used an append split")
+		}
+		if !bytes.Equal(before, EncodeNode(root, testNodePageSize)) {
+			t.Fatal("replacement split changed committed input")
+		}
+		assertTreeSeparators(t, store, got)
+	})
+}
+
 func TestTreePutEntryReturnsAllocationError(t *testing.T) {
 	allocationErr := errors.New("no page available")
 	store := &memoryTreeStore{pageSize: 64, nextID: 3, nodes: make(map[page.ID]*Node)}
