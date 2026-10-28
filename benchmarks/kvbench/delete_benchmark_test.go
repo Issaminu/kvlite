@@ -38,6 +38,8 @@ func deleteBenchmarkCases() []deleteBenchmarkCase {
 			deleteBenchmarkCase{name: "existing/sequential/clients=1", records: records, operations: records, order: keyOrderSequential, clients: 1, batchSize: 1},
 			deleteBenchmarkCase{name: "existing/random/clients=1/batch=100", records: records, operations: records / 100, order: keyOrderRandom, clients: 1, batchSize: 100},
 			deleteBenchmarkCase{name: "existing/random/clients=1/batch=1000", records: records, operations: records / 1_000, order: keyOrderRandom, clients: 1, batchSize: 1_000},
+			deleteBenchmarkCase{name: "existing/sequential/value=65536/clients=1/batch=32", records: 512, operations: 16, valueBytes: 65536, order: keyOrderSequential, clients: 1, batchSize: 32},
+			deleteBenchmarkCase{name: "existing/random/value=65536/clients=1/batch=32", records: 512, operations: 16, valueBytes: 65536, order: keyOrderRandom, clients: 1, batchSize: 32},
 		)
 	}
 	largeRecords := scaleSizedValue(512, 128, 32)

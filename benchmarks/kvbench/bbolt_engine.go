@@ -342,3 +342,5 @@ func bboltCollection(tx *bolt.Tx, path [][]byte) *bolt.Bucket {
 }
 
 func (engine *bboltEngine) Close() error { return engine.db.Close() }
+
+func (engine *bboltEngine) Sync(_ context.Context) error { return engine.db.Sync() }

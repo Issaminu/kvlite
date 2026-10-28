@@ -135,7 +135,7 @@ func TestDeleteBenchmarkScales(t *testing.T) {
 	}{
 		{scale: "light", want: 5},
 		{scale: "medium", want: 5},
-		{scale: "large", want: 8},
+		{scale: "large", want: 10},
 	} {
 		t.Run(test.scale, func(t *testing.T) {
 			t.Setenv("KVBENCH_WORKLOAD", "all")

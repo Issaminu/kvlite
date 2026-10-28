@@ -2,8 +2,10 @@ package kvbench
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"math/rand"
 	"os"
 	"slices"
 	"sync"
@@ -632,4 +634,332 @@ func closeBenchmarkEngine(b *testing.B, engine Engine) {
 	if err := engine.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
 		b.Error(err)
 	}
+}
+
+// batchAPICase describes a fixed single-bucket batch request schedule.
+type batchAPICase struct {
+	batch, value, hits int
+	order              string
+	fragmented, sync   bool
+}
+
+type syncEngine interface{ Sync(context.Context) error }
+
+// BenchmarkGetBatch measures owned batch results, order, repeats, and missing keys.
+func BenchmarkGetBatch(b *testing.B) {
+	if !workloadEnabled(benchmarkRead) {
+		b.Skip("read workloads are not selected")
+	}
+	env := readBenchmarkEnvironment(b)
+	if env.mode != DurabilityDurable {
+		b.Skip("reads do not depend on commit sync")
+	}
+	var cases []batchAPICase
+	for _, batch := range []int{32, 256} {
+		for _, order := range []string{"sequential", "shuffled", "random", "repeat"} {
+			cases = append(cases, batchAPICase{batch: batch, value: 128, hits: 100, order: order})
+			if order == "random" {
+				cases = append(cases, batchAPICase{batch: batch, value: 128, hits: 50, order: order})
+			}
+		}
+	}
+	for _, order := range []string{"sequential", "random"} {
+		cases = append(cases, batchAPICase{batch: 256, value: 128, hits: 0, order: order}, batchAPICase{batch: 32, value: 64 << 10, hits: 100, order: order})
+	}
+	for _, c := range cases {
+		if lightScale() && (c.batch != 32 || c.value != 128 || c.order != "random" || c.hits != 100) {
+			continue
+		}
+		name := fmt.Sprintf("read/value=%d/keys=%d/order=%s/hit=%d/%s", c.value, c.batch, c.order, c.hits, env.kind)
+		runScaledBenchmark(b, name, func(b *testing.B) {
+			records, reads := scaleSizedValue(8192, 2048, 512), scaleSizedValue(131072, 32768, 4096)
+			if c.value > 128 {
+				records, reads = scaleSizedValue(512, 128, 32), scaleSizedValue(2048, 512, 128)
+			}
+			setup, err := makePairs(records, c.value, 1, keyOrderSequential, 42)
+			if err != nil {
+				b.Fatal(err)
+			}
+			engine, err := prepareBenchmarkEngine(b, env.kind, env.mode, env.redisAddress, 1, setup)
+			if err != nil {
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
+			keys := make([][]byte, reads)
+			permutation := rand.New(rand.NewSource(42)).Perm(records)
+			var wantChecksum uint64
+			for i := range keys {
+				index := i % records
+				if c.order == "random" {
+					index = permutation[index]
+				}
+				if c.order == "repeat" {
+					index = permutation[((i/c.batch)*8+i%8)%records]
+				}
+				keys[i] = setup[index].Key
+				value := setup[index].Value
+				if c.hits == 0 || c.hits == 50 && i%2 == 0 {
+					keys[i] = makeMissingKey("between", index)
+					value = nil
+				}
+				wantChecksum = consumeScannedPair(wantChecksum, keys[i], value)
+			}
+			if c.order == "shuffled" {
+				random := rand.New(rand.NewSource(42))
+				for first := 0; first < len(keys); first += c.batch {
+					group := keys[first : first+c.batch]
+					random.Shuffle(len(group), func(i, j int) { group[i], group[j] = group[j], group[i] })
+				}
+			}
+			// Touch the same requests before timing. Each timed call still returns new copies.
+			for first := 0; first < len(keys); first += c.batch {
+				if _, err := engine.GetBatch(b.Context(), keys[first:first+c.batch]); err != nil {
+					b.Fatal(err)
+				}
+			}
+			var checksum uint64
+			b.ReportAllocs()
+			b.SetBytes(int64(reads * c.value))
+			for b.Loop() {
+				checksum = 0
+				for first := 0; first < len(keys); first += c.batch {
+					requested := keys[first : first+c.batch]
+					values, err := engine.GetBatch(b.Context(), requested)
+					if err != nil {
+						b.Fatal(err)
+					}
+					if len(values) != len(requested) {
+						b.Fatal("batch read returned the wrong result count")
+					}
+					for i, value := range values {
+						if (len(requested[i]) != 16) != (value == nil) {
+							b.Fatal("batch read changed missing-key positions")
+						}
+						checksum = consumeScannedPair(checksum, requested[i], value)
+					}
+				}
+			}
+			if checksum != wantChecksum {
+				b.Fatalf("batch read checksum: got %d, want %d", checksum, wantChecksum)
+			}
+			allKeys := make([][]byte, len(setup))
+			for i, pair := range setup {
+				allKeys[i] = pair.Key
+			}
+			values, err := engine.GetBatch(b.Context(), allKeys)
+			if err != nil {
+				b.Fatal(err)
+			}
+			for i, pair := range setup {
+				if !bytes.Equal(values[i], pair.Value) {
+					b.Fatalf("batch read changed key %x", pair.Key)
+				}
+			}
+			b.ReportMetric(float64(b.N*reads)/b.Elapsed().Seconds(), "keys/s")
+			// Default time and allocation metrics describe one fixed pass; ns/batch describes one API call.
+			b.ReportMetric(float64(reads/c.batch), "batches/op")
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*(reads/c.batch)), "ns/batch")
+			b.ReportMetric(checksumMetric(checksum), "checksum")
+		})
+	}
+}
+
+// BenchmarkPutBatch measures changing values, duplicates, and inserts into a fragmented file.
+func BenchmarkPutBatch(b *testing.B) {
+	if !workloadEnabled(benchmarkUpdate) {
+		b.Skip("write workloads are not selected")
+	}
+	env := readBenchmarkEnvironment(b)
+	var cases []batchAPICase
+	for _, batch := range []int{32, 256} {
+		for _, order := range []string{"sequential", "random", "repeat"} {
+			cases = append(cases, batchAPICase{batch: batch, value: 128, order: order})
+		}
+	}
+	for _, order := range []string{"sequential", "random"} {
+		cases = append(cases, batchAPICase{batch: 32, value: 64 << 10, order: order})
+	}
+	cases = append(cases, batchAPICase{batch: 32, value: 64 << 10, order: "random", fragmented: true})
+	for _, c := range cases {
+		if lightScale() && (c.batch != 32 || c.value != 128 || c.order != "random" || c.fragmented) {
+			continue
+		}
+		if mediumScale() && c.order == "repeat" {
+			continue
+		}
+		shape := "replace"
+		if c.fragmented {
+			shape = "fragmented-insert"
+		}
+		name := fmt.Sprintf("%s/%s/value=%d/keys=%d/order=%s/%s", env.mode, shape, c.value, c.batch, c.order, env.kind)
+		runScaledBenchmark(b, name, func(b *testing.B) { benchmarkBatchPuts(b, env, c) })
+	}
+}
+
+// BenchmarkSync measures writes followed by an explicit storage sync on a no-commit-sync handle.
+// Redis has no matching direct flush call in this adapter, so it has no result.
+func BenchmarkSync(b *testing.B) {
+	if !workloadEnabled(benchmarkUpdate) {
+		b.Skip("write workloads are not selected")
+	}
+	env := readBenchmarkEnvironment(b)
+	if env.mode != DurabilityNoCommitSync || env.kind == EngineRedis {
+		b.Skip("explicit sync needs an embedded no-commit-sync handle")
+	}
+	for _, batch := range []int{32, 256} {
+		if lightScale() && batch != 32 {
+			continue
+		}
+		c := batchAPICase{batch: batch, value: 128, order: "random", sync: true}
+		name := fmt.Sprintf("%s/write-and-sync/value=128/keys=%d/%s", env.mode, batch, env.kind)
+		runScaledBenchmark(b, name, func(b *testing.B) { benchmarkBatchPuts(b, env, c) })
+	}
+}
+
+func benchmarkBatchPuts(b *testing.B, env benchmarkEnvironment, c batchAPICase) {
+	records := scaleSizedValue(8192, 2048, 512)
+	if c.value > 128 {
+		records = scaleSizedValue(512, 128, 32)
+	}
+	initial := bytes.Repeat([]byte{1}, c.value)
+	setup := make([]Pair, records)
+	for i := range setup {
+		setup[i] = Pair{Key: makeKey(1, uint64(i)), Value: initial}
+	}
+	permutation := rand.New(rand.NewSource(42)).Perm(records)
+	phases := [2][][]Pair{}
+	for phase := range phases {
+		value := bytes.Repeat([]byte{byte(2 + phase)}, c.value)
+		for first := 0; first < records; first += c.batch {
+			writes := make([]Pair, 0, c.batch)
+			for offset := range c.batch {
+				index := (first + offset) % records
+				if c.order == "random" {
+					index = permutation[index]
+				}
+				if c.order == "repeat" {
+					index = permutation[((first/c.batch)*8+offset%8)%records]
+				}
+				key := setup[index].Key
+				if c.fragmented {
+					key = makeKey(2, uint64(index))
+				}
+				writes = append(writes, Pair{Key: key, Value: value})
+			}
+			phases[phase] = append(phases[phase], writes)
+		}
+	}
+	prepare := func() Engine {
+		engine, err := prepareBenchmarkEngine(b, env.kind, env.mode, env.redisAddress, 1, setup)
+		if err != nil {
+			b.Fatal(err)
+		}
+		// Warm every value, then restore it. This makes both warm-up passes real writes.
+		warm := make([]Pair, len(setup))
+		for i, pair := range setup {
+			warm[i] = Pair{Key: pair.Key, Value: bytes.Repeat([]byte{4}, c.value)}
+		}
+		if err := loadPairs(b.Context(), engine, warm, c.batch); err != nil {
+			b.Fatal(err)
+		}
+		if err := loadPairs(b.Context(), engine, setup, c.batch); err != nil {
+			b.Fatal(err)
+		}
+		if c.fragmented {
+			keys := make([][]byte, 0, len(setup)/2)
+			for i := 1; i < len(setup); i += 2 {
+				keys = append(keys, setup[i].Key)
+			}
+			if err := engine.DeleteBatch(b.Context(), keys); err != nil {
+				b.Fatal(err)
+			}
+		}
+		if c.sync {
+			syncer, ok := engine.(syncEngine)
+			if !ok {
+				b.Fatal("engine has no explicit sync")
+			}
+			if err := syncer.Sync(b.Context()); err != nil {
+				b.Fatal(err)
+			}
+		}
+		return engine
+	}
+	engine := prepare()
+	b.Cleanup(func() { closeBenchmarkEngine(b, engine) })
+	counters := writeCounters{hasWAL: true, hasProcessIO: true}
+	iteration := 0
+	b.ReportAllocs()
+	b.SetBytes(int64(records * c.value))
+	for b.Loop() {
+		b.StopTimer()
+		if iteration > 0 && c.fragmented {
+			closeBenchmarkEngine(b, engine)
+			engine = prepare()
+		}
+		before := readWriteCounters(b, engine, env.kind)
+		syncer, _ := engine.(syncEngine)
+		b.StartTimer()
+		for _, writes := range phases[iteration%2] {
+			err := engine.PutBatch(b.Context(), writes)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if c.sync {
+				if err := syncer.Sync(b.Context()); err != nil {
+					b.Fatal(err)
+				}
+			}
+		}
+		b.StopTimer()
+		counters.add(before, readWriteCounters(b, engine, env.kind))
+		b.StartTimer()
+		iteration++
+	}
+	if err := engine.Validate(b.Context()); err != nil {
+		b.Fatal(err)
+	}
+	expected := make(map[string][]byte, len(setup)*2)
+	for i, pair := range setup {
+		if !c.fragmented || i%2 == 0 {
+			expected[string(pair.Key)] = pair.Value
+		}
+	}
+	for _, writes := range phases[(iteration-1)%2] {
+		for _, write := range writes {
+			expected[string(write.Key)] = write.Value
+		}
+	}
+	count, err := engine.Count(b.Context())
+	if err != nil || count != len(expected) {
+		b.Fatalf("batch count: got %d, want %d, error %v", count, len(expected), err)
+	}
+	keys := make([][]byte, 0, len(expected))
+	for key := range expected {
+		keys = append(keys, []byte(key))
+	}
+	slices.SortFunc(keys, bytes.Compare)
+	values, err := engine.GetBatch(b.Context(), keys)
+	if err != nil {
+		b.Fatal(err)
+	}
+	for i, key := range keys {
+		if !bytes.Equal(values[i], expected[string(key)]) {
+			b.Fatalf("wrong final batch value for %x", key)
+		}
+	}
+	calls := float64(b.N * len(phases[0]))
+	b.ReportMetric(float64(b.N*records)/b.Elapsed().Seconds(), "ack-keys/s")
+	// Default time and allocation metrics describe one fixed pass; counters below describe one API call.
+	b.ReportMetric(float64(len(phases[0])), "batches/op")
+	b.ReportMetric(float64(b.Elapsed().Nanoseconds())/calls, "ns/batch")
+	if counters.hasWAL {
+		b.ReportMetric(float64(counters.walCommits)/calls, "wal-commits/batch")
+		b.ReportMetric(float64(counters.walWrittenBytes)/calls, "wal-B/batch")
+	}
+	if counters.hasProcessIO {
+		b.ReportMetric(float64(counters.writeCalls)/calls, "write-calls/batch")
+		b.ReportMetric(float64(counters.storageWrittenBytes)/calls, "storage-written-B/batch")
+	}
+	reportDeleteStorage(b, engine)
 }

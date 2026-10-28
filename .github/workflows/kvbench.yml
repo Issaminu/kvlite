@@ -17,9 +17,9 @@ on:
         options: [focused, reads, writes, deletes, mixed, all]
         default: all
       engines:
-        description: Comma-separated engines (kvlite,bbolt,redis)
+        description: Comma-separated engines (kvlite,bbolt,lmdb,redis)
         type: string
-        default: kvlite,bbolt,redis
+        default: kvlite,bbolt,lmdb,redis
       case:
         description: 'Optional exact case, for example durable:BenchmarkLifecycle/scale=medium/close-after-writes'
         type: string
@@ -39,7 +39,7 @@ jobs:
     env:
       SCALE: ${{ github.event_name == 'pull_request' && 'light' || inputs.scale || 'medium' }}
       WORKLOAD: ${{ github.event_name == 'pull_request' && 'focused' || inputs.workload || 'all' }}
-      ENGINES: ${{ inputs.engines || 'kvlite,bbolt,redis' }}
+      ENGINES: ${{ inputs.engines || 'kvlite,bbolt,lmdb,redis' }}
       CASE: ${{ inputs.case || '' }}
       PROFILING: ${{ inputs.profiling || false }}
       # The Tests workflow runs the tests for pushes and pull requests. A manual run can use a branch that no other workflow tests.

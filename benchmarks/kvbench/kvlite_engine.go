@@ -92,6 +92,10 @@ func (engine *kvliteEngine) DeleteBatch(_ context.Context, keys [][]byte) error 
 	return engine.db.DeleteBatch(benchmarkBucketName, keys)
 }
 
+func (engine *kvliteEngine) Sync(_ context.Context) error {
+	return engine.db.Sync()
+}
+
 func (engine *kvliteEngine) PrepareBucket(_ context.Context, name []byte, pairs []Pair) error {
 	return engine.db.Update(func(tx *kvlite.Tx) error {
 		bucket, err := tx.CreateBucket(name)

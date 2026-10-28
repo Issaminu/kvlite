@@ -162,6 +162,10 @@ func (engine *lmdbEngine) PutBatch(_ context.Context, pairs []Pair) error {
 	})
 }
 
+func (engine *lmdbEngine) Sync(_ context.Context) error {
+	return engine.env.Sync(true)
+}
+
 func (engine *lmdbEngine) Delete(ctx context.Context, key []byte) error {
 	return engine.DeleteBatch(ctx, [][]byte{key})
 }

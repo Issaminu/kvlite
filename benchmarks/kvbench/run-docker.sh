@@ -15,9 +15,9 @@ readonly suite_dir
 repository_dir="$(cd "${suite_dir}/../.." && pwd)"
 readonly repository_dir
 results_dir="${KVBENCH_RESULTS_DIR:-/tmp/kvlite-kvbench-results}"
-usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile] [--profile-engines=kvlite,bbolt,redis] [--skip-tests]"
+usage="usage: ./run-docker.sh [light|medium|large] [--engines=kvlite,bbolt,lmdb,redis] [--workloads=focused|reads|writes|deletes|mixed|all] [--storage=tmpfs|volume] [--case=durable:BenchmarkName/scale=light/...] [--profile] [--profile-engines=kvlite,bbolt,lmdb,redis] [--skip-tests]"
 benchmark_scale="light"
-engine_option="--engines=kvlite,bbolt,redis"
+engine_option="--engines=kvlite,bbolt,lmdb,redis"
 workload_option=""
 storage_option=""
 case_option=""
@@ -175,9 +175,9 @@ selected_engines=""
 uses_redis=0
 for engine in "${requested_engines[@]}"; do
 	case "${engine}" in
-	kvlite | bbolt | redis) ;;
+	kvlite | bbolt | lmdb | redis) ;;
 	*)
-		echo "engines must be kvlite, bbolt, or redis" >&2
+		echo "engines must be kvlite, bbolt, lmdb, or redis" >&2
 		exit 1
 		;;
 	esac
@@ -224,28 +224,30 @@ if ((case_set)); then
 		exit 1
 	fi
 	case "${selected_case_name}" in
-	*/kvlite | */bbolt | */redis) selected_case_name="${selected_case_name%/*}" ;;
+	*/kvlite | */bbolt | */lmdb | */redis) selected_case_name="${selected_case_name%/*}" ;;
 	esac
 	IFS='/' read -r -a case_parts <<<"${selected_case_name}"
 	benchmark_filter=""
 	for part in "${case_parts[@]}"; do
 		benchmark_filter+="${benchmark_filter:+/}^${part}$"
 	done
+	# Finish at the engine name so a scalar case cannot include nested batch variants.
+	benchmark_filter+='/^(kvlite|bbolt|lmdb|redis)$'
 elif [[ "${benchmark_workload}" == "focused" ]]; then
 	readonly benchmark_filter='^Benchmark(AcknowledgedOperations|FocusedWrites|DeleteOperations)$'
 else
 	case "${benchmark_workload}" in
 	reads)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|ReadTransactions|GetBatch|Enumeration|OrderedOperations|ScaleAndAccessDistribution|Latency|Collections)$'
 		;;
 	writes)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|Latency|Collections)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|PutBatch|Sync|DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete|Latency|Collections)$'
 		;;
 	deletes)
 		readonly benchmark_filter='^Benchmark(DeleteOperations|DeleteBuckets|DeleteVisibility|PageReuse|PageReusePlateau|TailReclamation|ReopenAfterDelete)$'
 		;;
 	mixed)
-		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|MixedTransactions|Latency)$'
+		readonly benchmark_filter='^Benchmark(AcknowledgedOperations|PutBatch|MixedTransactions|Latency)$'
 		;;
 	all)
 		readonly benchmark_filter='^Benchmark'
@@ -307,6 +309,7 @@ start_go() {
 		--cpuset-cpus "${cpu_set}" \
 		--memory "${go_memory}" \
 		--env GOFLAGS=-buildvcs=false \
+		--env CGO_ENABLED=1 \
 		--network "${network_name}" \
 		"${benchmark_data_mount[@]}" \
 		--volume "${cache_volume_name}:/go-cache" \
@@ -389,6 +392,7 @@ run_go() {
 		sh -c 'mkdir -p "$GOCACHE" "$GOMODCACHE" "$TMPDIR" && exec go test "$@"' sh "$@"
 }
 
+# Keep Blackout campaigns and its own packages out of benchmark preflight.
 run_root_tests() {
 	docker exec \
 		--workdir /workspace \
@@ -396,7 +400,7 @@ run_root_tests() {
 		--env GOMODCACHE=/go-cache/mod \
 		--env TMPDIR=/tmp/kvlite-tests \
 		"${go_name}" \
-		sh -c 'mkdir -p "$GOCACHE" "$GOMODCACHE" "$TMPDIR" && exec go test -count=1 ./...'
+		sh -c 'mkdir -p "$GOCACHE" "$GOMODCACHE" "$TMPDIR" && exec go test -count=1 -skip "Blackout|SimulatedDisk" . ./internal/btree ./internal/checksum ./internal/fileio ./internal/page ./internal/wal'
 }
 
 engine_order() {
@@ -533,6 +537,9 @@ verify_redis_reopen_after_kill() {
 	echo "Working tree:"
 	git -C "${repository_dir}" status --short
 	docker exec "${go_name}" go version
+	docker exec "${go_name}" go env CGO_ENABLED CC
+	docker exec --env GOMODCACHE=/go-cache/mod "${go_name}" go list -m github.com/PowerDNS/lmdb-go
+	run_go durable "" -run '^TestLMDBVersion$' -v
 	if ((uses_redis)); then
 		docker exec "${redis_name}" redis-server --version
 	else
@@ -554,7 +561,12 @@ fi
 	{
 		git ls-files -z -- . ':(exclude)benchmarks/kvbench/benchmark-results*.md'
 		git ls-files --others --exclude-standard -z -- . ':(exclude)benchmarks/kvbench/benchmark-results*.md'
-	} | sort -z | xargs -0 shasum -a 256
+	} | sort -z | while IFS= read -r -d '' source_path; do
+		# Git lists tracked deletions too. Hash only files that are present.
+		if [[ -f "${source_path}" ]]; then
+			shasum -a 256 "${source_path}"
+		fi
+	done
 ) >"${results_dir}/source-sha256.txt"
 
 if [[ "${benchmark_scale}" != "light" ]]; then
