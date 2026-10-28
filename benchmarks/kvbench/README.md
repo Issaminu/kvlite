@@ -129,7 +129,7 @@ Native group commit remains enabled. KVLite can group concurrent durable updates
 | Mode | KVLite | bbolt | LMDB | Redis |
 | --- | --- | --- | --- | --- |
 | `durable` | `SyncFull` | `NoSync=false`, `NoGrowSync=false` | Default synchronized commits | AOF enabled, `appendfsync always` |
-| `no-commit-sync` | `SyncNone`, WAL bypassed | `NoSync=true`, `NoGrowSync=true` | `NoSync\|WriteMap` | AOF enabled, `appendfsync no` |
+| `no-commit-sync` | `SyncNone`, WAL enabled | `NoSync=true`, `NoGrowSync=true` | `NoSync\|WriteMap` | AOF enabled, `appendfsync no` |
 
 Durable timings include the engine's acknowledgement and storage-sync boundary. No-commit-sync timings omit commit synchronization and do not provide the same crash guarantees. LMDB's mapped-write configuration is used only on disposable no-commit-sync fixtures. bbolt persists its freelist in both modes.
 

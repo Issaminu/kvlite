@@ -30,7 +30,7 @@ func (db *DB) mapMainFile() error {
 	if isMapper {
 		data, err = mapper.Map(int(info.Size()))
 	} else {
-		db.mappedWritable = db.options.Synchronous == SyncNone && !db.options.ReadOnly && systemMappingAllowsWrites
+		db.mappedWritable = db.options.DisableWAL && !db.options.ReadOnly && systemMappingAllowsWrites
 		if db.mappedWritable {
 			data, db.mappedBacking, err = mapDirectFileRegion(osFile, int(info.Size()), systemMapMainFile)
 		} else {

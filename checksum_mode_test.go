@@ -54,10 +54,16 @@ func checkDataPageFields(t *testing.T, db *DB, enabled bool) {
 }
 
 func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
-	for _, syncMode := range []Sync{SyncNone, SyncNormal, SyncFull} {
-		t.Run(fmt.Sprint(syncMode), func(t *testing.T) {
+	for _, options := range []Options{
+		{Synchronous: SyncNone},
+		{Synchronous: SyncNone, DisableWAL: true},
+		{Synchronous: SyncNormal},
+		{Synchronous: SyncFull},
+	} {
+		t.Run(fmt.Sprintf("mode=%d/disable-wal=%t", options.Synchronous, options.DisableWAL), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "database")
-			db, err := Open(path, 0600, &Options{Synchronous: syncMode, CheckpointThresholdBytes: 1 << 30})
+			options.CheckpointThresholdBytes = 1 << 30
+			db, err := Open(path, 0600, &options)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -107,10 +113,10 @@ func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if syncMode != SyncNone && !bytes.Equal(beforeMain, afterMain) {
+			if (!options.DisableWAL) && !bytes.Equal(beforeMain, afterMain) {
 				t.Fatal("disable changed the main file without a checkpoint")
 			}
-			if syncMode == SyncNone && bytes.Equal(beforeMain, afterMain) {
+			if (options.DisableWAL) && bytes.Equal(beforeMain, afterMain) {
 				t.Fatal("SyncNone did not write the checksum mode to the main file")
 			}
 			// A changed leaf becomes unchecked. Untouched pages retain sums.
@@ -150,7 +156,7 @@ func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
 			}
 			for _, name := range []string{path, backup} {
 				for _, readOnly := range []bool{true, false} {
-					db, err = Open(name, 0600, &Options{ReadOnly: readOnly, Synchronous: syncMode, DataPageChecksums: true})
+					db, err = Open(name, 0600, &Options{ReadOnly: readOnly, Synchronous: options.Synchronous, DisableWAL: options.DisableWAL, DataPageChecksums: true})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -291,13 +297,18 @@ func TestSetDataPageChecksums_Errors(t *testing.T) {
 
 func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 	for _, test := range []struct {
-		mode    Sync
-		initial bool
-	}{{SyncNormal, false}, {SyncNormal, true}, {SyncNone, false}, {SyncNone, true}} {
+		mode       Sync
+		initial    bool
+		disableWAL bool
+	}{
+		{SyncNormal, false, false}, {SyncNormal, true, false},
+		{SyncNone, false, false}, {SyncNone, true, false},
+		{SyncNone, false, true}, {SyncNone, true, true},
+	} {
 		mode, initial := test.mode, test.initial
-		t.Run(fmt.Sprintf("sync=%d/initial=%t", mode, initial), func(t *testing.T) {
+		t.Run(fmt.Sprintf("sync=%d/initial=%t/disable-wal=%t", mode, initial, test.disableWAL), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "database")
-			db, err := Open(path, 0600, &Options{Synchronous: mode, DataPageChecksums: initial})
+			db, err := Open(path, 0600, &Options{Synchronous: mode, DisableWAL: test.disableWAL, DataPageChecksums: initial})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -322,7 +333,7 @@ func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 			<-started
 			modeDone := make(chan error, 1)
 			go func() { modeDone <- db.SetDataPageChecksums(!initial) }()
-			if initial && mode != SyncNone {
+			if initial && !test.disableWAL {
 				select {
 				case err := <-modeDone:
 					if err != nil {
@@ -347,7 +358,7 @@ func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 			case <-time.After(5 * time.Second):
 				t.Fatal("backup did not finish")
 			}
-			if !initial || mode == SyncNone {
+			if !initial || test.disableWAL {
 				select {
 				case err := <-modeDone:
 					if err != nil {

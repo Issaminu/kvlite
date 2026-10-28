@@ -1316,6 +1316,38 @@ func closeWithoutCheckpoint(t *testing.T, db *DB) {
 	}
 }
 
+func TestRecovery_SyncNoneWAL(t *testing.T) {
+	for _, readOnly := range []bool{false, true} {
+		for _, disableWAL := range []bool{false, true} {
+			t.Run(fmt.Sprintf("readonly=%t/disable-wal=%t", readOnly, disableWAL), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "db")
+				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, CheckpointThresholdBytes: 1 << 30, DataPageChecksums: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				createBucket(t, db, testBucketName)
+				for _, value := range []string{"first", "later"} {
+					if err := db.Put(testBucketName, []byte("key"), []byte(value)); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if db.wal.Stats().CommittedRecordCount == 0 {
+					t.Fatal("fixture has no committed WAL data")
+				}
+				closeWithoutCheckpoint(t, db)
+				db, err = Open(path, 0600, &Options{Synchronous: SyncNone, ReadOnly: readOnly, DisableWAL: disableWAL})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				if got, err := db.Get(testBucketName, []byte("key")); err != nil || string(got) != "later" {
+					t.Fatalf("recovered value: %q, %v", got, err)
+				}
+			})
+		}
+	}
+}
+
 // TestAllocationBytePatchRecoversInReadOnlyAndWritableModes rebuilds an allocation page from a complete WAL image and later byte patches.
 func TestAllocationBytePatchRecoversInReadOnlyAndWritableModes(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")

@@ -12,7 +12,7 @@ import (
 
 // Checkpoint moves committed WAL data into the main database file and clears the WAL without closing the database.
 // In [SyncFull] and [SyncNormal], it synchronizes the WAL and main file before clearing the WAL, regardless of the automatic checkpoint threshold.
-// A [SyncNone] or memory database has no WAL changes to move and returns nil. Use [DB.Sync] to force storage synchronization in SyncNone.
+// In [SyncNone], it moves the data without storage synchronization. With [Options.DisableWAL] enabled, or in a memory database, it has no WAL changes to move and returns nil. Use [DB.Sync] to force storage synchronization in SyncNone.
 //
 // Checkpoint waits for active transaction callbacks. A WAL checkpoint also waits for active backups and blocks database operations while it runs.
 // Do not call it from a View or Update callback. Writes that have not committed when checkpointing begins are not covered.
@@ -28,7 +28,7 @@ func (db *DB) Checkpoint() error {
 	if err := db.writeFailure(); err != nil {
 		return err
 	}
-	if db.memoryNodes != nil || db.options.Synchronous == SyncNone {
+	if db.memoryNodes != nil || db.options.DisableWAL {
 		return nil
 	}
 	for db.activeBackups > 0 {

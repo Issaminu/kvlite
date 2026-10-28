@@ -12,6 +12,27 @@ func TestOptions_DoesNotExposePageSize(t *testing.T) {
 	}
 }
 
+func TestOptions_DisableWAL(t *testing.T) {
+	for _, mode := range []Sync{SyncDefault, SyncFull, SyncNormal, SyncNone} {
+		for _, disableWAL := range []bool{false, true} {
+			options := Options{Synchronous: mode, DisableWAL: disableWAL}
+			resolved, err := resolveOptions(&options, 4096)
+			if disableWAL && mode != SyncNone {
+				if !errors.Is(err, ErrInvalid) {
+					t.Fatalf("options %+v: got %v, want ErrInvalid", options, err)
+				}
+				continue
+			}
+			if err != nil {
+				t.Fatalf("options %+v: %v", options, err)
+			}
+			if resolved.DisableWAL != disableWAL {
+				t.Fatalf("options %+v: resolved DisableWAL = %t", options, resolved.DisableWAL)
+			}
+		}
+	}
+}
+
 func TestOptions_MaxWriteBatchSize(t *testing.T) {
 	for _, test := range []struct {
 		name  string

@@ -18,7 +18,7 @@ import (
 )
 
 func TestBackupLiveSnapshot(t *testing.T) {
-	for _, mode := range []Sync{SyncFull, SyncNormal} {
+	for _, mode := range []Sync{SyncFull, SyncNormal, SyncNone} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			dir := t.TempDir()
 			db, err := Open(filepath.Join(dir, "source.db"), 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30})

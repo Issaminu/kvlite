@@ -89,7 +89,7 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 
 // enableDataPageChecksums protects complete nodes in batches.
 // The mode stays disabled until the caller commits the final metadata change.
-// SyncFull and SyncNormal write redo images first. SyncNone writes directly without recovery protection.
+// With the WAL enabled, conversion writes redo images first. Otherwise it writes directly without recovery protection.
 // The caller must hold operationMu and have no active backups.
 func (db *DB) enableDataPageChecksums() error {
 	// Resolve old changes before checking retained sums. A failed conversion can
@@ -104,7 +104,7 @@ func (db *DB) enableDataPageChecksums() error {
 		if len(nodes) == 0 {
 			return nil
 		}
-		if db.options.Synchronous == SyncNone {
+		if db.options.DisableWAL {
 			if err := db.writeDirectPages(db.meta, nodes, nil, nil, true); err != nil {
 				return err
 			}

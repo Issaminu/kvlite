@@ -113,8 +113,8 @@ func (db *DB) writeFailure() error {
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions.
-// With [SyncFull] or [SyncNormal], Open commits a new database to the WAL and checkpoints it. A crash during creation leaves an empty file or a database that the next Open recovers.
-// With [SyncNone], Open writes the new database directly. A process crash during creation can leave a corrupt file. Existing WAL data is recovered before direct writes start.
+// With the WAL enabled, Open commits a new database to the WAL and checkpoints it. In [SyncFull] and [SyncNormal], a crash during creation leaves an empty file or a database that the next Open recovers.
+// With [SyncNone] and [Options.DisableWAL] enabled, Open writes the new database directly. A process crash during creation can leave a corrupt file. Existing WAL data is recovered before direct writes start.
 // A read-only Open requires an existing database and does not create either file. An empty file returns an error that matches [os.ErrNotExist].
 // With [SyncFull] or [SyncNormal], the first write-ahead log sync of a writable handle also syncs the parent directory.
 // That sync runs before a commit or a checkpoint depends on the file names, so a handle that does not write does not sync the directory.
@@ -307,8 +307,8 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 }
 
 // initializeNewDatabase writes the metadata, bitmap, and root of an empty database.
-// SyncFull and SyncNormal commit them to the WAL before the main file.
-// SyncNone writes the main file directly and can leave partial data after a crash.
+// With the WAL enabled, it commits them to the WAL before the main file.
+// Otherwise it writes the main file directly and can leave partial data after a crash.
 func (db *DB) initializeNewDatabase() error {
 	allocation := newAllocationBitmap(db.meta.PageSize())
 	db.rootNode = btree.NewLeafNode(db.meta.Root())
@@ -318,7 +318,7 @@ func (db *DB) initializeNewDatabase() error {
 	for i := range allocation.segments {
 		pages[i] = wal.AllocationRecord{PageID: allocation.segmentPageID(i), Payload: allocation.encodeSegment(i)}
 	}
-	if db.options.Synchronous == SyncNone {
+	if db.options.DisableWAL {
 		size, err := db.logicalFileSize()
 		if err != nil {
 			return err
@@ -385,7 +385,7 @@ func (db *DB) failOpen(err error) (*DB, error) {
 
 // Sync flushes committed database and WAL data to storage without closing the database or forcing a checkpoint. It also syncs their directory, except on Windows.
 // Sync works in [SyncFull], [SyncNormal], and [SyncNone], regardless of when the configured mode normally synchronizes writes.
-// It does not change the synchronization mode for later writes. In SyncNone it makes completed writes durable, but a later direct write can still corrupt earlier data if it crashes halfway through.
+// It does not change the synchronization mode for later writes. In SyncNone it makes completed writes durable, but a later unsynchronized checkpoint or direct write can still corrupt earlier data if it crashes halfway through.
 // A memory database has nothing to flush and returns nil.
 //
 // Sync waits for active transaction callbacks. Do not call it from a View or Update callback.
@@ -415,7 +415,7 @@ func (db *DB) Sync() error {
 	return nil
 }
 
-// Close releases the database resources. For a writable file database in SyncFull or SyncNormal, it first checkpoints committed data and removes the WAL. SyncNone changes the main file during each write and adds no storage synchronization at close. After [ErrWALWriteFailed] or [ErrDatabaseWriteFailed], Close only releases resources. A memory database discards all data without file operations.
+// Close releases the database resources. For a writable file database, it first checkpoints committed WAL data and removes the WAL. SyncNone adds no storage synchronization at close. After [ErrWALWriteFailed] or [ErrDatabaseWriteFailed], Close only releases resources. A memory database discards all data without file operations.
 //
 // Close prevents new data operations and waits for active operations to finish. After Close succeeds, data operations return [ErrDatabaseNotOpen], but [DB.Path] remains available. If Close returns an error, the database remains open so the caller can retry, but some cleanup can remain incomplete.
 func (db *DB) Close() error {
@@ -525,7 +525,7 @@ func (db *DB) Path() string {
 // empty value. If key names a nested bucket, Put returns
 // [ErrIncompatibleValue] instead of replacing the bucket.
 func (db *DB) Put(bucketName, key, value []byte) error {
-	if db.options != nil && db.options.Synchronous == SyncNone && db.memoryNodes == nil {
+	if db.options != nil && db.options.DisableWAL && db.memoryNodes == nil {
 		return db.putMapped(bucketName, []KeyValue{{Key: key, Value: value}})
 	}
 	return db.Update(func(tx *Tx) error { return tx.putManaged(bucketName, key, value) })
@@ -545,7 +545,7 @@ func (db *DB) PutBatch(bucketName []byte, entries []KeyValue) error {
 	if len(entries) == 1 {
 		return db.Put(bucketName, entries[0].Key, entries[0].Value)
 	}
-	if db.options != nil && db.options.Synchronous == SyncNone && db.memoryNodes == nil {
+	if db.options != nil && db.options.DisableWAL && db.memoryNodes == nil {
 		return db.putMapped(bucketName, entries)
 	}
 	return db.Update(func(tx *Tx) error {

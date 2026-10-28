@@ -16,7 +16,7 @@ import (
 )
 
 func TestDBCheckpointMovesCommittedWAL(t *testing.T) {
-	for _, mode := range []Sync{SyncFull, SyncNormal} {
+	for _, mode := range []Sync{SyncFull, SyncNormal, SyncNone} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
 			db, err := Open(path, 0600, &Options{Synchronous: mode, CheckpointThresholdBytes: 1 << 30, DataPageChecksums: true})
@@ -67,6 +67,48 @@ func TestDBCheckpointMovesCommittedWAL(t *testing.T) {
 	}
 }
 
+func TestSyncNoneSkipsAutomaticSync(t *testing.T) {
+	for _, threshold := range []uint64{1, 1 << 30} {
+		t.Run(fmt.Sprint(threshold), func(t *testing.T) {
+			syncCalls := 0
+			fsys := disk.New(1, disk.Config{OnEvent: func(event disk.Event) {
+				if event.Op == "sync" || event.Op == "syncdir" {
+					syncCalls++
+				}
+			}})
+			options := &Options{Synchronous: SyncNone, CheckpointThresholdBytes: threshold}
+			db, err := open(simulatedPath, 0600, options, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { db.Close() })
+			simulatedPut(t, db, "key", "value")
+			if threshold == 1 && db.wal.Stats().CommittedRecordCount != 0 {
+				t.Fatal("automatic checkpoint left committed WAL data")
+			}
+			closeWithoutCheckpoint(t, db)
+			db, err = open(simulatedPath, 0600, options, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, err := db.Get(testBucketName, []byte("key")); err != nil || string(got) != "value" {
+				t.Fatalf("recovered value: %q, %v", got, err)
+			}
+			simulatedPut(t, db, "key", "checkpoint")
+			if err := db.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			simulatedPut(t, db, "key", "close")
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if syncCalls != 0 {
+				t.Fatalf("SyncNone issued %d storage syncs", syncCalls)
+			}
+		})
+	}
+}
+
 func TestDBCheckpointPersistsMainFile(t *testing.T) {
 	for _, mode := range []Sync{SyncFull, SyncNormal} {
 		t.Run(fmt.Sprint(mode), func(t *testing.T) {
@@ -105,16 +147,16 @@ func TestDBCheckpointNoOpAndHandleErrors(t *testing.T) {
 		t.Fatalf("closed memory checkpoint: %v", err)
 	}
 	path := filepath.Join(t.TempDir(), "db")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 	createBucket(t, db, testBucketName)
 	before := db.wal.Stats()
-	db.wal.SetSyncFileForTesting(func() error { t.Error("SyncNone checkpoint synchronized the WAL"); return nil })
+	db.wal.SetSyncFileForTesting(func() error { t.Error("DisableWAL checkpoint synchronized the WAL"); return nil })
 	if err := db.Checkpoint(); err != nil || db.wal.Stats() != before {
-		t.Fatalf("SyncNone checkpoint was not a no-op: %v", err)
+		t.Fatalf("DisableWAL checkpoint was not a no-op: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatal(err)

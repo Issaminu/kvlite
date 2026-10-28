@@ -9970,37 +9970,62 @@ func (file *directWriteGuard) Truncate(size int64) error {
 }
 
 func TestSyncModesSelectWAL(t *testing.T) {
-	for _, mode := range []Sync{SyncDefault, SyncFull, SyncNormal, SyncNone} {
-		t.Run(fmt.Sprint(mode), func(t *testing.T) {
-			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: mode})
+	for _, options := range []Options{
+		{Synchronous: SyncDefault},
+		{Synchronous: SyncFull},
+		{Synchronous: SyncNormal},
+		{Synchronous: SyncNone},
+		{Synchronous: SyncNone, DisableWAL: true},
+	} {
+		t.Run(fmt.Sprintf("mode=%d/disable-wal=%t", options.Synchronous, options.DisableWAL), func(t *testing.T) {
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &options)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer db.Close()
 			createBucket(t, db, testBucketName)
+			if err := db.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			mainBefore, err := os.ReadFile(db.path)
+			if err != nil {
+				t.Fatal(err)
+			}
 			if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 				t.Fatal(err)
+			}
+			if err := db.PutBatch(testBucketName, []KeyValue{{Key: []byte("key"), Value: []byte("later")}, {Key: []byte("second"), Value: []byte("value")}}); err != nil {
+				t.Fatal(err)
+			}
+			mainAfter, err := os.ReadFile(db.path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !options.DisableWAL {
+				if db.mappedWritable || !bytes.Equal(mainBefore, mainAfter) {
+					t.Fatal("WAL writes enabled or changed the writable main-file mapping")
+				}
 			}
 			stats, err := db.Stats()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if mode == SyncNone {
+			if options.DisableWAL {
 				if stats.WALCommitCount != 0 || stats.WALBytesWritten != 0 || stats.WALPageCount != 0 {
-					t.Fatalf("SyncNone used the WAL: %+v", stats)
+					t.Fatalf("DisableWAL still used the WAL: %+v", stats)
 				}
 			} else if stats.WALCommitCount == 0 || stats.WALBytesWritten == 0 {
-				t.Fatalf("mode %d did not use the WAL: %+v", mode, stats)
+				t.Fatalf("options %+v did not use the WAL: %+v", options, stats)
 			}
 		})
 	}
 }
 
-func TestSyncNoneWritesMainBeforeReturn(t *testing.T) {
+func TestDisableWALWritesMainBeforeReturn(t *testing.T) {
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -10113,9 +10138,9 @@ func TestSyncNoneWritesMainBeforeReturn(t *testing.T) {
 	}
 }
 
-func TestSyncNonePartialWriteStopsHandle(t *testing.T) {
+func TestDisableWALPartialWriteStopsHandle(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: true})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -10156,7 +10181,7 @@ func TestSyncNonePartialWriteStopsHandle(t *testing.T) {
 	}
 }
 
-func TestSyncNoneRecoversPriorLog(t *testing.T) {
+func TestDisableWALRecoversPriorLog(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNormal})
 	if err != nil {
@@ -10167,7 +10192,7 @@ func TestSyncNoneRecoversPriorLog(t *testing.T) {
 		t.Fatal(err)
 	}
 	closeWithoutCheckpoint(t, db)
-	db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -10185,9 +10210,9 @@ func TestSyncNoneRecoversPriorLog(t *testing.T) {
 	}
 }
 
-func TestSyncNoneBackupWaitsBeforeCallback(t *testing.T) {
+func TestDisableWALBackupWaitsBeforeCallback(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -10246,7 +10271,7 @@ func TestDirectMappingReserveGrowthShrink(t *testing.T) {
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -10318,7 +10343,7 @@ func TestDirectMappingReserveGrowthShrink(t *testing.T) {
 			if db.mappedBacking != nil || db.mappedFile != nil {
 				t.Fatal("Close retained the full reserved map")
 			}
-			for _, options := range []*Options{{Synchronous: SyncNone}, {Synchronous: SyncFull}, {ReadOnly: true}} {
+			for _, options := range []*Options{{Synchronous: SyncNone}, {Synchronous: SyncNone, DisableWAL: true}, {Synchronous: SyncFull}, {ReadOnly: true}} {
 				reopened, err := Open(path, 0600, options)
 				if err != nil {
 					t.Fatal(err)
@@ -10326,7 +10351,7 @@ func TestDirectMappingReserveGrowthShrink(t *testing.T) {
 				if value, err := reopened.Get(testBucketName, []byte("keep")); err != nil || string(value) != "stable" {
 					t.Fatalf("reopened value: %q, %v", value, err)
 				}
-				if options.Synchronous != SyncNone && reopened.mappedBacking != nil {
+				if !options.DisableWAL && reopened.mappedBacking != nil {
 					t.Fatal("WAL or read-only handle reserved a writable span")
 				}
 				if err := reopened.Close(); err != nil {
@@ -10359,7 +10384,7 @@ func TestDirectWriteMappingChecksSizeChanges(t *testing.T) {
 				t.Fatal(err)
 			}
 			file := &directStatsMappingFile{File: main, follows: follows}
-			db := &DB{file: file, wal: log, options: &Options{Synchronous: SyncNone}}
+			db := &DB{file: file, wal: log, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
 			if err := db.mapMainFile(); err != nil {
 				t.Fatal(err)
 			}
@@ -10529,10 +10554,15 @@ func TestMappedWALProcessExit(t *testing.T) {
 
 // Fixture damage must cut at a record boundary, not the unused allocation tail.
 func TestWALMappingSelectedByMode(t *testing.T) {
-	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
-		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+	for _, options := range []Options{
+		{Synchronous: SyncNone},
+		{Synchronous: SyncNone, DisableWAL: true},
+		{Synchronous: SyncNormal},
+		{Synchronous: SyncFull},
+	} {
+		t.Run(fmt.Sprintf("sync=%d/disable-wal=%t", options.Synchronous, options.DisableWAL), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: mode})
+			db, err := Open(path, 0600, &options)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -10542,9 +10572,9 @@ func TestWALMappingSelectedByMode(t *testing.T) {
 				t.Fatal(err)
 			}
 			writer, mapped := db.wal.FileForTesting().(*mappedWALFile)
-			wantMapped := mode != SyncNone && systemMappingAllowsWrites
+			wantMapped := !options.DisableWAL && systemMappingAllowsWrites
 			if mapped != wantMapped {
-				t.Fatalf("mode %d: mapped writer=%t, want %t", mode, mapped, wantMapped)
+				t.Fatalf("options %+v: mapped writer=%t, want %t", options, mapped, wantMapped)
 			}
 			if mapped && len(writer.backing) == 0 {
 				t.Fatal("small transaction did not use the mapped writer")
@@ -10587,7 +10617,7 @@ func TestDirectMappedNodeEncoding(t *testing.T) {
 			if err = file.Truncate(24 * pageSize); err != nil {
 				t.Fatal(err)
 			}
-			db := &DB{file: file, options: &Options{Synchronous: SyncNone}}
+			db := &DB{file: file, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
 			if err = db.mapMainFile(); err != nil {
 				t.Fatal(err)
 			}
@@ -10634,14 +10664,14 @@ func TestDirectMappedNodeEncoding(t *testing.T) {
 	}
 }
 
-func TestSyncNoneMappedEncodingKeepsPrivateEntries(t *testing.T) {
+func TestDisableWALMappedEncodingKeepsPrivateEntries(t *testing.T) {
 	if !systemMappingAllowsWrites {
 		t.Skip("writable mapping is not used on this platform")
 	}
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -10658,7 +10688,7 @@ func TestSyncNoneMappedEncodingKeepsPrivateEntries(t *testing.T) {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
-			db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+			db, err = Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -11401,7 +11431,7 @@ func TestManagedPutMappedSameLength(t *testing.T) {
 		for _, branch := range []bool{false, true} {
 			t.Run(fmt.Sprintf("bytes=%d/checksums=%t/branch=%t", valueSize, checksums, branch), func(t *testing.T) {
 				path := filepath.Join(t.TempDir(), "db")
-				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -11521,7 +11551,7 @@ func TestManagedPutMappedSameLength(t *testing.T) {
 func TestManagedPutMappedDoesNotAllocate(t *testing.T) {
 	for _, valueSize := range []int{128, 64 << 10} {
 		t.Run(fmt.Sprint(valueSize), func(t *testing.T) {
-			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -11547,7 +11577,7 @@ func TestManagedPutMappedDoesNotAllocate(t *testing.T) {
 }
 
 func TestManagedPutMappedValidatesBeforeWrite(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: true})
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11591,7 +11621,7 @@ func TestManagedPutMappedValidatesBeforeWrite(t *testing.T) {
 }
 
 func TestManagedPutMappedWaitsForBackup(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11643,7 +11673,7 @@ func TestDBPutMappedInsert(t *testing.T) {
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -11827,7 +11857,7 @@ func TestManagedPutReplacesEncodedBucketRoot(t *testing.T) {
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -11924,7 +11954,7 @@ func TestManagedPutReplacesEncodedBucketRoot(t *testing.T) {
 }
 
 func TestManagedPutEncodedRootKeepsLookupErrors(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -11966,7 +11996,7 @@ func TestManagedPutEncodedRootKeepsLookupErrors(t *testing.T) {
 
 func TestManagedPutBorrowsOnlyUntilMainWrite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "db")
-	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -12340,9 +12370,14 @@ func TestIdenticalPutKeepsPrivateStateClean(t *testing.T) {
 }
 
 func TestSyncDurabilityAcrossModes(t *testing.T) {
-	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
+	for _, options := range []Options{
+		{Synchronous: SyncNone},
+		{Synchronous: SyncNone, DisableWAL: true},
+		{Synchronous: SyncNormal},
+		{Synchronous: SyncFull},
+	} {
 		for _, inheritNone := range []bool{false, true} {
-			t.Run(fmt.Sprintf("mode=%d/inheritNone=%t", mode, inheritNone), func(t *testing.T) {
+			t.Run(fmt.Sprintf("mode=%d/disable-wal=%t/inheritNone=%t", options.Synchronous, options.DisableWAL, inheritNone), func(t *testing.T) {
 				fsys := disk.New(1, disk.Config{KeepChange: disk.Ratio{Num: 0, Den: 1}})
 				db, err := open(simulatedPath, 0600, &Options{Synchronous: SyncFull}, fsys)
 				if err != nil {
@@ -12362,7 +12397,7 @@ func TestSyncDurabilityAcrossModes(t *testing.T) {
 						t.Fatal(err)
 					}
 				}
-				db, err = open(simulatedPath, 0600, &Options{Synchronous: mode}, fsys)
+				db, err = open(simulatedPath, 0600, &options, fsys)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -12379,7 +12414,7 @@ func TestSyncDurabilityAcrossModes(t *testing.T) {
 				}
 				simulatedCrash(fsys, db)
 				fsys.Restart(true)
-				if got, err := simulatedGet(t, fsys, mode, "key"); err != nil || got != "B" {
+				if got, err := simulatedGet(t, fsys, options.Synchronous, "key"); err != nil || got != "B" {
 					t.Fatalf("Sync lost data after power failure: %q, %v", got, err)
 				}
 			})
@@ -12391,10 +12426,15 @@ func TestSyncNativeMappedAndWALWrites(t *testing.T) {
 	previous := fileio.SkipDriveCacheFlushForTesting
 	fileio.SkipDriveCacheFlushForTesting = false
 	defer func() { fileio.SkipDriveCacheFlushForTesting = previous }()
-	for _, mode := range []Sync{SyncNone, SyncNormal, SyncFull} {
-		t.Run(fmt.Sprint(mode), func(t *testing.T) {
+	for _, options := range []Options{
+		{Synchronous: SyncNone},
+		{Synchronous: SyncNone, DisableWAL: true},
+		{Synchronous: SyncNormal},
+		{Synchronous: SyncFull},
+	} {
+		t.Run(fmt.Sprintf("mode=%d/disable-wal=%t", options.Synchronous, options.DisableWAL), func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "db")
-			db, err := Open(path, 0600, &Options{Synchronous: mode})
+			db, err := Open(path, 0600, &options)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -12410,7 +12450,7 @@ func TestSyncNativeMappedAndWALWrites(t *testing.T) {
 			if err := db.Sync(); err != nil {
 				t.Fatal(err)
 			}
-			if mode == SyncNone && db.wal.Stats().CommitCount != 0 {
+			if options.DisableWAL && db.wal.Stats().CommitCount != 0 {
 				t.Fatal("SyncNone gained WAL commits")
 			}
 			// Close only the descriptors, leaving the durable WAL available for recovery.
@@ -12422,7 +12462,7 @@ func TestSyncNativeMappedAndWALWrites(t *testing.T) {
 			}
 			db.closed = true
 			db.stopWriteBatcherAndWait()
-			reopened, err := Open(path, 0600, &Options{Synchronous: mode})
+			reopened, err := Open(path, 0600, &options)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -13204,7 +13244,7 @@ func TestDBPutBatchMappedReplacements(t *testing.T) {
 	}
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
-			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -13289,7 +13329,7 @@ func TestDBPutBatchMappedPreflightChecksLaterLeaves(t *testing.T) {
 	}
 	for _, checksums := range []bool{false, true} {
 		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
-			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -13340,7 +13380,7 @@ func TestDBPutBatchMappedPreflightChecksLaterLeaves(t *testing.T) {
 }
 
 func TestDBPutBatchMappedWaitsForBackup(t *testing.T) {
-	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -13394,7 +13434,7 @@ func TestDBPutBatchMappedContinuedReplacements(t *testing.T) {
 	for _, size := range []int{64 << 10, 1 << 20} {
 		for _, checksums := range []bool{false, true} {
 			t.Run(fmt.Sprintf("size=%d/checksums=%t", size, checksums), func(t *testing.T) {
-				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -13495,7 +13535,7 @@ func TestDBPutBatchMappedDuplicateOrder(t *testing.T) {
 	for _, size := range []int{128, 64 << 10} {
 		for _, checksums := range []bool{false, true} {
 			t.Run(fmt.Sprintf("size=%d/checksums=%t", size, checksums), func(t *testing.T) {
-				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+				db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true, DataPageChecksums: checksums})
 				if err != nil {
 					t.Fatal(err)
 				}

@@ -334,7 +334,7 @@ func TestDirectMappingReserveFallbackAndBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &directStatsMappingFile{File: file, follows: true}
-	db := &DB{file: fake, options: &Options{Synchronous: SyncNone}}
+	db := &DB{file: fake, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
 	if err := db.mapMainFile(); err != nil {
 		t.Fatal(err)
 	}
@@ -348,7 +348,7 @@ func TestDirectMappingReserveUnmapsFullBacking(t *testing.T) {
 	if !systemMappingAllowsWrites {
 		t.Skip("writable mappings are unavailable")
 	}
-	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone})
+	db, err := Open(filepath.Join(t.TempDir(), "db"), 0600, &Options{Synchronous: SyncNone, DisableWAL: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestDirectMappedFileWrites(t *testing.T) {
 	if err := file.Truncate(length); err != nil {
 		t.Fatal(err)
 	}
-	db := &DB{file: file, options: &Options{Synchronous: SyncNone}}
+	db := &DB{file: file, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
 	if err := db.mapMainFile(); err != nil {
 		t.Fatal(err)
 	}

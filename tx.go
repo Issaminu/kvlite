@@ -64,7 +64,7 @@ func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map
 //
 // If a write or sync of the write-ahead log fails during the commit, Update returns an error that matches [ErrWALWriteFailed]. The changes can be saved or lost, because the failed write can still reach storage. The DB then stops. Later transactions, reads, writes, and backups return the same error without calling fn. Close the DB and open it again. Then check the data before you repeat a change that is not safe to apply twice.
 //
-// With [SyncNone], Update waits for active backups before it calls fn. A direct main-file commit failure returns [ErrDatabaseWriteFailed] and stops later data operations. The file can be partly changed or corrupt. A process crash during a direct commit can also damage data from earlier successful transactions.
+// With [SyncNone] and [Options.DisableWAL] enabled, Update waits for active backups before it calls fn. A direct main-file commit failure returns [ErrDatabaseWriteFailed] and stops later data operations. The file can be partly changed or corrupt. A process crash during a direct commit can also damage data from earlier successful transactions.
 //
 // Only one Update callback runs at a time. Update waits for active [DB.View] callbacks to finish. New View callbacks wait until Update returns.
 //
@@ -84,10 +84,10 @@ func (db *DB) Update(transaction func(tx *Tx) error) error {
 	return db.updateDirect(transaction)
 }
 
-// prepareDirectWrite waits for backups in SyncNone and checks prior write errors.
+// prepareDirectWrite waits for backups when writes bypass the WAL and checks prior write errors.
 // The caller must hold operationMu. The lock is released while a backup finishes.
 func (db *DB) prepareDirectWrite() error {
-	for db.options.Synchronous == SyncNone && db.activeBackups > 0 {
+	for db.options.DisableWAL && db.activeBackups > 0 {
 		done := db.backupsDone
 		db.operationMu.Unlock()
 		<-done
@@ -122,7 +122,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		}
 	} else {
 		var retired map[page.ID]struct{}
-		if tx.allocationOwned && db.options.Synchronous != SyncNone {
+		if tx.allocationOwned && !db.options.DisableWAL {
 			retired = tx.allocation.walRetiredPages()
 		}
 		var encodedMeta []byte
@@ -135,7 +135,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 			return nil
 		}
 		var err error
-		if db.options.Synchronous == SyncNone {
+		if db.options.DisableWAL {
 			err = db.writeDirectPages(tx.meta, nodes, allocationPages, encodedMeta, tx.meta.DataPageChecksums())
 		} else {
 			needsCheckpoint, err = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
@@ -166,7 +166,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		db.cacheWriteNode(node.Final)
 	}
 	if needsCheckpoint {
-		// The WAL is already durable. A checkpoint failure must not turn this
+		// The WAL commit succeeded. A checkpoint failure must not turn this
 		// committed transaction into a reported failure.
 		// The sync of the WAL truncate saves the header sync of the next commit.
 		if db.checkpointWAL() == nil {

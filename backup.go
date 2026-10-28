@@ -21,7 +21,7 @@ import (
 // A memory database returns an error that matches [errors.ErrUnsupported] without file operations.
 // An empty path returns [ErrPathRequired]. An existing path or path+"-wal" returns an error that matches [os.ErrExist].
 //
-// SyncFull and SyncNormal can accept writes while the copy runs. SyncNone writes wait for the backup.
+// With the WAL enabled, writes can proceed while the copy runs. Otherwise writes wait for the backup.
 // Checkpointing waits until all backups finish, so the WAL can grow during a backup.
 // Backup retains the committed WAL page images from its start until it returns.
 // Close waits for Backup to finish. Do not call Backup inside a transaction callback.

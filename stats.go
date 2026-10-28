@@ -32,7 +32,7 @@ type Stats struct {
 	WALBytesWritten uint64
 	// WALCommitCount counts successful nonempty WAL commits since this handle opened.
 	// Several Update callbacks can share one commit. Failed commits and recovered transactions do not count.
-	// In SyncFull and SyncNormal, the creating handle counts the new database commit and checkpoint. SyncNone creation adds neither count.
+	// With the WAL enabled, the creating handle counts the new database commit and checkpoint. Creation without the WAL adds neither count.
 	WALCommitCount uint64
 	// CheckpointCount is the number of checkpoints that wrote all committed pages and cleared the WAL.
 	CheckpointCount uint64
