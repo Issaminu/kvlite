@@ -27,6 +27,7 @@ type EngineKind string
 const (
 	EngineKVLite EngineKind = "kvlite"
 	EngineBBolt  EngineKind = "bbolt"
+	EngineLMDB   EngineKind = "lmdb"
 	EngineRedis  EngineKind = "redis"
 )
 
@@ -107,6 +108,8 @@ func openEngine(ctx context.Context, options engineOpenOptions) (Engine, error) 
 		return openKVLiteEngine(filepath.Join(options.DataDir, "kvlite.db"), options.Mode)
 	case EngineBBolt:
 		return openBBoltEngine(filepath.Join(options.DataDir, "bbolt.db"), options.Mode, options.ClientCount)
+	case EngineLMDB:
+		return openLMDBEngine(filepath.Join(options.DataDir, "lmdb.db"), options.Mode)
 	case EngineRedis:
 		return openRedisEngine(ctx, options.RedisAddr, options.Mode, options.ClientCount, options.RedisFlushDB)
 	default:

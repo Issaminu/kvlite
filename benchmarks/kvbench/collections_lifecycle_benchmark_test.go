@@ -28,6 +28,8 @@ func BenchmarkCollections(b *testing.B) {
 			model := "native-buckets"
 			if environment.kind == EngineRedis {
 				model = "logical-prefixes"
+			} else if environment.kind == EngineLMDB {
+				model = "flat-named-databases"
 			}
 			name := fmt.Sprintf("%s/collections=%d/depth=%d/model=%s/%s", environment.mode, count, depth, model, environment.kind)
 			if workloadEnabled(benchmarkUpdate) {

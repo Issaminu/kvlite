@@ -140,7 +140,7 @@ func readBenchmarks(path string) ([]result, error) {
 		name := cpuSuffix.ReplaceAllString(fields[0], "")
 		parts := strings.Split(name, "/")
 		engine := parts[len(parts)-1]
-		if engine != "kvlite" && engine != "bbolt" && engine != "redis" {
+		if engine != "kvlite" && engine != "bbolt" && engine != "lmdb" && engine != "redis" {
 			return nil, fmt.Errorf("%s: unknown engine in %q", path, name)
 		}
 		if _, err := strconv.Atoi(fields[1]); err != nil {
@@ -257,7 +257,7 @@ func collect(dir string) (report, error) {
 			continue
 		}
 		mode, caseName, _ := strings.Cut(key, "\x00")
-		for _, peer := range []string{"bbolt", "redis"} {
+		for _, peer := range []string{"bbolt", "lmdb", "redis"} {
 			other, ok := engines[peer]
 			if !ok || other.Median == 0 {
 				continue
@@ -411,7 +411,7 @@ func markdown(r report) string {
 			}
 			b.WriteByte('\n')
 		}
-		for _, peer := range []string{"bbolt", "redis"} {
+		for _, peer := range []string{"bbolt", "lmdb", "redis"} {
 			var faster, slower []comparison
 			matched, overlapping := 0, 0
 			for _, row := range r.Comparisons {
@@ -530,6 +530,7 @@ func firstHotspot(h []hotspot) string {
 	for _, item := range []struct{ prefix, label string }{
 		{"github.com/Issaminu/kvlite", "kvlite"},
 		{"go.etcd.io/bbolt", "bbolt"},
+		{"github.com/PowerDNS/lmdb-go/lmdb", "lmdb"},
 		{"github.com/redis/go-redis/v9", "redis"},
 	} {
 		if strings.HasPrefix(name, item.prefix) {
@@ -546,6 +547,8 @@ func engineFunction(name, engine string) bool {
 		return (strings.HasPrefix(name, "github.com/Issaminu/kvlite.") || strings.HasPrefix(name, "github.com/Issaminu/kvlite/")) && !strings.Contains(name, "/benchmarks/kvbench.")
 	case "bbolt":
 		return strings.HasPrefix(name, "go.etcd.io/bbolt.") || strings.HasPrefix(name, "go.etcd.io/bbolt/")
+	case "lmdb":
+		return strings.HasPrefix(name, "github.com/PowerDNS/lmdb-go/lmdb.") || strings.HasPrefix(name, "github.com/PowerDNS/lmdb-go/lmdb/") || strings.HasPrefix(name, "mdb_") || strings.HasPrefix(name, "lmdbgo_")
 	case "redis":
 		return strings.HasPrefix(name, "github.com/redis/go-redis/v9.") || strings.HasPrefix(name, "github.com/redis/go-redis/v9/")
 	}

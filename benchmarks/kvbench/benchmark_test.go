@@ -243,7 +243,7 @@ func BenchmarkAcknowledgedOperations(b *testing.B) {
 	}
 	redisAddress := os.Getenv("KVBENCH_REDIS_ADDR")
 	engine := EngineKind(os.Getenv("KVBENCH_ENGINE"))
-	if engine != EngineKVLite && engine != EngineBBolt && engine != EngineRedis {
+	if engine != EngineKVLite && engine != EngineBBolt && engine != EngineRedis && engine != EngineLMDB {
 		b.Fatalf("KVBENCH_ENGINE is %q", engine)
 	}
 	if engine == EngineRedis && redisAddress == "" {
@@ -351,6 +351,9 @@ func BenchmarkFocusedWrites(b *testing.B) {
 }
 
 func benchmarkDatabase(b *testing.B, kind EngineKind, mode DurabilityMode, redisAddress string, benchmarkCase benchmarkCase) {
+	if kind == EngineLMDB && benchmarkCase.keyBytes > lmdbMaxKeySize {
+		b.Skip("key size exceeds LMDB's native key limit")
+	}
 	setupValueBytes := benchmarkCase.setupValueBytes
 	if setupValueBytes == 0 {
 		setupValueBytes = benchmarkCase.valueBytes

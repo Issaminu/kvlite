@@ -4,6 +4,7 @@ go 1.26.0
 
 require (
 	github.com/Issaminu/kvlite v0.0.0
+	github.com/PowerDNS/lmdb-go v1.9.4
 	github.com/redis/go-redis/v9 v9.22.0
 	go.etcd.io/bbolt v1.4.3
 )

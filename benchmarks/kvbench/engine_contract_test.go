@@ -9,8 +9,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
+
+	"github.com/PowerDNS/lmdb-go/lmdb"
 )
 
 func TestEmbeddedEngineContract(t *testing.T) {
@@ -20,6 +23,7 @@ func TestEmbeddedEngineContract(t *testing.T) {
 	}{
 		{name: "kvlite", open: openTestKVLiteEngine},
 		{name: "bbolt", open: openTestBBoltEngine},
+		{name: "lmdb", open: openTestLMDBEngine},
 	} {
 		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
 			t.Run(test.name+"/"+string(mode), func(t *testing.T) {
@@ -60,6 +64,7 @@ func TestWarmUpHandleKeepsStoredData(t *testing.T) {
 	}{
 		{name: "kvlite", open: openTestKVLiteEngine},
 		{name: "bbolt", open: openTestBBoltEngine},
+		{name: "lmdb", open: openTestLMDBEngine},
 	} {
 		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
 			t.Run(test.name+"/"+string(mode), func(t *testing.T) {
@@ -108,6 +113,7 @@ func TestBucketDeleteEngineContract(t *testing.T) {
 	}{
 		{name: "kvlite", open: openTestKVLiteEngine},
 		{name: "bbolt", open: openTestBBoltEngine},
+		{name: "lmdb", open: openTestLMDBEngine},
 	} {
 		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
 			t.Run(test.name+"/"+string(mode), func(t *testing.T) {
@@ -325,6 +331,15 @@ func openTestBBoltEngine(t *testing.T, mode DurabilityMode) Engine {
 	return engine
 }
 
+func openTestLMDBEngine(t *testing.T, mode DurabilityMode) Engine {
+	t.Helper()
+	engine, err := openLMDBEngine(filepath.Join(t.TempDir(), "lmdb.db"), mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return engine
+}
+
 func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
 	if kind := os.Getenv("KVBENCH_CRASH_HELPER"); kind != "" {
 		engine, err := openEngine(context.Background(), engineOpenOptions{
@@ -352,7 +367,7 @@ func TestDurableEmbeddedEngineReopensWithoutCleanClose(t *testing.T) {
 		os.Exit(0)
 	}
 
-	for _, kind := range []EngineKind{EngineKVLite, EngineBBolt} {
+	for _, kind := range []EngineKind{EngineKVLite, EngineBBolt, EngineLMDB} {
 		t.Run(string(kind), func(t *testing.T) {
 			for _, deleted := range []bool{false, true} {
 				name := "put"
@@ -419,6 +434,164 @@ func createKilledDatabase(tb testing.TB, kind EngineKind, dataDir string, delete
 	// Wait for them here, so a timed open measures recovery and not one lock retry of the engine.
 	if err := waitForReleasedFileLocks(dataDir, 5*time.Second); err != nil {
 		tb.Fatal(err)
+	}
+}
+
+func TestLMDBVersion(t *testing.T) {
+	_, _, _, version := lmdb.Version()
+	t.Logf("%s; Go binding: github.com/PowerDNS/lmdb-go; map size: %d; maximum key size: %d; the 32768-byte key case is skipped", version, lmdbMapSize, lmdbMaxKeySize)
+}
+
+func TestLMDBTransactions(t *testing.T) {
+	for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
+		t.Run(string(mode), func(t *testing.T) {
+			engine := openTestLMDBEngine(t, mode).(*lmdbEngine)
+			defer engine.Close()
+			ctx := t.Context()
+			key := []byte("key")
+			if err := engine.Put(ctx, key, []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			for _, read := range []func() ([][]byte, error){
+				func() ([][]byte, error) { return engine.GetBatch(ctx, [][]byte{key, key}) },
+				func() ([][]byte, error) { return engine.MixedBatch(ctx, [][]byte{key, key}, nil) },
+			} {
+				values, err := read()
+				if err != nil {
+					t.Fatal(err)
+				}
+				values[0][0] = 'x'
+				if string(values[1]) != "value" {
+					t.Fatal("read results share memory")
+				}
+				if value, err := engine.Get(ctx, key); err != nil || string(value) != "value" {
+					t.Fatalf("read result changed stored data: %q, %v", value, err)
+				}
+			}
+			invalid := []Pair{{Key: []byte("new"), Value: []byte("value")}, {Key: bytes.Repeat([]byte("x"), lmdbMaxKeySize+1), Value: []byte("value")}}
+			for _, write := range []func() error{
+				func() error { return engine.PutBatch(ctx, invalid) },
+				func() error { _, err := engine.MixedBatch(ctx, [][]byte{key}, invalid); return err },
+			} {
+				if err := write(); err == nil {
+					t.Fatal("accepted an oversized key")
+				}
+				if _, err := engine.Get(ctx, []byte("new")); !errors.Is(err, ErrKeyNotFound) {
+					t.Fatalf("failed transaction kept a write: %v", err)
+				}
+			}
+			if err := engine.Put(ctx, []byte("empty"), nil); err != nil {
+				t.Fatal(err)
+			}
+			if value, err := engine.Get(ctx, []byte("empty")); err != nil || len(value) != 0 {
+				t.Fatalf("empty value: %q, %v", value, err)
+			}
+			if err := engine.env.SetFlags(lmdb.NoMetaSync); err != nil {
+				t.Fatal(err)
+			}
+			if err := engine.Validate(ctx); err == nil {
+				t.Fatal("accepted a changed synchronization setting")
+			}
+		})
+	}
+}
+
+func TestLMDBPutBatchPreservesOrderAndInputOwnership(t *testing.T) {
+	for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
+		t.Run(string(mode), func(t *testing.T) {
+			engine := openTestLMDBEngine(t, mode)
+			defer engine.Close()
+			ctx := t.Context()
+			if err := engine.PutBatch(ctx, nil); err != nil {
+				t.Fatal(err)
+			}
+			if count, err := engine.Count(ctx); err != nil || count != 0 {
+				t.Fatalf("empty batch changed data: count=%d error=%v", count, err)
+			}
+			pairs := []Pair{
+				{Key: []byte("m"), Value: []byte("before")},
+				{Key: []byte("z"), Value: nil},
+				{Key: []byte("a"), Value: []byte("first")},
+				{Key: []byte("m"), Value: []byte("after")},
+				{Key: []byte("b"), Value: []byte{}},
+			}
+			original := make([]Pair, len(pairs))
+			for index, pair := range pairs {
+				original[index] = Pair{Key: bytes.Clone(pair.Key), Value: bytes.Clone(pair.Value)}
+			}
+			if err := engine.PutBatch(ctx, pairs); err != nil {
+				t.Fatal(err)
+			}
+			for index, pair := range pairs {
+				if !bytes.Equal(pair.Key, original[index].Key) || !bytes.Equal(pair.Value, original[index].Value) {
+					t.Fatal("batch changed the caller's order or bytes")
+				}
+				pair.Key[0] ^= 1
+				if len(pair.Value) > 0 {
+					pair.Value[0] ^= 1
+				}
+			}
+			for key, want := range map[string]string{"a": "first", "b": "", "m": "after", "z": ""} {
+				value, err := engine.Get(ctx, []byte(key))
+				if err != nil || value == nil || string(value) != want {
+					t.Fatalf("batch value %q: got %q error=%v, want %q", key, value, err, want)
+				}
+			}
+			if err := engine.Validate(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestLMDBScans(t *testing.T) {
+	engine := openTestLMDBEngine(t, DurabilityDurable).(*lmdbEngine)
+	defer engine.Close()
+	ctx := t.Context()
+	for _, key := range []string{"a", "aa", "ab", "b"} {
+		if err := engine.Put(ctx, []byte(key), []byte(key)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, test := range []struct {
+		name  string
+		visit func(func([]byte, []byte) error) error
+		want  []string
+	}{
+		{"prefix", func(fn func([]byte, []byte) error) error { return engine.ScanPrefix(ctx, []byte("a"), fn) }, []string{"a", "aa", "ab"}},
+		{"missing-prefix", func(fn func([]byte, []byte) error) error { return engine.ScanPrefix(ctx, []byte("z"), fn) }, nil},
+		{"range", func(fn func([]byte, []byte) error) error {
+			return engine.VisitOrdered(ctx, []byte("aa"), []byte("b"), false, 0, fn)
+		}, []string{"aa", "ab"}},
+		{"limit", func(fn func([]byte, []byte) error) error { return engine.VisitOrdered(ctx, nil, nil, false, 2, fn) }, []string{"a", "aa"}},
+		{"reverse", func(fn func([]byte, []byte) error) error {
+			return engine.VisitOrdered(ctx, []byte("aa"), nil, true, 0, fn)
+		}, []string{"b", "ab", "aa"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var keys []string
+			if err := test.visit(func(key, value []byte) error {
+				keys = append(keys, string(key))
+				if !bytes.Equal(key, value) {
+					t.Fatalf("scan value: %q=%q", key, value)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(keys, test.want) {
+				t.Fatalf("keys: %q, want %q", keys, test.want)
+			}
+		})
+	}
+	stop := errors.New("stop scan")
+	for _, visit := range []func(func([]byte, []byte) error) error{
+		func(fn func([]byte, []byte) error) error { return engine.ScanPrefix(ctx, nil, fn) },
+		func(fn func([]byte, []byte) error) error { return engine.VisitOrdered(ctx, nil, nil, false, 0, fn) },
+	} {
+		if err := visit(func(_, _ []byte) error { return stop }); !errors.Is(err, stop) {
+			t.Fatalf("scan callback error: %v", err)
+		}
 	}
 }
 

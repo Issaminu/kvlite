@@ -172,3 +172,58 @@ func TestProfiledEngines(t *testing.T) {
 		t.Fatal("accepted missing profiles when every engine was profiled")
 	}
 }
+
+func TestLMDBReport(t *testing.T) {
+	dir := t.TempDir()
+	var raw strings.Builder
+	for _, engine := range []string{"kvlite", "bbolt", "lmdb", "redis"} {
+		for _, value := range []int{100, 120} {
+			fmt.Fprintf(&raw, "BenchmarkRead/scale=light/%s-8 1 %d ns/op\n", engine, value)
+		}
+	}
+	for name, content := range map[string]string{
+		"environment.txt": "Measured rounds: 2\nMeasured samples: 2\n",
+		"durable.txt":     raw.String(), "no-commit-sync.txt": "",
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := collect(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Comparisons) != 3 || r.Comparisons[1].Peer != "lmdb" || r.Comparisons[1].PeerMedian != 110 {
+		t.Fatalf("comparisons: %+v", r.Comparisons)
+	}
+	if text := markdown(r); !strings.Contains(text, "KVLite against lmdb") {
+		t.Fatalf("LMDB comparison is absent: %s", text)
+	}
+	var cases bytes.Buffer
+	if err := listCases(dir, &cases, "lmdb"); err != nil {
+		t.Fatal(err)
+	}
+	if got := cases.String(); got != "0001\tdurable\tBenchmarkRead/scale=light/lmdb\tlmdb\t^BenchmarkRead$/^scale=light$/^lmdb$\t2\n" {
+		t.Fatalf("LMDB profile cases: %q", got)
+	}
+	if err := writeReport(dir); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"report.json", "report.md", "summary.csv", "comparisons.csv", "metrics.csv"} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil || !strings.Contains(string(data), "lmdb") {
+			t.Errorf("%s has no LMDB result: %v", name, err)
+		}
+	}
+}
+
+func TestLMDBProfileFunctions(t *testing.T) {
+	for _, name := range []string{"github.com/PowerDNS/lmdb-go/lmdb.(*Txn).Get", "github.com/PowerDNS/lmdb-go/lmdb._Cfunc_mdb_get", "mdb_page_search", "lmdbgo_mdb_get"} {
+		if !engineFunction(name, "lmdb") {
+			t.Errorf("LMDB profile function was excluded: %s", name)
+		}
+	}
+	if engineFunction("testing.(*B).runN", "lmdb") {
+		t.Error("test code was included as LMDB code")
+	}
+}

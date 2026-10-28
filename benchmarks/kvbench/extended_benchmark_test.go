@@ -30,7 +30,7 @@ func readBenchmarkEnvironment(b *testing.B) benchmarkEnvironment {
 	if environment.mode != DurabilityDurable && environment.mode != DurabilityNoCommitSync {
 		b.Fatalf("KVBENCH_DURABILITY is %q", environment.mode)
 	}
-	if environment.kind != EngineKVLite && environment.kind != EngineBBolt && environment.kind != EngineRedis {
+	if environment.kind != EngineKVLite && environment.kind != EngineBBolt && environment.kind != EngineRedis && environment.kind != EngineLMDB {
 		b.Fatalf("KVBENCH_ENGINE is %q", environment.kind)
 	}
 	if environment.kind == EngineRedis && environment.redisAddress == "" {
