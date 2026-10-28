@@ -59,6 +59,7 @@ const (
 type Config struct {
 	// Database options.
 	Sync            kvlite.Sync // the sync mode of the first open
+	DisableWAL      bool        // direct writes; valid only with SyncNone
 	Checksums       bool
 	OptionChanges   bool // each open picks new options (see sessions.go); without it, every open uses the options above
 	CheckpointBytes uint64
@@ -116,9 +117,9 @@ func (config Config) String() string {
 			operations = append(operations, fmt.Sprintf("%s=%d", operationNames[op], weight))
 		}
 	}
-	return fmt.Sprintf("option-changes=%t path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v rot=%v misdirect=%v page=%d map=%s sync=%s checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t revert-sync=%t sector=%d keep=%v in-order=%v ops=[%s]",
+	return fmt.Sprintf("option-changes=%t path=%s mode=%o hostile=%t/%t full=%v read-corruption=%v rot=%v misdirect=%v page=%d map=%s sync=%s disable-wal=%t checksums=%t checkpoint=%d buckets=%d nested=%t keys=%d shape=%d access=%d values=%v mutations=%v max=%d abort=%v crash-now=%v schedule-crash=%v power=%t io=%t revert-sync=%t sector=%d keep=%v in-order=%v ops=[%s]",
 		config.OptionChanges, pathModeNames[config.PathMode], config.FileMode, config.Disk.TornSectors, config.Disk.Garbage, config.Disk.FullFault, config.Disk.ReadCorruption, config.CorruptAtRest, config.Disk.Misdirect,
-		config.PageSize, config.mappingName(), syncName, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
+		config.PageSize, config.mappingName(), syncName, config.DisableWAL, config.Checksums, config.CheckpointBytes, config.BucketCount, config.NestedBuckets, config.KeyCount, config.KeyShape, config.Access,
 		config.ValueWeights, config.MutationWeights, config.MaxMutations, config.Abort, config.CrashNow, config.ScheduleCrash,
 		config.PowerFailures, config.IOFaults, config.Disk.RevertFailedSync, config.Disk.SectorSize, config.Disk.KeepChange, config.Disk.InOrder, strings.Join(operations, " "))
 }
@@ -215,7 +216,6 @@ func newConfig(seed uint64) Config {
 
 	config.CrashNow = sometimes(rand, 4, 60)
 	config.ScheduleCrash = sometimes(rand, 4, 60)
-	// SyncNone promises nothing after a power failure, so its runs crash only the process.
 	// SyncNone promises nothing after a power failure. A SyncNone session taints the storage, so no power failure happens until a syncing session makes it durable.
 	config.PowerFailures = (config.Sync != kvlite.SyncNone || config.OptionChanges) && !rand.Chance(disk.OneIn(5))
 
@@ -279,9 +279,10 @@ func newConfig(seed uint64) Config {
 	config.ReadOnlyRecovery = sometimes(rand, 2, 6)
 	if config.IOFaults {
 		// A failed sync behaves as on Btrfs in some runs, and as on ext4 and XFS in the others.
-		// This draw comes last, so the earlier draws of a seed do not change.
+		// Draw this after the other storage settings so their choices stay unchanged.
 		config.Disk.RevertFailedSync = rand.Chance(disk.OneIn(4))
 	}
+	config.DisableWAL = config.Sync == kvlite.SyncNone && rand.Bool()
 	return config
 }
 

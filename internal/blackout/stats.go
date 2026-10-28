@@ -27,6 +27,9 @@ type Stats struct {
 	Forms                [formCount]int // opens with explicit, nil, and zero Options
 	OptionChanges        int            // opens whose options differ from the previous open
 	TaintsCleared        int            // SyncNone sessions that a later syncing session made durable
+	SyncNoneSessions     [2][2]int      // verified SyncNone opens, indexed by DisableWAL then data-page checksums (false=0, true=1)
+	UnsyncedWALCrashes   int            // process crashes of WAL-backed SyncNone handles
+	InvalidWALOpens      int            // invalid DisableWAL combinations rejected without file changes
 	InvalidOpens         int            // checks that Open refuses invalid options
 	LargeWALSessions     int            // sessions without an automatic checkpoint
 	BatchSizeOneSessions int            // SyncFull or other sessions with MaxWriteBatchSize 1
@@ -59,6 +62,13 @@ func (stats *Stats) Add(other Stats) {
 	}
 	stats.OptionChanges += other.OptionChanges
 	stats.TaintsCleared += other.TaintsCleared
+	for walMode := range stats.SyncNoneSessions {
+		for checksums := range stats.SyncNoneSessions[walMode] {
+			stats.SyncNoneSessions[walMode][checksums] += other.SyncNoneSessions[walMode][checksums]
+		}
+	}
+	stats.UnsyncedWALCrashes += other.UnsyncedWALCrashes
+	stats.InvalidWALOpens += other.InvalidWALOpens
 	stats.InvalidOpens += other.InvalidOpens
 	stats.LargeWALSessions += other.LargeWALSessions
 	stats.BatchSizeOneSessions += other.BatchSizeOneSessions

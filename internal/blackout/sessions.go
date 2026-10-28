@@ -13,9 +13,10 @@ import (
 // An application can change its options between opens, for example after an upgrade.
 // With Config.OptionChanges, each open of the main handle starts a session with new options from the options generator.
 //
-// SyncNone can corrupt the main file after a failed write or a process or system crash.
-// Its sessions therefore run with healthy storage and no injected crashes.
-// Their successful operations still have to match the model.
+// DisableWAL selects direct main-file writes, which can corrupt earlier data after a failed write or process crash.
+// Those sessions run with healthy storage and no injected crashes.
+// WAL-backed SyncNone sessions keep process crashes and I/O faults, but neither form permits power failures.
+// Every successful operation still has to match the model.
 // A SyncNone session also taints the storage until its writes become durable.
 // While the storage is tainted, no power failure happens, the floor does not move, and no sync fails.
 // A failed sync is a storage failure too: it can drop the unsynced pages of the SyncNone session, even from the cache of the running process.
@@ -37,6 +38,7 @@ var formNames = [formCount]string{"explicit", "nil", "zero"}
 type session struct {
 	form            optionsForm
 	sync            kvlite.Sync // the sync mode that Open resolves
+	disableWAL      bool        // direct main-file writes
 	checksums       bool        // the checksum option; Open uses it only for a new file
 	checkpointBytes uint64      // zero means the default threshold
 	maxBatch        int         // zero means the default
@@ -46,7 +48,7 @@ func (options session) String() string {
 	if options.form != formExplicit {
 		return formNames[options.form] + " options (SyncFull and every default)"
 	}
-	return fmt.Sprintf("sync=%s checksums=%t checkpoint=%d max-batch=%d", syncNames[options.sync], options.checksums, options.checkpointBytes, options.maxBatch)
+	return fmt.Sprintf("sync=%s disable-wal=%t checksums=%t checkpoint=%d max-batch=%d", syncNames[options.sync], options.disableWAL, options.checksums, options.checkpointBytes, options.maxBatch)
 }
 
 // largeWAL is a checkpoint threshold that no run reaches, so the WAL grows until an explicit checkpoint, a Close, or a recovery.
@@ -54,7 +56,7 @@ const largeWAL = 1 << 40
 
 // firstSession returns the options that the config generator selected.
 func firstSession(config *Config) session {
-	return session{form: formExplicit, sync: config.Sync, checksums: config.Checksums, checkpointBytes: config.CheckpointBytes}
+	return session{form: formExplicit, sync: config.Sync, disableWAL: config.DisableWAL, checksums: config.Checksums, checkpointBytes: config.CheckpointBytes}
 }
 
 // nextSession picks the options of the next open.
@@ -92,6 +94,7 @@ func (runner *runner) nextSession() session {
 		next.checkpointBytes = largeWAL
 	}
 	next.maxBatch = [...]int{0, 1, 2, 100}[rand.IntN(4)]
+	next.disableWAL = next.sync == kvlite.SyncNone && rand.Bool()
 	return next
 }
 
@@ -122,12 +125,12 @@ func (runner *runner) startSession() {
 }
 
 // configureSessionFaults keeps recovery checks within the selected mode's guarantees.
-// SyncNone uses healthy storage here because it has no recovery guarantee after failed writes.
-// TestSyncNonePartialWriteStopsHandle covers its stopped handle.
+// Direct writes use healthy storage because they have no recovery guarantee after failed writes.
+// TestDisableWALPartialWriteStopsHandle covers its stopped handle.
 func (runner *runner) configureSessionFaults() {
-	runner.faults = runner.config.IOFaults && runner.crash.enabled && runner.session.sync != kvlite.SyncNone
+	runner.faults = runner.config.IOFaults && runner.crash.enabled && !runner.session.disableWAL
 	runner.fsys.SetFaults(runner.faults)
-	if runner.session.sync == kvlite.SyncNone {
+	if runner.session.disableWAL {
 		runner.fsys.CancelCrash()
 	}
 }
@@ -142,6 +145,7 @@ func (runner *runner) options() *kvlite.Options {
 	}
 	return &kvlite.Options{
 		Synchronous:              runner.session.sync,
+		DisableWAL:               runner.session.disableWAL,
 		DataPageChecksums:        runner.session.checksums,
 		CheckpointThresholdBytes: runner.session.checkpointBytes,
 		MaxWriteBatchSize:        runner.session.maxBatch,
@@ -190,16 +194,20 @@ func (runner *runner) openInvalid() {
 	rand := runner.optionsRand
 	options := &kvlite.Options{}
 	var name string
-	switch rand.IntN(3) {
+	switch rand.IntN(4) {
 	case 0:
 		options.Synchronous = kvlite.Sync(rand.Range(4, 255))
 		name = "sync mode"
 	case 1:
 		options.MaxWriteBatchSize = -rand.Range(1, 1000)
 		name = "MaxWriteBatchSize"
-	default:
+	case 2:
 		options.LockTimeout = -time.Duration(rand.Range(1, 1_000_000_000))
 		name = "LockTimeout"
+	default:
+		options.Synchronous = [...]kvlite.Sync{kvlite.SyncDefault, kvlite.SyncFull, kvlite.SyncNormal}[rand.IntN(3)]
+		options.DisableWAL = true
+		name = "DisableWAL"
 	}
 	runner.stats.InvalidOpens++
 	names, mutations := runner.fsys.Names(), runner.fsys.Mutations()
@@ -225,5 +233,9 @@ func (runner *runner) openInvalid() {
 	}
 	if runner.fsys.Mutations() != mutations || !slices.Equal(names, runner.fsys.Names()) {
 		runner.fail("Open with invalid options changed the files")
+		return
+	}
+	if options.DisableWAL {
+		runner.stats.InvalidWALOpens++
 	}
 }

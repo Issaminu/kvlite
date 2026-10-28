@@ -76,6 +76,8 @@ func (runner *runner) checkStats() {
 	mainSize, _ := runner.fsys.FileSize(runner.realPath)
 	walSize, _ := runner.fsys.FileSize(runner.realPath + "-wal")
 	switch {
+	case runner.session.disableWAL && (stats.WALSize != 0 || stats.WALPageCount != 0 || stats.WALBytesWritten != 0 || stats.WALCommitCount != 0):
+		runner.fail("DB.Stats: DisableWAL produced WAL data: %+v", stats)
 	case stats.PageSize != runner.work.pageSize:
 		runner.fail("DB.Stats: PageSize is %d, want %d", stats.PageSize, runner.work.pageSize)
 	case stats.FileSize != mainSize:

@@ -66,11 +66,12 @@ func Stress(target Target, seed uint64, settings StressSettings) error {
 		CheckpointThresholdBytes: [...]uint64{1, 64 << 10, 0}[rand.IntN(3)],
 		DataPageChecksums:        rand.Bool(),
 	}
+	run.options.DisableWAL = run.options.Synchronous == kvlite.SyncNone && rand.Bool()
 	run.pageSize = [...]int{4096, 16384}[rand.IntN(2)]
 	staleMappings := rand.Chance(disk.OneIn(4))
 	run.fsys = disk.New(streamSeed(seed, streamDisk), disk.Config{StaleMappings: staleMappings})
-	run.name = fmt.Sprintf("stress seed %d (clients=%d operations=%d sync=%s max-batch=%d checkpoint=%d checksums=%t page=%d stale-mappings=%t)",
-		seed, settings.Clients, settings.Operations, syncNames[run.options.Synchronous], run.options.MaxWriteBatchSize,
+	run.name = fmt.Sprintf("stress seed %d (clients=%d operations=%d sync=%s disable-wal=%t max-batch=%d checkpoint=%d checksums=%t page=%d stale-mappings=%t)",
+		seed, settings.Clients, settings.Operations, syncNames[run.options.Synchronous], run.options.DisableWAL, run.options.MaxWriteBatchSize,
 		run.options.CheckpointThresholdBytes, run.options.DataPageChecksums, run.pageSize, staleMappings)
 
 	timer := time.AfterFunc(stressTimeout, func() {
@@ -383,7 +384,7 @@ func (run *stressRun) backup(client, operation int) {
 		return
 	}
 	defer run.fsys.Remove(path)
-	backup, err := run.target.Open(path, 0o600, &kvlite.Options{ReadOnly: true, Synchronous: run.options.Synchronous}, run.fsys, run.pageSize)
+	backup, err := run.target.Open(path, 0o600, &kvlite.Options{ReadOnly: true, Synchronous: run.options.Synchronous, DisableWAL: run.options.DisableWAL}, run.fsys, run.pageSize)
 	if err != nil {
 		run.fail("open the backup: %v", err)
 		return

@@ -184,7 +184,7 @@ func (runner *runner) run() (err error) {
 // safetyStep runs one step of the safety phase: a crash now, or one operation with an optional crash inside it.
 func (runner *runner) safetyStep() {
 	runner.readCorruptions = runner.fsys.Stats().ReadCorruptions
-	if runner.session.sync != kvlite.SyncNone {
+	if !runner.session.disableWAL {
 		switch event, calls := runner.crash.beforeStep(); event {
 		case crashNow:
 			runner.stats.CrashesNow++
@@ -346,6 +346,9 @@ func (runner *runner) closeDB() bool {
 
 // recoverCrash drops the crashed handle, restarts the simulated process, and checks the recovered state.
 func (runner *runner) recoverCrash() {
+	if runner.session.sync == kvlite.SyncNone && !runner.session.disableWAL {
+		runner.stats.UnsyncedWALCrashes++
+	}
 	_, event := runner.fsys.Crashed()
 	if event.Op != "crash" {
 		kind := event.Op
@@ -392,7 +395,7 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 			runner.fsys.SetFaults(false)
 			runner.fsys.CancelCrash()
 			defer runner.fsys.SetFaults(runner.faults)
-		} else if afterCrash && runner.session.sync != kvlite.SyncNone {
+		} else if afterCrash && !runner.session.disableWAL {
 			if crash, calls := runner.crash.duringRecovery(); crash {
 				runner.fsys.ScheduleCrash(calls)
 			}
@@ -429,6 +432,16 @@ func (runner *runner) openAndVerify(afterCrash bool) {
 	runner.verify(afterCrash)
 	if runner.failure == nil {
 		runner.resetMemory()
+		if runner.session.sync == kvlite.SyncNone {
+			walMode, checksumMode := 0, 0
+			if runner.session.disableWAL {
+				walMode = 1
+			}
+			if runner.target.DataPageChecksums(runner.db) {
+				checksumMode = 1
+			}
+			runner.stats.SyncNoneSessions[walMode][checksumMode]++
+		}
 	}
 }
 

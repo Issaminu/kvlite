@@ -161,6 +161,41 @@ func TestBlackout(t *testing.T) {
 	}
 }
 
+func TestBlackoutSyncNoneWALModes(t *testing.T) {
+	skipUnlessBlackout(t)
+	for _, disableWAL := range []bool{false, true} {
+		for _, checksums := range []bool{false, true} {
+			t.Run(fmt.Sprintf("disable-wal=%t/checksums=%t", disableWAL, checksums), func(t *testing.T) {
+				result := blackout.Run(target, 1, blackout.Settings{Steps: 150, DeepCheck: true, Change: func(config *blackout.Config) {
+					config.Sync = kvlite.SyncNone
+					config.DisableWAL = disableWAL
+					config.Checksums = checksums
+					config.OptionChanges = false
+					config.PowerFailures = true // SyncNone must suppress these despite the requested policy.
+					config.IOFaults = true
+					config.CrashNow = disk.OneIn(4)
+					config.ScheduleCrash = disk.OneIn(4)
+					config.CorruptAtRest = disk.Never
+					config.Disk = disk.Config{WriteFault: disk.OneIn(20), StatFault: disk.OneIn(30)}
+				}})
+				if result.Err != nil {
+					t.Fatal(result.Err)
+				}
+				if result.Stats.Disk.PowerFailures != 0 {
+					t.Fatal("SyncNone permitted a power failure")
+				}
+				if disableWAL {
+					if result.Stats.Disk.InjectedFaults != 0 || result.Stats.Disk.ProcessCrashes != 0 {
+						t.Fatal("direct writes permitted injected faults or process crashes")
+					}
+				} else if result.Stats.UnsyncedWALCrashes == 0 || result.Stats.Disk.InjectedFaults == 0 {
+					t.Fatal("WAL-backed SyncNone omitted process crashes or I/O faults")
+				}
+			})
+		}
+	}
+}
+
 // TestBlackoutIsDeterministic runs seeds twice and requires the same trace, so that a printed seed replays a failure.
 // It is a test of Blackout itself.
 func TestBlackoutIsDeterministic(t *testing.T) {
@@ -273,6 +308,7 @@ func TestBlackoutDetectsDurabilityDefects(t *testing.T) {
 			settings := func(lie disk.SyncLie) blackout.Settings {
 				return blackout.Settings{Steps: 150, Change: func(config *blackout.Config) {
 					config.Sync = kvlite.SyncFull
+					config.DisableWAL = false
 					config.PowerFailures = true
 					config.CheckpointBytes = 1
 					config.CrashNow = disk.OneIn(8)

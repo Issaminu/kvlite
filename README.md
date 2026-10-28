@@ -383,6 +383,8 @@ One 64-bit seed selects the database options, the workload, the time of each cra
 - A read-only recovery and a writable recovery of the same files must show the same state.
 - At the end of each run, all faults stop. Each operation must then succeed, and a clean close and reopen must keep the latest state.
 
+`SyncNone` is generated with the WAL enabled and disabled. WAL-backed sessions retain process crashes and I/O faults. Direct-write sessions use healthy storage without injected crashes. Both exclude power failures and failed syncs until a syncing session makes the storage durable. Coverage requires both WAL settings with data-page checksums on and off, plus rejection of invalid `DisableWAL` combinations without file changes. Failed runs do not count toward coverage.
+
 #### Continuous, non-stop chaos simulations
 
 - Each push to `main` and each pull request runs 200 new seeds, the fixed seeds, and the tests of Blackout itself ([workflow](.github/workflows/blackout.yml)).

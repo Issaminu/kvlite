@@ -9,10 +9,14 @@ import (
 // MissingCoverage returns each important case that no run of results reached.
 // The cases are every operation, change, scan, and contract, every outcome that the checks handle, every kind of fault, and the important option combinations.
 // A change to Blackout that makes a case unreachable shows up here, even when every seed passes.
+// Only successful runs contribute coverage.
 func MissingCoverage(results []Result) []string {
 	var total Stats
 	reached := map[string]bool{}
 	for _, result := range results {
+		if result.Err != nil {
+			continue
+		}
 		total.Add(result.Stats)
 		config := result.Config
 		reached[fmt.Sprintf("sync=%s checksums=%t", syncNames[config.Sync], config.Checksums)] = true
@@ -44,6 +48,11 @@ func MissingCoverage(results []Result) []string {
 		for _, checksums := range []bool{false, true} {
 			name := fmt.Sprintf("sync=%s checksums=%t", syncNames[sync], checksums)
 			require(name, reached[name])
+		}
+	}
+	for walMode := range total.SyncNoneSessions {
+		for checksums, count := range total.SyncNoneSessions[walMode] {
+			require(fmt.Sprintf("SyncNone with DisableWAL=%t checksums=%t", walMode == 1, checksums == 1), count > 0)
 		}
 	}
 	for _, sync := range []kvlite.Sync{kvlite.SyncFull, kvlite.SyncNormal} {
@@ -121,6 +130,8 @@ func MissingCoverage(results []Result) []string {
 		{"Open with zero options", total.Forms[formZero]},
 		{"a SyncNone session that a later syncing session made durable", total.TaintsCleared},
 		{"Open that refused invalid options", total.InvalidOpens},
+		{"Open that refused DisableWAL outside SyncNone", total.InvalidWALOpens},
+		{"process crash with WAL-backed SyncNone", total.UnsyncedWALCrashes},
 		{"a session without an automatic checkpoint (a large WAL)", total.LargeWALSessions},
 		{"a session with MaxWriteBatchSize 1", total.BatchSizeOneSessions},
 		{"a returned slice checked at the end of its transaction", total.HeldChecks},
