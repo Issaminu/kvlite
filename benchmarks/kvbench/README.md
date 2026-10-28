@@ -189,7 +189,7 @@ Compare matching case names and units under the same scale, storage, CPU allocat
 
 For `BenchmarkGetBatch`, `BenchmarkPutBatch`, and `BenchmarkSync`, **one Go benchmark operation is a fixed pass containing several API calls**. `ns/op`, `B/op`, and `allocs/op` describe that pass; use `ns/batch` for per-call timing. Other groups retain their own operation boundaries.
 
-Latency cases call `time.Now` around each operation. Use them for latency distributions and the acknowledged-operations group for throughput. Payload throughput measures logical bytes returned or changed, not physical disk I/O.
+Latency cases call `time.Now` around each operation. Use them for latency distributions and the acknowledged-operations group for throughput. Payload throughput counts the configured logical payload, not physical disk I/O. Batch-read miss cases count requested bytes even when no value is returned.
 
 Go allocation figures exclude Redis server allocations and LMDB's native C allocations, so they are not whole-engine memory comparisons. Linux `/proc/self/io` counters cover the embedded process, exclude Redis server writes, and do not directly attribute all mapped writeback to the timed calls. Storage-write bytes are zero on tmpfs. The suite does not report a combined client/server CPU or peak-memory comparison.
 
