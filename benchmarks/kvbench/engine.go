@@ -32,7 +32,9 @@ const (
 
 var benchmarkBucketName = []byte("kvbench")
 
-// Engine runs operations that have a matched contract across all three databases.
+// Engine runs operations that have a matched contract across the selected databases.
+// Get and GetBatch return owned values.
+// GetBatch preserves input order and returns a nil slot for each missing key.
 type Engine interface {
 	Get(context.Context, []byte) ([]byte, error)
 	GetBatch(context.Context, [][]byte) ([][]byte, error)

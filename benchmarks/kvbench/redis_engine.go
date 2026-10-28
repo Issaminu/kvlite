@@ -1,6 +1,7 @@
 package kvbench
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -132,6 +133,9 @@ func (engine *redisEngine) Get(ctx context.Context, key []byte) ([]byte, error) 
 }
 
 func (engine *redisEngine) GetBatch(ctx context.Context, keys [][]byte) ([][]byte, error) {
+	if len(keys) == 0 {
+		return [][]byte{}, nil
+	}
 	arguments := make([]string, len(keys))
 	for index, key := range keys {
 		arguments[index] = string(key)
@@ -143,13 +147,13 @@ func (engine *redisEngine) GetBatch(ctx context.Context, keys [][]byte) ([][]byt
 	values := make([][]byte, len(results))
 	for index, result := range results {
 		if result == nil {
-			return nil, ErrKeyNotFound
+			continue
 		}
 		switch value := result.(type) {
 		case string:
 			values[index] = []byte(value)
 		case []byte:
-			values[index] = value
+			values[index] = bytes.Clone(value)
 		default:
 			return nil, fmt.Errorf("Redis MGET returned %T", result)
 		}
@@ -162,13 +166,15 @@ func (engine *redisEngine) Put(ctx context.Context, key, value []byte) error {
 }
 
 func (engine *redisEngine) PutBatch(ctx context.Context, pairs []Pair) error {
-	_, err := engine.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-		for _, pair := range pairs {
-			pipe.Set(ctx, string(pair.Key), pair.Value, 0)
-		}
+	if len(pairs) == 0 {
 		return nil
-	})
-	return err
+	}
+	arguments := make([]any, 0, len(pairs)*2)
+	for _, pair := range pairs {
+		arguments = append(arguments, string(pair.Key), pair.Value)
+	}
+	// MSET applies the complete batch atomically, including repeated-key order.
+	return engine.client.MSet(ctx, arguments...).Err()
 }
 
 func (engine *redisEngine) Delete(ctx context.Context, key []byte) error {
@@ -176,6 +182,9 @@ func (engine *redisEngine) Delete(ctx context.Context, key []byte) error {
 }
 
 func (engine *redisEngine) DeleteBatch(ctx context.Context, keys [][]byte) error {
+	if len(keys) == 0 {
+		return nil
+	}
 	arguments := make([]string, len(keys))
 	for index, key := range keys {
 		arguments[index] = string(key)

@@ -32,12 +32,27 @@ func openBBoltEngine(path string, mode DurabilityMode, clients int) (Engine, err
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Update(func(tx *bolt.Tx) error {
-		_, err := tx.CreateBucketIfNotExists(benchmarkBucketName)
-		return err
+	if mode == DurabilityDurable && clients > 1 {
+		// A group cannot fill beyond the active clients; keep partial groups from waiting for the default 10 ms.
+		db.MaxBatchSize = clients
+		db.MaxBatchDelay = 100 * time.Microsecond
+	}
+	var bucketExists bool
+	if err := db.View(func(tx *bolt.Tx) error {
+		bucketExists = tx.Bucket(benchmarkBucketName) != nil
+		return nil
 	}); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if !bucketExists {
+		if err := db.Update(func(tx *bolt.Tx) error {
+			_, err := tx.CreateBucketIfNotExists(benchmarkBucketName)
+			return err
+		}); err != nil {
+			_ = db.Close()
+			return nil, err
+		}
 	}
 	engine := &bboltEngine{
 		db:            db,
@@ -70,9 +85,6 @@ func (engine *bboltEngine) GetBatch(_ context.Context, keys [][]byte) ([][]byte,
 		bucket := tx.Bucket(benchmarkBucketName)
 		for index, key := range keys {
 			value := bucket.Get(key)
-			if value == nil {
-				return ErrKeyNotFound
-			}
 			values[index] = bytes.Clone(value)
 		}
 		return nil
@@ -110,8 +122,8 @@ func (engine *bboltEngine) Validate(_ context.Context) error {
 	if engine.useWriteBatch != wantWriteBatch {
 		return fmt.Errorf("bbolt DB.Batch use is %t, want %t", engine.useWriteBatch, wantWriteBatch)
 	}
-	if engine.useWriteBatch && (engine.db.MaxBatchSize != 1_000 || engine.db.MaxBatchDelay != 10*time.Millisecond) {
-		return fmt.Errorf("bbolt batch limit is %d calls and %s, want 1000 calls and 10ms", engine.db.MaxBatchSize, engine.db.MaxBatchDelay)
+	if engine.useWriteBatch && (engine.db.MaxBatchSize != engine.clients || engine.db.MaxBatchDelay != 100*time.Microsecond) {
+		return fmt.Errorf("bbolt batch limit is %d calls and %s, want %d calls and 100us", engine.db.MaxBatchSize, engine.db.MaxBatchDelay, engine.clients)
 	}
 	return nil
 }

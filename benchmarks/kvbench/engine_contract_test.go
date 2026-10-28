@@ -29,6 +29,29 @@ func TestEmbeddedEngineContract(t *testing.T) {
 	}
 }
 
+func TestBBoltConcurrentBatchSettings(t *testing.T) {
+	for _, clients := range []int{1, 8, 32} {
+		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
+			t.Run(fmt.Sprintf("%s/clients=%d", mode, clients), func(t *testing.T) {
+				engine, err := openBBoltEngine(filepath.Join(t.TempDir(), "bbolt.db"), mode, clients)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer engine.Close()
+				if err := engine.Validate(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.Put(t.Context(), []byte("key"), []byte("value")); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.Delete(t.Context(), []byte("key")); err != nil {
+					t.Fatal(err)
+				}
+			})
+		}
+	}
+}
+
 // TestWarmUpHandleKeepsStoredData checks that the untimed warm-up commit of a timed run leaves the stored data unchanged.
 func TestWarmUpHandleKeepsStoredData(t *testing.T) {
 	for _, test := range []struct {
@@ -148,6 +171,17 @@ func testEngineContract(t *testing.T, engine Engine) {
 	if err != nil || len(batchValues) != 2 || !bytes.Equal(batchValues[0], pairs[2].Value) || !bytes.Equal(batchValues[1], pairs[3].Value) {
 		t.Fatalf("batch read: got %q with error %v", batchValues, err)
 	}
+	batchValues, err = engine.GetBatch(ctx, [][]byte{pairs[3].Key, makeKey(99, 99), pairs[2].Key, pairs[3].Key})
+	if err != nil || len(batchValues) != 4 || batchValues[1] != nil || !bytes.Equal(batchValues[0], pairs[3].Value) || !bytes.Equal(batchValues[2], pairs[2].Value) || !bytes.Equal(batchValues[3], pairs[3].Value) {
+		t.Fatalf("batch order, duplicates or missing slot: %q, %v", batchValues, err)
+	}
+	batchValues[0][0] ^= 1
+	if !bytes.Equal(batchValues[3], pairs[3].Value) {
+		t.Fatal("duplicate batch results share mutable memory")
+	}
+	if value, err := engine.Get(ctx, pairs[3].Key); err != nil || !bytes.Equal(value, pairs[3].Value) {
+		t.Fatalf("batch result changed stored data: %q, %v", value, err)
+	}
 	if got, err := engine.Count(ctx); err != nil || got != len(pairs) {
 		t.Fatalf("count: got %d, want %d, error %v", got, len(pairs), err)
 	}
@@ -244,6 +278,12 @@ func testEngineContract(t *testing.T, engine Engine) {
 	batch[0].Value[0] = 'x'
 	if got, err := engine.Get(ctx, wantBatchKey); err != nil || !bytes.Equal(got, wantBatchValue) {
 		t.Fatalf("PutBatch retained input memory: got %q, want %q, error %v", got, wantBatchValue, err)
+	}
+	if err := engine.Put(ctx, []byte("empty-value"), nil); err != nil {
+		t.Fatal(err)
+	}
+	if values, err := engine.GetBatch(ctx, [][]byte{[]byte("empty-value"), []byte("absent-value")}); err != nil || len(values) != 2 || values[0] == nil || len(values[0]) != 0 || values[1] != nil {
+		t.Fatalf("empty and missing batch values: %q, %v", values, err)
 	}
 
 	beforeDeleteCount, err := engine.Count(ctx)
@@ -379,5 +419,46 @@ func createKilledDatabase(tb testing.TB, kind EngineKind, dataDir string, delete
 	// Wait for them here, so a timed open measures recovery and not one lock retry of the engine.
 	if err := waitForReleasedFileLocks(dataDir, 5*time.Second); err != nil {
 		tb.Fatal(err)
+	}
+}
+
+func TestExistingBucketOpenDoesNotRewriteData(t *testing.T) {
+	for _, kind := range []EngineKind{EngineKVLite, EngineBBolt} {
+		for _, mode := range []DurabilityMode{DurabilityDurable, DurabilityNoCommitSync} {
+			t.Run(string(kind)+"/"+string(mode), func(t *testing.T) {
+				options := engineOpenOptions{Kind: kind, Mode: mode, DataDir: t.TempDir(), ClientCount: 1}
+				engine, err := openEngine(t.Context(), options)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.Put(t.Context(), []byte("kept"), []byte("value")); err != nil {
+					t.Fatal(err)
+				}
+				if err := engine.Close(); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(options.DataDir, string(kind)+".db")
+				before, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				engine, err = openEngine(t.Context(), options)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer engine.Close()
+				value, err := engine.Get(t.Context(), []byte("kept"))
+				if err != nil || string(value) != "value" {
+					t.Fatalf("reopen lost data: %q %v", value, err)
+				}
+				after, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(before, after) {
+					t.Fatal("opening an existing benchmark bucket rewrote the database")
+				}
+			})
+		}
 	}
 }

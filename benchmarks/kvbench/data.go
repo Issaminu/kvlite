@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+
+	"github.com/Issaminu/kvlite"
 )
 
 func scaleValue(standard, light int) int {
@@ -41,10 +43,7 @@ const (
 )
 
 // Pair contains one key and one value for a benchmark operation.
-type Pair struct {
-	Key   []byte
-	Value []byte
-}
+type Pair = kvlite.KeyValue
 
 func makeKey(workload, index uint64) []byte {
 	key := make([]byte, 16)

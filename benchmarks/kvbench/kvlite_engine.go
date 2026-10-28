@@ -44,6 +44,13 @@ func kvliteSync(mode DurabilityMode) (kvlite.Sync, error) {
 }
 
 func (engine *kvliteEngine) ensureBucket() error {
+	err := engine.db.View(func(tx *kvlite.Tx) error {
+		_, err := tx.Bucket(benchmarkBucketName)
+		return err
+	})
+	if err == nil || !errors.Is(err, kvlite.ErrBucketNotFound) {
+		return err
+	}
 	return engine.db.Update(func(tx *kvlite.Tx) error {
 		_, err := tx.Bucket(benchmarkBucketName)
 		if err == nil {
@@ -66,25 +73,7 @@ func (engine *kvliteEngine) Get(_ context.Context, key []byte) ([]byte, error) {
 }
 
 func (engine *kvliteEngine) GetBatch(_ context.Context, keys [][]byte) ([][]byte, error) {
-	values := make([][]byte, len(keys))
-	err := engine.db.View(func(tx *kvlite.Tx) error {
-		bucket, err := tx.Bucket(benchmarkBucketName)
-		if err != nil {
-			return err
-		}
-		for index, key := range keys {
-			value, err := bucket.Get(key)
-			if errors.Is(err, btree.ErrKeyNotFound) {
-				return ErrKeyNotFound
-			}
-			if err != nil {
-				return err
-			}
-			values[index] = bytes.Clone(value)
-		}
-		return nil
-	})
-	return values, err
+	return engine.db.GetBatch(benchmarkBucketName, keys)
 }
 
 func (engine *kvliteEngine) Put(_ context.Context, key, value []byte) error {
@@ -92,18 +81,7 @@ func (engine *kvliteEngine) Put(_ context.Context, key, value []byte) error {
 }
 
 func (engine *kvliteEngine) PutBatch(_ context.Context, pairs []Pair) error {
-	return engine.db.Update(func(tx *kvlite.Tx) error {
-		bucket, err := tx.Bucket(benchmarkBucketName)
-		if err != nil {
-			return err
-		}
-		for _, pair := range pairs {
-			if err := bucket.Put(pair.Key, pair.Value); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	return engine.db.PutBatch(benchmarkBucketName, pairs)
 }
 
 func (engine *kvliteEngine) Delete(_ context.Context, key []byte) error {
@@ -111,13 +89,7 @@ func (engine *kvliteEngine) Delete(_ context.Context, key []byte) error {
 }
 
 func (engine *kvliteEngine) DeleteBatch(_ context.Context, keys [][]byte) error {
-	return engine.db.Update(func(tx *kvlite.Tx) error {
-		bucket, err := tx.Bucket(benchmarkBucketName)
-		if err != nil {
-			return err
-		}
-		return bucket.DeleteBatch(keys)
-	})
+	return engine.db.DeleteBatch(benchmarkBucketName, keys)
 }
 
 func (engine *kvliteEngine) PrepareBucket(_ context.Context, name []byte, pairs []Pair) error {
@@ -153,27 +125,25 @@ func (engine *kvliteEngine) BucketExists(_ context.Context, name []byte) (bool, 
 }
 
 func (engine *kvliteEngine) MixedBatch(_ context.Context, keys [][]byte, pairs []Pair) ([][]byte, error) {
-	values := make([][]byte, len(keys))
+	var values [][]byte
 	err := engine.db.Update(func(tx *kvlite.Tx) error {
 		bucket, err := tx.Bucket(benchmarkBucketName)
 		if err != nil {
 			return err
 		}
-		for index, key := range keys {
-			value, err := bucket.Get(key)
-			if err != nil {
-				return err
-			}
-			values[index] = bytes.Clone(value)
+		values, err = bucket.GetBatch(keys)
+		if err != nil {
+			return err
 		}
-		for _, pair := range pairs {
-			if err := bucket.Put(pair.Key, pair.Value); err != nil {
-				return err
-			}
+		for index := range values {
+			values[index] = bytes.Clone(values[index])
 		}
-		return nil
+		return bucket.PutBatch(pairs)
 	})
-	return values, err
+	if err != nil {
+		return nil, err
+	}
+	return values, nil
 }
 
 func (engine *kvliteEngine) ScanPrefix(_ context.Context, prefix []byte, visit func([]byte, []byte) error) error {
@@ -333,12 +303,7 @@ func (engine *kvliteEngine) PutCollectionBatch(_ context.Context, path [][]byte,
 		if err != nil {
 			return err
 		}
-		for _, pair := range pairs {
-			if err := bucket.Put(pair.Key, pair.Value); err != nil {
-				return err
-			}
-		}
-		return nil
+		return bucket.PutBatch(pairs)
 	})
 }
 
