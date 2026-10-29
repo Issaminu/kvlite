@@ -389,10 +389,8 @@ func (tx *Tx) prepareCommit() error {
 					if err != nil {
 						return err
 					}
-					for step := 0; step < oldCount; step++ {
-						if err := allocation.retire(head + page.ID(step)); err != nil {
-							return err
-						}
+					if err := allocation.retireSpan(head, oldCount); err != nil {
+						return err
 					}
 					delete(tx.store.dirty, head)
 					delete(tx.store.nodes, head)
@@ -409,10 +407,8 @@ func (tx *Tx) prepareCommit() error {
 					tx.metaDirty = true
 				}
 			} else if count < oldCount {
-				for offset := count; offset < oldCount; offset++ {
-					if err := tx.writableAllocation().retire(head + page.ID(offset)); err != nil {
-						return err
-					}
+				if err := tx.writableAllocation().retireSpan(head+page.ID(count), oldCount-count); err != nil {
+					return err
 				}
 			}
 			node.SetStoragePageCount(count)

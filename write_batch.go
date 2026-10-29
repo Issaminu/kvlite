@@ -6,7 +6,6 @@ import (
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/page"
-	"github.com/Issaminu/kvlite/internal/wal"
 )
 
 const (
@@ -181,49 +180,17 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	var commitErr error
 	needsCheckpoint := false
 	if hasPendingWrites {
-		// Use the same page preparation as a direct write.
-		// All callbacks have finished. Preparation can reuse the batch's private allocation changes.
+		// Callbacks have finished, so commit owns preparation and publication of their combined state.
 		tx := Tx{
 			db:              db,
 			meta:            state.meta,
 			rootNode:        state.rootNode,
 			allocation:      state.allocation,
 			allocationOwned: state.allocation != nil,
+			metaDirty:       state.metaDirty,
 		}
 		tx.store.dirty = state.dirty
-		commitErr = tx.prepareCommit()
-		state.meta = tx.meta
-		state.rootNode = tx.rootNode
-		state.metaDirty = state.metaDirty || tx.metaDirty
-		state.allocation = tx.allocation
-		if commitErr == nil {
-			var retired map[page.ID]struct{}
-			if state.allocation != nil {
-				retired = state.allocation.walRetiredPages()
-			}
-			// state.dirty contains the original and final image of each changed page. One WAL transaction gives all dependent callbacks the same commit result.
-			nodes, encodedMeta := makeWALCommitData(state.dirty, state.meta, state.metaDirty)
-			var allocationPages []wal.AllocationRecord
-			if state.allocation != nil {
-				allocationPages = state.allocation.pageRecords()
-			}
-			needsCheckpoint, commitErr = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
-			if commitErr == nil {
-				// Publish the new state only after the WAL append and required synchronization succeed.
-				db.meta = state.meta
-				db.rootNode = state.rootNode
-				if state.allocation != nil {
-					db.allocation = state.allocation.publish()
-					db.stats.PagesReused += state.allocation.pagesReused
-					db.stats.PagesRetired += state.allocation.pagesRetired
-					db.stats.TailPagesReclaimed += state.allocation.tailPagesRemoved
-				}
-				// Page-ID order makes cache eviction, and so the later file reads, repeatable.
-				for _, node := range nodes {
-					db.cacheWriteNode(node.Final)
-				}
-			}
-		}
+		needsCheckpoint, commitErr = tx.commit()
 	}
 
 	for index, request := range requests {

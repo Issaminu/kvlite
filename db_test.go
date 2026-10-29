@@ -7143,6 +7143,12 @@ func TestWriteBatch_LaterCallbackSeesEarlierWrite(t *testing.T) {
 			t.Fatalf("write result: %+v", result)
 		}
 	}
+	for key, want := range map[string]string{"first": "one", "second": "two"} {
+		got, err := db.Get(testBucketName, []byte(key))
+		if err != nil || string(got) != want {
+			t.Fatalf("published batch value %q: got %q, error %v", key, got, err)
+		}
+	}
 }
 
 func TestWriteBatch_RetirementReusesPrivateAllocationPage(t *testing.T) {

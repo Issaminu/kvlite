@@ -106,11 +106,32 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 	if err := transaction(tx); err != nil {
 		return err
 	}
-	if err := tx.prepareCommit(); err != nil {
+	needsCheckpoint, err := tx.commit()
+	if err != nil {
 		return err
 	}
+	if needsCheckpoint {
+		// The WAL commit succeeded. A checkpoint failure must not turn this
+		// committed transaction into a reported failure.
+		// The sync of the WAL truncate saves the header sync of the next commit.
+		if db.checkpointWAL() == nil {
+			_ = db.wal.SyncTruncate()
+		}
+	}
+
+	return nil
+}
+
+// commit prepares, writes, and publishes this transaction's private state.
+// The caller holds operationMu and has excluded backups when writes bypass the WAL.
+// A true result requests checkpoint maintenance; the caller chooses when to acknowledge success.
+func (tx *Tx) commit() (bool, error) {
+	db := tx.db
+	if err := tx.prepareCommit(); err != nil {
+		return false, err
+	}
 	if tx.borrowedValue && tx.rootNode.HasBorrowedValues() {
-		return page.ErrInvalid
+		return false, page.ErrInvalid
 	}
 	needsCheckpoint := false
 	var nodes []wal.NodeRecord
@@ -132,7 +153,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 			allocationPages = tx.allocation.pageRecords()
 		}
 		if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
-			return nil
+			return false, nil
 		}
 		var err error
 		if db.options.DisableWAL {
@@ -141,7 +162,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 			needsCheckpoint, err = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
 		}
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 	db.meta = tx.meta
@@ -165,16 +186,7 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 		}
 		db.cacheWriteNode(node.Final)
 	}
-	if needsCheckpoint {
-		// The WAL commit succeeded. A checkpoint failure must not turn this
-		// committed transaction into a reported failure.
-		// The sync of the WAL truncate saves the header sync of the next commit.
-		if db.checkpointWAL() == nil {
-			_ = db.wal.SyncTruncate()
-		}
-	}
-
-	return nil
+	return needsCheckpoint, nil
 }
 
 // writableAllocation gives this callback its own allocation changes.

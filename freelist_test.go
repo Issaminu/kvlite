@@ -1771,22 +1771,24 @@ func TestNativeNodeSpanGrowsAndShrinksInPlace(t *testing.T) {
 		t.Fatal(err)
 	}
 	original := db.memoryNodes[head]
-	grown := bytes.Repeat([]byte("v"), int(db.meta.PageSize())*2)
+	const extraPages = 130
+	grown := bytes.Repeat([]byte("v"), int(db.meta.PageSize())*extraPages)
 	if err := db.Put(name, key, grown); err != nil {
 		t.Fatal(err)
 	}
 	node := db.memoryNodes[head]
-	if node == nil || node.StoragePageCount() != 3 || db.meta.LastPage() != head+2 {
+	if node == nil || node.StoragePageCount() != extraPages+1 || db.meta.LastPage() != head+extraPages {
 		t.Fatal("growth did not extend the existing span")
 	}
 	if string(original.EntryAt(0).Value()) != "old" || original.StoragePageCount() != 1 {
 		t.Fatal("growth changed the committed original")
 	}
-	for offset := page.ID(0); offset < 3; offset++ {
+	for offset := page.ID(0); offset <= extraPages; offset++ {
 		if !db.allocation.allocated(head + offset) {
 			t.Fatal("grown span contains a free page")
 		}
 	}
+	retiredBefore := db.stats.PagesRetired
 	if err := db.Put(name, key, []byte("small")); err != nil {
 		t.Fatal(err)
 	}
@@ -1794,8 +1796,13 @@ func TestNativeNodeSpanGrowsAndShrinksInPlace(t *testing.T) {
 	if node == nil || node.StoragePageCount() != 1 || db.meta.LastPage() != head {
 		t.Fatal("shrink did not retain the head and reclaim the tail")
 	}
-	if db.allocation.allocated(head+1) || db.allocation.allocated(head+2) {
-		t.Fatal("surplus pages remain allocated")
+	for offset := page.ID(1); offset <= extraPages; offset++ {
+		if db.allocation.allocated(head + offset) {
+			t.Fatal("surplus pages remain allocated")
+		}
+	}
+	if got := db.stats.PagesRetired - retiredBefore; got != extraPages {
+		t.Fatalf("retired %d pages, want %d", got, extraPages)
 	}
 	got, err := db.Get(name, key)
 	if err != nil || string(got) != "small" {
