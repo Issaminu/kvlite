@@ -746,15 +746,24 @@ func (wal *WAL) LookupCommittedPage(record *CommittedPage, key []byte, includeKe
 	return btree.LookupEncodedWALNode(record.Payload, record.Header.PageID, key, wal.pageSize, nil, includeKey)
 }
 
+// CommittedPageView borrows the existing node or compact image of a verified WAL record.
+func (wal *WAL) CommittedPageView(record *CommittedPage) (btree.NodeView, error) {
+	if record.Node != nil {
+		return btree.ViewNode(record.Node), nil
+	}
+	if record.Payload == nil {
+		return btree.NodeView{}, ErrRecordPayloadRequired
+	}
+	return btree.ViewNodeImage(record.Payload, record.Header.PageID, wal.pageSize, true, false)
+}
+
 // VisitCommittedPageReferences visits child nodes and continuation IDs separately.
 // Encoded nodes hold every storage page in one contiguous image.
 // Each payload must come from a verified WAL record or a successful Commit.
 func (wal *WAL) VisitCommittedPageReferences(record *CommittedPage, visit, visitContinuation func(page.ID) error) error {
-	if record.Node != nil {
-		return btree.VisitNodeReferences(record.Node, visit, visitContinuation)
+	view, err := wal.CommittedPageView(record)
+	if err != nil {
+		return err
 	}
-	if record.Payload == nil {
-		return ErrRecordPayloadRequired
-	}
-	return btree.VisitWALNodeReferences(record.Payload, record.Header.PageID, wal.pageSize, nil, visit, visitContinuation)
+	return view.VisitReferences(wal.pageSize, visit, visitContinuation)
 }

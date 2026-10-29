@@ -15,6 +15,85 @@ import (
 const encodedUint32Size = 4
 const checksumZeroBlockSize = 4096
 
+// NodeView reads a node without materializing its entries or child list.
+// It borrows an existing Node, a complete encoded image, or both for the same committed page.
+// The owner must keep that storage unchanged while the view is in use.
+type NodeView struct {
+	node  *Node
+	image []byte
+}
+
+func (view NodeView) entryCount() int {
+	if view.node != nil {
+		return len(view.node.entries)
+	}
+	return int(binary.LittleEndian.Uint32(view.image[10:14]))
+}
+
+// ViewNode borrows an existing node, including private transaction changes.
+func ViewNode(node *Node) NodeView {
+	return NodeView{node: node}
+}
+
+// PageID returns the head page of this node.
+func (view NodeView) PageID() page.ID {
+	if view.node != nil {
+		return view.node.PageID()
+	}
+	return page.ID(binary.LittleEndian.Uint64(view.image[2:10]))
+}
+
+// VisitReferences checks and visits child nodes, then physical continuation pages.
+// pageSize is the storage unit used by the reader; callbacks can stop with an error.
+func (view NodeView) VisitReferences(pageSize int64, visit, visitContinuation func(page.ID) error) error {
+	if view.node != nil {
+		return VisitNodeReferences(view.node, visit, visitContinuation)
+	}
+	if pageSize < NodeHeaderSize {
+		return ErrInvalid
+	}
+	if err := checkBody(view.image, NodeHeader{Type: mappedNodeType(view.image), EntryCount: uint32(view.entryCount())}, true, visit); err != nil {
+		return err
+	}
+	if visitContinuation != nil {
+		count := (uint64(len(view.image)) + uint64(pageSize) - 1) / uint64(pageSize)
+		for offset := uint64(1); offset < count; offset++ {
+			if err := visitContinuation(view.PageID() + page.ID(offset)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// ViewNodeImage checks the encoded header and directory bounds and borrows its logical image.
+// data contains the complete padded main-file span or compact WAL payload.
+// wal selects the compact format; checksums applies only to main-file spans.
+func ViewNodeImage(data []byte, id page.ID, pageSize int64, wal, checksums bool) (NodeView, error) {
+	if _, _, ok := plainNodeHeader(data, id, pageSize, wal, checksums); ok {
+		size := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
+		image := data[:size:len(data)]
+		count := binary.LittleEndian.Uint32(image[10:14])
+		var err error
+		if mappedNodeType(image) == NodeTypeLeaf {
+			_, err = leafDataStart(uint64(size), count)
+		} else {
+			_, err = branchDataStart(uint64(size), count)
+		}
+		return NodeView{image: image}, err
+	}
+	image, h, err := nodeImage(data, id, pageSize, nil, wal, checksums)
+	if err != nil {
+		return NodeView{}, err
+	}
+	if h.Type == NodeTypeLeaf {
+		_, err = leafDataStart(uint64(len(image)), h.EntryCount)
+	} else {
+		_, err = branchDataStart(uint64(len(image)), h.EntryCount)
+	}
+	return NodeView{image: data[:len(image):len(data)]}, err
+}
+
 var checksumZeroBlock [checksumZeroBlockSize]byte
 
 // MaxNodeImageSize bounds a logical image before a reader allocates it.
@@ -302,21 +381,11 @@ func VisitWALNodeReferences(data []byte, id page.ID, pageSize int64, readPage fu
 	return visitNodeReferences(data, id, pageSize, readPage, visit, visitContinuation, true, false)
 }
 func visitNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), visit, visitContinuation func(page.ID) error, forWAL, checksums bool) error {
-	image, h, err := nodeImage(data, id, pageSize, readPage, forWAL, checksums)
+	image, _, err := nodeImage(data, id, pageSize, readPage, forWAL, checksums)
 	if err != nil {
 		return err
 	}
-	if err := checkBody(image, h, true, visit); err != nil {
-		return err
-	}
-	if visitContinuation != nil {
-		for i := 1; i < (len(image)+int(pageSize)-1)/int(pageSize); i++ {
-			if err := visitContinuation(id + page.ID(i)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
+	return (NodeView{image: image}).VisitReferences(pageSize, visit, visitContinuation)
 }
 
 // EncodeWALNode returns the complete compact logical image with a zero checksum.
