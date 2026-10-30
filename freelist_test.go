@@ -236,7 +236,7 @@ func TestReadAllocationBitmapReadsOnlySegmentPages(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	db := &DB{file: file, meta: meta}
+	db := &DB{storage: storage{file: file, meta: meta}}
 	loaded, err := db.readAllocationBitmap(meta, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -268,7 +268,7 @@ func TestReadAllocationBitmapRejectsMissingTail(t *testing.T) {
 	defer file.Close()
 
 	meta := page.NewMeta(512)
-	db := &DB{file: file, meta: meta}
+	db := &DB{storage: storage{file: file, meta: meta}}
 	if _, err := db.readAllocationBitmap(meta, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("missing allocation page: got %v, want invalid file error", err)
 	}
@@ -1918,7 +1918,7 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 			} else if err != nil || !bytes.Equal(got, updated) {
 				t.Fatalf("relocated leaf through its new parent: %v", err)
 			}
-			view := &DB{meta: prepared.meta, allocation: prepared.allocation.publish()}
+			view := &DB{storage: storage{meta: prepared.meta, allocation: prepared.allocation.publish()}}
 			if err := view.validatePageOwnershipWith(probe.store.ReadNode); err != nil {
 				t.Fatal(err)
 			}
@@ -1979,7 +1979,7 @@ func TestNativeNodeSpanBatchCatalogRootCollapse(t *testing.T) {
 	if _, err := probe.Bucket(remaining); err != nil {
 		t.Fatal(err)
 	}
-	view := &DB{meta: prepared.meta, allocation: prepared.allocation.publish()}
+	view := &DB{storage: storage{meta: prepared.meta, allocation: prepared.allocation.publish()}}
 	if err := view.validatePageOwnershipWith(probe.store.ReadNode); err != nil {
 		t.Fatal(err)
 	}

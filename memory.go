@@ -25,10 +25,12 @@ func OpenMemory() *DB {
 	root := btree.NewLeafNode(meta.Root())
 	options := defaultOptions(meta.PageSize())
 	return &DB{
-		meta:        meta,
-		rootNode:    root,
-		memoryNodes: map[page.ID]*btree.Node{root.PageID(): root},
-		options:     &options,
-		allocation:  newAllocationBitmap(meta.PageSize()),
+		storage: storage{
+			meta:        meta,
+			rootNode:    root,
+			memoryNodes: map[page.ID]*btree.Node{root.PageID(): root},
+			options:     &options,
+			allocation:  newAllocationBitmap(meta.PageSize()),
+		},
 	}
 }

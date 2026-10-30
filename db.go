@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
-	"sync/atomic"
 
 	"github.com/Issaminu/kvlite/internal/btree"
 	"github.com/Issaminu/kvlite/internal/fileio"
@@ -24,43 +23,18 @@ const (
 	maxCachedWriteNodePages = 1024
 )
 
-type writeNodeCacheEntry struct {
-	node *btree.Node // Nil means the decoded image was invalidated.
-	// referenced is the CLOCK bit. Read-only lookups set it while they hold only the read lock of writeNodesMu, so it is atomic.
-	referenced atomic.Bool
-}
-
 // DB is an open handle to a KVLite database in a file or in memory. Create it with [Open] or [OpenMemory]. Its zero value is not usable, and it must not be copied. Its methods accept concurrent calls. Read-only transaction callbacks can run together, but a write callback runs alone. Callers access named buckets through managed transactions or the [DB.Put], [DB.Get], [DB.Delete], and [DB.DeleteBucket] methods.
 type DB struct {
-	path              string
-	fs                fileio.FS // the file system of the database files; nil for a memory database
-	file              fileio.File
-	meta              *page.Meta
-	rootNode          *btree.Node
-	memoryNodes       map[page.ID]*btree.Node          // A non-nil map owns all committed nodes of a memory database. It never evicts a live node.
-	writeNodes        map[page.ID]*writeNodeCacheEntry // Each committed node refers only to stable heap bytes that later write clones can share.
-	writeNodesMu      sync.RWMutex                     // Protects cache access by concurrent readers. Writers already hold operationMu exclusively.
-	writeNodeSlots    []page.ID
-	nextWriteNodeSlot int
-	mappedFile        []byte
-	mappedBacking     []byte // full writable mapping; mappedFile exposes only the real file length
-	mappedWritable    bool
-	directWriter      directMappedFile
-	mainWriteFailure  error // A failed main-file write or explicit sync stops later data operations.
-	options           *Options
-	wal               *wal.WAL
-	operationMu       sync.RWMutex
-	activeBackups     int           // Protected by operationMu. A backup keeps the main file unchanged.
-	backupsDone       chan struct{} // Closed under operationMu when the last active backup finishes.
-	lifecycleMu       sync.RWMutex
-	activeOperations  sync.WaitGroup
-	writeRequests     chan *writeRequest
-	stopWriteBatcher  chan struct{}
-	writeBatcherDone  chan struct{}
-	closing           bool
-	closed            bool
-	stats             Stats
-	allocation        *allocationBitmap
+	path string
+	storage
+	operationMu      sync.RWMutex
+	lifecycleMu      sync.RWMutex
+	activeOperations sync.WaitGroup
+	writeRequests    chan *writeRequest
+	stopWriteBatcher chan struct{}
+	writeBatcherDone chan struct{}
+	closing          bool
+	closed           bool
 }
 
 func (db *DB) ensureOpen() error {
@@ -166,11 +140,13 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 	}
 
 	db := &DB{
-		path:       path,
-		fs:         fsys,
-		file:       dbFile,
-		options:    resolvedOptions,
-		writeNodes: make(map[page.ID]*writeNodeCacheEntry),
+		path: path,
+		storage: storage{
+			fs:         fsys,
+			file:       dbFile,
+			options:    resolvedOptions,
+			writeNodes: make(map[page.ID]*writeNodeCacheEntry),
+		},
 	}
 	// The main file descriptor owns the process lock. failOpen and Close release the lock when they close this file.
 	// A file of a simulated test FS has no descriptor and no lock.

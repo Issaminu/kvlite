@@ -386,7 +386,7 @@ func TestMakeWALCommitData_EncodesChangedMetadata(t *testing.T) {
 func TestWriteTx_PreservesOriginalNodeAcrossWriteBatchCallbacks(t *testing.T) {
 	meta := page.NewMeta(4096)
 	root := btree.NewLeafNode(meta.Root())
-	db := &DB{meta: meta, rootNode: root}
+	db := &DB{storage: storage{meta: meta, rootNode: root}}
 	base := btree.NewLeafNode(10)
 	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("old"))); err != nil {
 		t.Fatal(err)
@@ -528,7 +528,7 @@ func TestReadNode_ReusesOwnedCommittedNodeAfterMappingRefresh(t *testing.T) {
 }
 
 func TestWriteNodeCache_BoundsPagesAndGivesReferencesAnotherChance(t *testing.T) {
-	db := &DB{writeNodes: make(map[page.ID]*writeNodeCacheEntry)}
+	db := &DB{storage: storage{writeNodes: make(map[page.ID]*writeNodeCacheEntry)}}
 	for pageID := page.ID(1); pageID <= maxCachedWriteNodePages; pageID++ {
 		db.cacheWriteNode(btree.NewLeafNode(pageID))
 	}
@@ -9573,7 +9573,7 @@ func TestDelete_CompactPrivateLeafRollback(t *testing.T) {
 func TestDeleteLeafEntries_PreservesWriteBatchImages(t *testing.T) {
 	meta := page.NewMeta(4096)
 	root := btree.NewLeafNode(meta.Root())
-	db := &DB{meta: meta, rootNode: root}
+	db := &DB{storage: storage{meta: meta, rootNode: root}}
 	base := btree.NewLeafNode(10)
 	for _, key := range []string{"a", "b", "c", "d", "e", "f"} {
 		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), []byte(key))); err != nil {
@@ -9605,7 +9605,7 @@ func TestDeleteLeafEntries_PreservesWriteBatchImages(t *testing.T) {
 
 func TestRecoveryWholeNodePatchChain(t *testing.T) {
 	const pageSize = 4096
-	db := &DB{meta: page.NewMeta(pageSize)}
+	db := &DB{storage: storage{meta: page.NewMeta(pageSize)}}
 	base := btree.NewLeafNode(20)
 	value := bytes.Repeat([]byte{'a'}, 3*pageSize)
 	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
@@ -9718,7 +9718,7 @@ func TestRecoveryWholeNodeSpanReuseAndBounds(t *testing.T) {
 				}
 				records = append(records, wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: old.PageID(), TxID: txid}, Payload: btree.EncodeWALNode(old)})
 			}
-			db := &DB{meta: meta, allocation: allocation}
+			db := &DB{storage: storage{meta: meta, allocation: allocation}}
 			got, err := db.materializeWALPages(records)
 			if fault == "stale-head" {
 				if err != nil || len(got) != 1 || got[0].Header.PageID != head {
@@ -10393,7 +10393,7 @@ func TestDirectWriteMappingChecksSizeChanges(t *testing.T) {
 				t.Fatal(err)
 			}
 			file := &directStatsMappingFile{File: main, follows: follows}
-			db := &DB{file: file, wal: log, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
+			db := &DB{storage: storage{file: file, wal: log, options: &Options{Synchronous: SyncNone, DisableWAL: true}}}
 			if err := db.mapMainFile(); err != nil {
 				t.Fatal(err)
 			}
@@ -10626,7 +10626,7 @@ func TestDirectMappedNodeEncoding(t *testing.T) {
 			if err = file.Truncate(24 * pageSize); err != nil {
 				t.Fatal(err)
 			}
-			db := &DB{file: file, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
+			db := &DB{storage: storage{file: file, options: &Options{Synchronous: SyncNone, DisableWAL: true}}}
 			if err = db.mapMainFile(); err != nil {
 				t.Fatal(err)
 			}

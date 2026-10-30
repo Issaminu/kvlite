@@ -12,7 +12,7 @@ import (
 // Direct writes use a writable mapping when the operating system supports it.
 // File reads remain available if mapping fails.
 // A file of a test FS is mapped only when it implements [fileio.Mapper]. Otherwise its reads use ReadAt.
-func (db *DB) mapMainFile() error {
+func (db *storage) mapMainFile() error {
 	mapper, isMapper := db.file.(fileio.Mapper)
 	osFile, isOSFile := db.file.(*os.File)
 	if !isMapper && !isOSFile {
@@ -46,7 +46,7 @@ func (db *DB) mapMainFile() error {
 }
 
 // unmapMainFile releases the mapped bytes after all readers stop.
-func (db *DB) unmapMainFile() error {
+func (db *storage) unmapMainFile() error {
 	if len(db.mappedFile) == 0 && len(db.mappedBacking) == 0 {
 		db.mappedFile = nil
 		return nil
@@ -69,7 +69,7 @@ func (db *DB) unmapMainFile() error {
 }
 
 // refreshMainFileMapping replaces a mapping that cannot represent the current main file.
-func (db *DB) refreshMainFileMapping() error {
+func (db *storage) refreshMainFileMapping() error {
 	followsWrites := db.mainFileMappingFollowsWrites()
 	info, err := db.file.Stat()
 	if err != nil {
@@ -115,7 +115,7 @@ func mapDirectFileRegion(file *os.File, length int, mapFile func(*os.File, int, 
 
 // resizeDirectMappedView changes the visible byte range within a reserved mapping.
 // The caller must grow the file before it accesses added bytes.
-func (db *DB) resizeDirectMappedView(size int64) bool {
+func (db *storage) resizeDirectMappedView(size int64) bool {
 	if _, realFile := db.file.(*os.File); !realFile || !db.mappedWritable || size <= 0 || size > int64(len(db.mappedBacking)) {
 		return false
 	}
@@ -123,7 +123,7 @@ func (db *DB) resizeDirectMappedView(size int64) bool {
 	return true
 }
 
-func (db *DB) mainFileMappingFollowsWrites() bool {
+func (db *storage) mainFileMappingFollowsWrites() bool {
 	if mapper, ok := db.file.(fileio.Mapper); ok {
 		return mapper.MappingFollowsWrites()
 	}
@@ -132,7 +132,7 @@ func (db *DB) mainFileMappingFollowsWrites() bool {
 
 // directWriteFile uses a shared mapping for writes that fit its current range.
 // The operation lock excludes readers. File growth still uses ordinary writes.
-func (db *DB) directWriteFile() fileio.File {
+func (db *storage) directWriteFile() fileio.File {
 	if _, ok := db.file.(*os.File); ok && db.mappedWritable {
 		db.directWriter.File, db.directWriter.db = db.file, db
 		return &db.directWriter
@@ -142,7 +142,7 @@ func (db *DB) directWriteFile() fileio.File {
 
 type directMappedFile struct {
 	fileio.File
-	db *DB
+	db *storage
 }
 
 func (file directMappedFile) WriteAt(data []byte, offset int64) (int, error) {

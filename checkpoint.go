@@ -53,14 +53,14 @@ func (db *DB) Checkpoint() error {
 // The checkpoint refreshes the mapping before another operation can read it.
 //
 // The caller must hold the exclusive database operation lock.
-func (db *DB) checkpointWAL() (err error) {
+func (db *storage) checkpointWAL() (err error) {
 	return db.checkpointWALWithChecksums(db.meta.DataPageChecksums())
 }
 
 // checkpointWALWithChecksums selects data-page protection for this checkpoint.
 // Checksum conversion uses true while the committed file mode remains disabled.
 // The caller must hold the exclusive database operation lock.
-func (db *DB) checkpointWALWithChecksums(enabled bool) (err error) {
+func (db *storage) checkpointWALWithChecksums(enabled bool) (err error) {
 	if db.activeBackups > 0 {
 		return nil
 	}
@@ -91,7 +91,7 @@ func (db *DB) checkpointWALWithChecksums(enabled bool) (err error) {
 }
 
 // logicalFileSize is the byte length through the last allocated page.
-func (db *DB) logicalFileSize() (int64, error) {
+func (db *storage) logicalFileSize() (int64, error) {
 	return fileSizeForMeta(db.meta)
 }
 
@@ -108,7 +108,7 @@ func fileSizeForMeta(meta *page.Meta) (int64, error) {
 // writeDirectPages writes private transaction pages before their state becomes visible.
 // The caller holds operationMu and has waited for active backups.
 // A failure stops data operations because the main file can be partly changed.
-func (db *DB) writeDirectPages(meta *page.Meta, nodes []wal.NodeRecord, allocationPages []wal.AllocationRecord, encodedMeta []byte, checksums bool) (err error) {
+func (db *storage) writeDirectPages(meta *page.Meta, nodes []wal.NodeRecord, allocationPages []wal.AllocationRecord, encodedMeta []byte, checksums bool) (err error) {
 	defer func() {
 		if err != nil {
 			db.mainWriteFailure = fmt.Errorf("%w: %w", ErrDatabaseWriteFailed, err)

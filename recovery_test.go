@@ -1291,7 +1291,7 @@ func TestLoadCommittedIntoOverlay_RejectsInvalidLeafDescriptor(t *testing.T) {
 		},
 		{Header: wal.RecordHeader{Type: wal.RecordTypeCommit, TxID: txID}},
 	}
-	db := &DB{meta: meta, allocation: newAllocationBitmap(4096), wal: wal.New(wal.Config{PageSize: 4096})}
+	db := &DB{storage: storage{meta: meta, allocation: newAllocationBitmap(4096), wal: wal.New(wal.Config{PageSize: 4096})}}
 	committed := committedWALRecords(records)
 
 	if err := db.loadCommittedIntoOverlay(committed); !errors.Is(err, ErrInvalid) {

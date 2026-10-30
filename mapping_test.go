@@ -334,7 +334,7 @@ func TestDirectMappingReserveFallbackAndBounds(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake := &directStatsMappingFile{File: file, follows: true}
-	db := &DB{file: fake, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
+	db := &DB{storage: storage{file: fake, options: &Options{Synchronous: SyncNone, DisableWAL: true}}}
 	if err := db.mapMainFile(); err != nil {
 		t.Fatal(err)
 	}
@@ -385,7 +385,7 @@ func TestDirectMappedFileWrites(t *testing.T) {
 	if err := file.Truncate(length); err != nil {
 		t.Fatal(err)
 	}
-	db := &DB{file: file, options: &Options{Synchronous: SyncNone, DisableWAL: true}}
+	db := &DB{storage: storage{file: file, options: &Options{Synchronous: SyncNone, DisableWAL: true}}}
 	if err := db.mapMainFile(); err != nil {
 		t.Fatal(err)
 	}
