@@ -251,8 +251,15 @@ func validateLookupKey(key []byte) error {
 // The caller must validate key.
 func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
 	if node.IsLeaf() {
-		entry, found, err := node.FindEntryRef(key)
-		return entry, found, 0, err
+		index, found, err := node.findKeyIndex(key)
+		if err != nil || !found {
+			return Entry{}, found, 0, err
+		}
+		entry := node.entries[index]
+		if entry.value == nil {
+			entry.value = []byte{}
+		}
+		return entry, true, 0, nil
 	}
 	childIndex, err := node.FindChildIndex(key)
 	if err != nil {

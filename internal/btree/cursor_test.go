@@ -18,6 +18,10 @@ func (store *cursorErrorStore) ReadNode(page.ID) (*Node, error) {
 	return nil, store.readErr
 }
 
+func (store *cursorErrorStore) LookupPage(page.ID, []byte, bool) (Entry, bool, page.ID, error) {
+	return Entry{}, false, 0, store.readErr
+}
+
 func requireCursorEntry(t *testing.T, entry *Entry, found bool, err error, wantKey, wantValue []byte) {
 	t.Helper()
 	if err != nil {
@@ -199,4 +203,49 @@ func TestCursorSeekForwardReusesLeafAndRetainsPath(t *testing.T) {
 	requireCursorEntry(t, entry, found, err, []byte("key-050"), []byte("value-050"))
 	entry, found, err = cursor.Prev()
 	requireCursorEntry(t, entry, found, err, []byte("key-049"), []byte("value-049"))
+}
+
+func TestCursor_FindPreservesIterationPosition(t *testing.T) {
+	for _, count := range []int{3, 100} {
+		t.Run(fmt.Sprint(count), func(t *testing.T) {
+			tree, root := newCursorTestTree(t, count)
+			cursor := tree.Cursor(root)
+			entry, found, err := cursor.Seek([]byte("key-001"))
+			requireCursorEntry(t, entry, found, err, []byte("key-001"), []byte("value-001"))
+			for _, includeKey := range []bool{false, true} {
+				got, found, err := cursor.Find([]byte("key-002"), includeKey)
+				if err != nil || !found || string(got.Value()) != "value-002" {
+					t.Fatalf("exact hit: found=%t value=%q error=%v", found, got.Value(), err)
+				}
+				if includeKey && string(got.Key()) != "key-002" {
+					t.Fatalf("exact key: got %q", got.Key())
+				}
+				if _, found, err := cursor.Find([]byte("key-001x"), includeKey); err != nil || found {
+					t.Fatalf("exact miss: found=%t error=%v", found, err)
+				}
+			}
+			for _, test := range []struct {
+				key  []byte
+				want error
+			}{
+				{nil, ErrKeyRequired},
+				{make([]byte, MaxKeySize+1), ErrKeyTooLarge},
+			} {
+				if _, found, err := cursor.Find(test.key, true); found || !errors.Is(err, test.want) {
+					t.Fatalf("invalid key: found=%t error=%v, want %v", found, err, test.want)
+				}
+			}
+			entry, found, err = cursor.Next()
+			requireCursorEntry(t, entry, found, err, []byte("key-002"), []byte("value-002"))
+		})
+	}
+}
+
+func TestCursor_FindReturnsReaderError(t *testing.T) {
+	tree, root := newCursorTestTree(t, 100)
+	want := errors.New("exact lookup read failed")
+	store := &cursorErrorStore{memoryTreeStore: *tree.store.(*memoryTreeStore), readErr: want}
+	if _, found, err := NewTree(store).Cursor(root).Find([]byte("key-002"), true); found || !errors.Is(err, want) {
+		t.Fatalf("reader failure: found=%t error=%v, want %v", found, err, want)
+	}
 }

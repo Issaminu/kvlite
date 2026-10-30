@@ -34,20 +34,13 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 
 // FindEntryRef looks a key up in this leaf without copying its key or value.
 // The returned entry refers to storage owned by the node.
-func (n *Node) FindEntryRef(key []byte) (Entry, bool, error) {
+func (n *Node) FindEntryRef(key []byte) (entry Entry, found bool, err error) {
 	if !n.IsLeaf() {
-		return Entry{}, false, ErrNotLeafNode
+		err = ErrNotLeafNode
+		return
 	}
-	idx, found, err := n.findKeyIndex(key)
-	if err != nil || !found {
-		return Entry{}, found, err
-	}
-
-	entry := n.entries[idx]
-	if entry.value == nil {
-		entry.value = []byte{}
-	}
-	return entry, true, nil
+	entry, found, _, err = LookupNode(n, key)
+	return
 }
 
 func cloneValue(value []byte) []byte {

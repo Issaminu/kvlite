@@ -1205,6 +1205,17 @@ func (db *DB) cacheWriteNode(node *btree.Node) {
 	db.writeNodes[pageID] = entry
 }
 
+// committedNodeReader adapts DB's committed lookups to [btree.NodeReader].
+// db must be non-nil. The caller holds operationMu for reading or writing while using the reader.
+type committedNodeReader struct {
+	db *DB
+}
+
+func (reader committedNodeReader) LookupPage(id page.ID, key []byte, includeKey bool) (entry btree.Entry, found bool, child page.ID, err error) {
+	entry, found, child, err = reader.db.lookupCommittedPage(id, key, includeKey)
+	return
+}
+
 // lookupCommittedPage searches one committed page.
 // In a file database, a WAL page has priority over the main-file page with the same ID.
 // includeKey controls whether an encoded lookup returns the matched key.
@@ -1244,17 +1255,9 @@ func (db *DB) lookupCheckedMainPage(pageID page.ID, key []byte, includeKey bool)
 // It omits encoded keys because Get needs only the value and flags.
 // Decoded and ordinary mapped values borrow database storage.
 // Continued encoded leaf values own their bytes.
-func (db *DB) findCommittedEntry(pageID page.ID, key []byte) (btree.Entry, bool, error) {
-	for {
-		entry, found, childPageID, err := db.lookupCommittedPage(pageID, key, false)
-		if err != nil {
-			return btree.Entry{}, false, err
-		}
-		if childPageID == 0 {
-			return entry, found, nil
-		}
-		pageID = childPageID
-	}
+func (db *DB) findCommittedEntry(id page.ID, key []byte) (btree.Entry, bool, error) {
+	reader := committedNodeReader{db: db}
+	return btree.FindEntry(reader, id, key, false)
 }
 
 // errMetaRead marks a failed read of a metadata page.

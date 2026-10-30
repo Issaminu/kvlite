@@ -10,12 +10,7 @@ import (
 
 // Store provides the page view, mutable-node ownership, and page allocation used by a [Tree].
 type Store interface {
-	// LookupPage searches one page without returning a Node.
-	// The store selects the page representation.
-	// A leaf returns an entry and a zero child page ID.
-	// A branch returns the selected child page ID.
-	// With includeKey false, an encoded leaf entry can omit its key and does not copy a continued key.
-	LookupPage(pageID page.ID, key []byte, includeKey bool) (Entry, bool, page.ID, error)
+	NodeReader
 	// PageSize returns the fixed encoded size of one tree page.
 	PageSize() int64
 	// ReadNode returns the node visible to the current operation.
@@ -118,18 +113,11 @@ func (tree *Tree) FindEntryRef(root *Node, key []byte, includeKey bool) (Entry, 
 		return Entry{}, false, err
 	}
 
-	if root.IsLeaf() {
-		entry, found, err := root.FindEntryRef(key)
-		if err == nil && found {
-			err = tree.recordBucketParent(root, entry)
-		}
-		return entry, found, err
+	entry, found, err := tree.Cursor(root).Find(key, includeKey)
+	if err == nil && found && root.IsLeaf() {
+		err = tree.recordBucketParent(root, entry)
 	}
-	_, _, childPageID, err := LookupNode(root, key)
-	if err != nil {
-		return Entry{}, false, err
-	}
-	return tree.findEntryRefFromPage(childPageID, key, includeKey)
+	return entry, found, err
 }
 
 // FindEntryRefFromPage starts at rootPageID without requiring a root Node.
@@ -139,20 +127,7 @@ func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte, includeKe
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, err
 	}
-	return tree.findEntryRefFromPage(rootPageID, key, includeKey)
-}
-
-func (tree *Tree) findEntryRefFromPage(pageID page.ID, key []byte, includeKey bool) (Entry, bool, error) {
-	for {
-		entry, found, childPageID, err := tree.store.LookupPage(pageID, key, includeKey)
-		if err != nil {
-			return Entry{}, false, err
-		}
-		if childPageID == 0 {
-			return entry, found, nil
-		}
-		pageID = childPageID
-	}
+	return FindEntry(tree.store, rootPageID, key, includeKey)
 }
 
 // validateEntry checks the key and value limits before insertion changes a node.

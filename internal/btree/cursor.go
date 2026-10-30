@@ -1,6 +1,28 @@
 package btree
 
-import "bytes"
+import (
+	"bytes"
+
+	"github.com/Issaminu/kvlite/internal/page"
+)
+
+// NodeReader searches the pages visible to one database operation.
+// Implementations select committed storage or a transaction's private changes.
+// The caller must keep the visible tree unchanged during a traversal.
+type NodeReader interface {
+	// LookupPage searches the node whose head page is id; the node can span several storage pages.
+	// key must be non-empty and no longer than MaxKeySize. The method must not change or retain key.
+	// includeKey requests the stored key for a leaf match. When false, an encoded result can omit it;
+	// a decoded result can still include it. Values and flags are returned for every match.
+	//
+	// A branch returns a zero entry, found false, and the child page to search next.
+	// A leaf returns child zero and either the matching entry with found true, or a zero entry with found false.
+	// A stored empty value is a match; found distinguishes it from a missing key.
+	// On an error, child must be zero and the caller must ignore entry and found.
+	//
+	// Returned key and value bytes are read-only and remain valid while their backing storage stays unchanged.
+	LookupPage(id page.ID, key []byte, includeKey bool) (entry Entry, found bool, child page.ID, err error)
+}
 
 // cursorFrame records one branch-to-child move in a cursor path.
 // A branch is a node that points to child nodes.
@@ -42,6 +64,31 @@ type Cursor struct {
 func (tree *Tree) Cursor(root *Node) *Cursor {
 	// Leave the path and leaf empty until a positioning method selects an entry.
 	return &Cursor{tree: tree, root: root}
+}
+
+// Find searches for an exact key without changing the cursor's iteration position.
+// includeKey permits encoded results to omit the matched key.
+func (cursor *Cursor) Find(key []byte, includeKey bool) (Entry, bool, error) {
+	if err := validateLookupKey(key); err != nil {
+		return Entry{}, false, err
+	}
+	entry, found, child, err := LookupDecodedNode(cursor.root, key)
+	if err != nil || child == 0 {
+		return entry, found, err
+	}
+	return FindEntry(cursor.tree.store, child, key, includeKey)
+}
+
+// FindEntry searches for an exact key without allocating cursor iteration state.
+// Entry bytes borrow the reader; includeKey permits omitting the matched key.
+// The caller must validate key.
+func FindEntry(reader NodeReader, id page.ID, key []byte, includeKey bool) (entry Entry, found bool, err error) {
+	for {
+		entry, found, id, err = reader.LookupPage(id, key, includeKey)
+		if id == 0 {
+			return
+		}
+	}
 }
 
 // First moves to the entry with the smallest key.
