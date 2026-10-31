@@ -13,7 +13,7 @@ import (
 // Only one goroutine runs at a time: the runner gives one reader a turn, and the workload generator picks the next reader, so the seed replays.
 // A writer waits for every open View, so this step has readers only.
 //
-// Each reader keeps the slices that its reads return, without a copy, while the other readers read and change the node cache.
+// Each reader keeps the slices that its reads return, without a copy, while the other readers read the same pages.
 // At the end of its View, every kept slice must still hold its bytes: KVLite documents that they stay valid until the callback returns.
 func (runner *runner) readers() {
 	count := runner.work.rand.Range(2, 4)
