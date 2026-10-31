@@ -389,8 +389,7 @@ One 64-bit seed selects the database options, the workload, the time of each cra
 
 #### Continuous, non-stop chaos simulations
 
-- Each push to `main` and each pull request runs 200 new seeds, the fixed seeds, and the tests of Blackout itself ([workflow](.github/workflows/blackout.yml)).
-- The Blackout [supervisor](internal/blackout/supervisor/doc.go) runs random seeds without end on a small server with 2 ARM CPUs. It tests each new commit of `main`. It makes a failing seed shorter, and it opens a GitHub issue with the seed, the report, and the replay command. These issues have the label [`blackout`](https://github.com/Issaminu/kvlite/issues?q=label%3Ablackout).
+The Blackout [supervisor](internal/blackout/supervisor/doc.go) runs random seeds without end on a small server with 2 ARM CPUs. It tests each new commit of `main`. It makes a failing seed shorter, and it opens a GitHub issue with the seed, the report, and the replay command. These issues have the label [`blackout`](https://github.com/Issaminu/kvlite/issues?q=label%3Ablackout).
 
 #### Run Blackout
 
@@ -455,7 +454,7 @@ Several `DB.View` callbacks can run at the same time. A `DB.Update` callback run
 
 A writable handle takes an exclusive file lock. Read-only handles take shared locks and can run together. `Options.LockTimeout` limits how long `Open` waits for a conflicting lock. Its zero value waits without a time limit.
 
-KVLite implements file locks for macOS, Linux, BSD systems, Solaris, and Windows. `Open` returns an unsupported-operation error on other systems.
+KVLite supports Linux, macOS, and Windows, and CI runs the tests on each of them. implements file locks for Linux, Android, macOS, the BSD systems, Solaris, illumos, and Windows. `Open` returns an unsupported-operation error on other systems, such as AIX.
 
 Run independent read transactions on one open database:
 
@@ -571,7 +570,7 @@ BLACKOUT=1 go test ./... -count=1
 
 To run more seeds or replay a failure, see [Crash testing with Blackout](#crash-testing-with-blackout).
 
-CI also runs the tests on Linux, Windows, and macOS, on amd64 and Arm, and on 32-bit builds. It runs `go vet` on Linux amd64, and it builds KVLite for FreeBSD, OpenBSD, NetBSD, Solaris, and illumos. A Linux amd64 machine can run the 32-bit tests directly. On any machine, `go vet` with another `GOOS` and `GOARCH` checks that the code builds for that platform:
+CI also runs the tests on Linux, Windows, and macOS, on amd64 and ARM, and on 32-bit builds. It runs `go vet` on Linux amd64, and it builds KVLite for 25 operating system and CPU targets. A Linux amd64 machine can run the 32-bit tests directly. On any machine, `go vet` with another `GOOS` and `GOARCH` checks that the code builds for that platform:
 
 ```sh
 GOARCH=386 go test ./... -count=1

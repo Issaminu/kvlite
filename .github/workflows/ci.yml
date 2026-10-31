@@ -66,7 +66,7 @@ jobs:
         run: go test -timeout=20m ./...
 
   vet:
-    name: Vet for each supported platform
+    name: Vet both Go modules on linux/amd64
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -74,17 +74,30 @@ jobs:
         with:
           go-version: '1.26.8'
 
-      # go vet type-checks the test files of each target too.
-      # The loop reports every failing target before the step fails.
-      - name: Vet KVLite for each target
-        run: |
-          failed=0
-          for target in linux/amd64 linux/arm64 linux/386 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 windows/386 freebsd/amd64 openbsd/amd64 netbsd/amd64 solaris/amd64 illumos/amd64; do
-            echo "go vet for $target"
-            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./... || failed=1
-          done
-          exit "$failed"
+      # go test runs only a subset of the vet checks, so this step runs all of them.
+      - name: Vet KVLite
+        run: go vet ./...
 
       - name: Vet KVBench
         working-directory: benchmarks/kvbench
         run: go vet ./...
+
+  build:
+    name: Build KVLite for each cross-platform target
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      # These targets only build. The test jobs above run the tests.
+      # The loop reports every failing target before the step fails.
+      - name: Build KVLite for each target
+        run: |
+          failed=0
+          for target in aix/ppc64 android/arm64 linux/386 linux/amd64 linux/arm linux/arm64 linux/loong64 linux/mips linux/mips64 linux/mips64le linux/mipsle linux/ppc64 linux/ppc64le linux/riscv64 linux/s390x openbsd/386 openbsd/amd64 openbsd/arm openbsd/arm64 openbsd/ppc64 openbsd/riscv64 solaris/amd64 windows/386 windows/amd64 windows/arm64; do
+            echo "go build for $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go build ./... || failed=1
+          done
+          exit "$failed"

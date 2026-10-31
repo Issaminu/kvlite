@@ -10,11 +10,22 @@ permissions:
 
 jobs:
   blackout:
-    name: Blackout simulation
+    name: Blackout simulation (${{ matrix.goarch }})
     runs-on: ubuntu-24.04
+    # Both architectures run the same seeds, so a failure on one architecture only points to code that depends on the word size.
+    # The amd64 runner runs 386 programs natively. The race detector does not support 386.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goarch: amd64
+            race: -race
+          - goarch: '386'
+            race: ''
     # A plain go test runs no Blackout tests. BLACKOUT=1 runs them.
     env:
       BLACKOUT: "1"
+      GOARCH: ${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -32,7 +43,7 @@ jobs:
 
       # TestBlackoutStress runs its clients in parallel, so the race detector checks real concurrent work here.
       - name: Run the fixed Blackout seeds and the other Blackout tests of KVLite
-        run: go test -race -timeout=20m -run '^Test(Blackout|SimulatedDisk_)' .
+        run: go test ${{ matrix.race }} -timeout=20m -run '^Test(Blackout|SimulatedDisk_)' .
 
       - name: Test the Blackout packages
-        run: go test -race ./internal/blackout/...
+        run: go test ${{ matrix.race }} ./internal/blackout/...
