@@ -161,7 +161,8 @@ func (tree *Tree) PutEntry(root page.ID, entry Entry) (page.ID, error) {
 	if err := tree.validateEntry(entry); err != nil {
 		return 0, err
 	}
-	node, path, err := tree.findLeaf(root, entry.Key())
+	var frames [8]treePathStep
+	node, path, err := tree.findLeaf(root, entry.Key(), frames[:0])
 	if err != nil {
 		return 0, err
 	}
@@ -393,8 +394,9 @@ func (tree *Tree) DeleteEntries(root page.ID, keys [][]byte) (page.ID, bool, err
 		slices.SortFunc(ordered, bytes.Compare)
 	}
 	changed := false
+	var frames [8]treePathStep
 	for first := 0; first < len(ordered); {
-		node, path, err := tree.findLeaf(root, ordered[first])
+		node, path, err := tree.findLeaf(root, ordered[first], frames[:0])
 		if err != nil {
 			return 0, changed, err
 		}
@@ -464,7 +466,8 @@ func (tree *Tree) deleteEntry(root page.ID, key []byte, bucket bool) (page.ID, b
 		return 0, false, ErrKeyTooLarge
 	}
 
-	node, path, err := tree.findLeaf(root, key)
+	var frames [8]treePathStep
+	node, path, err := tree.findLeaf(root, key, frames[:0])
 	if err != nil {
 		return root, false, err
 	}
@@ -488,13 +491,14 @@ func (tree *Tree) deleteEntry(root page.ID, key []byte, bucket bool) (page.ID, b
 }
 
 // findLeaf returns the leaf for key and the branch path from root to it.
+// It appends the path to frames, so a caller can keep a short path in a stack array.
 // It saves the parent of each node on that path, so that RepairMoved can find the parents later.
-func (tree *Tree) findLeaf(root page.ID, key []byte) (Node, []treePathStep, error) {
+func (tree *Tree) findLeaf(root page.ID, key []byte, frames []treePathStep) (Node, []treePathStep, error) {
 	node, err := tree.store.ReadNode(root)
 	if err != nil {
 		return Node{}, nil, err
 	}
-	leaf, path, err := findLeaf(tree.store, node, key, nil)
+	leaf, path, err := findLeaf(tree.store, node, key, frames)
 	if err != nil {
 		return Node{}, path, err
 	}
