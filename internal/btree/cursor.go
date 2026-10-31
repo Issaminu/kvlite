@@ -148,10 +148,40 @@ func (cursor *Cursor) position(index int) (bool, error) {
 	if index < 0 || index >= cursor.leafCount {
 		return cursor.moveLeaf(index < 0)
 	}
-	if err := cursor.entries.position(cursor.leaf, index); err != nil {
-		cursor.entries.valid = false
-		return false, err
+	if cursor.leaf.node != nil {
+		cursor.entries.index, cursor.entries.valid = index, true
+		return true, nil
 	}
+	// Adjacent movement reuses the entry bounds that the previous step already checked.
+	forward := cursor.entries.valid && index == cursor.entries.index+1
+	backward := cursor.entries.valid && index == cursor.entries.index-1
+	cursor.entries.valid = false
+	image := cursor.leaf.image
+	flags, start, keyEnd, end := leafSpan(image, index)
+	dataStart := uint64(NodeHeaderSize + cursor.leafCount*leafEntryDescriptorSize)
+	if !validLeaf(flags, start, keyEnd, end, dataStart, uint64(len(image))) {
+		return false, entryError(index)
+	}
+	if index == 0 && start != dataStart || index+1 == cursor.leafCount && end != uint64(len(image)) {
+		return false, entryError(index)
+	}
+	if forward {
+		if start != uint64(cursor.entries.valueEnd) || bytes.Compare(image[cursor.entries.keyStart:cursor.entries.keyEnd], image[start:keyEnd]) >= 0 {
+			return false, entryError(index)
+		}
+	} else if backward {
+		if end != uint64(cursor.entries.keyStart) || bytes.Compare(image[start:keyEnd], image[cursor.entries.keyStart:cursor.entries.keyEnd]) >= 0 {
+			return false, entryError(index)
+		}
+	} else if index > 0 {
+		previousFlags, previousStart, previousKeyEnd, previousEnd := leafSpan(image, index-1)
+		if !validLeaf(previousFlags, previousStart, previousKeyEnd, previousEnd, dataStart, uint64(len(image))) || previousEnd != start || bytes.Compare(image[previousStart:previousKeyEnd], image[start:keyEnd]) >= 0 {
+			return false, entryError(index)
+		}
+	}
+	cursor.entries.keyStart, cursor.entries.keyEnd, cursor.entries.valueEnd = uint32(start), uint32(keyEnd), uint32(end)
+	cursor.entries.index, cursor.entries.valid = index, true
+	cursor.entries.flags = flags
 	return true, nil
 }
 

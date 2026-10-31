@@ -47,11 +47,12 @@ func (view Node) Entry(index int) (Entry, error) {
 	if !view.IsLeaf() || index < 0 || index >= view.EntryCount() {
 		return Entry{}, ErrInvalid
 	}
-	var entries nodeEntries
-	if err := entries.position(view, index); err != nil {
+	// A cursor without a path checks the entry in the same way as a cursor step.
+	cursor := Cursor{leaf: view, leafCount: view.EntryCount()}
+	if _, err := cursor.position(index); err != nil {
 		return Entry{}, err
 	}
-	return view.entryAtPosition(entries), nil
+	return view.entryAtPosition(cursor.entries), nil
 }
 
 // Child returns the checked branch child at index, from zero through EntryCount.
@@ -303,44 +304,6 @@ type nodeEntries struct {
 	valid                      bool
 	flags                      uint32
 	keyStart, keyEnd, valueEnd uint32
-}
-
-func (entries *nodeEntries) position(node Node, index int) error {
-	if node.node != nil {
-		entries.index, entries.valid = index, true
-		return nil
-	}
-	// Adjacent movement reuses the entry bounds that the previous step already checked.
-	forward := entries.valid && index == entries.index+1
-	backward := entries.valid && index == entries.index-1
-	entries.valid = false
-	image := node.image
-	flags, start, keyEnd, end := leafSpan(image, index)
-	dataStart := uint64(NodeHeaderSize + node.EntryCount()*leafEntryDescriptorSize)
-	if !validLeaf(flags, start, keyEnd, end, dataStart, uint64(len(image))) {
-		return entryError(index)
-	}
-	if index == 0 && start != dataStart || index+1 == node.EntryCount() && end != uint64(len(image)) {
-		return entryError(index)
-	}
-	if forward {
-		if start != uint64(entries.valueEnd) || bytes.Compare(image[entries.keyStart:entries.keyEnd], image[start:keyEnd]) >= 0 {
-			return entryError(index)
-		}
-	} else if backward {
-		if end != uint64(entries.keyStart) || bytes.Compare(image[start:keyEnd], image[entries.keyStart:entries.keyEnd]) >= 0 {
-			return entryError(index)
-		}
-	} else if index > 0 {
-		previousFlags, previousStart, previousKeyEnd, previousEnd := leafSpan(image, index-1)
-		if !validLeaf(previousFlags, previousStart, previousKeyEnd, previousEnd, dataStart, uint64(len(image))) || previousEnd != start || bytes.Compare(image[previousStart:previousKeyEnd], image[start:keyEnd]) >= 0 {
-			return entryError(index)
-		}
-	}
-	entries.keyStart, entries.keyEnd, entries.valueEnd = uint32(start), uint32(keyEnd), uint32(end)
-	entries.index, entries.valid = index, true
-	entries.flags = flags
-	return nil
 }
 
 // visitRange visits this leaf's entries in [start,end) without decoding an entry list.
