@@ -1,557 +1,465 @@
 package btree
 
 import (
-	"fmt"
-	"slices"
+	"bytes"
+	"encoding/binary"
 
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// NodeHeaderSize is the encoded size of a B+tree node head.
-const NodeHeaderSize = 22
-
-const (
-	nodeTypeOffset       = 0
-	nodePageIDOffset     = 2
-	nodeEntryCountOffset = 10
-	nodeChecksumOffset   = 14
-)
-
-// NodeType identifies the 16-bit type field of a tree file page.
-type NodeType uint16
-
-const (
-	// NodeTypeLeaf identifies a node that stores key and value entries.
-	NodeTypeLeaf NodeType = 1
-	// NodeTypeBranch identifies a node that stores separator keys and child page IDs.
-	NodeTypeBranch NodeType = 2
-)
-
-// NodeHeader identifies one complete leaf or branch span. Fields are little-endian.
-//
-// [0:2] type; [2:10] head page ID; [10:14] entry count;
-// [14:18] whole-span CRC32C; [18:22] logical body length.
-// The header and body length determine the number of storage pages.
-// Only the first page has a header. All following pages contain raw body bytes.
-// Zero disables the data checksum. A calculated CRC of zero is stored as one.
-type NodeHeader struct {
-	Type       NodeType
-	PageID     page.ID
-	EntryCount uint32
-	Checksum   uint32
-	BodyLength uint32
+// NodeReader searches the pages visible to one database operation.
+// Implementations select committed storage or a transaction's private changes.
+// The caller must keep the visible tree unchanged during a traversal.
+type NodeReader interface {
+	// ReadNode returns the read-only node whose first storage page is id.
+	// It borrows storage for the enclosing operation's lifetime. An unreadable,
+	// unallocated node returns an error, rather than a missing key.
+	// Acquisition checks the header and checksum; operations check the entries they use.
+	ReadNode(id page.ID) (Node, error)
 }
 
-// Node contains one logical B+tree node. PageID names the head of its consecutive span.
-// Its keys and values can borrow a complete immutable encoded image.
+// Node provides read-only access to one leaf or branch without exposing its representation.
+// Its entries borrow the owner's storage and remain valid only while that storage stays unchanged.
+// Obtain a Node through a NodeReader, MutableNode.ReadOnly, or ReadNodeImage. The zero value is invalid.
 type Node struct {
-	header           NodeHeader
-	entries          []Entry
-	Children         []page.ID // for non-leaf nodes: len(Children) == len(entries)+1
-	encodedSize      int       // Encoded bytes, or zero when the current size has not been calculated.
-	storageTailPages uint32    // Allocated pages after the head. Memory only; kept until commit preparation.
+	node  *MutableNode
+	image []byte
 }
 
-// StoragePageCount returns the allocated span length, including the head.
-// A private change keeps its previous span length until commit preparation.
-func (n *Node) StoragePageCount() int { return int(n.storageTailPages) + 1 }
-
-// SetStoragePageCount records the allocated consecutive span length.
-// count includes the head and must be positive.
-func (n *Node) SetStoragePageCount(count int) {
-	if count < 1 {
-		panic("btree: empty node span")
+// EntryCount returns the number of leaf entries or branch separators.
+func (view Node) EntryCount() int {
+	if view.node != nil {
+		return len(view.node.entries)
 	}
-	n.storageTailPages = uint32(count - 1)
+	return int(binary.LittleEndian.Uint32(view.image[10:14]))
 }
 
-// OverflowPages derives the tail page IDs from the head and count.
-// The returned list is private to the caller. The node stores no ID list.
-func (n *Node) OverflowPages() []page.ID {
-	ids := make([]page.ID, n.StoragePageCount()-1)
-	for i := range ids {
-		ids[i] = n.PageID() + page.ID(i) + 1
+// IsLeaf reports whether the node contains entries rather than child references.
+func (view Node) IsLeaf() bool {
+	if view.node != nil {
+		return view.node.IsLeaf()
 	}
-	return ids
+	return mappedNodeType(view.image) == NodeTypeLeaf
 }
 
-func newNodeHeader(nodeType NodeType, pgid page.ID) NodeHeader {
-	return NodeHeader{
-		Type:   nodeType,
-		PageID: pgid,
+// Entry returns the checked leaf entry at index. Its bytes are read-only and
+// borrow the node. An invalid index or descriptor returns ErrInvalid.
+func (view Node) Entry(index int) (Entry, error) {
+	if !view.IsLeaf() || index < 0 || index >= view.EntryCount() {
+		return Entry{}, ErrInvalid
 	}
-}
-
-// IsLeaf reports whether n stores key and value entries.
-func (n *Node) IsLeaf() bool {
-	return n.kind() == NodeTypeLeaf
-}
-
-// kind returns NodeTypeLeaf or NodeTypeBranch.
-func (n *Node) kind() NodeType {
-	return n.header.Type
-}
-
-func (n *Node) PageID() page.ID {
-	return n.header.PageID
-}
-
-func (n *Node) SetPageID(pgid page.ID) {
-	n.header.PageID = pgid
-	n.header.Checksum = 0
-}
-
-func (n *Node) EntryCount() int {
-	return len(n.entries)
-}
-
-// EntryAt returns the entry at index without copying it.
-// The returned entry refers to storage owned by the node.
-// It remains valid until the node changes its entry list.
-// The caller must not replace the entry or change its slices.
-func (n *Node) EntryAt(index int) *Entry {
-	return &n.entries[index]
-}
-
-// Clone returns a structural copy of n with the same page ID.
-// The clone owns its entry and child lists.
-// It shares the immutable key and value bytes with n.
-// Node changes must replace an entry or byte slice instead of changing shared bytes in place.
-func (n *Node) Clone() *Node {
-	entries := make([]Entry, len(n.entries), max(len(n.entries)+1, cap(n.entries)))
-	copy(entries, n.entries)
-	return &Node{
-		header:           n.header,
-		entries:          entries,
-		Children:         slices.Clone(n.Children),
-		storageTailPages: n.storageTailPages,
+	var entries nodeEntries
+	if err := entries.position(view, index); err != nil {
+		return Entry{}, err
 	}
+	return view.entryAtPosition(entries), nil
 }
 
-// CloneWithoutLeafEntries returns a private leaf with the selected entries removed.
-// firstIndex and rest must contain distinct, ascending entry indexes.
-// n must be a leaf. The clone owns its lists and shares immutable key and value
-// bytes with n, as Clone does. Only entries that remain are copied.
-// With minimumSize set, it keeps spare slots for an empty or small leaf.
-// Zero disables that reservation.
-func (n *Node) CloneWithoutLeafEntries(firstIndex int, rest []int, minimumSize int64) *Node {
-	remaining := len(n.entries) - 1 - len(rest)
-	capacity, size := remaining, 0
-	if minimumSize > 0 {
-		size = NodeHeaderSize
-		if remaining > 0 {
-			size = n.EncodedSize() - n.entries[firstIndex].EncodedSize(true)
-			for _, index := range rest {
-				size -= n.entries[index].EncodedSize(true)
-			}
-		}
-		if remaining == 0 || int64(size) < minimumSize {
-			capacity = len(n.entries)
+// Child returns the checked branch child at index, from zero through EntryCount.
+// A leaf, invalid index, or invalid encoded child reference returns ErrInvalid.
+func (view Node) Child(index int) (page.ID, error) {
+	if view.IsLeaf() || index < 0 || index > view.EntryCount() {
+		return 0, ErrInvalid
+	}
+	if view.node != nil {
+		return view.node.Children[index], nil
+	}
+	if count := view.EntryCount(); count > 0 {
+		if _, err := view.separator(min(index, count-1)); err != nil {
+			return 0, err
 		}
 	}
-	entries := slices.Grow([]Entry(nil), capacity)[:remaining]
-	copyLeafEntriesExcept(entries, n.entries, firstIndex, rest)
-	header := n.header
-	header.Checksum = 0
-	return &Node{
-		header:           header,
-		entries:          entries,
-		Children:         slices.Clone(n.Children),
-		encodedSize:      size,
-		storageTailPages: n.storageTailPages,
-	}
-}
-
-func (n *Node) firstKey() []byte {
-	if len(n.entries) == 0 {
-		return nil
-	}
-	return n.entries[0].key
-}
-
-const (
-	MaxKeySize   = 32768         // 32 KiB
-	MaxValueSize = (1 << 31) - 2 // ~2 GiB
-)
-
-type Entry struct {
-	flags       uint32
-	valueOwned  bool
-	borrowValue bool
-	key         []byte
-	value       []byte
-}
-
-func NewEntry(flags uint32, key, value []byte) Entry {
-	return Entry{flags: flags, key: key, value: value}
-}
-
-// NewEntryBorrowingValue makes an entry that keeps value without a copy on insertion.
-// Insertion still copies the key.
-// The caller must keep value unchanged until the node is written.
-// A node with such a value must not enter committed memory state.
-func NewEntryBorrowingValue(key, value []byte) Entry {
-	return Entry{key: key, value: value, borrowValue: true}
-}
-
-// HasBorrowedValues reports whether a node retains values owned by its caller.
-func (n *Node) HasBorrowedValues() bool {
-	for _, entry := range n.entries {
-		if entry.borrowValue {
-			return true
-		}
-	}
-	return false
-}
-
-func (e Entry) Flags() uint32 {
-	return e.flags
-}
-
-func (e Entry) Key() []byte {
-	return e.key
-}
-
-func (e Entry) Value() []byte {
-	return e.value
-}
-
-// ValueIsOwned reports whether an encoded lookup made a private value buffer.
-// The caller can retain and change that value without a copy.
-// Values in decoded nodes and ordinary mapped pages return false.
-func (e Entry) ValueIsOwned() bool {
-	return e.valueOwned
-}
-
-// EncodedSize reports how many bytes this entry occupies inside an encoded node.
-// A leaf uses one 16-byte descriptor followed by its key and value.
-// A branch uses one 8-byte descriptor, one child page ID, and its separator key.
-// The branch node also stores one extra child page ID.
-func (e Entry) EncodedSize(isLeaf bool) int {
-	size := branchEntryDescriptorSize + page.IDSize + len(e.key)
-	if isLeaf {
-		size = leafEntryDescriptorSize + len(e.key) + len(e.value)
-	}
-	return size
-}
-
-func validateLookupKey(key []byte) error {
-	if len(key) == 0 {
-		return ErrKeyRequired
-	}
-	if len(key) > MaxKeySize {
-		return ErrKeyTooLarge
-	}
-	return nil
-}
-
-// LookupNode searches one decoded node.
-// A leaf returns an entry and a zero child page ID.
-// A branch returns the selected child page ID.
-// The caller must validate key.
-func LookupNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
-	if node.IsLeaf() {
-		index, found, err := node.findKeyIndex(key)
-		if err != nil || !found {
-			return Entry{}, found, 0, err
-		}
-		entry := node.entries[index]
-		if entry.value == nil {
-			entry.value = []byte{}
-		}
-		return entry, true, 0, nil
-	}
-	childIndex, err := node.FindChildIndex(key)
-	if err != nil {
-		return Entry{}, false, 0, err
-	}
-	childPageID := node.Children[childIndex]
-	if childPageID == page.Meta0ID {
-		return Entry{}, false, 0, fmt.Errorf("read node child page ID %d: %w", childPageID, ErrInvalid)
-	}
-	return Entry{}, false, childPageID, nil
-}
-
-// LookupDecodedNode validates key and searches one decoded node.
-func LookupDecodedNode(node *Node, key []byte) (Entry, bool, page.ID, error) {
-	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, 0, err
-	}
-	return LookupNode(node, key)
-}
-
-// NeedsSplit reports whether the node exceeds one page and has enough entries to split.
-// A leaf needs two entries. A branch needs three keys so both results keep at
-// least two children. Fewer large entries use continuation pages. Splitting
-// a two-key branch would create a one-child side and make large-key inserts
-// grow the tree by one level at each split.
-// This saves the size for commit preparation. The caller must own the node.
-func (n *Node) NeedsSplit(pageSize int64) bool {
-	minimum := 2
-	if !n.IsLeaf() {
-		minimum = 3
-	}
-	return len(n.entries) >= minimum && int64(n.CacheEncodedSize()) > pageSize
-}
-
-// EncodedSize reports the exact number of bytes that [EncodeNode] writes for n.
-func (n *Node) EncodedSize() int {
-	if n.encodedSize != 0 {
-		return n.encodedSize
-	}
-	return n.computeEncodedSize()
-}
-
-// computeEncodedSize adds the encoded size of every entry.
-// It is not inlined, so EncodedSize stays small enough to inline at its callers.
-// Most calls find the saved size and do not need this loop.
-//
-//go:noinline
-func (n *Node) computeEncodedSize() int {
-	return NodeHeaderSize + nodePayloadSize(n)
-}
-
-// CacheEncodedSize saves the current size for page counting and encoding.
-// The caller must have exclusive access to n. Readers use EncodedSize, which changes no state.
-// Mutations update the saved size or clear it when the layout changes. Clone starts without a saved size.
-func (n *Node) CacheEncodedSize() int {
-	n.encodedSize = n.EncodedSize()
-	return n.encodedSize
-}
-
-// chooseSplitIndex selects a separator near half a page based on encoded entry bytes while preserving valid left and right node shapes.
-// A leaf keeps its separator as the first entry of the right node, while a branch promotes and removes its separator.
-func (n *Node) chooseSplitIndex(pageSize int64) (int, error) {
-	limit := int(pageSize / 2)
-	currSize := 0
-	separatorIndex := -1
-
-	for i, entry := range n.entries {
-		currSize += entry.EncodedSize(n.IsLeaf())
-		if currSize >= limit {
-			separatorIndex = i
-			break
-		}
-	}
-
-	if separatorIndex == -1 {
-		return -1, ErrNodeNotSaturated
-	}
-
-	// The leaf separator remains in the right node, so each side must keep at least one entry.
-	if n.IsLeaf() {
-		if len(n.entries) < 2 {
-			return -1, ErrNodeNotSaturated
-		}
-		return min(max(separatorIndex, 1), len(n.entries)-1), nil
-	}
-
-	if len(n.entries) < 2 {
-		return -1, ErrNodeNotSaturated
-	}
-	// Removing a separator from a two-entry branch leaves one side with no separator and one child page.
-	if len(n.entries) == 2 {
-		return min(max(separatorIndex, 0), 1), nil
-	}
-	return min(max(separatorIndex, 1), len(n.entries)-2), nil
-}
-
-// Split changes n into the left node and returns a new right node and its read-only separator key.
-// A leaf keeps all entry keys in the two resulting leaves.
-// A branch promotes the separator and removes it from both child nodes.
-// If n has too few entries to split, Split returns [ErrNodeNotSaturated] without changing n.
-func (n *Node) Split(newPageID page.ID, pageSize int64) (*Node, []byte, error) {
-	separatorIndex, err := n.chooseSplitIndex(pageSize)
-	if err != nil {
-		return nil, nil, err
-	}
-
-	rightNode := &Node{
-		header:   newNodeHeader(n.kind(), newPageID),
-		Children: []page.ID{},
-	}
-
-	separator := n.entries[separatorIndex].key
-	if n.IsLeaf() {
-		separator = leafSeparator(n.entries[separatorIndex-1].key, separator)
-		n.splitLeaf(rightNode, separatorIndex)
-	} else {
-		n.splitBranch(rightNode, separatorIndex)
-	}
-	n.header.Checksum = 0
-
-	return rightNode, separator, nil
-}
-
-// redistributionScore describes the two pages we would get by moving entries
-// between neighbors. The score is valid only if both pages fit. underfull says
-// how many more bytes the pages need to reach the target size. imbalance says
-// how far apart their sizes are. Smaller values are better.
-type redistributionScore struct {
-	underfull int64 // for nuking the Node and putting it's content in the left/right nodes. underfull is "how much of the left/right node's size remains to reach the 25% target (a quarter of a page's size)"
-	imbalance int64 // for NOT nuking the Node, and taking some of the left/right node's content into the Node. imbalance is "if we were to distribute some of the left/right node's content into the Node, what's the difference would be between the left/right size and the Node's size?"
-	valid     bool
-}
-
-// chooseSiblingRedistribution decides which neighbor should share entries with
-// node. It tries left with node and node with right on copies. The pages stay
-// unchanged until the caller makes the chosen move.
-//
-// First prefer the pair that leaves fewer bytes below the target size. If the
-// pairs tie, prefer the pair with sizes closer together. An exact tie selects
-// left. ok is false if neither pair can make two pages that fit.
-func chooseSiblingRedistribution(parent *Node, childIndex int, left, node, right *Node, pageSize, minimumSize int64) (useLeft, ok bool) {
-	leftScore := redistributionScore{}
-	if left != nil {
-		leftScore = scoreRedistribution(parent, childIndex-1, left, node, pageSize, minimumSize)
-	}
-	rightScore := redistributionScore{}
-	if right != nil {
-		rightScore = scoreRedistribution(parent, childIndex, node, right, pageSize, minimumSize)
-	}
-
-	if !leftScore.valid {
-		return false, rightScore.valid
-	}
-	if !rightScore.valid {
-		return true, true
-	}
-
-	if rightScore.underfull < leftScore.underfull ||
-		rightScore.underfull == leftScore.underfull && rightScore.imbalance < leftScore.imbalance {
-		return false, true
-	}
-	return true, true
-}
-
-// scoreRedistribution tries one move on copies and measures the result.
-// The real pages must stay unchanged while we compare the two neighbors.
-// separatorIndex selects the parent key between left and right.
-func scoreRedistribution(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) redistributionScore {
-	parent = parent.Clone()
-	left = left.Clone()
-	right = right.Clone()
-	if !redistributeChildren(parent, separatorIndex, left, right, pageSize, minimumSize) {
-		return redistributionScore{}
-	}
-	underfull, imbalance := redistributionPenalty(int64(left.EncodedSize()), int64(right.EncodedSize()), minimumSize)
-	return redistributionScore{underfull: underfull, imbalance: imbalance, valid: true}
-}
-
-// mergedChildrenSize checks if left can hold all of right before a merge.
-// It counts the bytes that the merged node would write. It changes no node.
-// For leaves, the parent key already occurs in right. For branches, the parent
-// key moves into the merged node, along with the child page IDs.
-func mergedChildrenSize(parent *Node, separatorIndex int, left, right *Node) int64 {
-	size := NodeHeaderSize
-	for _, entry := range left.entries {
-		size += entry.EncodedSize(left.IsLeaf())
-	}
-	for _, entry := range right.entries {
-		size += entry.EncodedSize(right.IsLeaf())
-	}
-	if !left.IsLeaf() {
-		// Each branch entry counts one child ID. A branch has one more child
-		// than entries, so count that last ID as well.
-		size += parent.entries[separatorIndex].EncodedSize(false)
-		size += page.IDSize
-	}
-	return int64(size)
-}
-
-// redistributeChildren moves entries between two adjacent pages that cannot
-// merge. It chooses a place to divide their entries, then changes both pages
-// and the parent key between them. It returns false without changes if no
-// division makes two pages that fit.
-//
-// For leaves, the parent must store the first key in the new right page.
-// For branches, the old parent key goes between the two entry lists. The chosen
-// dividing key then moves from the list into the parent.
-func redistributeChildren(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) bool {
-	var ok bool
-	if left.IsLeaf() {
-		ok = redistributeLeaves(parent, separatorIndex, left, right, pageSize, minimumSize)
-	} else {
-		ok = redistributeBranches(parent, separatorIndex, left, right, pageSize, minimumSize)
-	}
+	id, ok := branchChild(view.image, view.EntryCount(), index)
 	if !ok {
-		return false
+		return 0, childError(index)
 	}
-	// These three pages now have different bytes. Their old checksums no
-	// longer match them.
-	left.header.Checksum = 0
-	right.header.Checksum = 0
-	parent.header.Checksum = 0
-	return true
+	return id, nil
 }
 
-// redistributionPenalty measures how well two pages use their space.
-// For a target of 64 bytes, pages of 40 and 80 bytes miss the target by 24
-// bytes in total. Their sizes differ by 40 bytes. Callers compare the first
-// result before the second, so they first try to make both pages less empty.
-func redistributionPenalty(leftSize, rightSize, minimumSize int64) (underfull, imbalance int64) {
-	underfull = max(minimumSize-leftSize, 0) + max(minimumSize-rightSize, 0)
-	return underfull, max(leftSize-rightSize, rightSize-leftSize)
-}
-
-// mergeChildren puts right into left and removes right from their parent.
-// The caller first checks that all data will fit in left. After this call,
-// the caller returns right's page to the store.
-//
-// For leaves, the parent's key is already the first key in right. For
-// branches, that key exists only in the parent. When branches join, the key
-// moves down between their two groups of keys.
-func mergeChildren(parent *Node, separatorIndex int, left, right *Node) {
-	left.encodedSize = 0
-	parent.encodedSize = 0
-	if left.IsLeaf() {
-		left.entries = append(left.entries, right.entries...)
+// Lookup searches one node. A leaf returns an entry and found; a branch returns
+// the child page to search next. A missing leaf key returns found false and child zero.
+// includeKey allows an encoded leaf to omit the matched key. Values remain read-only.
+func (view Node) Lookup(key []byte, includeKey bool) (entry Entry, found bool, child page.ID, err error) {
+	if err = validateLookupKey(key); err != nil {
+		return
+	}
+	if view.node != nil {
+		return LookupNode(view.node, key)
+	}
+	if view.IsLeaf() {
+		_, found, err = lookupLeafBody(view.image, uint32(view.EntryCount()), key, includeKey, &entry)
 	} else {
-		left.entries = append(left.entries, parent.entries[separatorIndex])
-		left.entries = append(left.entries, right.entries...)
-		left.Children = append(left.Children, right.Children...)
+		child, err = lookupBranchBody(view.image, uint32(view.EntryCount()), key)
 	}
-	// The parent no longer needs a key or a child ID for the old right page.
-	parent.entries = slices.Delete(parent.entries, separatorIndex, separatorIndex+1)
-	removedChild := separatorIndex + 1
-	parent.Children = slices.Delete(parent.Children, removedChild, removedChild+1)
-	// Only the pages that stay in the tree need their checksums cleared.
-	left.header.Checksum = 0
-	parent.header.Checksum = 0
+	return
 }
 
-// WALBodyOffset selects the type-specific start of the compact WAL payload.
-func (n *Node) WALBodyOffset() int {
-	if n.IsLeaf() {
-		return leafBodyOffset(n)
+// Clone returns a private decoded node with independent entry and child lists.
+// Keys and values remain read-only and can borrow the source storage. Call
+// OwnImageBytes before persistence can overwrite or release an encoded source.
+// The result never aliases the MutableNode backing this read-only view.
+func (view Node) Clone(pageSize int64) (*MutableNode, error) {
+	if view.node != nil {
+		return view.node.Clone(), nil
 	}
-	return branchBodyOffset(n)
+	return view.decode(pageSize)
 }
 
-// VisitNodeReferences visits child nodes and continuation pages separately.
-// visit receives branch children or nested bucket roots. visitContinuation
-// receives storage pages of this node; these pages are not tree children.
-// Pass nil for visitContinuation when only child references are needed.
-func VisitNodeReferences(node *Node, visit, visitContinuation func(page.ID) error) error {
+// decode borrows decoded lists for read-only work inside this package.
+// Mutations must use Store.EditNode; callers outside btree use Clone.
+func (view Node) decode(pageSize int64) (*MutableNode, error) {
+	if view.node != nil {
+		return view.node, nil
+	}
+	image := view.image
+	h := NodeHeader{Type: mappedNodeType(image), PageID: view.PageID(), EntryCount: uint32(view.EntryCount()), BodyLength: uint32(len(image) - NodeHeaderSize)}
+	node, err := decodeBody(image, h, true)
+	if err != nil {
+		return nil, err
+	}
+	node.SetStoragePageCount((len(image) + int(pageSize) - 1) / int(pageSize))
+	for index := range node.entries {
+		node.entries[index].borrowedImage = true
+		node.entries[index].borrowedKey = true
+	}
+	return node, nil
+}
+
+// EncodedSize returns the logical byte size, excluding storage-page padding.
+func (view Node) EncodedSize() int {
+	if view.node != nil {
+		return view.node.EncodedSize()
+	}
+	return len(view.image)
+}
+
+// StoragePageCount returns the currently allocated span length, including the head.
+func (view Node) StoragePageCount(pageSize int64) int {
+	if view.node != nil {
+		return view.node.StoragePageCount()
+	}
+	return (len(view.image) + int(pageSize) - 1) / int(pageSize)
+}
+
+// separator returns the checked branch separator at index.
+// It borrows node storage; an invalid index or encoded key returns ErrInvalid.
+func (view Node) separator(index int) ([]byte, error) {
+	if view.IsLeaf() || index < 0 || index >= view.EntryCount() {
+		return nil, ErrInvalid
+	}
+	if view.node != nil {
+		return view.node.entries[index].key, nil
+	}
+	dataStart, err := branchDataStart(uint64(len(view.image)), uint32(view.EntryCount()))
+	if err != nil {
+		return nil, err
+	}
+	start, end := branchKey(view.image, index)
+	if !validKey(start, end, dataStart, uint64(len(view.image))) {
+		return nil, entryError(index)
+	}
+	if index == 0 && start != dataStart || index+1 == view.EntryCount() && end != uint64(len(view.image)) {
+		return nil, entryError(index)
+	}
+	if index > 0 {
+		previousStart, previousEnd := branchKey(view.image, index-1)
+		if !validKey(previousStart, previousEnd, dataStart, uint64(len(view.image))) || previousEnd != start || bytes.Compare(view.image[previousStart:previousEnd], view.image[start:end]) >= 0 {
+			return nil, entryError(index)
+		}
+	}
+	return view.image[start:end:end], nil
+}
+
+func (view Node) search(key []byte) (int, bool, error) {
+	if view.node != nil {
+		if view.IsLeaf() {
+			return view.node.findKeyIndex(key)
+		}
+		index, err := view.node.FindChildIndex(key)
+		return index, false, err
+	}
+	if view.IsLeaf() {
+		var entry Entry
+		return lookupLeafBody(view.image, uint32(view.EntryCount()), key, false, &entry)
+	}
+	index, _, err := searchBranchBody(view.image, uint32(view.EntryCount()), key)
+	return index, false, err
+}
+
+func (view Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
+	index, found, err := view.search(key)
+	if err != nil || !found {
+		return 0, found, err
+	}
+	entry, err := view.Entry(index)
+	if err != nil {
+		return 0, false, err
+	}
+	if (entry.flags&BucketLeafFlag != 0) != bucket {
+		return 0, false, ErrIncompatibleValue
+	}
+	return index, true, nil
+}
+
+// ReadOnly borrows the node contents without permitting mutation through the result.
+// The owner must keep the contents unchanged while the result is in use.
+func (node *MutableNode) ReadOnly() Node {
+	return Node{node: node}
+}
+
+// PageID returns the head page of this node.
+func (view Node) PageID() page.ID {
+	if view.node != nil {
+		return view.node.PageID()
+	}
+	return page.ID(binary.LittleEndian.Uint64(view.image[2:10]))
+}
+
+// VisitReferences checks and visits child nodes, then physical continuation pages.
+// pageSize is the storage unit used by the reader; callbacks can stop with an error.
+func (view Node) VisitReferences(pageSize int64, visit, visitContinuation func(page.ID) error) error {
+	if view.node != nil {
+		return VisitNodeReferences(view.node, visit, visitContinuation)
+	}
+	if pageSize < NodeHeaderSize {
+		return ErrInvalid
+	}
+	if err := checkBody(view.image, NodeHeader{Type: mappedNodeType(view.image), EntryCount: uint32(view.EntryCount())}, true, visit); err != nil {
+		return err
+	}
 	if visitContinuation != nil {
-		for offset := 1; offset < node.StoragePageCount(); offset++ {
-			if err := visitContinuation(node.PageID() + page.ID(offset)); err != nil {
+		count := (uint64(len(view.image)) + uint64(pageSize) - 1) / uint64(pageSize)
+		for offset := uint64(1); offset < count; offset++ {
+			if err := visitContinuation(view.PageID() + page.ID(offset)); err != nil {
 				return err
 			}
 		}
 	}
-	if node.IsLeaf() {
-		return visitLeafReferences(node, visit)
-	}
-	return visitBranchReferences(node, visit)
+	return nil
 }
 
-// OwnBorrowedValues copies temporary values so the node can enter committed memory.
-func (n *Node) OwnBorrowedValues() {
-	for i := range n.entries {
-		if n.entries[i].borrowValue {
-			n.entries[i].value = cloneValue(n.entries[i].value)
-			n.entries[i].borrowValue = false
+// ReadNodeImage checks the encoded header and borrows its logical image.
+// Node operations check the directories and entries they use.
+// data contains the complete padded main-file span or compact WAL payload.
+// wal selects the compact format; checksums applies only to main-file spans.
+func ReadNodeImage(data []byte, id page.ID, pageSize int64, wal, checksums bool) (Node, error) {
+	var image []byte
+	if _, _, ok := plainNodeHeader(data, id, pageSize, wal, checksums); ok {
+		size := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
+		image = data[:size:len(data)]
+	} else {
+		checked, _, err := nodeImage(data, id, pageSize, nil, wal, checksums)
+		if err != nil {
+			return Node{}, err
 		}
+		image = data[:len(checked):len(data)]
+	}
+	return nodeFromImage(image)
+}
+
+func nodeFromImage(image []byte) (Node, error) {
+	// Empty nodes have no entry access through which to check unused body bytes.
+	if binary.LittleEndian.Uint32(image[10:14]) == 0 {
+		emptySize := NodeHeaderSize
+		if mappedNodeType(image) == NodeTypeBranch {
+			emptySize += page.IDSize
+		}
+		if len(image) != emptySize {
+			return Node{}, errBodySize
+		}
+	}
+	return Node{image: image}, nil
+}
+
+// nodeEntries keeps the checked bounds of one leaf entry. Adjacent moves reuse
+// those bounds without reading the previous descriptor again.
+type nodeEntries struct {
+	index                      int
+	valid                      bool
+	flags                      uint32
+	keyStart, keyEnd, valueEnd uint32
+}
+
+func (entries *nodeEntries) position(node Node, index int) error {
+	if node.node != nil {
+		entries.index, entries.valid = index, true
+		return nil
+	}
+	if !entries.valid {
+		if _, err := leafDataStart(uint64(len(node.image)), uint32(node.EntryCount())); err != nil {
+			return err
+		}
+	}
+	// Adjacent movement reuses the entry bounds that the previous step already checked.
+	forward := entries.valid && index == entries.index+1
+	backward := entries.valid && index == entries.index-1
+	entries.valid = false
+	image := node.image
+	flags, start, keyEnd, end := leafSpan(image, index)
+	dataStart := uint64(NodeHeaderSize + node.EntryCount()*leafEntryDescriptorSize)
+	if !validLeaf(flags, start, keyEnd, end, dataStart, uint64(len(image))) {
+		return entryError(index)
+	}
+	if index == 0 && start != dataStart || index+1 == node.EntryCount() && end != uint64(len(image)) {
+		return entryError(index)
+	}
+	if forward {
+		if start != uint64(entries.valueEnd) || bytes.Compare(image[entries.keyStart:entries.keyEnd], image[start:keyEnd]) >= 0 {
+			return entryError(index)
+		}
+	} else if backward {
+		if end != uint64(entries.keyStart) || bytes.Compare(image[start:keyEnd], image[entries.keyStart:entries.keyEnd]) >= 0 {
+			return entryError(index)
+		}
+	} else if index > 0 {
+		previousFlags, previousStart, previousKeyEnd, previousEnd := leafSpan(image, index-1)
+		if !validLeaf(previousFlags, previousStart, previousKeyEnd, previousEnd, dataStart, uint64(len(image))) || previousEnd != start || bytes.Compare(image[previousStart:previousKeyEnd], image[start:keyEnd]) >= 0 {
+			return entryError(index)
+		}
+	}
+	entries.keyStart, entries.keyEnd, entries.valueEnd = uint32(start), uint32(keyEnd), uint32(end)
+	entries.index, entries.valid = index, true
+	entries.flags = flags
+	return nil
+}
+
+// visitRange visits this leaf's entries in [start,end) without decoding an entry list.
+// Empty bounds are unbounded. The callback receives read-only borrowed bytes.
+func (node Node) visitRange(start, end []byte, visit func(uint32, []byte, []byte) error) error {
+	if !node.IsLeaf() {
+		return ErrNotLeafNode
+	}
+	if node.node == nil {
+		return visitLeafRange(node.image, start, end, visit)
+	}
+	first, _, err := node.search(start)
+	if err != nil {
+		return err
+	}
+	for _, entry := range node.node.entries[first:] {
+		if len(end) > 0 && bytes.Compare(entry.key, end) >= 0 {
+			break
+		}
+		if err := visit(entry.flags, entry.key, entry.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// visitReverse visits this leaf's entries from largest to smallest key.
+// A callback error stops iteration. The callback bytes borrow the node.
+func (node Node) visitReverse(visit func(uint32, []byte, []byte) error) error {
+	if !node.IsLeaf() {
+		return ErrNotLeafNode
+	}
+	if node.node == nil {
+		return visitLeafReverse(node.image, visit)
+	}
+	for index := len(node.node.entries) - 1; index >= 0; index-- {
+		entry := node.node.entries[index]
+		if err := visit(entry.flags, entry.key, entry.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// children returns an iterator over branch children whose ranges intersect [start,end).
+// Empty bounds are unbounded. reverse selects descending key order.
+// Encoded child IDs are checked before iteration. Bounded ranges also check separator keys;
+// unbounded traversal does not read them. VisitReferences checks the full node.
+func (node Node) children(start, end []byte, reverse bool) (childIterator, error) {
+	if node.IsLeaf() {
+		return childIterator{}, ErrNotBranchNode
+	}
+	count := node.EntryCount()
+	if node.node == nil {
+		if len(start) != 0 || len(end) != 0 {
+			if err := checkBranchBody(node.image, NodeHeader{EntryCount: uint32(count)}, true, nil); err != nil {
+				return childIterator{}, err
+			}
+		} else {
+			if _, err := branchDataStart(uint64(len(node.image)), uint32(count)); err != nil {
+				return childIterator{}, err
+			}
+			for index := 0; index <= count; index++ {
+				if _, ok := branchChild(node.image, count, index); !ok {
+					return childIterator{}, childError(index)
+				}
+			}
+		}
+	}
+	first, last := 0, count
+	if len(start) > 0 {
+		index, _, err := node.search(start)
+		if err != nil {
+			return childIterator{}, err
+		}
+		first = index
+	}
+	if len(end) > 0 {
+		for index := first; index < count; index++ {
+			var separator []byte
+			if node.node != nil {
+				separator = node.node.entries[index].key
+			} else {
+				from, to := branchKey(node.image, index)
+				separator = node.image[from:to]
+			}
+			if bytes.Compare(separator, end) >= 0 {
+				last = index
+				break
+			}
+		}
+	}
+	step := 1
+	if reverse {
+		first, last, step = last, first, -1
+	}
+	result := childIterator{index: first, end: last + step, step: step}
+	if node.node != nil {
+		if len(node.node.Children) != count+1 {
+			return childIterator{}, ErrInvalid
+		}
+		result.decoded = node.node.Children
+	} else {
+		offset := NodeHeaderSize + count*branchEntryDescriptorSize
+		result.encoded = node.image[offset : offset+(count+1)*page.IDSize]
+	}
+	return result, nil
+}
+
+// childIterator holds a position in a node's immutable child list.
+// It borrows node storage. Its zero value is exhausted.
+type childIterator struct {
+	decoded          []page.ID
+	encoded          []byte
+	index, end, step int
+}
+
+// next returns the next child page ID, or false when exhausted.
+func (children *childIterator) next() (page.ID, bool) {
+	if children.index == children.end {
+		return 0, false
+	}
+	index := children.index
+	children.index += children.step
+	if children.decoded != nil {
+		return children.decoded[index], true
+	}
+	offset := index * page.IDSize
+	return page.ID(binary.LittleEndian.Uint64(children.encoded[offset : offset+page.IDSize])), true
+}
+
+// entryAtPosition borrows the entry whose bounds position already checked.
+func (node Node) entryAtPosition(position nodeEntries) Entry {
+	if node.node != nil {
+		return node.node.entries[position.index]
+	}
+	return Entry{
+		flags: position.flags,
+		key:   node.image[position.keyStart:position.keyEnd:position.keyEnd],
+		value: node.image[position.keyEnd:position.valueEnd:position.valueEnd],
 	}
 }

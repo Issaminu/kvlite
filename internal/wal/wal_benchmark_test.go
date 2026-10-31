@@ -20,7 +20,7 @@ func BenchmarkEncodeTransaction(b *testing.B) {
 				const pageSize = 4096
 				node := btree.NewLeafNode(3)
 				if branch {
-					node = btree.NewRootNode(3, btree.NewLeafNode(4), btree.NewLeafNode(5), make([]byte, size))
+					node = btree.NewRootNode(3, btree.NewLeafNode(4).PageID(), btree.NewLeafNode(5).PageID(), make([]byte, size))
 				} else if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), make([]byte, size))); err != nil {
 					b.Fatal(err)
 				}

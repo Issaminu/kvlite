@@ -57,17 +57,16 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 		return nil
 	}
 
-	var root *btree.Node
 	if enabled {
 		if err := db.enableDataPageChecksums(); err != nil {
 			return err
 		}
+		// Turn the mode on only after the converted root passes its checksum check.
 		data, err := db.readMainNodePage(db.meta.Root())
 		if err != nil {
 			return err
 		}
-		root, err = btree.DecodeNode(slices.Clone(data), db.meta.Root(), db.meta.PageSize(), db.readMainNodePage, true)
-		if err != nil {
+		if err := btree.CheckNodeChecksum(data, db.meta.Root()); err != nil {
 			return err
 		}
 	}
@@ -82,7 +81,6 @@ func (db *DB) SetDataPageChecksums(enabled bool) error {
 		clear(db.writeNodes)
 		db.writeNodeSlots = nil
 		db.nextWriteNodeSlot = 0
-		db.rootNode = root
 	}
 	return nil
 }

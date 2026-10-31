@@ -326,7 +326,7 @@ func (db *DB) materializeWALPage(records []wal.WALRecord, chain []int) (wal.WALR
 		return wal.WALRecord{}, err
 	}
 	// After an entry patch, node holds the latest state instead of image. So a series of entry patches decodes the page once.
-	var node *btree.Node
+	var node *btree.MutableNode
 	for _, index := range chain[first+1:] {
 		record := records[index]
 		switch record.Header.Type {

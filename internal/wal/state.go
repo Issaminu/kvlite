@@ -45,8 +45,8 @@ type CommittedPage struct {
 	Header RecordHeader
 	// Payload holds a recovered node image, a complete allocation page, or encoded metadata.
 	Payload []byte
-	// Node holds a data node from the current process. A page must not hold both Node and Payload.
-	Node *btree.Node
+	// Node holds an immutable committed data node from the current process. A page must not hold both Node and Payload.
+	Node *btree.MutableNode
 }
 
 func New(config Config) *WAL {
@@ -288,7 +288,7 @@ func checkpointRecordPages(record *CommittedPage, pageSize int64) (int, error) {
 // The node's input bytes must stay separate from that destination.
 // A false result must write nothing and selects the ordinary buffered writer.
 type NodeWriter interface {
-	WriteNode(node *btree.Node, pageSize int64, checksums bool) (bool, error)
+	WriteNode(node *btree.MutableNode, pageSize int64, checksums bool) (bool, error)
 }
 
 // writeCheckpointRecordRuns combines adjacent complete spans into bounded writes.

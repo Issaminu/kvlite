@@ -20,11 +20,11 @@ import (
 // validatePageOwnership walks every tree page to test the bitmap against the tree.
 // Normal Open checks only bitmap pages, so this test helper can find an incorrect bit on a child page.
 func (db *DB) validatePageOwnership() error {
-	return db.validatePageOwnershipWith(db.readNode)
+	return db.validatePageOwnershipWith(db.committedNode)
 }
 
 // validatePageOwnershipWith is validatePageOwnership with its own page reader.
-func (db *DB) validatePageOwnershipWith(readNode func(page.ID) (*btree.Node, error)) error {
+func (db *DB) validatePageOwnershipWith(readNode func(page.ID) (*btree.MutableNode, error)) error {
 	if db.allocation == nil || db.meta == nil {
 		return ErrInvalid
 	}
@@ -524,7 +524,7 @@ func TestDeleteReusesRetiredPageAfterReopen(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if got := bucket.rootNode.PageID(); got != freePage {
+				if got := testBucketRoot(t, bucket).PageID(); got != freePage {
 					return fmt.Errorf("reused page: got %d, want %d", got, freePage)
 				}
 				return nil
@@ -804,10 +804,10 @@ func TestCheckRejectsReachablePageMarkedFree(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if bucket.rootNode.IsLeaf() {
+		if testBucketRoot(t, bucket).IsLeaf() {
 			return errors.New("test bucket did not split")
 		}
-		childPageID = bucket.rootNode.Children[0]
+		childPageID = testBucketRoot(t, bucket).Children[0]
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -953,7 +953,7 @@ func TestAllocationReopensAndReusesPageFromSecondSegment(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got := bucket.rootNode.PageID(); got != secondPage {
+		if got := testBucketRoot(t, bucket).PageID(); got != secondPage {
 			return fmt.Errorf("bucket root page: got %d, want %d", got, secondPage)
 		}
 		return bucket.Put([]byte("key"), []byte("value"))
@@ -1477,7 +1477,7 @@ func TestNativeUnchangedSpansStillFinalizeRetirement(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		retired = temporary.rootNode.PageID()
+		retired = testBucketRoot(t, temporary).PageID()
 		_, err = tx.CreateBucket([]byte("tail"))
 		return err
 	}); err != nil {
@@ -1521,7 +1521,7 @@ func TestNativeNodeSpanRepairsNestedRootAndKeepsRollbackPrivate(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		oldHead = child.rootNode.PageID()
+		oldHead = testBucketRoot(t, child).PageID()
 		if err := child.Put([]byte("key"), []byte("old")); err != nil {
 			return err
 		}
@@ -1576,13 +1576,13 @@ func TestNativeNodeSpanRepairsNestedRootAndKeepsRollbackPrivate(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := child.loadRootNode(); err != nil {
+		if err := testLoadRoot(t, child); err != nil {
 			return err
 		}
-		if child.rootNode.PageID() == oldHead {
+		if testBucketRoot(t, child).PageID() == oldHead {
 			return errors.New("nested root pointer was not repaired")
 		}
-		if child.rootNode.StoragePageCount() != btree.NodePageCount(child.rootNode, tx.meta.PageSize()) {
+		if testBucketRoot(t, child).StoragePageCount() != btree.NodePageCount(testBucketRoot(t, child), tx.meta.PageSize()) {
 			return errors.New("node span count differs")
 		}
 		got, err := child.Get([]byte("key"))
@@ -1604,12 +1604,12 @@ func TestNativeNodeSpanRepairsNestedRootAndKeepsRollbackPrivate(t *testing.T) {
 func TestNativeNodeSpanMovesCatalogRoot(t *testing.T) {
 	db := OpenMemory()
 	defer db.Close()
-	oldRoot := db.rootNode
+	oldRoot := db.memoryNodes[db.meta.Root()]
 	name := bytes.Repeat([]byte{'n'}, btree.MaxKeySize)
 	if err := db.Update(func(tx *Tx) error { _, err := tx.CreateBucket(name); return err }); err != nil {
 		t.Fatal(err)
 	}
-	if db.meta.Root() == oldRoot.PageID() || db.rootNode.PageID() != db.meta.Root() {
+	if db.meta.Root() == oldRoot.PageID() {
 		t.Fatal("catalog relocation did not publish its metadata root")
 	}
 	if oldRoot.PageID() != firstAllocationSegmentID+page.AllocationSegmentPages(db.meta.PageSize()) || oldRoot.EntryCount() != 0 {
@@ -1644,12 +1644,12 @@ func TestNativeNodeSpanBatchParentsStayPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	oldHead := bucket.rootNode.PageID()
+	oldHead := testBucketRoot(t, bucket).PageID()
 	value := bytes.Repeat([]byte{'a'}, int(db.meta.PageSize())*2)
 	if err := bucket.Put([]byte("key"), value); err != nil {
 		t.Fatal(err)
 	}
-	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, first.allocation)
+	second := newWriteTx(db, writeBatchState{meta: first.meta, dirty: first.store.dirty, allocation: first.allocation, tree: first.tree})
 	other, err := second.Bucket([]byte("data"))
 	if err != nil {
 		t.Fatal(err)
@@ -1660,12 +1660,11 @@ func TestNativeNodeSpanBatchParentsStayPrivate(t *testing.T) {
 	if !bytes.Equal(first.store.dirty[oldHead].final.EntryAt(0).Value(), value) {
 		t.Fatal("later failed callback changed an earlier image")
 	}
-	prepared := &Tx{db: db, meta: first.meta, rootNode: first.rootNode, allocation: first.allocation, allocationOwned: first.allocationOwned}
-	prepared.store.dirty = first.store.dirty
+	prepared := newCommitTx(db, writeBatchState{meta: first.meta, dirty: first.store.dirty, allocation: first.allocation, tree: first.tree})
 	if err := prepared.prepareCommit(); err != nil {
 		t.Fatal(err)
 	}
-	probe := newWriteTx(db, prepared.meta, prepared.rootNode, prepared.store.dirty, prepared.allocation)
+	probe := newWriteTx(db, writeBatchState{meta: prepared.meta, dirty: prepared.store.dirty, allocation: prepared.allocation, tree: prepared.tree})
 	gotBucket, err := probe.Bucket([]byte("data"))
 	if err != nil {
 		t.Fatal(err)
@@ -1674,10 +1673,10 @@ func TestNativeNodeSpanBatchParentsStayPrivate(t *testing.T) {
 	if err != nil || !bytes.Equal(got, value) {
 		t.Fatalf("prepared batch lost its parent reference: %v", err)
 	}
-	if gotBucket.rootNode.PageID() == oldHead {
+	if testBucketRoot(t, gotBucket).PageID() == oldHead {
 		t.Fatal("fixture did not relocate the bucket root")
 	}
-	if prepared.store.dirty[gotBucket.rootNode.PageID()].original != nil {
+	if prepared.store.dirty[testBucketRoot(t, gotBucket).PageID()].original != nil {
 		t.Fatal("relocated node kept a patch base")
 	}
 	if string(db.memoryNodes[oldHead].EntryAt(0).Value()) != "old" {
@@ -1703,16 +1702,16 @@ func TestNativeNodeSpanRepairsUnchangedBranch(t *testing.T) {
 		t.Fatal(err)
 	}
 	var oldHead page.ID
-	var branch *btree.Node
+	var branch *btree.MutableNode
 	if err := db.View(func(tx *Tx) error {
 		bucket, err := tx.Bucket([]byte("data"))
 		if err != nil {
 			return err
 		}
-		if err := bucket.loadRootNode(); err != nil {
+		if err := testLoadRoot(t, bucket); err != nil {
 			return err
 		}
-		branch = bucket.rootNode
+		branch = testBucketRoot(t, bucket)
 		if branch.IsLeaf() {
 			return errors.New("fixture has no branch")
 		}
@@ -1762,10 +1761,10 @@ func TestNativeNodeSpanGrowsAndShrinksInPlace(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := bucket.loadRootNode(); err != nil {
+		if err := testLoadRoot(t, bucket); err != nil {
 			return err
 		}
-		head = bucket.rootNode.PageID()
+		head = testBucketRoot(t, bucket).PageID()
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -1846,20 +1845,20 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if bucket.rootNode.IsLeaf() || len(bucket.rootNode.Children) != 3 {
+			if testBucketRoot(t, bucket).IsLeaf() || len(testBucketRoot(t, bucket).Children) != 3 {
 				t.Fatal("fixture needs one branch with three leaf children")
 			}
-			oldHead := bucket.rootNode.Children[2]
+			oldHead := testBucketRoot(t, bucket).Children[2]
 			value := bytes.Repeat([]byte{'v'}, pageSize*2)
 			if err := bucket.Put(key(300), value); err != nil {
 				t.Fatal(err)
 			}
-			oldParent := first.store.dirty[oldHead].parent
+			oldParent := testParent(t, first, oldHead)
 			if oldParent == nil || oldParent.IsLeaf() {
 				t.Fatal("first callback did not retain the leaf's branch parent")
 			}
 
-			second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, first.allocation)
+			second := newWriteTx(db, writeBatchState{meta: first.meta, dirty: first.store.dirty, allocation: first.allocation, tree: first.tree})
 			other, err := second.Bucket([]byte("data"))
 			if err != nil {
 				t.Fatal(err)
@@ -1873,11 +1872,11 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 			} else if err := other.Put(key(150), bytes.Repeat([]byte{'n'}, pageSize/4)); err != nil {
 				t.Fatal(err)
 			}
-			parent := second.store.dirty[oldHead].parent
+			parent := testParent(t, second, oldHead)
 			if parent == nil || parent.PageID() == oldParent.PageID() {
 				t.Fatal("later callback did not replace the saved parent")
 			}
-			if first.store.dirty[oldHead].parent != oldParent {
+			if testParent(t, first, oldHead).PageID() != oldParent.PageID() {
 				t.Fatal("later callback changed the earlier callback's parent record")
 			}
 			if parent.IsLeaf() != (name == "root-collapse") {
@@ -1897,15 +1896,14 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 			for id, change := range second.store.dirty {
 				first.store.dirty[id] = change
 			}
-			prepared := &Tx{db: db, meta: second.meta, rootNode: second.rootNode, allocation: second.allocation, allocationOwned: second.allocationOwned}
-			prepared.store.dirty = first.store.dirty
+			prepared := newCommitTx(db, writeBatchState{meta: second.meta, dirty: first.store.dirty, allocation: second.allocation, tree: second.tree})
 			if err := prepared.prepareCommit(); err != nil {
 				t.Fatal(err)
 			}
 			if _, exists := prepared.store.dirty[oldHead]; exists {
 				t.Fatal("fixture did not relocate the changed leaf")
 			}
-			probe := newWriteTx(db, prepared.meta, prepared.rootNode, prepared.store.dirty, prepared.allocation)
+			probe := newWriteTx(db, writeBatchState{meta: prepared.meta, dirty: prepared.store.dirty, allocation: prepared.allocation, tree: prepared.tree})
 			visible, err := probe.Bucket([]byte("data"))
 			if err != nil {
 				t.Fatal(err)
@@ -1919,7 +1917,7 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 				t.Fatalf("relocated leaf through its new parent: %v", err)
 			}
 			view := &DB{storage: storage{meta: prepared.meta, allocation: prepared.allocation.publish()}}
-			if err := view.validatePageOwnershipWith(probe.store.ReadNode); err != nil {
+			if err := view.validatePageOwnershipWith(probe.store.decodedNode); err != nil {
 				t.Fatal(err)
 			}
 			if got := db.memoryNodes[oldHead].EntryAt(0).Value(); !bytes.Equal(got, bytes.Repeat([]byte{'s'}, pageSize/4)) {
@@ -1954,33 +1952,32 @@ func TestNativeNodeSpanBatchCatalogRootCollapse(t *testing.T) {
 	if _, err := first.CreateBucket(key(999, keySize)); err != nil {
 		t.Fatal(err)
 	}
-	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, first.allocation)
+	second := newWriteTx(db, writeBatchState{meta: first.meta, dirty: first.store.dirty, allocation: first.allocation, tree: first.tree})
 	for _, number := range []int{100, 200, 300, 999} {
 		if err := second.DeleteBucket(key(number, keySize)); err != nil {
 			t.Fatal(err)
 		}
 	}
 	oldRoot := second.meta.Root()
-	if !second.rootNode.IsLeaf() || second.store.dirty[oldRoot].parent != nil {
+	if !testNode(t, &second.store, second.meta.Root()).IsLeaf() || testParent(t, second, oldRoot) != nil {
 		t.Fatal("promoted catalog root kept its old branch parent")
 	}
 	for id, change := range second.store.dirty {
 		first.store.dirty[id] = change
 	}
-	prepared := &Tx{db: db, meta: second.meta, rootNode: second.rootNode, allocation: second.allocation, allocationOwned: second.allocationOwned}
-	prepared.store.dirty = first.store.dirty
+	prepared := newCommitTx(db, writeBatchState{meta: second.meta, dirty: first.store.dirty, allocation: second.allocation, tree: second.tree})
 	if err := prepared.prepareCommit(); err != nil {
 		t.Fatal(err)
 	}
 	if prepared.meta.Root() == oldRoot {
 		t.Fatal("fixture did not relocate the promoted catalog root")
 	}
-	probe := newWriteTx(db, prepared.meta, prepared.rootNode, prepared.store.dirty, prepared.allocation)
+	probe := newWriteTx(db, writeBatchState{meta: prepared.meta, dirty: prepared.store.dirty, allocation: prepared.allocation, tree: prepared.tree})
 	if _, err := probe.Bucket(remaining); err != nil {
 		t.Fatal(err)
 	}
 	view := &DB{storage: storage{meta: prepared.meta, allocation: prepared.allocation.publish()}}
-	if err := view.validatePageOwnershipWith(probe.store.ReadNode); err != nil {
+	if err := view.validatePageOwnershipWith(probe.store.decodedNode); err != nil {
 		t.Fatal(err)
 	}
 }

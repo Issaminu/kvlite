@@ -232,7 +232,7 @@ func appendEntryPatchDelete(patch []byte, key []byte) []byte {
 // It merges both sorted entry lists once. An entry with equal key, flags, and value makes no operation.
 // A branch entry is a separator key with zero flags, and its value is the 8-byte ID of the child on its right side (see entryPatchEntry).
 // It returns false without new bytes when the node types differ, when a branch changes its first child, or when the payload would not be smaller than limit.
-func appendEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte, bool) {
+func appendEntryPatch(patch []byte, base, target *btree.MutableNode, limit int) ([]byte, bool) {
 	if base.IsLeaf() != target.IsLeaf() {
 		return patch, false
 	}
@@ -284,7 +284,7 @@ func appendEntryPatch(patch []byte, base, target *btree.Node, limit int) ([]byte
 
 // sameEntryPatchEntry reports whether entry baseIndex of base and entry targetIndex of target, which have the same key, store the same flags and value in an entry patch.
 // leaf selects the node type of both nodes. A branch compares the IDs of the right children as integers, so it needs no encoded copy of them.
-func sameEntryPatchEntry(base *btree.Node, baseIndex int, target *btree.Node, targetIndex int, leaf bool) bool {
+func sameEntryPatchEntry(base *btree.MutableNode, baseIndex int, target *btree.MutableNode, targetIndex int, leaf bool) bool {
 	if !leaf {
 		return base.Children[baseIndex+1] == target.Children[targetIndex+1]
 	}
@@ -295,7 +295,7 @@ func sameEntryPatchEntry(base *btree.Node, baseIndex int, target *btree.Node, ta
 // entryPatchEntry returns the key, flags, and value that an entry patch stores for entry index of node.
 // A leaf returns its stored entry.
 // A branch returns separator index with zero flags, and the ID of the child on its right side, encoded into child.
-func entryPatchEntry(node *btree.Node, index int, child *[page.IDSize]byte) ([]byte, uint32, []byte) {
+func entryPatchEntry(node *btree.MutableNode, index int, child *[page.IDSize]byte) ([]byte, uint32, []byte) {
 	entry := node.EntryAt(index)
 	if node.IsLeaf() {
 		return entry.Key(), entry.Flags(), entry.Value()
@@ -330,7 +330,7 @@ func entryPatchEntry(node *btree.Node, index int, child *[page.IDSize]byte) ([]b
 // Set operations copy their key and value bytes. An empty patch makes no change.
 // It does not limit the size of the result. The caller checks it.
 // It returns an error that wraps [page.ErrInvalid] when the patch is invalid for node. Then node can be partly changed.
-func ApplyEntryPatch(node *btree.Node, patch []byte) error {
+func ApplyEntryPatch(node *btree.MutableNode, patch []byte) error {
 	var previous []byte
 	for offset := 0; offset < len(patch); {
 		if len(patch)-offset < entryPatchDeleteHeaderSize {

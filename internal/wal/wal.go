@@ -328,7 +328,7 @@ func (wal *WAL) appendNodeRecord(transaction []byte, record *NodeRecord, txid Tx
 // A patch is possible only when flags, keys, and value lengths keep the same encoded layout.
 // It returns the encoded size of target, and false when the layout changes.
 // patch is a pointer, so the loop does not keep the slice in registers: each bytes.Equal call would then store and load it again for every entry.
-func appendLeafBytePatch(patch *[]byte, base, target *btree.Node, limit int) (int, bool) {
+func appendLeafBytePatch(patch *[]byte, base, target *btree.MutableNode, limit int) (int, bool) {
 	if !base.IsLeaf() || base.EntryCount() != target.EntryCount() {
 		return 0, false
 	}
@@ -361,7 +361,7 @@ func appendLeafBytePatch(patch *[]byte, base, target *btree.Node, limit int) (in
 // appendBranchBytePatch scans one branch once and appends the ranges of changed child IDs and separator keys to *patch.
 // A patch is possible only when the child count and separator-key lengths keep the same encoded layout.
 // It returns the encoded size of target, and false when the layout changes. patch is a pointer for the reason in appendLeafBytePatch.
-func appendBranchBytePatch(patch *[]byte, base, target *btree.Node) (int, bool) {
+func appendBranchBytePatch(patch *[]byte, base, target *btree.MutableNode) (int, bool) {
 	if base.IsLeaf() || base.EntryCount() != target.EntryCount() {
 		return 0, false
 	}
@@ -711,59 +711,15 @@ func (wal *WAL) reachedCheckpointThreshold() bool {
 	return wal.bytesSinceCheckpoint >= wal.checkpointThresholdBytes
 }
 
-// CommittedPageToNode returns the decoded node for a committed data page.
-// One complete logical payload contains the head and every raw trailing page.
-// The payload must come from a verified WAL record or a successful Commit.
-func (wal *WAL) CommittedPageToNode(record *CommittedPage) (*btree.Node, error) {
+// ReadNode borrows the node stored in a verified committed WAL record.
+// pageSize is the database's physical page size. The record must remain unchanged
+// while the result is in use.
+func (record *CommittedPage) ReadNode(pageSize int64) (btree.Node, error) {
 	if record.Node != nil {
-		return record.Node, nil
+		return record.Node.ReadOnly(), nil
 	}
 	if record.Payload == nil {
-		return nil, ErrRecordPayloadRequired
+		return btree.Node{}, ErrRecordPayloadRequired
 	}
-
-	if _, err := ValidateNodeImage(record.Payload, record.Header.PageID, wal.pageSize); err != nil {
-		return nil, err
-	}
-	node, err := btree.DecodeWALNode(record.Payload, record.Header.PageID, wal.pageSize, nil)
-
-	if err != nil {
-		return nil, fmt.Errorf("failed to deserialize node: %w", err)
-	}
-
-	return node, nil
-}
-
-// LookupCommittedPage searches one committed leaf or routes through one branch.
-// A decoded record uses its Node. An encoded record uses one contiguous image.
-// Entries borrow their source bytes. Keep those bytes unchanged while using them.
-// Set includeKey to false to omit the key from encoded lookup results.
-// Decoded entries still borrow their key and value from the Node.
-func (wal *WAL) LookupCommittedPage(record *CommittedPage, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
-	if record.Node != nil {
-		return btree.LookupDecodedNode(record.Node, key)
-	}
-	return btree.LookupEncodedWALNode(record.Payload, record.Header.PageID, key, wal.pageSize, nil, includeKey)
-}
-
-// CommittedPageView borrows the existing node or compact image of a verified WAL record.
-func (wal *WAL) CommittedPageView(record *CommittedPage) (btree.NodeView, error) {
-	if record.Node != nil {
-		return btree.ViewNode(record.Node), nil
-	}
-	if record.Payload == nil {
-		return btree.NodeView{}, ErrRecordPayloadRequired
-	}
-	return btree.ViewNodeImage(record.Payload, record.Header.PageID, wal.pageSize, true, false)
-}
-
-// VisitCommittedPageReferences visits child nodes and continuation IDs separately.
-// Encoded nodes hold every storage page in one contiguous image.
-// Each payload must come from a verified WAL record or a successful Commit.
-func (wal *WAL) VisitCommittedPageReferences(record *CommittedPage, visit, visitContinuation func(page.ID) error) error {
-	view, err := wal.CommittedPageView(record)
-	if err != nil {
-		return err
-	}
-	return view.VisitReferences(wal.pageSize, visit, visitContinuation)
+	return btree.ReadNodeImage(record.Payload, record.Header.PageID, pageSize, true, false)
 }

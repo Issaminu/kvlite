@@ -2,10 +2,8 @@ package kvlite
 
 import (
 	"bytes"
-	"errors"
 
 	"github.com/Issaminu/kvlite/internal/btree"
-	"github.com/Issaminu/kvlite/internal/page"
 )
 
 // Cursor reads the entries in one bucket in key order. An entry is either a key/value pair or the name of a nested bucket. Use [Cursor.First], [Cursor.Last], or [Cursor.Seek] to select a starting entry. Then use [Cursor.Next] or [Cursor.Prev] to move one entry at a time.
@@ -23,17 +21,14 @@ type Cursor struct {
 	bucketVersion uint64
 }
 
-// Cursor creates a cursor for bucket. A new cursor has no current entry. Call [Cursor.First], [Cursor.Last], or [Cursor.Seek] before [Cursor.Next] or [Cursor.Prev].
+// Cursor creates a cursor for bucket. A new cursor has no current entry. Call [Cursor.First], [Cursor.Last], or [Cursor.Seek] before [Cursor.Next] or [Cursor.Prev]. Page reads and validation happen during movement.
 func (bucket *Bucket) Cursor() (*Cursor, error) {
 	if err := bucket.liveError(); err != nil {
 		return nil, err
 	}
-	if err := bucket.loadRootNode(); err != nil {
-		return nil, err
-	}
 	return &Cursor{
 		bucket:        bucket,
-		treeCursor:    *bucket.tx.tree.Cursor(bucket.rootNode),
+		treeCursor:    btree.NewCursor(bucket.tx.nodeReader(), bucket.rootPageID),
 		bucketVersion: bucket.treeVersion,
 	}, nil
 }
@@ -91,18 +86,18 @@ func (cursor *Cursor) checkValid() error {
 	return nil
 }
 
-func (cursor *Cursor) result(entry *btree.Entry, found bool, err error) ([]byte, []byte, error) {
+func (cursor *Cursor) result(found bool, err error) ([]byte, []byte, error) {
 	if err != nil || !found {
 		return nil, nil, err
 	}
-	if entry.Flags()&btree.BucketLeafFlag != 0 {
-		return entry.Key(), nil, nil
+	flags, key, value := cursor.treeCursor.Entry()
+	if flags&btree.BucketLeafFlag != 0 {
+		return key, nil, nil
 	}
-	value := entry.Value()
 	if value == nil {
 		value = []byte{}
 	}
-	return entry.Key(), value, nil
+	return key, value, nil
 }
 
 // ScanPrefix reads matching entries without changing the bucket.
@@ -118,69 +113,6 @@ func (cursor *Cursor) result(entry *btree.Entry, found bool, err error) ([]byte,
 // If fn returns an error, ScanPrefix stops and returns that error. A nil fn returns [ErrScanCallbackRequired].
 func (bucket *Bucket) ScanPrefix(prefix []byte, fn func(key, value []byte) error) error {
 	return bucket.ScanRange(prefix, prefixRangeEnd(prefix), fn)
-}
-
-// scanMappedTreeRange visits entries in the half-open range [start, end) from the main database file.
-// It reads leaf entries from complete consecutive spans. It decodes branches to select their children.
-// The caller must first prove that committed WAL pages cannot replace pages in the main file.
-// Results borrow the span bytes. They remain valid while the current database operation holds its read lock.
-func (db *DB) scanMappedTreeRange(pageID page.ID, start, end []byte, visit func(uint32, []byte, []byte) error) error {
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
-		return err
-	}
-	err = btree.VisitCheckedLeafRange(data, start, end, visit, db.meta.DataPageChecksums())
-	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
-		return err
-	}
-
-	// A branch contains child page IDs instead of values. Decode only the branch so the scan can select its children.
-	branch, err := db.readOnlyNode(pageID)
-	if err != nil {
-		return err
-	}
-	firstChild := 0
-	if len(start) > 0 {
-		// Branch separators let the scan skip every child whose entries sort before start.
-		firstChild, err = branch.FindChildIndex(start)
-		if err != nil {
-			return err
-		}
-	}
-	for childIndex := firstChild; childIndex < len(branch.Children); childIndex++ {
-		// The separator before a child is its lower bound. This child and all later children are outside the range when that separator is not less than end.
-		if len(end) > 0 && childIndex > 0 && bytes.Compare(branch.EntryAt(childIndex-1).Key(), end) >= 0 {
-			break
-		}
-		if err := db.scanMappedTreeRange(branch.Children[childIndex], start, end, visit); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// scanMappedTreeReverse visits the main file from the largest key to the smallest key.
-// The caller must first prove that committed WAL pages cannot replace pages in the main file.
-func (db *DB) scanMappedTreeReverse(pageID page.ID, visit func(uint32, []byte, []byte) error) error {
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
-		return err
-	}
-	err = btree.VisitCheckedLeafReverse(data, visit, db.meta.DataPageChecksums())
-	if err == nil || !errors.Is(err, btree.ErrNotLeafNode) {
-		return err
-	}
-
-	branch, err := db.readOnlyNode(pageID)
-	if err != nil {
-		return err
-	}
-	for index := len(branch.Children) - 1; index >= 0; index-- {
-		if err := db.scanMappedTreeReverse(branch.Children[index], visit); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // prefixRangeEnd returns the smallest exclusive end for a prefix scan. For example, "acct/" ends at "acct0".
@@ -220,37 +152,15 @@ func (bucket *Bucket) ScanRange(start, end []byte, fn func(key, value []byte) er
 	if len(end) > 0 && bytes.Compare(start, end) >= 0 {
 		return nil
 	}
-	// Mapped pages do not include newer page images from the WAL. Use the mapped scan only when the read-only view has no committed WAL overlay.
-	if bucket.tx.readOnly && bucket.tx.db.wal != nil && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
-		rootPageID := bucket.rootPageID
-		if bucket.rootNode != nil {
-			// A read-only bucket clears rootPageID after it loads rootNode. The loaded node keeps the same page ID.
-			rootPageID = bucket.rootNode.PageID()
+	return btree.ScanRange(bucket.tx.nodeReader(), bucket.rootPageID, start, end, func(flags uint32, key, value []byte) error {
+		if flags&btree.BucketLeafFlag != 0 {
+			return fn(key, nil)
 		}
-		return bucket.tx.db.scanMappedTreeRange(rootPageID, start, end, func(flags uint32, key, value []byte) error {
-			// Preserve the public scan result rules. A nested bucket has a nil value. An empty stored value has a non-nil empty value.
-			if flags&btree.BucketLeafFlag != 0 {
-				return fn(key, nil)
-			}
-			if value == nil {
-				value = []byte{}
-			}
-			return fn(key, value)
-		})
-	}
-	// The cursor reads the WAL overlay and transaction changes. Keep it as the general path when the mapped main file is not the complete view.
-	cursor, err := bucket.Cursor()
-	if err != nil {
-		return err
-	}
-	key, value, err := cursor.Seek(start)
-	for err == nil && key != nil && (len(end) == 0 || bytes.Compare(key, end) < 0) {
-		if err := fn(key, value); err != nil {
-			return err
+		if value == nil {
+			value = []byte{}
 		}
-		key, value, err = cursor.Next()
-	}
-	return err
+		return fn(key, value)
+	})
 }
 
 // ScanReverse reads all entries in the bucket from the largest key to the smallest key.
@@ -265,31 +175,13 @@ func (bucket *Bucket) ScanReverse(fn func(key, value []byte) error) error {
 	if fn == nil {
 		return ErrScanCallbackRequired
 	}
-	if bucket.tx.readOnly && bucket.tx.db.wal != nil && bucket.tx.db.wal.Stats().CommittedRecordCount == 0 {
-		rootPageID := bucket.rootPageID
-		if bucket.rootNode != nil {
-			rootPageID = bucket.rootNode.PageID()
+	return btree.ScanReverse(bucket.tx.nodeReader(), bucket.rootPageID, func(flags uint32, key, value []byte) error {
+		if flags&btree.BucketLeafFlag != 0 {
+			return fn(key, nil)
 		}
-		return bucket.tx.db.scanMappedTreeReverse(rootPageID, func(flags uint32, key, value []byte) error {
-			if flags&btree.BucketLeafFlag != 0 {
-				return fn(key, nil)
-			}
-			if value == nil {
-				value = []byte{}
-			}
-			return fn(key, value)
-		})
-	}
-	cursor, err := bucket.Cursor()
-	if err != nil {
-		return err
-	}
-	key, value, err := cursor.Last()
-	for err == nil && key != nil {
-		if err := fn(key, value); err != nil {
-			return err
+		if value == nil {
+			value = []byte{}
 		}
-		key, value, err = cursor.Prev()
-	}
-	return err
+		return fn(key, value)
+	})
 }

@@ -11,8 +11,9 @@ import (
 // BucketLeafFlag marks a leaf value that stores a nested bucket root page ID.
 const BucketLeafFlag uint32 = 0x01
 
-func NewLeafNode(pgid page.ID) *Node {
-	return &Node{
+// NewLeafNode creates an empty private leaf at head page pgid.
+func NewLeafNode(pgid page.ID) *MutableNode {
+	return &MutableNode{
 		header:   newNodeHeader(NodeTypeLeaf, pgid),
 		Children: []page.ID{},
 		entries:  []Entry{},
@@ -21,7 +22,7 @@ func NewLeafNode(pgid page.ID) *Node {
 
 // Find the index of the key in it's leaf node.
 // Returns (index, isFound, err)
-func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
+func (n *MutableNode) findKeyIndex(key []byte) (int, bool, error) {
 	if !n.IsLeaf() {
 		return -1, false, ErrNotLeafNode
 	}
@@ -34,7 +35,7 @@ func (n *Node) findKeyIndex(key []byte) (int, bool, error) {
 
 // FindEntryRef looks a key up in this leaf without copying its key or value.
 // The returned entry refers to storage owned by the node.
-func (n *Node) FindEntryRef(key []byte) (entry Entry, found bool, err error) {
+func (n *MutableNode) FindEntryRef(key []byte) (entry Entry, found bool, err error) {
 	if !n.IsLeaf() {
 		err = ErrNotLeafNode
 		return
@@ -58,7 +59,7 @@ type leafInsert struct {
 }
 
 // prepareInsert checks a leaf insertion without changing the leaf.
-func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
+func (n *MutableNode) prepareInsert(entry Entry) (leafInsert, error) {
 	if !n.IsLeaf() {
 		return leafInsert{}, ErrNotLeafNode
 	}
@@ -78,7 +79,7 @@ func (n *Node) prepareInsert(entry Entry) (leafInsert, error) {
 }
 
 // applyInsert changes a leaf after prepareInsert has accepted the operation.
-func (n *Node) applyInsert(prepared leafInsert) {
+func (n *MutableNode) applyInsert(prepared leafInsert) {
 	// Keep a known size exact so a batch does not rescan the leaf after each put.
 	// A replacement keeps its key and descriptor; only its value length changes.
 	if n.encodedSize != 0 {
@@ -92,6 +93,7 @@ func (n *Node) applyInsert(prepared leafInsert) {
 	if prepared.found {
 		n.entries[prepared.index].flags = prepared.entry.flags
 		n.entries[prepared.index].borrowValue = prepared.entry.borrowValue
+		n.entries[prepared.index].borrowedImage = false
 		if prepared.entry.borrowValue {
 			n.entries[prepared.index].value = prepared.entry.value
 		} else {
@@ -100,8 +102,12 @@ func (n *Node) applyInsert(prepared leafInsert) {
 		return
 	}
 
-	entry := prepared.entry
-	entry.key = slices.Clone(entry.key)
+	entry := Entry{
+		flags:       prepared.entry.flags,
+		borrowValue: prepared.entry.borrowValue,
+		key:         slices.Clone(prepared.entry.key),
+		value:       prepared.entry.value,
+	}
 	if !entry.borrowValue {
 		entry.value = cloneValue(entry.value)
 	}
@@ -111,7 +117,7 @@ func (n *Node) applyInsert(prepared leafInsert) {
 	n.entries[prepared.index] = entry
 }
 
-func (n *Node) InsertEntry(entry Entry) error {
+func (n *MutableNode) InsertEntry(entry Entry) error {
 	prepared, err := n.prepareInsert(entry)
 	if err != nil {
 		return err
@@ -120,7 +126,7 @@ func (n *Node) InsertEntry(entry Entry) error {
 	return nil
 }
 
-func (n *Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
+func (n *MutableNode) prepareDelete(key []byte, bucket bool) (int, bool, error) {
 	index, found, err := n.findKeyIndex(key)
 	if err != nil || !found {
 		return 0, found, err
@@ -134,7 +140,7 @@ func (n *Node) prepareDelete(key []byte, bucket bool) (int, bool, error) {
 // DeleteLeafEntries removes selected entries from a private leaf in one pass.
 // n must be a leaf owned by the caller. firstIndex and rest must contain
 // distinct, ascending entry indexes. It clears unused entry slots.
-func (n *Node) DeleteLeafEntries(firstIndex int, rest []int) {
+func (n *MutableNode) DeleteLeafEntries(firstIndex int, rest []int) {
 	remaining := len(n.entries) - 1 - len(rest)
 	copyLeafEntriesExcept(n.entries[:remaining], n.entries, firstIndex, rest)
 	clear(n.entries[remaining:])
@@ -157,7 +163,7 @@ func copyLeafEntriesExcept(dst, entries []Entry, firstIndex int, rest []int) {
 
 // DeleteKey removes the leaf entry that has key. It returns [ErrKeyNotFound] when the leaf has no such entry.
 // WAL recovery uses it to replay an entry patch. It removes the entry with DeleteLeafEntries, as the normal delete path does.
-func (n *Node) DeleteKey(key []byte) error {
+func (n *MutableNode) DeleteKey(key []byte) error {
 	index, found, err := n.findKeyIndex(key)
 	if err != nil {
 		return err
@@ -172,7 +178,7 @@ func (n *Node) DeleteKey(key []byte) error {
 // InsertOrReplaceLeafEntry inserts entry, or it replaces the entry that has the same key.
 // Unlike InsertEntry, it does not compare the bucket flags of the two entries: an entry patch can replace a value with a nested bucket in one change, or the reverse.
 // WAL recovery uses it to replay an entry patch. It copies the key and value bytes.
-func (n *Node) InsertOrReplaceLeafEntry(entry Entry) error {
+func (n *MutableNode) InsertOrReplaceLeafEntry(entry Entry) error {
 	index, found, err := n.findKeyIndex(entry.key)
 	if err != nil {
 		return err
@@ -224,7 +230,7 @@ func leafSeparator(leftMaximum, rightMinimum []byte) []byte {
 }
 
 // redistributeLeaves changes the entry lists and the parent separator if both pages fit.
-func redistributeLeaves(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) bool {
+func redistributeLeaves(parent *MutableNode, separatorIndex int, left, right *MutableNode, pageSize, minimumSize int64) bool {
 	entries := make([]Entry, 0, len(left.entries)+len(right.entries))
 	entries = append(entries, left.entries...)
 	entries = append(entries, right.entries...)
@@ -243,14 +249,14 @@ func redistributeLeaves(parent *Node, separatorIndex int, left, right *Node, pag
 }
 
 // splitLeaf moves entries from index onward into the new right leaf.
-func (n *Node) splitLeaf(right *Node, index int) {
+func (n *MutableNode) splitLeaf(right *MutableNode, index int) {
 	n.encodedSize, right.encodedSize = 0, 0
 	right.entries = slices.Clone(n.entries[index:])
 	n.entries = n.entries[:index]
 }
 
 // visitLeafReferences visits roots of nested buckets stored as leaf values.
-func visitLeafReferences(node *Node, visit func(page.ID) error) error {
+func visitLeafReferences(node *MutableNode, visit func(page.ID) error) error {
 	for _, entry := range node.entries {
 		if entry.flags&BucketLeafFlag == 0 {
 			continue

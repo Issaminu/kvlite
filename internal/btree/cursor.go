@@ -6,40 +6,12 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// NodeReader searches the pages visible to one database operation.
-// Implementations select committed storage or a transaction's private changes.
-// The caller must keep the visible tree unchanged during a traversal.
-type NodeReader interface {
-	// LookupPage searches the node whose head page is id; the node can span several storage pages.
-	// key must be non-empty and no longer than MaxKeySize. The method must not change or retain key.
-	// includeKey requests the stored key for a leaf match. When false, an encoded result can omit it;
-	// a decoded result can still include it. Values and flags are returned for every match.
-	//
-	// A branch returns a zero entry, found false, and the child page to search next.
-	// A leaf returns child zero and either the matching entry with found true, or a zero entry with found false.
-	// A stored empty value is a match; found distinguishes it from a missing key.
-	// On an error, child must be zero and the caller must ignore entry and found.
-	//
-	// Returned key and value bytes are read-only and remain valid while their backing storage stays unchanged.
-	LookupPage(id page.ID, key []byte, includeKey bool) (entry Entry, found bool, child page.ID, err error)
-}
-
-// cursorFrame records one branch-to-child move in a cursor path.
-// A branch is a node that points to child nodes.
-// A leaf is a node that stores ordered entries.
-// The cursor stores frames in root-to-leaf order.
-// It uses the child indexes to find the next or previous subtree without searching from the root again.
-type cursorFrame struct {
-	node       *Node // node is the branch that contains the selected child.
-	childIndex int   // childIndex is the selected index in node.Children.
-}
-
 // Cursor reads entries in key order without changing the tree.
 // It saves each branch-to-child move from the root to the current leaf.
 // [Cursor.Next] and [Cursor.Prev] use this path when they reach a leaf boundary.
 // This avoids a new root search for each entry.
 //
-// Create a Cursor with [Tree.Cursor].
+// Create a Cursor with [NewCursor].
 // The zero value is not valid.
 // A new cursor has no current entry until [Cursor.First], [Cursor.Last], or [Cursor.Seek] finds one.
 // Do not copy a cursor after a positioning method uses it because a copy can share the saved path.
@@ -48,22 +20,218 @@ type cursorFrame struct {
 // For example, a cursor can reach one leaf through child 1 of the root and then child 2 of the next branch.
 // Its path contains those two branch choices.
 //
-// Returned entries refer to node storage.
+// [Cursor.Entry] returns read-only bytes that refer to node storage.
 // The caller must not change the root or any node that the cursor can reach while the cursor is in use.
 type Cursor struct {
-	tree       *Tree         // tree reads child nodes through the store for this operation.
-	root       *Node         // root is the fixed start of every new cursor search.
-	path       []cursorFrame // path contains the branch choices from root to leaf.
-	leaf       *Node         // leaf contains the current entry. A nil leaf means that the cursor has no current entry.
-	entryIndex int           // entryIndex selects the current entry when leaf is not nil.
+	reader    NodeReader     // reader returns the node for each page ID.
+	rootID    page.ID        // rootID is the fixed start of every search from the root.
+	path      []treePathStep // path contains the branch choices from the root to leaf.
+	leaf      Node           // leaf is the leaf that contains the current entry.
+	leafCount int            // leafCount is the entry count of leaf.
+	entries   nodeEntries    // entries holds the checked bounds of the current entry. If entries.valid is false, the cursor has no current entry.
 }
 
-// Cursor returns an unpositioned cursor that reads the tree below root.
-// The caller must pass a non-nil root that belongs to tree.
-// The caller must keep root and every node returned by the tree store unchanged while it uses the cursor.
-func (tree *Tree) Cursor(root *Node) *Cursor {
-	// Leave the path and leaf empty until a positioning method selects an entry.
-	return &Cursor{tree: tree, root: root}
+// NewCursor returns an unpositioned cursor that starts at the root page root.
+// reader and the bytes that it returns must stay valid and unchanged while the cursor is in use.
+func NewCursor(reader NodeReader, root page.ID) Cursor { return Cursor{reader: reader, rootID: root} }
+
+// First moves to the smallest key and replaces the previous position.
+// It returns found false for an empty tree, or an error if a page cannot be read or validated.
+func (cursor *Cursor) First() (bool, error) { return cursor.edge(false) }
+
+// Last moves to the largest key and replaces the previous position.
+// It returns found false for an empty tree, or an error if a page cannot be read or validated.
+func (cursor *Cursor) Last() (bool, error) { return cursor.edge(true) }
+
+// edge moves to the smallest key, or to the largest key when reverse is true.
+func (cursor *Cursor) edge(reverse bool) (bool, error) {
+	// A search from the root makes every branch choice from the old position invalid.
+	cursor.path = cursor.path[:0]
+	cursor.entries.valid = false
+	root, err := cursor.reader.ReadNode(cursor.rootID)
+	if err != nil {
+		return false, err
+	}
+	found, err := cursor.descend(root, reverse)
+	if err != nil || found {
+		return found, err
+	}
+	// The edge leaf is empty. An empty leaf does not mark the end of the tree.
+	return cursor.moveLeaf(reverse)
+}
+
+// Seek moves to the first key greater than or equal to target, replacing the previous position.
+// A nil or empty target selects the smallest key. A target after the last key returns found false.
+// A page read or validation failure returns an error and clears the current position.
+func (cursor *Cursor) Seek(target []byte) (bool, error) {
+	cursor.entries.valid = false
+	root, err := cursor.reader.ReadNode(cursor.rootID)
+	if err != nil {
+		return false, err
+	}
+	leaf, path, err := findLeaf(cursor.reader, root, target, cursor.path[:0])
+	cursor.path = path
+	if err != nil {
+		return false, err
+	}
+	cursor.setLeaf(leaf)
+
+	// search returns the first index whose key is not less than target.
+	// Seek accepts an equal key and the next greater key, so it does not use the exact-match result.
+	index, _, err := leaf.search(target)
+	if err != nil {
+		return false, err
+	}
+	if index == cursor.leafCount {
+		// target sorts after this leaf. The next leaf contains the next greater key.
+		return cursor.moveLeaf(false)
+	}
+	return cursor.position(index)
+}
+
+// SeekForward reuses the current leaf when target lies within its key range.
+// Other targets use Seek, including targets that move backward. Results follow Seek's rules.
+func (cursor *Cursor) SeekForward(target []byte) (bool, error) {
+	if cursor.entries.valid {
+		first, err := cursor.leaf.Entry(0)
+		if err != nil {
+			cursor.entries.valid = false
+			return false, err
+		}
+		last, err := cursor.leaf.Entry(cursor.leaf.EntryCount() - 1)
+		if err != nil {
+			cursor.entries.valid = false
+			return false, err
+		}
+		if bytes.Compare(target, first.key) >= 0 && bytes.Compare(target, last.key) <= 0 {
+			index, _, err := cursor.leaf.search(target)
+			if err != nil {
+				cursor.entries.valid = false
+				return false, err
+			}
+			return cursor.position(index)
+		}
+	}
+	return cursor.Seek(target)
+}
+
+// Next moves to the next key using the saved branch path at leaf boundaries.
+// It returns found false when unpositioned or exhausted, or an error if a page cannot be read or validated.
+func (cursor *Cursor) Next() (found bool, err error) {
+	if cursor.entries.valid {
+		found, err = cursor.position(cursor.entries.index + 1)
+	}
+	return
+}
+
+// Prev moves to the previous key using the saved branch path at leaf boundaries.
+// It returns found false when unpositioned or exhausted, or an error if a page cannot be read or validated.
+func (cursor *Cursor) Prev() (found bool, err error) {
+	if cursor.entries.valid {
+		found, err = cursor.position(cursor.entries.index - 1)
+	}
+	return
+}
+
+// setLeaf makes leaf the current leaf.
+// The cursor has no current entry until position selects one.
+func (cursor *Cursor) setLeaf(leaf Node) {
+	cursor.leaf, cursor.leafCount = leaf, leaf.EntryCount()
+	// Clear the old bounds so that position does not compare entries from two different leaves.
+	cursor.entries = nodeEntries{}
+}
+
+// position selects the entry at index in the current leaf.
+// An index before or after the leaf moves to the adjacent leaf in that direction.
+// A validation failure clears the current position.
+func (cursor *Cursor) position(index int) (bool, error) {
+	if index < 0 || index >= cursor.leafCount {
+		return cursor.moveLeaf(index < 0)
+	}
+	if err := cursor.entries.position(cursor.leaf, index); err != nil {
+		cursor.entries.valid = false
+		return false, err
+	}
+	return true, nil
+}
+
+// readChild reads the child at index in the branch view.
+func (cursor *Cursor) readChild(view Node, index int) (Node, error) {
+	id, err := view.Child(index)
+	if err != nil {
+		return Node{}, err
+	}
+	return cursor.reader.ReadNode(id)
+}
+
+// descend follows the first child of each branch down to a leaf, or the last child when reverse is true.
+// It appends each branch choice to the path and then selects the first or last entry of the leaf.
+// It returns found false for an empty leaf, so that the caller can move to the adjacent leaf.
+func (cursor *Cursor) descend(view Node, reverse bool) (bool, error) {
+	for !view.IsLeaf() {
+		index := 0
+		if reverse {
+			// A branch with n separator keys has n+1 children, so child n is the last child.
+			index = view.EntryCount()
+		}
+		cursor.path = append(cursor.path, treePathStep{parent: view, childIndex: index})
+		var err error
+		view, err = cursor.readChild(view, index)
+		if err != nil {
+			return false, err
+		}
+	}
+	cursor.setLeaf(view)
+	if cursor.leafCount == 0 {
+		return false, nil
+	}
+	index := 0
+	if reverse {
+		index = cursor.leafCount - 1
+	}
+	return cursor.position(index)
+}
+
+// moveLeaf moves to the first entry of the next leaf, or to the last entry of the previous leaf when reverse is true.
+// It walks the saved path from the current leaf toward the root.
+// The first branch that has a child in that direction holds the nearest subtree with the adjacent key.
+// It returns found false and clears the current position when no such subtree exists.
+func (cursor *Cursor) moveLeaf(reverse bool) (bool, error) {
+	cursor.entries.valid = false
+	for len(cursor.path) > 0 {
+		last := len(cursor.path) - 1
+		frame := &cursor.path[last]
+		next := frame.childIndex + 1
+		if reverse {
+			next = frame.childIndex - 1
+		}
+		if next < 0 || next > frame.parent.EntryCount() {
+			// This branch has no child in that direction. Continue with its parent.
+			cursor.path = cursor.path[:last]
+			continue
+		}
+		frame.childIndex = next
+		view, err := cursor.readChild(frame.parent, next)
+		if err != nil {
+			return false, err
+		}
+		found, err := cursor.descend(view, reverse)
+		if err != nil || found {
+			return found, err
+		}
+		// The selected subtree ends in an empty leaf. An empty leaf does not mark the end of the tree.
+	}
+	return false, nil
+}
+
+// Entry returns the current flags, key, and value, or zero and nil slices when unpositioned.
+// The bytes borrow reader's storage and remain valid while that storage stays unchanged.
+func (cursor *Cursor) Entry() (flags uint32, key, value []byte) {
+	if !cursor.entries.valid {
+		return 0, nil, nil
+	}
+	entry := cursor.leaf.entryAtPosition(cursor.entries)
+	return entry.flags, entry.key, entry.value
 }
 
 // Find searches for an exact key without changing the cursor's iteration position.
@@ -72,310 +240,5 @@ func (cursor *Cursor) Find(key []byte, includeKey bool) (Entry, bool, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, err
 	}
-	entry, found, child, err := LookupDecodedNode(cursor.root, key)
-	if err != nil || child == 0 {
-		return entry, found, err
-	}
-	return FindEntry(cursor.tree.store, child, key, includeKey)
-}
-
-// FindEntry searches for an exact key without allocating cursor iteration state.
-// Entry bytes borrow the reader; includeKey permits omitting the matched key.
-// The caller must validate key.
-func FindEntry(reader NodeReader, id page.ID, key []byte, includeKey bool) (entry Entry, found bool, err error) {
-	for {
-		entry, found, id, err = reader.LookupPage(id, key, includeKey)
-		if id == 0 {
-			return
-		}
-	}
-}
-
-// First moves to the entry with the smallest key.
-// It replaces any earlier cursor position.
-// First returns a nil entry and false when the tree is empty.
-// It returns a store error if it cannot read a child node.
-func (cursor *Cursor) First() (*Entry, bool, error) {
-	// A search from the root makes every branch choice from the old position invalid.
-	cursor.path = cursor.path[:0]
-
-	// The smallest key is in the leaf reached through the first child of each branch.
-	leaf, err := cursor.descendFirst(cursor.root)
-	if err != nil {
-		return nil, false, err
-	}
-
-	// Skip empty leaves before selecting the smallest entry.
-	if leaf.EntryCount() == 0 {
-		return cursor.moveToNextLeaf()
-	}
-	return cursor.position(leaf, 0)
-}
-
-// Last moves to the entry with the largest key.
-// It replaces any earlier cursor position.
-// Last returns a nil entry and false when the tree is empty.
-// It returns a store error if it cannot read a child node.
-func (cursor *Cursor) Last() (*Entry, bool, error) {
-	// A search from the root makes every branch choice from the old position invalid.
-	cursor.path = cursor.path[:0]
-
-	// The largest key is in the leaf reached through the last child of each branch.
-	leaf, err := cursor.descendLast(cursor.root)
-	if err != nil {
-		return nil, false, err
-	}
-
-	// Skip empty leaves before selecting the largest entry.
-	if leaf.EntryCount() == 0 {
-		return cursor.moveToPreviousLeaf()
-	}
-	return cursor.position(leaf, len(leaf.entries)-1)
-}
-
-// Seek moves to the first entry whose key is equal to or greater than target.
-// It replaces any earlier cursor position.
-// A nil or empty target moves to the smallest key.
-// Seek returns a nil entry and false when target sorts after every key.
-// It returns a store error if it cannot read a child node.
-func (cursor *Cursor) Seek(target []byte) (*Entry, bool, error) {
-	// Seek starts at the root, so no branch choice from the old position can remain.
-	cursor.path = cursor.path[:0]
-	node := cursor.root
-
-	// Follow the separator keys until node is the only leaf that can contain target.
-	for !node.IsLeaf() {
-		childIndex, err := node.FindChildIndex(target)
-		if err != nil {
-			return nil, false, err
-		}
-
-		// Save this branch choice before the descent. A later boundary move uses it to find an adjacent subtree.
-		cursor.path = append(cursor.path, cursorFrame{node: node, childIndex: childIndex})
-		node, err = cursor.readChild(node, childIndex)
-		if err != nil {
-			return nil, false, err
-		}
-	}
-
-	// Leaf entries are sorted. findKeyIndex returns the first index whose key is not less than target.
-	// An exact-match result is not needed because Seek accepts both an equal key and the next greater key.
-	entryIndex, _, err := node.findKeyIndex(target)
-	if err != nil {
-		return nil, false, err
-	}
-	if entryIndex < len(node.entries) {
-		return cursor.position(node, entryIndex)
-	}
-
-	// target sorts after this leaf. Use the saved path to find the first entry in the next leaf.
-	cursor.leaf = nil
-	return cursor.moveToNextLeaf()
-}
-
-// SeekForward searches like Seek and reuses the current leaf when target is inside it.
-// Ordered batch reads benefit from this check; ordinary Seek keeps its root-search path.
-// Targets outside the current leaf use Seek, including targets that move backward.
-func (cursor *Cursor) SeekForward(target []byte) (*Entry, bool, error) {
-	if leaf := cursor.leaf; leaf != nil && leaf.EntryCount() != 0 &&
-		bytes.Compare(target, leaf.entries[0].key) >= 0 && bytes.Compare(target, leaf.entries[len(leaf.entries)-1].key) <= 0 {
-		index, _, err := leaf.findKeyIndex(target)
-		if err != nil {
-			cursor.leaf = nil
-			return nil, false, err
-		}
-		return cursor.position(leaf, index)
-	}
-	entry, found, err := cursor.Seek(target)
-	if err != nil {
-		cursor.leaf = nil
-	}
-	return entry, found, err
-}
-
-// Next moves to the next entry in key order.
-// It returns a nil entry and false when the cursor has no current entry or is at the end of the tree.
-// It returns a store error if it must change leaves and cannot read a child node.
-func (cursor *Cursor) Next() (*Entry, bool, error) {
-	// A new cursor and an exhausted cursor have no entry from which to move.
-	if cursor.leaf == nil {
-		return nil, false, nil
-	}
-
-	// When the leaf has another entry, only the entry index must change.
-	nextIndex := cursor.entryIndex + 1
-	if nextIndex < len(cursor.leaf.entries) {
-		cursor.entryIndex = nextIndex
-		return &cursor.leaf.entries[nextIndex], true, nil
-	}
-
-	// The leaf has no later entry. The saved branch path identifies the next leaf.
-	return cursor.moveToNextLeaf()
-}
-
-// Prev moves to the previous entry in key order.
-// It returns a nil entry and false when the cursor has no current entry or is at the start of the tree.
-// It returns a store error if it must change leaves and cannot read a child node.
-func (cursor *Cursor) Prev() (*Entry, bool, error) {
-	// A new cursor and an exhausted cursor have no entry from which to move.
-	if cursor.leaf == nil {
-		return nil, false, nil
-	}
-
-	// When the leaf has an earlier entry, only the entry index must change.
-	if cursor.entryIndex > 0 {
-		cursor.entryIndex--
-		return &cursor.leaf.entries[cursor.entryIndex], true, nil
-	}
-
-	// The leaf has no earlier entry. The saved branch path identifies the previous leaf.
-	return cursor.moveToPreviousLeaf()
-}
-
-// position selects entryIndex in leaf as the current cursor entry.
-// It returns a nil entry and clears the current position when entryIndex is outside the leaf.
-// This boundary rule handles an empty tree for First and Last.
-func (cursor *Cursor) position(leaf *Node, entryIndex int) (*Entry, bool, error) {
-	if entryIndex < 0 || entryIndex >= len(leaf.entries) {
-		// A nil leaf is the single marker for a cursor that has no current entry.
-		cursor.leaf = nil
-		return nil, false, nil
-	}
-
-	// Publish the leaf and index only after the bounds check makes both values safe for current to use.
-	cursor.leaf = leaf
-	cursor.entryIndex = entryIndex
-	return &leaf.entries[entryIndex], true, nil
-}
-
-// readChild returns the child selected by childIndex in parent.
-// It reads through the tree store so the cursor sees the node version for the current operation.
-// It returns [ErrKeyNotFound] when the selected page ID has no node.
-// The caller must pass a branch node and a valid child index.
-func (cursor *Cursor) readChild(parent *Node, childIndex int) (*Node, error) {
-	// A branch stores page IDs instead of direct child pointers. Resolve the selected page through the store.
-	child, err := cursor.tree.store.ReadNode(parent.Children[childIndex])
-	if err != nil {
-		return nil, err
-	}
-	if child == nil {
-		// A branch that points to no node is an invalid tree, not the normal absence of a user key.
-		return nil, ErrKeyNotFound
-	}
-	return child, nil
-}
-
-// descendFirst follows the first child of each branch until it reaches a leaf.
-// It appends each branch choice to the existing cursor path.
-// This lets First build a path from the root and lets a boundary move extend a retained path.
-func (cursor *Cursor) descendFirst(node *Node) (*Node, error) {
-	for !node.IsLeaf() {
-		// Child zero contains the smallest keys below this branch.
-		// Save the choice before reading the child so the complete path reaches the returned leaf.
-		cursor.path = append(cursor.path, cursorFrame{node: node, childIndex: 0})
-		var err error
-		node, err = cursor.readChild(node, 0)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return node, nil
-}
-
-// descendLast follows the last child of each branch until it reaches a leaf.
-// It appends each branch choice to the existing cursor path.
-// This lets Last build a path from the root and lets a boundary move extend a retained path.
-func (cursor *Cursor) descendLast(node *Node) (*Node, error) {
-	for !node.IsLeaf() {
-		// The final child contains the largest keys below this branch.
-		childIndex := len(node.Children) - 1
-		// Save the choice before reading the child so the complete path reaches the returned leaf.
-		cursor.path = append(cursor.path, cursorFrame{node: node, childIndex: childIndex})
-		var err error
-		node, err = cursor.readChild(node, childIndex)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return node, nil
-}
-
-// moveToNextLeaf moves to the first entry in the next leaf.
-// It searches the saved path from the current leaf toward the root.
-// The first branch with a later child is the nearest subtree that can contain a greater key.
-// It returns a nil entry and clears the current position when no later subtree exists.
-func (cursor *Cursor) moveToNextLeaf() (*Entry, bool, error) {
-	// Start with the parent nearest the leaf. It is the first place where a later subtree can exist.
-	for len(cursor.path) > 0 {
-		index := len(cursor.path) - 1
-		frame := &cursor.path[index]
-		if frame.childIndex+1 >= len(frame.node.Children) {
-			// This branch has no later child. Continue with its parent.
-			cursor.path = cursor.path[:index]
-			continue
-		}
-
-		// Select the next child at this branch. Every deeper frame still describes the old subtree and must be removed.
-		frame.childIndex++
-		cursor.path = cursor.path[:index+1]
-		node, err := cursor.readChild(frame.node, frame.childIndex)
-		if err != nil {
-			return nil, false, err
-		}
-
-		// The first leaf below the selected subtree contains its smallest key. That key is the next key in the tree.
-		leaf, err := cursor.descendFirst(node)
-		if err != nil {
-			return nil, false, err
-		}
-		// An empty leaf does not mark the end of the tree.
-		if leaf.EntryCount() == 0 {
-			continue
-		}
-		return cursor.position(leaf, 0)
-	}
-
-	// Every saved branch selected its final child, so the cursor was at the largest key in the tree.
-	cursor.leaf = nil
-	return nil, false, nil
-}
-
-// moveToPreviousLeaf moves to the last entry in the previous leaf.
-// It searches the saved path from the current leaf toward the root.
-// The first branch with an earlier child is the nearest subtree that can contain a smaller key.
-// It returns a nil entry and clears the current position when no earlier subtree exists.
-func (cursor *Cursor) moveToPreviousLeaf() (*Entry, bool, error) {
-	// Start with the parent nearest the leaf. It is the first place where an earlier subtree can exist.
-	for len(cursor.path) > 0 {
-		index := len(cursor.path) - 1
-		frame := &cursor.path[index]
-		if frame.childIndex == 0 {
-			// This branch has no earlier child. Continue with its parent.
-			cursor.path = cursor.path[:index]
-			continue
-		}
-
-		// Select the previous child at this branch. Every deeper frame still describes the old subtree and must be removed.
-		frame.childIndex--
-		cursor.path = cursor.path[:index+1]
-		node, err := cursor.readChild(frame.node, frame.childIndex)
-		if err != nil {
-			return nil, false, err
-		}
-
-		// The last leaf below the selected subtree contains its largest key. That key is the previous key in the tree.
-		leaf, err := cursor.descendLast(node)
-		if err != nil {
-			return nil, false, err
-		}
-		// An empty leaf does not mark the end of the tree.
-		if leaf.EntryCount() == 0 {
-			continue
-		}
-		return cursor.position(leaf, leaf.EntryCount()-1)
-	}
-
-	// Every saved branch selected its first child, so the cursor was at the smallest key in the tree.
-	cursor.leaf = nil
-	return nil, false, nil
+	return FindEntry(cursor.reader, cursor.rootID, key, includeKey)
 }

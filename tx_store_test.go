@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/page"
 	"os"
 	"path/filepath"
 	"testing"
@@ -171,6 +173,190 @@ func TestLargeLeafDeleteWALFailure(t *testing.T) {
 			}
 			if err := db.validatePageOwnership(); err != nil {
 				t.Fatal(err)
+			}
+		})
+	}
+}
+
+// testBucketRoot materializes a root only when a test inspects its decoded shape.
+// decodedNode returns the transaction's private node, or a decoded copy of the committed node that owns its bytes.
+// Tests use it to inspect node fields that [btree.Node] does not expose.
+func (store *txTreeStore) decodedNode(id page.ID) (*btree.MutableNode, error) {
+	if node := store.privateNode(id); node != nil {
+		return node, nil
+	}
+	view, err := store.ReadNode(id)
+	if err != nil {
+		return nil, err
+	}
+	node, err := view.Clone(store.PageSize())
+	if err != nil {
+		return nil, err
+	}
+	node.OwnImageBytes()
+	return node, nil
+}
+
+func testBucketRoot(t *testing.T, bucket *Bucket) *btree.MutableNode {
+	t.Helper()
+	node, err := bucket.tx.store.decodedNode(bucket.rootPageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.OwnImageBytes()
+	return node
+}
+
+func testNode(t *testing.T, store *txTreeStore, id page.ID) *btree.MutableNode {
+	t.Helper()
+	node, err := store.decodedNode(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return node
+}
+func testLoadRoot(t *testing.T, bucket *Bucket) error {
+	_, err := bucket.tx.store.ReadNode(bucket.rootPageID)
+	return err
+}
+func testEditNode(t *testing.T, store *txTreeStore, node *btree.MutableNode) *btree.MutableNode {
+	t.Helper()
+	if store.privateNode(node.PageID()) == nil {
+		if store.baseDirty == nil {
+			store.baseDirty = make(map[page.ID]dirtyNode)
+		}
+		store.baseDirty[node.PageID()] = dirtyNode{original: node, final: node}
+	}
+	private, err := store.EditNode(node.PageID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return private
+}
+func testParent(t *testing.T, tx *Tx, id page.ID) *btree.MutableNode {
+	t.Helper()
+	parent, ok := tx.tree.Parent(id)
+	if !ok || parent == 0 {
+		return nil
+	}
+	return testNode(t, &tx.store, parent)
+}
+
+func testDeleteEntries(t *testing.T, store *txTreeStore, node *btree.MutableNode, first int, rest []int) *btree.MutableNode {
+	t.Helper()
+	private := testEditNode(t, store, node)
+	private.DeleteLeafEntries(first, rest)
+	return private
+}
+
+func TestWriteTransactionReadsDoNotDecodeNodes(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "read-only-nodes.db")
+	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, testBucketName)
+	entries := make([]KeyValue, 512)
+	for index := range entries {
+		entries[index] = KeyValue{Key: fmt.Appendf(nil, "key-%04d", index), Value: bytes.Repeat([]byte("v"), 128)}
+	}
+	if err := db.PutBatch(testBucketName, entries); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = Open(path, 0600, &Options{Synchronous: SyncNone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	clear(db.writeNodes)
+	db.writeNodeSlots = nil
+	db.nextWriteNodeSlot = 0
+	if err := db.Update(func(tx *Tx) error {
+		bucket, err := tx.Bucket(testBucketName)
+		if err != nil {
+			return err
+		}
+		for _, index := range []int{0, 127, 511} {
+			value, err := bucket.Get(entries[index].Key)
+			if err != nil || !bytes.Equal(value, entries[index].Value) {
+				return fmt.Errorf("Get %d: %v", index, err)
+			}
+		}
+		if _, err := bucket.GetBatch([][]byte{entries[511].Key, entries[0].Key, entries[127].Key}); err != nil {
+			return err
+		}
+		cursor, err := bucket.Cursor()
+		if err != nil {
+			return err
+		}
+		if _, _, err := cursor.Last(); err != nil {
+			return err
+		}
+		count := 0
+		if err := bucket.ScanRange(nil, nil, func([]byte, []byte) error { count++; return nil }); err != nil {
+			return err
+		}
+		if count != len(entries) {
+			return fmt.Errorf("scan visited %d entries", count)
+		}
+		stats, err := bucket.Stats()
+		if err != nil || stats.KeyN != len(entries) {
+			return fmt.Errorf("statistics: %+v, %v", stats, err)
+		}
+		if len(tx.store.dirty) != 0 || len(db.writeNodes) != 0 {
+			return errors.New("read populated private nodes or the decode cache")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReadNodeAndCheckNodeIgnoreDecodedMainFileCache(t *testing.T) {
+	for _, checksums := range []bool{false, true} {
+		t.Run(fmt.Sprint(checksums), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "cache.db")
+			db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			var id page.ID
+			if err := db.View(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				id = bucket.rootPageID
+				if _, err := tx.store.EditNode(id); !errors.Is(err, ErrTxNotWritable) {
+					return fmt.Errorf("read-only EditNode: %v", err)
+				}
+				return nil
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if cached := db.writeNodes[id]; cached == nil || cached.node == nil {
+				t.Fatal("fixture has no decoded cache entry")
+			}
+			// Damage the actual stored type while leaving the cached decoded node intact.
+			if _, err := db.file.WriteAt([]byte{99, 0}, int64(id)*db.meta.PageSize()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.storage.nodeReader().ReadNode(id); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("ReadNode hid corrupt storage: %v", err)
+			}
+			if _, err := db.checkNode(id); !errors.Is(err, ErrInvalid) {
+				t.Fatalf("CheckNode hid corrupt storage: %v", err)
 			}
 		})
 	}

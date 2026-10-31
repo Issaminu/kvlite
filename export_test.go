@@ -36,7 +36,7 @@ func BlackoutCheckpoint(db *DB) error {
 func BlackoutCheckPages(db *DB) error {
 	db.operationMu.Lock()
 	defer db.operationMu.Unlock()
-	return db.validatePageOwnershipWith(db.blackoutReadNode)
+	return db.validatePageOwnershipWith(db.committedNode)
 }
 
 // BlackoutBucketNames returns the names of the top-level buckets in key order.
@@ -49,7 +49,7 @@ func BlackoutBucketNames(db *DB) ([]string, error) {
 	for len(pending) > 0 {
 		pageID := pending[len(pending)-1]
 		pending = pending[:len(pending)-1]
-		node, err := db.blackoutReadNode(pageID)
+		node, err := db.committedNode(pageID)
 		if err != nil {
 			return nil, err
 		}
@@ -65,19 +65,19 @@ func BlackoutBucketNames(db *DB) ([]string, error) {
 	return names, nil
 }
 
-// blackoutReadNode reads a tree page like readNode, but without the node cache.
-func (db *DB) blackoutReadNode(pageID page.ID) (*btree.Node, error) {
-	if db.memoryNodes != nil {
-		return db.readNode(pageID)
-	}
-	if record, ok := db.wal.Lookup(pageID); ok {
-		return db.wal.CommittedPageToNode(&record)
-	}
-	data, err := db.readMainNodePage(pageID)
+// committedNode returns a checked decoded copy of a committed node. The copy owns its bytes.
+// It does not use the decoded cache. Tests and Blackout use it to inspect stored nodes.
+func (db *DB) committedNode(pageID page.ID) (*btree.MutableNode, error) {
+	node, err := db.checkNode(pageID)
 	if err != nil {
 		return nil, err
 	}
-	return btree.DecodeNode(slices.Clone(data), pageID, db.meta.PageSize(), db.readMainNodePage, db.meta.DataPageChecksums())
+	decoded, err := node.Clone(db.meta.PageSize())
+	if err != nil {
+		return nil, err
+	}
+	decoded.OwnImageBytes()
+	return decoded, nil
 }
 
 // BlackoutCheckpointCount returns the number of checkpoints that db completed.

@@ -8,17 +8,19 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-func NewRootNode(pgid page.ID, leftNode, rightNode *Node, separator []byte) *Node {
-	return &Node{
+// NewRootNode creates a branch above leftNode and rightNode, copying separator.
+// The child IDs identify node heads; separator is the lower bound of the right child.
+func NewRootNode(pgid page.ID, leftNode, rightNode page.ID, separator []byte) *MutableNode {
+	return &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, pgid),
 		entries:  []Entry{{key: slices.Clone(separator)}},
-		Children: []page.ID{leftNode.PageID(), rightNode.PageID()},
+		Children: []page.ID{leftNode, rightNode},
 	}
 }
 
 // Find the correct child node for this key.
 // It only returns the correct child for this node, if you actually want to reach the leaf node that has the key, then this function should be called in a loop.
-func (n *Node) FindChildIndex(key []byte) (int, error) {
+func (n *MutableNode) FindChildIndex(key []byte) (int, error) {
 	if n.IsLeaf() {
 		return -1, ErrNotBranchNode
 	}
@@ -28,28 +30,28 @@ func (n *Node) FindChildIndex(key []byte) (int, error) {
 	return index, nil
 }
 
-func (n *Node) setSeparator(index int, key []byte) {
+func (n *MutableNode) setSeparator(index int, key []byte) {
 	n.encodedSize = 0
 	n.entries[index].key = slices.Clone(key)
 	n.header.Checksum = 0
 }
 
 // InsertSplitChild inserts separator and rightNode immediately after the existing child at leftIndex.
-// parent must be a branch node, leftIndex must identify an existing child, and separator must remain read-only after the call.
-func (parent *Node) InsertSplitChild(leftIndex int, rightNode *Node, separator []byte) {
+// parent must be a branch node, and leftIndex must identify an existing child. It copies separator.
+func (parent *MutableNode) InsertSplitChild(leftIndex int, rightNode page.ID, separator []byte) {
 	parent.encodedSize = 0
 	parent.entries = append(parent.entries, Entry{})
 	copy(parent.entries[leftIndex+1:], parent.entries[leftIndex:])
-	parent.entries[leftIndex] = Entry{key: separator}
+	parent.entries[leftIndex] = Entry{key: slices.Clone(separator)}
 
 	parent.Children = append(parent.Children, 0)
 	copy(parent.Children[leftIndex+2:], parent.Children[leftIndex+1:])
-	parent.Children[leftIndex+1] = rightNode.PageID()
+	parent.Children[leftIndex+1] = rightNode
 	parent.header.Checksum = 0
 }
 
 // findSeparatorIndex returns the index of the first separator that is not smaller than key, and whether that separator equals key.
-func (n *Node) findSeparatorIndex(key []byte) (int, bool, error) {
+func (n *MutableNode) findSeparatorIndex(key []byte) (int, bool, error) {
 	if n.IsLeaf() {
 		return 0, false, ErrNotBranchNode
 	}
@@ -62,7 +64,7 @@ func (n *Node) findSeparatorIndex(key []byte) (int, bool, error) {
 // InsertOrReplaceSeparator makes child the child on the right side of the separator key.
 // If n has no separator equal to key, it inserts key and child at their sorted positions.
 // WAL recovery uses it to replay an entry patch. It copies key.
-func (n *Node) InsertOrReplaceSeparator(key []byte, child page.ID) error {
+func (n *MutableNode) InsertOrReplaceSeparator(key []byte, child page.ID) error {
 	index, found, err := n.findSeparatorIndex(key)
 	if err != nil {
 		return err
@@ -81,7 +83,7 @@ func (n *Node) InsertOrReplaceSeparator(key []byte, child page.ID) error {
 // DeleteSeparator removes the separator key and the child on its right side.
 // It returns [ErrKeyNotFound] when n has no separator equal to key.
 // WAL recovery uses it to replay an entry patch.
-func (n *Node) DeleteSeparator(key []byte) error {
+func (n *MutableNode) DeleteSeparator(key []byte) error {
 	index, found, err := n.findSeparatorIndex(key)
 	if err != nil {
 		return err
@@ -132,7 +134,7 @@ func chooseBranchRedistribution(entries []Entry, pageSize, minimumSize int64) in
 }
 
 // redistributeBranches changes the entry lists and the parent separator if both pages fit.
-func redistributeBranches(parent *Node, separatorIndex int, left, right *Node, pageSize, minimumSize int64) bool {
+func redistributeBranches(parent *MutableNode, separatorIndex int, left, right *MutableNode, pageSize, minimumSize int64) bool {
 	// Branch entries route searches to child pages. Put the old parent
 	// key between these two groups before we select a new key for it.
 	entries := make([]Entry, 0, len(left.entries)+len(right.entries)+1)
@@ -159,7 +161,7 @@ func redistributeBranches(parent *Node, separatorIndex int, left, right *Node, p
 }
 
 // splitBranch removes the promoted separator and moves its right children together.
-func (n *Node) splitBranch(right *Node, index int) {
+func (n *MutableNode) splitBranch(right *MutableNode, index int) {
 	n.encodedSize, right.encodedSize = 0, 0
 	right.entries = slices.Clone(n.entries[index+1:])
 	n.entries = n.entries[:index]
@@ -168,7 +170,7 @@ func (n *Node) splitBranch(right *Node, index int) {
 }
 
 // visitBranchReferences visits each child page of a decoded branch.
-func visitBranchReferences(node *Node, visit func(page.ID) error) error {
+func visitBranchReferences(node *MutableNode, visit func(page.ID) error) error {
 	for _, child := range node.Children {
 		if err := visit(child); err != nil {
 			return err

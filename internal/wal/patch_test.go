@@ -86,7 +86,7 @@ func TestApplyBytePatch_RejectsBaseLargerThanPage(t *testing.T) {
 
 // leafFromState builds one sorted leaf from a key-to-value state.
 // A value of nine bytes that starts with 'B' becomes a nested bucket entry with the other eight bytes as its root ID.
-func leafFromState(t *testing.T, id page.ID, state map[string]string) *btree.Node {
+func leafFromState(t *testing.T, id page.ID, state map[string]string) *btree.MutableNode {
 	t.Helper()
 	node := btree.NewLeafNode(id)
 	for key, value := range state {
@@ -103,13 +103,13 @@ func leafFromState(t *testing.T, id page.ID, state map[string]string) *btree.Nod
 }
 
 // branchFromState builds one branch with first child 100 and one right child for each separator key.
-func branchFromState(id page.ID, state map[string]page.ID) *btree.Node {
+func branchFromState(id page.ID, state map[string]page.ID) *btree.MutableNode {
 	keys := make([]string, 0, len(state))
 	for key := range state {
 		keys = append(keys, key)
 	}
 	slices.Sort(keys)
-	node := btree.NewRootNode(id, btree.NewLeafNode(100), btree.NewLeafNode(state[keys[0]]), []byte(keys[0]))
+	node := btree.NewRootNode(id, btree.NewLeafNode(100).PageID(), btree.NewLeafNode(state[keys[0]]).PageID(), []byte(keys[0]))
 	for _, key := range keys[1:] {
 		if err := node.InsertOrReplaceSeparator([]byte(key), state[key]); err != nil {
 			panic(err)
@@ -118,7 +118,7 @@ func branchFromState(id page.ID, state map[string]page.ID) *btree.Node {
 	return node
 }
 
-func mustEntryPatch(t *testing.T, base, target *btree.Node) []byte {
+func mustEntryPatch(t *testing.T, base, target *btree.MutableNode) []byte {
 	t.Helper()
 	patch, smaller := appendEntryPatch(nil, base, target, 1<<30)
 	if !smaller {
@@ -128,7 +128,7 @@ func mustEntryPatch(t *testing.T, base, target *btree.Node) []byte {
 }
 
 // replayEntryPatches applies every patch, in order, to a decoded copy of start and returns the compact result.
-func replayEntryPatches(t *testing.T, start *btree.Node, patches [][]byte) []byte {
+func replayEntryPatches(t *testing.T, start *btree.MutableNode, patches [][]byte) []byte {
 	t.Helper()
 	node, err := btree.DecodeWALNode(btree.EncodeWALNode(start), start.PageID(), 1<<20, nil)
 	if err != nil {
@@ -183,8 +183,8 @@ func TestEntryPatch_RandomChainsRebuildFinalNode(t *testing.T) {
 	for trial := range 200 {
 		leafState := map[string]string{}
 		branchState := map[string]page.ID{"k10": 10}
-		leaves := []*btree.Node{leafFromState(t, 2, leafState)}
-		branches := []*btree.Node{branchFromState(3, branchState)}
+		leaves := []*btree.MutableNode{leafFromState(t, 2, leafState)}
+		branches := []*btree.MutableNode{branchFromState(3, branchState)}
 		for range 12 {
 			for range 1 + rng.IntN(4) {
 				key := fmt.Sprintf("k%02d", rng.IntN(20))
@@ -207,7 +207,7 @@ func TestEntryPatch_RandomChainsRebuildFinalNode(t *testing.T) {
 			leaves = append(leaves, leafFromState(t, 2, leafState))
 			branches = append(branches, branchFromState(3, branchState))
 		}
-		for _, states := range [][]*btree.Node{leaves, branches} {
+		for _, states := range [][]*btree.MutableNode{leaves, branches} {
 			patches := make([][]byte, 0, len(states)-1)
 			for index := 1; index < len(states); index++ {
 				patches = append(patches, mustEntryPatch(t, states[index-1], states[index]))
@@ -224,7 +224,7 @@ func TestApplyEntryPatch_RejectsInvalidOperations(t *testing.T) {
 	branch := branchFromState(3, map[string]page.ID{"m": 10})
 	var metaChild [page.IDSize]byte
 	for name, test := range map[string]struct {
-		node  *btree.Node
+		node  *btree.MutableNode
 		patch []byte
 	}{
 		"unknown operation": {leaf, []byte{9, 1, 0, 'a'}},
@@ -440,7 +440,7 @@ func TestAppendChangedBytePatchRanges_MatchesByteScan(t *testing.T) {
 // Most of its time is the merge over the entries that did not change.
 func BenchmarkAppendEntryPatch(b *testing.B) {
 	key := func(index int) []byte { return fmt.Appendf(nil, "key-%011d", index) }
-	run := func(b *testing.B, base, target *btree.Node) {
+	run := func(b *testing.B, base, target *btree.MutableNode) {
 		patch := make([]byte, 0, 4096)
 		b.ReportAllocs()
 		for b.Loop() {
@@ -451,7 +451,7 @@ func BenchmarkAppendEntryPatch(b *testing.B) {
 		}
 	}
 	b.Run("branch/separators=150", func(b *testing.B) {
-		base := btree.NewRootNode(2, btree.NewLeafNode(100), btree.NewLeafNode(1000), key(0))
+		base := btree.NewRootNode(2, btree.NewLeafNode(100).PageID(), btree.NewLeafNode(1000).PageID(), key(0))
 		for index := 1; index < 150; index++ {
 			if err := base.InsertOrReplaceSeparator(key(index*2), page.ID(1000+index)); err != nil {
 				b.Fatal(err)

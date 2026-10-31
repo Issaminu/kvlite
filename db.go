@@ -71,19 +71,6 @@ func (db *DB) endOperation() {
 	db.activeOperations.Done()
 }
 
-// writeFailure returns the WAL or main-file error that stopped this handle, or nil.
-// After that failure, data operations must stop because the saved state is unknown.
-// The caller must hold operationMu.
-func (db *DB) writeFailure() error {
-	if db.mainWriteFailure != nil {
-		return db.mainWriteFailure
-	}
-	if db.wal == nil {
-		return nil
-	}
-	return db.wal.AppendFailure()
-}
-
 // Open opens the database at path. It returns [ErrPathRequired] for an empty path. It selects the valid metadata copy with the highest generation. It also recovers committed write-ahead log data before it returns. If options is nil, Open uses KVLite's fixed defaults.
 //
 // A writable Open creates the database when it does not exist. The new file uses mode subject to the process umask, and a new write-ahead log uses the resulting database permissions.
@@ -255,7 +242,8 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 			return db.failOpen(err)
 		}
 	}
-	if err := db.loadRootNode(); err != nil {
+	// Check the complete catalog root, so a damaged root fails Open and not a later transaction.
+	if _, err := db.checkNode(db.meta.Root()); err != nil {
 		return db.failOpen(err)
 	}
 	if err := db.mapMainFile(); err != nil {
@@ -287,9 +275,9 @@ func open(path string, mode os.FileMode, options *Options, fsys fileio.FS) (*DB,
 // Otherwise it writes the main file directly and can leave partial data after a crash.
 func (db *DB) initializeNewDatabase() error {
 	allocation := newAllocationBitmap(db.meta.PageSize())
-	db.rootNode = btree.NewLeafNode(db.meta.Root())
+	root := btree.NewLeafNode(db.meta.Root())
 	db.meta.RefreshChecksum()
-	nodes := []wal.NodeRecord{{Final: db.rootNode}}
+	nodes := []wal.NodeRecord{{Final: root}}
 	pages := make([]wal.AllocationRecord, len(allocation.segments))
 	for i := range allocation.segments {
 		pages[i] = wal.AllocationRecord{PageID: allocation.segmentPageID(i), Payload: allocation.encodeSegment(i)}
@@ -314,21 +302,6 @@ func (db *DB) initializeNewDatabase() error {
 	if err := db.wal.Checkpoint(db.file, size, db.meta.DataPageChecksums()); err != nil {
 		return fmt.Errorf("checkpoint new database: %w", err)
 	}
-	return nil
-}
-
-func (db *DB) loadRootNode() error {
-	if db.rootNode != nil {
-		return nil
-	}
-	rootNode, err := db.readNode(db.meta.Root())
-	if err != nil {
-		return err
-	}
-	if rootNode == nil {
-		return fmt.Errorf("read root node: got nil: %w", page.ErrInvalid)
-	}
-	db.rootNode = rootNode
 	return nil
 }
 
@@ -424,7 +397,6 @@ func (db *DB) Close() error {
 func (db *DB) close() error {
 	if db.memoryNodes != nil {
 		db.memoryNodes = nil
-		db.rootNode = nil
 		db.meta = nil
 		db.allocation = nil
 		return nil
@@ -634,6 +606,11 @@ func (db *DB) replaceMappedBatch(bucketName []byte, entries []KeyValue) (bool, e
 			if !db.nodeIsMapped(data, id) {
 				return false, nil
 			}
+			// Check the whole span now.
+			// A bad checksum in a later leaf must stop the batch before it changes an earlier leaf.
+			if _, err := btree.ReadCheckedNodeSpan(data, checksums); err != nil {
+				return true, err
+			}
 			var current btree.Entry
 			_, found, child, err := btree.PrepareMappedPut(data, pageSize, entry.Key, len(entry.Value), &current)
 			if err != nil {
@@ -689,12 +666,6 @@ func (db *DB) mappedBucketRoot(bucketName []byte) (page.ID, error) {
 		return 0, nil
 	}
 	return decodeBucketRootPageID(entry)
-}
-
-// nodeIsMapped reports whether checked node bytes alias the main-file mapping.
-func (db *DB) nodeIsMapped(data []byte, id page.ID) bool {
-	offset := int64(id) * db.meta.PageSize()
-	return offset <= int64(len(db.mappedFile)) && int64(len(data)) <= int64(len(db.mappedFile))-offset && &data[0] == &db.mappedFile[offset]
 }
 
 // putMappedEntry changes one entry without changing parent separators or node spans.
@@ -868,71 +839,6 @@ func (db *DB) GetBatch(bucketName []byte, keys [][]byte) ([][]byte, error) {
 	return values, nil
 }
 
-// readMainBatch reads sorted request positions from the main-file tree without decoding leaf entry lists.
-// Each leaf checksum is checked once for its request group. Branch separators partition the requests before recursion.
-// The caller holds the operation lock and has excluded WAL overlays and private transaction changes.
-// Result bytes borrow the page; DB.GetBatch copies them before ending its View.
-func (db *DB) readMainBatch(id page.ID, keys [][]byte, order []int, values [][]byte) error {
-	data, err := db.readMainNodePage(id)
-	if err != nil {
-		return err
-	}
-	entry, found, child, err := btree.LookupCheckedNodeSpan(data, keys[order[0]], false, db.meta.DataPageChecksums())
-	if err != nil {
-		return err
-	}
-	// checking if this node is a leaf
-	if child == 0 {
-		if found {
-			values[order[0]], err = valueFromEntry(entry, true)
-			if err != nil {
-				return err
-			}
-		}
-		for position := 1; position < len(order); position++ {
-			index, previous := order[position], order[position-1]
-			if bytes.Equal(keys[index], keys[previous]) {
-				values[index] = values[previous]
-				continue
-			}
-			entry, found, _, err := btree.LookupCheckedNodeSpan(data, keys[index], false, false)
-			if err != nil {
-				return err
-			}
-			if found {
-				values[index], err = valueFromEntry(entry, true)
-				if err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}
-	branch, err := db.readOnlyNode(id)
-	if err != nil {
-		return err
-	}
-	for start := 0; start < len(order); {
-		index, err := branch.FindChildIndex(keys[order[start]])
-		if err != nil {
-			return err
-		}
-		end := len(order)
-		if index < branch.EntryCount() {
-			separator := branch.EntryAt(index).Key()
-			end = start + 1
-			for end < len(order) && bytes.Compare(keys[order[end]], separator) < 0 {
-				end++
-			}
-		}
-		if err := db.readMainBatch(branch.Children[index], keys, order[start:end], values); err != nil {
-			return err
-		}
-		start = end
-	}
-	return nil
-}
-
 // hasMeta reports whether the main file holds data.
 // A Stat error is not an empty file: Open would then write a new database over the old one.
 func (db *DB) hasMeta() (bool, error) {
@@ -941,299 +847,6 @@ func (db *DB) hasMeta() (bool, error) {
 		return false, err
 	}
 	return fi.Size() > 0, nil
-}
-
-// readMainPage returns one complete main-file page.
-// Mapped bytes stay valid while the caller holds the database operation lock.
-func (db *DB) readMainPage(pageID page.ID) ([]byte, error) {
-	pageSize := db.meta.PageSize()
-	if pageSize <= 0 || uint64(pageID) > uint64(math.MaxInt64)/uint64(pageSize) {
-		return nil, fmt.Errorf("read page %d offset: %w", pageID, page.ErrInvalid)
-	}
-	offset := int64(pageID) * pageSize
-	mappedSize := int64(len(db.mappedFile))
-	if offset <= mappedSize && pageSize <= mappedSize-offset {
-		start := int(offset)
-		end := start + int(pageSize)
-		return db.mappedFile[start:end:end], nil
-	}
-
-	data := make([]byte, int(pageSize))
-	n, err := db.file.ReadAt(data, offset)
-	if err != nil {
-		if errors.Is(err, io.EOF) && n > 0 {
-			return nil, io.ErrUnexpectedEOF
-		}
-		return nil, err
-	}
-	if n != len(data) {
-		return nil, io.ErrUnexpectedEOF
-	}
-	return data, nil
-}
-
-// readMainNodePage returns the complete consecutive span of one node.
-// Mapped spans borrow the main-file mapping. A large unmapped node needs a head read, then one full-span read.
-func (db *DB) readMainNodePage(pageID page.ID) ([]byte, error) {
-	data, err := db.readMainPage(pageID)
-	if err != nil {
-		return nil, err
-	}
-	count, err := btree.NodeSpan(data, pageID, db.meta.PageSize())
-	if err != nil {
-		return nil, fmt.Errorf("read node %d: %w", pageID, err)
-	}
-	if pageID > db.meta.LastPage() || uint64(count) > uint64(db.meta.LastPage())+1-uint64(pageID) {
-		return nil, ErrInvalid
-	}
-	if !db.allocation.ownsNodeSpan(pageID, count) {
-		return nil, fmt.Errorf("node %d has free or reserved storage: %w", pageID, ErrInvalid)
-	}
-	if count > 1 {
-		size := int64(count) * db.meta.PageSize()
-		offset := int64(pageID) * db.meta.PageSize()
-		if offset <= int64(len(db.mappedFile)) && size <= int64(len(db.mappedFile))-offset {
-			data = db.mappedFile[offset : offset+size : offset+size]
-		} else {
-			data = make([]byte, int(size))
-			n, e := db.file.ReadAt(data, offset)
-			if e != nil {
-				if errors.Is(e, io.EOF) && n > 0 {
-					return nil, io.ErrUnexpectedEOF
-				}
-				return nil, e
-			}
-			if n != len(data) {
-				return nil, io.ErrUnexpectedEOF
-			}
-			// Check the returned header too. This read can return different bytes from the head read.
-			actualCount, err := btree.NodeSpan(data, pageID, db.meta.PageSize())
-			if err != nil {
-				return nil, fmt.Errorf("read node %d: %w", pageID, err)
-			}
-			if actualCount != count {
-				return nil, fmt.Errorf("node %d span changed during read: %w", pageID, ErrInvalid)
-			}
-		}
-	}
-	if err := btree.CheckNodeChecksumMode(data, db.meta.DataPageChecksums()); err != nil {
-		return nil, fmt.Errorf("read data node %d: %w", pageID, err)
-	}
-	return data, nil
-}
-
-// readNode returns one committed node. A file database gives the WAL image priority over the main-file image.
-func (db *DB) readNode(pgid page.ID) (*btree.Node, error) {
-	if db.memoryNodes != nil {
-		node, ok := db.memoryNodes[pgid]
-		if !ok {
-			return nil, fmt.Errorf("read memory page %d: %w", pgid, page.ErrInvalid)
-		}
-		return node, nil
-	}
-	// A committed WAL image overrides the main-file image until checkpoint cleanup clears the overlay.
-	record, ok := db.wal.Lookup(pgid)
-	if ok {
-		// An encoded record, such as the first page of a continued node, needs a full decode.
-		// Each successful commit caches its final nodes, and a failed commit changes neither the WAL nor the cache.
-		// So a cached node for this page is the committed version that the WAL record holds.
-		if record.Node == nil {
-			if node, ok := db.cachedWriteNode(pgid); ok {
-				return node, nil
-			}
-		}
-		node, err := db.wal.CommittedPageToNode(&record)
-		if err != nil {
-			return nil, err
-		}
-		db.cacheWriteNode(node)
-		return node, nil
-	}
-	if node, ok := db.cachedWriteNode(pgid); ok {
-		return node, nil
-	}
-
-	data, err := db.readMainNodePage(pgid)
-	if err != nil {
-		return nil, err
-	}
-	node, err := btree.DecodeNode(slices.Clone(data), pgid, db.meta.PageSize(), db.readMainNodePage, db.meta.DataPageChecksums())
-	if err != nil {
-		return nil, err
-	}
-	db.cacheWriteNode(node)
-	return node, nil
-}
-
-// readOnlyNode reads a committed node and keeps decoded main-file nodes in the shared cache.
-// The caller must hold the database operation read lock or write lock.
-func (db *DB) readOnlyNode(pageID page.ID) (*btree.Node, error) {
-	if db.memoryNodes != nil {
-		return db.readNode(pageID)
-	}
-	if record, ok := db.wal.Lookup(pageID); ok {
-		return db.wal.CommittedPageToNode(&record)
-	}
-	db.writeNodesMu.RLock()
-	if entry, ok := db.writeNodes[pageID]; ok && entry.node != nil {
-		node := entry.node
-		// Mark the hit so eviction skips this node once. A load first keeps hits from writing a shared cache line again and again.
-		if !entry.referenced.Load() {
-			entry.referenced.Store(true)
-		}
-		db.writeNodesMu.RUnlock()
-		return node, nil
-	}
-	db.writeNodesMu.RUnlock()
-
-	// Decode without the cache lock, so concurrent misses do not wait for each other.
-	// Mapped pages stay unchanged while the caller holds the operation lock.
-	// Two readers can decode the same page. The first insert wins, and the other copy is dropped.
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
-		return nil, err
-	}
-	node, err := btree.DecodeNode(slices.Clone(data), pageID, db.meta.PageSize(), db.readMainNodePage, db.meta.DataPageChecksums())
-	if err != nil {
-		return nil, err
-	}
-	db.writeNodesMu.Lock()
-	defer db.writeNodesMu.Unlock()
-	if cached, ok := db.cachedWriteNode(pageID); ok {
-		return cached, nil
-	}
-	db.cacheWriteNode(node)
-	return node, nil
-}
-
-// visitCommittedNodeReferences checks one node and visits its child and storage pages.
-// It does not make a private node copy or copy large values.
-func (db *DB) visitCommittedNodeReferences(pageID page.ID, visit, visitContinuation func(page.ID) error) error {
-	if db.memoryNodes != nil {
-		node, err := db.readNode(pageID)
-		if err != nil {
-			return err
-		}
-		return btree.VisitNodeReferences(node, visit, visitContinuation)
-	}
-	if record, ok := db.wal.Lookup(pageID); ok {
-		return db.wal.VisitCommittedPageReferences(&record, visit, visitContinuation)
-	}
-	if node, ok := db.cachedWriteNode(pageID); ok {
-		return btree.VisitNodeReferences(node, visit, visitContinuation)
-	}
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
-		return err
-	}
-	return btree.VisitMappedNodeReferences(data, pageID, db.meta.PageSize(), db.readMainNodePage, visit, visitContinuation, db.meta.DataPageChecksums())
-}
-
-// cachedWriteNode returns an immutable committed node. It marks the node as recently used so eviction skips it once.
-// The caller must hold the database operation write lock, or its read lock with writeNodesMu locked for writing. Open can call this before other goroutines can use the handle.
-func (db *DB) cachedWriteNode(pageID page.ID) (*btree.Node, bool) {
-	entry, ok := db.writeNodes[pageID]
-	if !ok || entry.node == nil {
-		return nil, false
-	}
-	entry.referenced.Store(true)
-	return entry.node, true
-}
-
-// invalidateWriteNode discards the decoded image and keeps its existing clock slot.
-// The caller must hold the database operation write lock.
-func (db *DB) invalidateWriteNode(id page.ID) {
-	if cached := db.writeNodes[id]; cached != nil {
-		cached.node = nil
-		cached.referenced.Store(false)
-	}
-}
-
-// cacheWriteNode keeps an immutable committed node for later write transactions. It keeps at most [maxCachedWriteNodePages] nodes.
-// The caller must hold the database operation write lock, or its read lock with writeNodesMu locked for writing. Open can call this before other goroutines can use the handle.
-func (db *DB) cacheWriteNode(node *btree.Node) {
-	pageID := node.PageID()
-	if entry, ok := db.writeNodes[pageID]; ok {
-		entry.node = node
-		entry.referenced.Store(true)
-		return
-	}
-
-	if len(db.writeNodeSlots) < maxCachedWriteNodePages {
-		db.writeNodeSlots = append(db.writeNodeSlots, pageID)
-	} else {
-		// Give recently used nodes one more pass. Remove the first node that no read used after the last pass.
-		for {
-			victimPageID := db.writeNodeSlots[db.nextWriteNodeSlot]
-			victim := db.writeNodes[victimPageID]
-			if !victim.referenced.Load() {
-				delete(db.writeNodes, victimPageID)
-				db.writeNodeSlots[db.nextWriteNodeSlot] = pageID
-				db.nextWriteNodeSlot = (db.nextWriteNodeSlot + 1) % maxCachedWriteNodePages
-				break
-			}
-			victim.referenced.Store(false)
-			db.nextWriteNodeSlot = (db.nextWriteNodeSlot + 1) % maxCachedWriteNodePages
-		}
-	}
-	entry := &writeNodeCacheEntry{node: node}
-	entry.referenced.Store(true)
-	db.writeNodes[pageID] = entry
-}
-
-// committedNodeReader adapts DB's committed lookups to [btree.NodeReader].
-// db must be non-nil. The caller holds operationMu for reading or writing while using the reader.
-type committedNodeReader struct {
-	db *DB
-}
-
-func (reader committedNodeReader) LookupPage(id page.ID, key []byte, includeKey bool) (entry btree.Entry, found bool, child page.ID, err error) {
-	entry, found, child, err = reader.db.lookupCommittedPage(id, key, includeKey)
-	return
-}
-
-// lookupCommittedPage searches one committed page.
-// In a file database, a WAL page has priority over the main-file page with the same ID.
-// includeKey controls whether an encoded lookup returns the matched key.
-func (db *DB) lookupCommittedPage(pageID page.ID, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
-	if db.memoryNodes != nil {
-		node, err := db.readNode(pageID)
-		if err != nil {
-			return btree.Entry{}, false, 0, err
-		}
-		return btree.LookupDecodedNode(node, key)
-	}
-	if record, ok := db.wal.Lookup(pageID); ok {
-		return db.wal.LookupCommittedPage(&record, key, includeKey)
-	}
-	if db.meta.DataPageChecksums() {
-		return db.lookupCheckedMainPage(pageID, key, includeKey)
-	}
-	// readMainNodePage checks the complete span before the lookup reads its body.
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
-		return btree.Entry{}, false, 0, err
-	}
-	return btree.LookupCheckedNodeSpan(data, key, includeKey, false)
-}
-
-// lookupCheckedMainPage searches one main-file page in a file with data-page checksums.
-// A separate function keeps the mode check and its error formatting out of lookupCommittedPage, which runs for each page of a point read.
-func (db *DB) lookupCheckedMainPage(pageID page.ID, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
-	data, err := db.readMainNodePage(pageID)
-	if err != nil {
-		return btree.Entry{}, false, 0, err
-	}
-	return btree.LookupCheckedNodeSpan(data, key, includeKey, true)
-}
-
-// findCommittedEntry searches one committed tree for Get.
-// It omits encoded keys because Get needs only the value and flags.
-// Decoded and ordinary mapped values borrow database storage.
-// Continued encoded leaf values own their bytes.
-func (db *DB) findCommittedEntry(id page.ID, key []byte) (btree.Entry, bool, error) {
-	reader := committedNodeReader{db: db}
-	return btree.FindEntry(reader, id, key, false)
 }
 
 // errMetaRead marks a failed read of a metadata page.
@@ -1366,37 +979,11 @@ func (db *DB) readValidMainMeta() (selected *page.Meta, walPageSize int64, err e
 // It runs without caller callbacks. A WAL commit copies values that it retains.
 // A direct commit keeps borrowed values out of the shared cache.
 func (tx *Tx) putManaged(bucketName, key, value []byte) error {
-	db := tx.db
-	borrowValue := db.memoryNodes == nil && int64(len(value)) > tx.meta.PageSize()
-	if borrowValue && len(bucketName) != 0 && len(key) != 0 && len(key) <= MaxKeySize && len(value) <= MaxValueSize {
-		catalogEntry, found, err := tx.tree.FindEntryRef(tx.rootNode, bucketName, true)
-		if err != nil {
-			return err
-		}
-		if !found {
-			return ErrBucketNotFound
-		}
-		rootID, err := decodeBucketRootPageID(catalogEntry)
-		if err != nil {
-			return err
-		}
-		replaced, err := tx.store.ReplaceLeafEntry(rootID, btree.NewEntryBorrowingValue(key, value), tx.tree.SkipIdenticalPuts)
-		if err != nil {
-			return err
-		}
-		if replaced {
-			tx.borrowedValue = true
-			if node := tx.store.nodes[rootID].node; node != nil {
-				tx.cacheBucket(&Bucket{tx: tx, name: catalogEntry.Key(), rootNode: node})
-			}
-			return nil
-		}
-	}
 	bucket, err := tx.Bucket(bucketName)
 	if err != nil {
 		return err
 	}
-	if borrowValue {
+	if tx.db.memoryNodes == nil && int64(len(value)) > tx.meta.PageSize() {
 		tx.borrowedValue = true
 		return bucket.putBucketEntry(btree.NewEntryBorrowingValue(key, value))
 	}

@@ -13,7 +13,6 @@ import (
 type Tx struct {
 	db              *DB
 	meta            *page.Meta
-	rootNode        *btree.Node
 	store           txTreeStore
 	tree            btree.Tree
 	allocation      *allocationChanges
@@ -30,32 +29,44 @@ type Tx struct {
 // newTx borrows committed state for a read transaction and creates private mutable state for a write transaction.
 func newTx(db *DB, readOnly bool) *Tx {
 	if !readOnly {
-		return newWriteTx(db, db.meta, db.rootNode, nil, nil)
+		return newWriteTx(db, writeBatchState{meta: db.meta})
 	}
 
-	tx := &Tx{db: db, meta: db.meta, rootNode: db.rootNode, readOnly: true}
+	tx := &Tx{db: db, meta: db.meta, readOnly: true}
 	tx.store = txTreeStore{
-		tx: tx,
+		tx:        tx,
+		committed: db.storage.nodeReader(),
 	}
 	tx.tree = *btree.NewTree(&tx.store)
 	return tx
 }
 
 // newWriteTx starts one private write transaction from the committed state or earlier callbacks in the same write batch.
-func newWriteTx(db *DB, baseMeta *page.Meta, baseRoot *btree.Node, baseDirty map[page.ID]dirtyNode, baseAllocation *allocationChanges) *Tx {
-	tx := &Tx{db: db, meta: baseMeta, rootNode: baseRoot, allocation: baseAllocation}
-	tx.store = txTreeStore{
-		tx:        tx,
-		baseDirty: baseDirty,
-		nodes:     make(map[page.ID]txNode),
-		dirty:     make(map[page.ID]dirtyNode),
-	}
-	tx.tree = *btree.NewTree(&tx.store)
+func newWriteTx(db *DB, state writeBatchState) *Tx {
+	tx := &Tx{db: db, meta: state.meta, allocation: state.allocation}
+	tx.store = txTreeStore{tx: tx, committed: db.storage.nodeReader(), baseDirty: state.dirty, dirty: make(map[page.ID]dirtyNode)}
+	tx.tree = state.tree.Fork(&tx.store)
 	tx.tree.SkipIdenticalPuts = db.memoryNodes != nil || (db.options != nil && db.options.Synchronous != SyncFull)
-
-	// B+tree writes clone this read-only root before they change it.
-	tx.store.nodes[baseRoot.PageID()] = txNode{node: baseRoot}
 	return tx
+}
+
+// newCommitTx returns the transaction that commits the combined state of a write batch.
+// The state's changes become this transaction's own changes.
+func newCommitTx(db *DB, state writeBatchState) *Tx {
+	tx := &Tx{db: db, meta: state.meta, allocation: state.allocation, allocationOwned: state.allocation != nil, metaDirty: state.metaDirty}
+	tx.store = txTreeStore{tx: tx, committed: db.storage.nodeReader(), dirty: state.dirty}
+	tx.tree = state.tree.Fork(&tx.store)
+	return tx
+}
+
+// nodeReader returns the reader for this transaction's view of the tree.
+// A read-only transaction has no private changes, so it reads committed storage directly.
+// Its operation lock keeps that storage unchanged, and traversal does not check empty private maps at every node.
+func (tx *Tx) nodeReader() btree.NodeReader {
+	if tx.readOnly {
+		return tx.store.committed
+	}
+	return &tx.store
 }
 
 // Update runs fn in one read-write transaction. The callback can read and write buckets. A read in fn can see a write made earlier in the same fn.
@@ -130,8 +141,8 @@ func (tx *Tx) commit() (bool, error) {
 	if err := tx.prepareCommit(); err != nil {
 		return false, err
 	}
-	if tx.borrowedValue && tx.rootNode.HasBorrowedValues() {
-		return false, page.ErrInvalid
+	for _, change := range tx.store.dirty {
+		change.final.OwnImageBytes()
 	}
 	needsCheckpoint := false
 	var nodes []wal.NodeRecord
@@ -142,31 +153,24 @@ func (tx *Tx) commit() (bool, error) {
 			tx.allocation.forEachRetired(func(id page.ID) { delete(db.memoryNodes, id) })
 		}
 	} else {
-		var retired map[page.ID]struct{}
-		if tx.allocationOwned && !db.options.DisableWAL {
-			retired = tx.allocation.walRetiredPages()
-		}
 		var encodedMeta []byte
 		nodes, encodedMeta = makeWALCommitData(tx.store.dirty, tx.meta, tx.metaDirty)
+		var allocation *allocationChanges
 		var allocationPages []wal.AllocationRecord
 		if tx.allocationOwned {
+			allocation = tx.allocation
 			allocationPages = tx.allocation.pageRecords()
 		}
 		if len(nodes) == 0 && len(allocationPages) == 0 && len(encodedMeta) == 0 {
 			return false, nil
 		}
 		var err error
-		if db.options.DisableWAL {
-			err = db.writeDirectPages(tx.meta, nodes, allocationPages, encodedMeta, tx.meta.DataPageChecksums())
-		} else {
-			needsCheckpoint, err = db.wal.Commit(nodes, allocationPages, encodedMeta, retired)
-		}
+		needsCheckpoint, err = db.persist(tx.meta, nodes, allocationPages, encodedMeta, allocation)
 		if err != nil {
 			return false, err
 		}
 	}
 	db.meta = tx.meta
-	db.rootNode = tx.rootNode
 	if tx.allocationOwned {
 		db.allocation = tx.allocation.publish()
 		db.stats.PagesReused += tx.allocation.pagesReused
@@ -280,13 +284,12 @@ func (tx *Tx) writableError() error {
 // putCatalogEntry writes entry to the transaction's top-level tree and records
 // a replacement catalog root in the transaction metadata.
 func (tx *Tx) putCatalogEntry(entry btree.Entry) error {
-	newRoot, err := tx.tree.PutEntry(tx.rootNode, entry)
+	newRoot, err := tx.tree.PutEntry(tx.meta.Root(), entry)
 	if err != nil {
 		return err
 	}
-	tx.rootNode = newRoot
-	if newRoot.PageID() != tx.meta.Root() {
-		tx.writableMeta().SetRoot(newRoot.PageID())
+	if newRoot != tx.meta.Root() {
+		tx.writableMeta().SetRoot(newRoot)
 		tx.metaDirty = true
 	}
 	return nil

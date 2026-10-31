@@ -19,7 +19,7 @@ import (
 // node_codec.go contains the node header, checksums, and the rules that leaves and branches share. Large nodes use one consecutive span.
 const leafEntryDescriptorSize = 4 * encodedUint32Size
 
-func leafPayloadSize(node *Node) int {
+func leafPayloadSize(node *MutableNode) int {
 	size := 0
 	for _, entry := range node.entries {
 		size += leafEntryDescriptorSize + len(entry.key) + len(entry.value)
@@ -27,7 +27,7 @@ func leafPayloadSize(node *Node) int {
 	return size
 }
 
-func leafBodyOffset(node *Node) int {
+func leafBodyOffset(node *MutableNode) int {
 	return NodeHeaderSize + len(node.entries)*leafEntryDescriptorSize
 }
 
@@ -41,7 +41,7 @@ func putLeafDescriptor(descriptor []byte, entry *Entry, offset int) {
 
 // putLeafBody writes the descriptors, keys, and values of one logical leaf.
 // image has the compact size of the node and starts with its header.
-func putLeafBody(image []byte, node *Node) {
+func putLeafBody(image []byte, node *MutableNode) {
 	offset := leafBodyOffset(node)
 	for index := range node.entries {
 		entry := &node.entries[index]
@@ -87,7 +87,7 @@ func leafDataStart(imageSize uint64, count uint32) (uint64, error) {
 // decodeLeafBody decodes every entry of one contiguous leaf image.
 // The entry keys and values borrow image. h becomes the node header.
 // exact requires the last entry to end at the end of image.
-func decodeLeafBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
+func decodeLeafBody(image []byte, h NodeHeader, exact bool) (*MutableNode, error) {
 	dataStart, err := leafDataStart(uint64(len(image)), h.EntryCount)
 	if err != nil {
 		return nil, err
@@ -113,10 +113,10 @@ func decodeLeafBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
 	if exact && next != imageSize {
 		return nil, errBodySize
 	}
-	return &Node{header: h, entries: entries}, nil
+	return &MutableNode{header: h, entries: entries}, nil
 }
 
-// checkLeafBody checks every entry of one contiguous leaf image in the same way as decodeLeafBody, without a Node.
+// checkLeafBody checks every entry of one contiguous leaf image in the same way as decodeLeafBody, without a MutableNode.
 // visit receives the root page ID of each nested bucket. visit can be nil.
 func checkLeafBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) error) error {
 	dataStart, err := leafDataStart(uint64(len(image)), h.EntryCount)
@@ -329,102 +329,6 @@ func VisitCheckedLeafReverse(data []byte, visit func(uint32, []byte, []byte) err
 		return err
 	}
 	return visitLeafReverse(image, visit)
-}
-
-// ReplaceMappedLeaf prepares a replacement for a one-entry, multi-page leaf.
-// It validates the old image without decoding or copying its value.
-// The returned node owns the new key and value and retains the old allocation
-// count until commit preparation. It does not change data.
-// With skipIdentical, an unchanged entry returns nil, true, nil.
-func ReplaceMappedLeaf(data []byte, id page.ID, pageSize int64, checksums bool, entry Entry, skipIdentical bool) (*Node, bool, error) {
-	image, err := singleLargeLeafImage(data, id, pageSize, checksums)
-	if err != nil || image == nil {
-		return nil, false, err
-	}
-	flags, start, keyEnd, end := leafSpan(image, 0)
-	if !bytes.Equal(image[start:keyEnd], entry.key) {
-		return nil, false, nil
-	}
-	if flags&BucketLeafFlag != entry.flags&BucketLeafFlag {
-		return nil, false, ErrIncompatibleValue
-	}
-	if skipIdentical && flags == entry.flags && bytes.Equal(image[keyEnd:end], entry.value) {
-		return nil, true, nil
-	}
-	node := NewLeafNode(id)
-	if err := node.InsertEntry(entry); err != nil {
-		return nil, false, err
-	}
-	node.SetStoragePageCount((len(image) + int(pageSize) - 1) / int(pageSize))
-	return node, true, nil
-}
-
-// DeleteMappedLeaf prepares an empty private replacement for a multi-page leaf containing only key.
-// It validates the old image without copying or retaining its bytes.
-// The empty node keeps the old allocation count until repair or commit releases the pages.
-// Nil selects the ordinary deletion path.
-func DeleteMappedLeaf(data []byte, id page.ID, pageSize int64, checksums bool, key []byte) (*Node, error) {
-	image, err := singleLargeLeafImage(data, id, pageSize, checksums)
-	if err != nil || image == nil {
-		return nil, err
-	}
-	flags, start, keyEnd, _ := leafSpan(image, 0)
-	if flags != 0 || !bytes.Equal(image[start:keyEnd], key) {
-		return nil, nil
-	}
-	node := NewLeafNode(id)
-	node.SetStoragePageCount((len(image) + int(pageSize) - 1) / int(pageSize))
-	return node, nil
-}
-
-func singleLargeLeafImage(data []byte, id page.ID, pageSize int64, checksums bool) ([]byte, error) {
-	if len(data) < NodeHeaderSize || mappedNodeType(data) != NodeTypeLeaf || binary.LittleEndian.Uint32(data[10:14]) != 1 {
-		return nil, nil
-	}
-	if pageSize >= NodeHeaderSize && uint64(binary.LittleEndian.Uint32(data[18:22]))+NodeHeaderSize <= uint64(pageSize) {
-		return nil, nil
-	}
-	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
-	if err != nil {
-		return nil, err
-	}
-	if err := checkLeafBody(image, h, true, nil); err != nil {
-		return nil, err
-	}
-	return image, nil
-}
-
-// MappedLeafNeighbor checks whether a new key can use a separate leaf beside data.
-// A neighbor is adjacent in key order, not necessarily in the file.
-// data must hold a complete one-entry leaf with a multi-page plain value.
-// The old leaf stays unchanged. A left neighbor needs an owned copy of the old
-// key as its separator. A right neighbor uses its own new key instead.
-func MappedLeafNeighbor(data []byte, id page.ID, pageSize int64, checksums bool, key []byte) (separator []byte, before, eligible bool, err error) {
-	if err := validateLookupKey(key); err != nil {
-		return nil, false, false, err
-	}
-	if len(data) < NodeHeaderSize || mappedNodeType(data) != NodeTypeLeaf || binary.LittleEndian.Uint32(data[10:14]) != 1 {
-		return nil, false, false, nil
-	}
-	if pageSize >= NodeHeaderSize && uint64(binary.LittleEndian.Uint32(data[18:22]))+NodeHeaderSize <= uint64(pageSize) {
-		return nil, false, false, nil
-	}
-	image, h, err := nodeImage(data, id, pageSize, nil, false, checksums)
-	if err != nil {
-		return nil, false, false, err
-	}
-	if err := checkLeafBody(image, h, true, nil); err != nil {
-		return nil, false, false, err
-	}
-	flags, start, keyEnd, end := leafSpan(image, 0)
-	order := bytes.Compare(key, image[start:keyEnd])
-	if flags != 0 || end-keyEnd <= uint64(pageSize) || order == 0 {
-		return nil, false, false, nil
-	}
-	if order < 0 {
-		return bytes.Clone(image[start:keyEnd]), true, true, nil
-	}
-	return nil, false, true, nil
 }
 
 // PrepareMappedPut checks a mapped leaf and looks up key without changing bytes.

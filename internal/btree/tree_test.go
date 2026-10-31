@@ -15,42 +15,23 @@ import (
 type memoryTreeStore struct {
 	pageSize    int64
 	nextID      page.ID
-	nodes       map[page.ID]*Node
-	dirty       map[page.ID]*Node
+	nodes       map[page.ID]*MutableNode
+	dirty       map[page.ID]*MutableNode
 	freed       []page.ID
 	allocateErr error
+}
+
+func (store *memoryTreeStore) ReadNode(id page.ID) (Node, error) {
+	node := store.nodes[id]
+	if node == nil {
+		return Node{}, ErrKeyNotFound
+	}
+	return node.ReadOnly(), nil
 }
 
 func (store *memoryTreeStore) PageSize() int64 {
 	return store.pageSize
 }
-
-func (store *memoryTreeStore) LookupPage(pageID page.ID, key []byte, _ bool) (Entry, bool, page.ID, error) {
-	node := store.nodes[pageID]
-	if node == nil {
-		return Entry{}, false, 0, ErrKeyNotFound
-	}
-	return LookupNode(node, key)
-}
-
-func (store *memoryTreeStore) ReadNode(pageID page.ID) (*Node, error) {
-	return store.nodes[pageID], nil
-}
-
-// This store keeps decoded nodes, so puts use the ordinary tree path.
-func (*memoryTreeStore) ReplaceLeafEntry(page.ID, Entry, bool) (bool, error) {
-	return false, nil
-}
-
-func (*memoryTreeStore) DeleteLeafEntry(page.ID, []byte) (*Node, error) {
-	return nil, nil
-}
-
-func (*memoryTreeStore) InsertLeafNeighbor(page.ID, Entry) (*Node, []byte, bool, error) {
-	return nil, nil, false, nil
-}
-
-func (store *memoryTreeStore) SetParent(page.ID, *Node) {}
 
 func (store *memoryTreeStore) AllocatePage() (page.ID, error) {
 	if store.allocateErr != nil {
@@ -68,36 +49,20 @@ func (store *memoryTreeStore) FreePage(pageID page.ID) error {
 	return nil
 }
 
-func (store *memoryTreeStore) WritableNode(node *Node) *Node {
-	if dirty, ok := store.dirty[node.PageID()]; ok {
-		return dirty
+func (store *memoryTreeStore) StageNode(node *MutableNode) {
+	if store.nodes == nil {
+		store.nodes = make(map[page.ID]*MutableNode)
 	}
-	private := node.Clone()
-	store.StageNode(private)
-	return private
-}
-
-func (store *memoryTreeStore) DeleteLeafEntries(node *Node, firstIndex int, rest []int, minimumSize int64) *Node {
-	if dirty, ok := store.dirty[node.PageID()]; ok {
-		dirty.DeleteLeafEntries(firstIndex, rest)
-		return dirty
-	}
-	private := node.CloneWithoutLeafEntries(firstIndex, rest, minimumSize)
-	store.StageNode(private)
-	return private
-}
-
-func (store *memoryTreeStore) StageNode(node *Node) {
 	if store.dirty == nil {
-		store.dirty = make(map[page.ID]*Node)
+		store.dirty = make(map[page.ID]*MutableNode)
 	}
 	store.nodes[node.PageID()] = node
 	store.dirty[node.PageID()] = node
 }
 
 func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 128, nextID: 2, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 128, nextID: 2, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(1)
 	if err := root.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
@@ -113,8 +78,8 @@ func TestTreeFindEntryRef_ReturnsLeafValue(t *testing.T) {
 }
 
 func TestTreeAppendSplitKeepsCompletedLeavesFull(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	value := bytes.Repeat([]byte("v"), 8)
@@ -145,7 +110,7 @@ func TestTreeAppendSplitKeepsCompletedLeavesFull(t *testing.T) {
 }
 
 func TestTreeAppendSplitRequiresNewGlobalMaximum(t *testing.T) {
-	leaf := func(id page.ID, keys string) *Node {
+	leaf := func(id page.ID, keys string) *MutableNode {
 		node := NewLeafNode(id)
 		for _, key := range []byte(keys) {
 			if err := node.InsertEntry(NewEntry(0, []byte{key}, bytes.Repeat([]byte("v"), 8))); err != nil {
@@ -156,9 +121,9 @@ func TestTreeAppendSplitRequiresNewGlobalMaximum(t *testing.T) {
 	}
 	t.Run("local maximum", func(t *testing.T) {
 		left, right := leaf(2, "abcd"), leaf(3, "z")
-		root := NewRootNode(1, left, right, []byte("z"))
-		store := &memoryTreeStore{pageSize: 128, nextID: 4, nodes: map[page.ID]*Node{1: root, 2: left, 3: right}}
-		got, err := NewTree(store).PutEntry(root, NewEntry(0, []byte("e"), bytes.Repeat([]byte("v"), 8)))
+		root := NewRootNode(1, left.PageID(), right.PageID(), []byte("z"))
+		store := &memoryTreeStore{pageSize: 128, nextID: 4, nodes: map[page.ID]*MutableNode{1: root, 2: left, 3: right}}
+		got, err := newTestTree(store).PutEntry(root, NewEntry(0, []byte("e"), bytes.Repeat([]byte("v"), 8)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -170,8 +135,8 @@ func TestTreeAppendSplitRequiresNewGlobalMaximum(t *testing.T) {
 	t.Run("replacement", func(t *testing.T) {
 		root := leaf(2, "abcdefgh")
 		before := EncodeNode(root, testNodePageSize)
-		store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: map[page.ID]*Node{2: root}}
-		got, err := NewTree(store).PutEntry(root, NewEntry(0, []byte("h"), bytes.Repeat([]byte("r"), 48)))
+		store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: map[page.ID]*MutableNode{2: root}}
+		got, err := newTestTree(store).PutEntry(root, NewEntry(0, []byte("h"), bytes.Repeat([]byte("r"), 48)))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -187,8 +152,8 @@ func TestTreeAppendSplitRequiresNewGlobalMaximum(t *testing.T) {
 
 func TestTreePutEntryReturnsAllocationError(t *testing.T) {
 	allocationErr := errors.New("no page available")
-	store := &memoryTreeStore{pageSize: 64, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 64, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 
@@ -206,8 +171,8 @@ func TestTreePutEntryReturnsAllocationError(t *testing.T) {
 // remain valid without changing the tree's page-size policy.
 func TestTreePutEntry_AcceptsKeyBeyondOnePage(t *testing.T) {
 	const pageSize int64 = 128
-	store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	for i := 0; i < 12; i++ {
@@ -246,9 +211,9 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 	store := &memoryTreeStore{
 		pageSize: pageSize,
 		nextID:   firstNewID,
-		nodes:    make(map[page.ID]*Node),
+		nodes:    make(map[page.ID]*MutableNode),
 	}
-	tree := NewTree(store)
+	tree := newTestTree(store)
 	root := NewLeafNode(rootPageID)
 	store.StageNode(root)
 
@@ -288,9 +253,9 @@ func TestTreePutEntry_RootSplitReturnsNewRoot(t *testing.T) {
 	store := &memoryTreeStore{
 		pageSize: pageSize,
 		nextID:   2,
-		nodes:    make(map[page.ID]*Node),
+		nodes:    make(map[page.ID]*MutableNode),
 	}
-	tree := NewTree(store)
+	tree := newTestTree(store)
 	root := NewLeafNode(rootPageID)
 	store.StageNode(root)
 
@@ -337,7 +302,7 @@ func TestTreePutEntry_DoesNotChangeStoredInputNodes(t *testing.T) {
 	if err := right.InsertEntry(NewEntry(0, []byte("z"), []byte("right"))); err != nil {
 		t.Fatal(err)
 	}
-	root := &Node{
+	root := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 1),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{left.PageID(), right.PageID()},
@@ -345,9 +310,9 @@ func TestTreePutEntry_DoesNotChangeStoredInputNodes(t *testing.T) {
 	store := &memoryTreeStore{
 		pageSize: 128,
 		nextID:   4,
-		nodes:    map[page.ID]*Node{1: root, 2: left, 3: right},
+		nodes:    map[page.ID]*MutableNode{1: root, 2: left, 3: right},
 	}
-	tree := NewTree(store)
+	tree := newTestTree(store)
 	beforeRoot := EncodeNode(root, testNodePageSize)
 	beforeLeft := EncodeNode(left, testNodePageSize)
 
@@ -371,7 +336,7 @@ func TestTreePutEntry_ClonesOnlyChangedLeafWithoutSplit(t *testing.T) {
 	if err := right.InsertEntry(NewEntry(0, []byte("z"), []byte("right"))); err != nil {
 		t.Fatal(err)
 	}
-	root := &Node{
+	root := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 1),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{left.PageID(), right.PageID()},
@@ -379,10 +344,10 @@ func TestTreePutEntry_ClonesOnlyChangedLeafWithoutSplit(t *testing.T) {
 	store := &memoryTreeStore{
 		pageSize: 4096,
 		nextID:   4,
-		nodes:    map[page.ID]*Node{1: root, 2: left, 3: right},
-		dirty:    make(map[page.ID]*Node),
+		nodes:    map[page.ID]*MutableNode{1: root, 2: left, 3: right},
+		dirty:    make(map[page.ID]*MutableNode),
 	}
-	tree := NewTree(store)
+	tree := newTestTree(store)
 
 	if _, err := tree.PutEntry(root, NewEntry(0, []byte("a"), []byte("changed"))); err != nil {
 		t.Fatal(err)
@@ -404,22 +369,17 @@ type countingPutStore struct {
 	writes int
 }
 
-func (store *countingPutStore) WritableNode(node *Node) *Node {
-	store.writes++
-	return store.memoryTreeStore.WritableNode(node)
-}
-
 func TestTreePutIdenticalEntryKeepsNodesClean(t *testing.T) {
 	for _, size := range []int{0, 128, 65536} {
 		t.Run(fmt.Sprint(size), func(t *testing.T) {
-			store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+			store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*MutableNode)}}
 			node := NewLeafNode(2)
 			value := bytes.Repeat([]byte("v"), size)
 			if err := node.InsertEntry(NewEntry(0, []byte("key"), value)); err != nil {
 				t.Fatal(err)
 			}
 			store.nodes[node.PageID()] = node
-			tree := NewTree(store)
+			tree := newTestTree(store)
 			tree.SkipIdenticalPuts = true
 			replacement := bytes.Clone(value)
 			got, err := tree.PutEntry(node, NewEntry(0, []byte("key"), replacement))
@@ -440,13 +400,13 @@ func TestTreePutIdenticalEntryKeepsNodesClean(t *testing.T) {
 }
 
 func TestTreePutIdenticalPrivateEntrySkipsWrite(t *testing.T) {
-	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*MutableNode)}}
 	committed := NewLeafNode(2)
 	if err := committed.InsertEntry(NewEntry(0, []byte("key"), []byte("old"))); err != nil {
 		t.Fatal(err)
 	}
 	store.nodes[committed.PageID()] = committed
-	tree := NewTree(store)
+	tree := newTestTree(store)
 	tree.SkipIdenticalPuts = true
 	private, err := tree.PutEntry(committed, NewEntry(0, []byte("key"), []byte("new")))
 	if err != nil {
@@ -461,13 +421,13 @@ func TestTreePutIdenticalPrivateEntrySkipsWrite(t *testing.T) {
 }
 
 func TestTreePutIdenticalValueStillChangesFlags(t *testing.T) {
-	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*MutableNode)}}
 	node := NewLeafNode(2)
 	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
 	store.nodes[node.PageID()] = node
-	tree := NewTree(store)
+	tree := newTestTree(store)
 	tree.SkipIdenticalPuts = true
 	private, err := tree.PutEntry(node, NewEntry(2, []byte("key"), []byte("value")))
 	if err != nil {
@@ -485,13 +445,13 @@ func TestTreePutIdenticalValueStillChangesFlags(t *testing.T) {
 }
 
 func TestTreePutIdenticalEntryRewritesByDefault(t *testing.T) {
-	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node)}}
+	store := &countingPutStore{memoryTreeStore: &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*MutableNode)}}
 	node := NewLeafNode(2)
 	if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
 	store.nodes[node.PageID()] = node
-	tree := NewTree(store)
+	tree := newTestTree(store)
 	if _, err := tree.PutEntry(node, NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 		t.Fatal(err)
 	}
@@ -501,8 +461,8 @@ func TestTreePutIdenticalEntryRewritesByDefault(t *testing.T) {
 }
 
 func TestTreeDeleteEntryRemovesExistingKey(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	for _, key := range []string{"a", "b", "c"} {
@@ -523,8 +483,8 @@ func TestTreeDeleteEntryRemovesExistingKey(t *testing.T) {
 }
 
 func TestTreeDeleteEntryMissingKeyDoesNotChangeTree(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	store.dirty = nil
@@ -542,8 +502,8 @@ func TestTreeDeleteEntryMissingKeyDoesNotChangeTree(t *testing.T) {
 }
 
 func TestTreeDeleteEntryValidatesKeyAndRejectsBucket(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	if err := root.InsertEntry(NewEntry(BucketLeafFlag, []byte("nested"), page.EncodeID(9))); err != nil {
@@ -563,8 +523,8 @@ func TestTreeDeleteEntryValidatesKeyAndRejectsBucket(t *testing.T) {
 }
 
 func TestTreeDeleteBucketEntryRejectsPlainValue(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	if err := root.InsertEntry(NewEntry(0, []byte("plain"), []byte("value"))); err != nil {
@@ -586,8 +546,8 @@ func TestTreeDeleteBucketEntryRejectsPlainValue(t *testing.T) {
 }
 
 func TestTreeDeleteEntryDoesNotDirtyUnchangedParent(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 5, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 5, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	left := NewLeafNode(3)
 	right := NewLeafNode(4)
 	for _, key := range []string{"a", "b", "c", "d"} {
@@ -600,7 +560,7 @@ func TestTreeDeleteEntryDoesNotDirtyUnchangedParent(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	root := NewRootNode(2, left, right, []byte("m"))
+	root := NewRootNode(2, left.PageID(), right.PageID(), []byte("m"))
 	store.StageNode(root)
 	store.StageNode(left)
 	store.StageNode(right)
@@ -625,7 +585,7 @@ func TestTreeDeleteEntryDoesNotDirtyUnchangedParent(t *testing.T) {
 // Removing an empty first leaf forces repair of its under-full parent.
 // The merge must change a private parent, not its committed image.
 func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
-	leaf := func(pageID page.ID, keys ...string) *Node {
+	leaf := func(pageID page.ID, keys ...string) *MutableNode {
 		node := NewLeafNode(pageID)
 		for _, key := range keys {
 			if err := node.InsertEntry(NewEntry(0, []byte(key), bytes.Repeat([]byte("v"), 16))); err != nil {
@@ -634,8 +594,8 @@ func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 		}
 		return node
 	}
-	branch := func(pageID page.ID, separators []string, children ...page.ID) *Node {
-		node := &Node{header: newNodeHeader(NodeTypeBranch, pageID), Children: children}
+	branch := func(pageID page.ID, separators []string, children ...page.ID) *MutableNode {
+		node := &MutableNode{header: newNodeHeader(NodeTypeBranch, pageID), Children: children}
 		for _, separator := range separators {
 			node.entries = append(node.entries, Entry{key: []byte(separator)})
 		}
@@ -645,15 +605,15 @@ func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 
 	firstKeys = []string{"a"}
 
-	nodes := []*Node{
+	nodes := []*MutableNode{
 		leaf(10, firstKeys...), leaf(11, "e", "f", "g", "h"),
 		leaf(12, "i", "j", "k", "l"), leaf(13, "m", "n", "o", "p"), leaf(14, "q", "r", "s", "t"),
 		branch(4, []string{"e"}, 10, 11),
 		branch(5, []string{"m", "q"}, 12, 13, 14),
 		branch(2, []string{"i"}, 4, 5),
 	}
-	store := &memoryTreeStore{pageSize: 256, nextID: 20, nodes: make(map[page.ID]*Node)}
-	committed := make(map[*Node][]byte)
+	store := &memoryTreeStore{pageSize: 256, nextID: 20, nodes: make(map[page.ID]*MutableNode)}
+	committed := make(map[*MutableNode][]byte)
 	for _, node := range nodes {
 		store.nodes[node.PageID()] = node
 		committed[node] = EncodeNode(node, testNodePageSize)
@@ -663,7 +623,7 @@ func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 		t.Fatalf("test setup: parent uses %d bytes, want an under-full parent below %d bytes", size, store.pageSize/4)
 	}
 
-	root, found, err := NewTree(store).DeleteEntry(store.nodes[2], []byte("a"))
+	root, found, err := newTestTree(store).DeleteEntry(store.nodes[2], []byte("a"))
 	if err != nil || !found {
 		t.Fatalf("delete: found %t, error %v", found, err)
 	}
@@ -681,8 +641,8 @@ func TestTreeDeleteEntryDoesNotMergeCommittedParentInPlace(t *testing.T) {
 }
 
 func TestTreeDeleteEntryMergesAndCollapsesRoot(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 128, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 128, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 
@@ -714,9 +674,9 @@ func TestTreeDeleteEmptyLeafKeepsOtherLeavesClean(t *testing.T) {
 	for _, count := range []int{2, 3} {
 		for removed := range count {
 			t.Run(fmt.Sprintf("children=%d/remove=%d", count, removed), func(t *testing.T) {
-				store := &memoryTreeStore{pageSize: 128, nodes: make(map[page.ID]*Node)}
-				root := &Node{header: newNodeHeader(NodeTypeBranch, 2)}
-				leaves := make([]*Node, count)
+				store := &memoryTreeStore{pageSize: 128, nodes: make(map[page.ID]*MutableNode)}
+				root := &MutableNode{header: newNodeHeader(NodeTypeBranch, 2)}
+				leaves := make([]*MutableNode, count)
 				for i := range count {
 					leaf := NewLeafNode(page.ID(i + 3))
 					key := []byte{byte('a' + i)}
@@ -731,7 +691,7 @@ func TestTreeDeleteEmptyLeafKeepsOtherLeavesClean(t *testing.T) {
 					}
 				}
 				store.nodes[root.PageID()] = root
-				gotRoot, found, err := NewTree(store).DeleteEntry(root, []byte{byte('a' + removed)})
+				gotRoot, found, err := newTestTree(store).DeleteEntry(root, []byte{byte('a' + removed)})
 				if err != nil || !found {
 					t.Fatalf("delete: found=%t error=%v", found, err)
 				}
@@ -745,7 +705,7 @@ func TestTreeDeleteEmptyLeafKeepsOtherLeavesClean(t *testing.T) {
 					if _, dirty := store.dirty[leaf.PageID()]; dirty {
 						t.Fatalf("unchanged leaf %d is dirty", leaf.PageID())
 					}
-					entry, found, err := NewTree(store).FindEntryRef(gotRoot, []byte{byte('a' + i)}, true)
+					entry, found, err := newTestTree(store).FindEntryRef(gotRoot, []byte{byte('a' + i)}, true)
 					if err != nil || !found || !bytes.Equal(entry.Value(), leaf.entries[0].value) {
 						t.Fatalf("retained leaf %d: found=%t error=%v", leaf.PageID(), found, err)
 					}
@@ -757,9 +717,9 @@ func TestTreeDeleteEmptyLeafKeepsOtherLeavesClean(t *testing.T) {
 }
 
 func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 128, nodes: make(map[page.ID]*Node)}
-	branch := func(id page.ID, keys string, firstLeaf page.ID) *Node {
-		node := &Node{header: newNodeHeader(NodeTypeBranch, id)}
+	store := &memoryTreeStore{pageSize: 128, nodes: make(map[page.ID]*MutableNode)}
+	branch := func(id page.ID, keys string, firstLeaf page.ID) *MutableNode {
+		node := &MutableNode{header: newNodeHeader(NodeTypeBranch, id)}
 		for i := range len(keys) {
 			leaf := NewLeafNode(firstLeaf + page.ID(i))
 			if err := leaf.InsertEntry(NewEntry(0, []byte{keys[i]}, bytes.Repeat([]byte("v"), 65536))); err != nil {
@@ -776,13 +736,13 @@ func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
 	}
 	left := branch(3, "abc", 10)
 	right := branch(4, "mno", 20)
-	left = NewRootNode(5, left, branch(6, "ghi", 30), []byte("g"))
-	right = NewRootNode(7, right, branch(8, "stu", 40), []byte("s"))
+	left = NewRootNode(5, left.PageID(), branch(6, "ghi", 30).PageID(), []byte("g"))
+	right = NewRootNode(7, right.PageID(), branch(8, "stu", 40).PageID(), []byte("s"))
 	store.nodes[left.PageID()] = left
 	store.nodes[right.PageID()] = right
-	root := NewRootNode(2, left, right, []byte("m"))
+	root := NewRootNode(2, left.PageID(), right.PageID(), []byte("m"))
 	store.nodes[root.PageID()] = root
-	gotRoot, found, err := NewTree(store).DeleteEntry(root, []byte("m"))
+	gotRoot, found, err := newTestTree(store).DeleteEntry(root, []byte("m"))
 	if err != nil || !found {
 		t.Fatalf("delete: found=%t error=%v", found, err)
 	}
@@ -811,8 +771,8 @@ func TestTreeDeleteEmptyFirstLeafUpdatesAncestor(t *testing.T) {
 }
 
 func TestTreeDeleteEntryRandomOrderKeepsExactSeparators(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 192, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 192, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 
@@ -859,7 +819,7 @@ func TestDeleteRepairDoesNotMergePastPageSize(t *testing.T) {
 	if err := right.InsertEntry(NewEntry(0, []byte("z"), []byte("r"))); err != nil {
 		t.Fatal(err)
 	}
-	parent := NewRootNode(2, left, right, []byte("z"))
+	parent := NewRootNode(2, left.PageID(), right.PageID(), []byte("z"))
 
 	if got := mergedChildrenSize(parent, 0, left, right); got <= pageSize {
 		t.Fatalf("merged size: got %d, want more than %d", got, pageSize)
@@ -884,7 +844,7 @@ func TestDeleteRepairRedistributesByEncodedBytes(t *testing.T) {
 	if err := right.InsertEntry(NewEntry(0, []byte("z"), bytes.Repeat([]byte("r"), 25))); err != nil {
 		t.Fatal(err)
 	}
-	parent := NewRootNode(2, left, right, []byte("z"))
+	parent := NewRootNode(2, left.PageID(), right.PageID(), []byte("z"))
 
 	if !redistributeChildren(parent, 0, left, right, pageSize, pageSize/4) {
 		t.Fatal("redistribution failed")
@@ -916,7 +876,7 @@ func TestDeleteRepairSelectsSiblingThatRepairsUnderfullPage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	parent := &Node{
+	parent := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 2),
 		entries:  []Entry{{key: []byte("m")}, {key: []byte("z1")}},
 		Children: []page.ID{left.PageID(), node.PageID(), right.PageID()},
@@ -936,9 +896,9 @@ func TestMergedBranchSizeMatchesEncodedResult(t *testing.T) {
 	rightLeaf := NewLeafNode(31)
 	otherLeftLeaf := NewLeafNode(32)
 	otherRightLeaf := NewLeafNode(33)
-	left := NewRootNode(20, leftLeaf, rightLeaf, []byte("b"))
-	right := NewRootNode(21, otherLeftLeaf, otherRightLeaf, []byte("z"))
-	parent := NewRootNode(10, left, right, []byte("m"))
+	left := NewRootNode(20, leftLeaf.PageID(), rightLeaf.PageID(), []byte("b"))
+	right := NewRootNode(21, otherLeftLeaf.PageID(), otherRightLeaf.PageID(), []byte("z"))
+	parent := NewRootNode(10, left.PageID(), right.PageID(), []byte("m"))
 
 	want := mergedChildrenSize(parent, 0, left, right)
 	parentCopy := parent.Clone()
@@ -950,7 +910,7 @@ func TestMergedBranchSizeMatchesEncodedResult(t *testing.T) {
 	}
 }
 
-func assertTreeSeparators(t *testing.T, store *memoryTreeStore, node *Node) []byte {
+func assertTreeSeparators(t *testing.T, store *memoryTreeStore, node *MutableNode) []byte {
 	t.Helper()
 	if node.IsLeaf() {
 		if len(node.entries) == 0 {
@@ -998,8 +958,8 @@ func TestLeafSeparator(t *testing.T) {
 }
 
 func TestAppendSplitSeparator(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 256, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
 	keys := [][]byte{
@@ -1030,8 +990,8 @@ func TestAppendSplitSeparator(t *testing.T) {
 func TestSeparatorBoundsAndGapInserts(t *testing.T) {
 	for _, pageSize := range []int64{128, 512, 4096} {
 		t.Run(fmt.Sprint(pageSize), func(t *testing.T) {
-			store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
-			tree := NewTree(store)
+			store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+			tree := newTestTree(store)
 			root := NewLeafNode(2)
 			store.StageNode(root)
 			reference := make(map[string][]byte)
@@ -1092,7 +1052,7 @@ func TestSeparatorBoundsAndGapInserts(t *testing.T) {
 	}
 }
 
-func checkSeparatorTree(t *testing.T, tree *Tree, store *memoryTreeStore, root *Node, reference map[string][]byte) {
+func checkSeparatorTree(t *testing.T, tree *testTree, store *memoryTreeStore, root *MutableNode, reference map[string][]byte) {
 	t.Helper()
 	assertTreeSeparators(t, store, root)
 	keys := make([]string, 0, len(reference))
@@ -1101,12 +1061,13 @@ func checkSeparatorTree(t *testing.T, tree *Tree, store *memoryTreeStore, root *
 	}
 	slices.Sort(keys)
 	cursor := tree.Cursor(root)
-	entry, found, err := cursor.First()
+	found, err := cursor.First()
 	for i, key := range keys {
-		if err != nil || !found || !bytes.Equal(entry.key, []byte(key)) || !bytes.Equal(entry.value, reference[key]) {
+		_, actualKey, actualValue := cursor.Entry()
+		if err != nil || !found || !bytes.Equal(actualKey, []byte(key)) || !bytes.Equal(actualValue, reference[key]) {
 			t.Fatalf("scan entry %d: found %t, error %v", i, found, err)
 		}
-		entry, found, err = cursor.Next()
+		found, err = cursor.Next()
 	}
 	if err != nil || found {
 		t.Fatalf("scan end: found %t, error %v", found, err)
@@ -1116,8 +1077,9 @@ func checkSeparatorTree(t *testing.T, tree *Tree, store *memoryTreeStore, root *
 		if err != nil || !found || !bytes.Equal(entry.value, reference[key]) {
 			t.Fatalf("lookup %x: found %t, error %v", key, found, err)
 		}
-		got, found, err := cursor.Seek([]byte(key))
-		if err != nil || !found || !bytes.Equal(got.key, []byte(key)) {
+		found, err = cursor.Seek([]byte(key))
+		_, actualKey, _ := cursor.Entry()
+		if err != nil || !found || !bytes.Equal(actualKey, []byte(key)) {
 			t.Fatalf("seek %x: found %t, error %v", key, found, err)
 		}
 	}
@@ -1143,12 +1105,12 @@ func separatorTestKeys(kind string, count int) [][]byte {
 }
 
 func TestFenceKeepsParentCleanAfterMinimumDelete(t *testing.T) {
-	store := &memoryTreeStore{pageSize: 512, nextID: 5, nodes: make(map[page.ID]*Node)}
-	tree := NewTree(store)
+	store := &memoryTreeStore{pageSize: 512, nextID: 5, nodes: make(map[page.ID]*MutableNode)}
+	tree := newTestTree(store)
 	left, right := NewLeafNode(2), NewLeafNode(3)
 	for i := range 4 {
 		for _, item := range []struct {
-			node *Node
+			node *MutableNode
 			side string
 		}{{left, "a"}, {right, "b"}} {
 			key := fmt.Appendf(nil, "account/%s/%03d", item.side, i)
@@ -1158,7 +1120,7 @@ func TestFenceKeepsParentCleanAfterMinimumDelete(t *testing.T) {
 		}
 	}
 	separator := leafSeparator(left.entries[len(left.entries)-1].key, right.entries[0].key)
-	root := NewRootNode(4, left, right, separator)
+	root := NewRootNode(4, left.PageID(), right.PageID(), separator)
 	store.StageNode(left)
 	store.StageNode(right)
 	store.StageNode(root)
@@ -1184,8 +1146,8 @@ func TestFenceKeepsParentCleanAfterMinimumDelete(t *testing.T) {
 func TestFenceDeletesAndRefillsOldGaps(t *testing.T) {
 	for _, pageSize := range []int64{128, 512} {
 		t.Run(fmt.Sprint(pageSize), func(t *testing.T) {
-			store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*Node)}
-			tree := NewTree(store)
+			store := &memoryTreeStore{pageSize: pageSize, nextID: 3, nodes: make(map[page.ID]*MutableNode)}
+			tree := newTestTree(store)
 			root := NewLeafNode(2)
 			store.StageNode(root)
 			reference := make(map[string][]byte)
@@ -1282,7 +1244,7 @@ func TestFenceDeletesAndRefillsOldGaps(t *testing.T) {
 // subtreeMinimum finds the first key below node. The search follows the first
 // child until it reaches a leaf. The returned key belongs to that leaf and
 // remains valid while the leaf remains valid. An empty leaf returns nil.
-func (tree *Tree) subtreeMinimum(node *Node) ([]byte, error) {
+func (tree *testTree) subtreeMinimum(node *MutableNode) ([]byte, error) {
 	for !node.IsLeaf() {
 		var err error
 		node, err = tree.readChild(node, 0)
@@ -1291,4 +1253,110 @@ func (tree *Tree) subtreeMinimum(node *Node) ([]byte, error) {
 		}
 	}
 	return node.firstKey(), nil
+}
+
+// testTree translates decoded fixtures to the production page-ID interface.
+// Assertions can inspect fixture nodes without adding representation choices to Tree.
+type testTree struct {
+	*Tree
+	fixtures interface{ seedNode(*MutableNode) }
+}
+
+func newTestTree(store interface {
+	Store
+	seedNode(*MutableNode)
+}) *testTree {
+	return &testTree{Tree: NewTree(store), fixtures: store}
+}
+
+func (tree *testTree) register(root *MutableNode) {
+	if _, err := tree.store.ReadNode(root.PageID()); err != nil {
+		tree.fixtures.seedNode(root)
+	}
+}
+func (tree *testTree) node(id page.ID, err error) (*MutableNode, error) {
+	if err != nil {
+		return nil, err
+	}
+	node, err := tree.store.ReadNode(id)
+	if err != nil {
+		return nil, err
+	}
+	return node.decode(tree.store.PageSize())
+}
+func (tree *testTree) PutEntry(root *MutableNode, entry Entry) (*MutableNode, error) {
+	tree.register(root)
+	return tree.node(tree.Tree.PutEntry(root.PageID(), entry))
+}
+func (tree *testTree) FindEntryRef(root *MutableNode, key []byte, includeKey bool) (Entry, bool, error) {
+	tree.register(root)
+	return tree.Tree.FindEntryRef(root.PageID(), key, includeKey)
+}
+func (tree *testTree) FindEntryRefFromPage(id page.ID, key []byte, includeKey bool) (Entry, bool, error) {
+	return tree.Tree.FindEntryRef(id, key, includeKey)
+}
+func (tree *testTree) DeleteEntry(root *MutableNode, key []byte) (*MutableNode, bool, error) {
+	tree.register(root)
+	id, found, err := tree.Tree.DeleteEntry(root.PageID(), key)
+	if err != nil {
+		return nil, found, err
+	}
+	node, err := tree.node(id, nil)
+	return node, found, err
+}
+func (tree *testTree) DeleteBucketEntry(root *MutableNode, key []byte) (*MutableNode, bool, error) {
+	tree.register(root)
+	id, found, err := tree.Tree.DeleteBucketEntry(root.PageID(), key)
+	if err != nil {
+		return nil, found, err
+	}
+	node, err := tree.node(id, nil)
+	return node, found, err
+}
+func (tree *testTree) DeleteEntries(root *MutableNode, keys [][]byte) (*MutableNode, bool, error) {
+	tree.register(root)
+	id, found, err := tree.Tree.DeleteEntries(root.PageID(), keys)
+	if err != nil {
+		return nil, found, err
+	}
+	node, err := tree.node(id, nil)
+	return node, found, err
+}
+func (tree *testTree) Cursor(root *MutableNode) *Cursor {
+	tree.register(root)
+	cursor := NewCursor(tree.store, root.PageID())
+	return &cursor
+}
+func (tree *testTree) readChild(parent *MutableNode, index int) (*MutableNode, error) {
+	node, err := tree.Tree.readChild(parent.ReadOnly(), index)
+	if err != nil {
+		return nil, err
+	}
+	return node.decode(tree.store.PageSize())
+}
+func (store *memoryTreeStore) EditNode(id page.ID) (*MutableNode, error) {
+	node := store.nodes[id]
+	if node == nil {
+		return nil, ErrInvalid
+	}
+	if dirty, ok := store.dirty[id]; ok {
+		return dirty, nil
+	}
+	private := node.Clone()
+	store.StageNode(private)
+	return private, nil
+}
+
+func (store *countingPutStore) EditNode(id page.ID) (*MutableNode, error) {
+	store.writes++
+	return store.memoryTreeStore.EditNode(id)
+}
+
+func (*memoryTreeStore) Writable() bool { return true }
+
+func (store *memoryTreeStore) seedNode(node *MutableNode) {
+	if store.nodes == nil {
+		store.nodes = make(map[page.ID]*MutableNode)
+	}
+	store.nodes[node.PageID()] = node
 }

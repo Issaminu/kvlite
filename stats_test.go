@@ -374,11 +374,11 @@ func TestStatsConcurrentReadersKeepCacheUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	before := readStats(t, db)
-	// Force concurrent cache misses before checking the cached read path.
+	// Encoded traversal must not populate a decoded cache, even under concurrent reads.
 	clear(db.writeNodes)
 	db.writeNodeSlots = nil
 	db.nextWriteNodeSlot = 0
-	for round := range 2 {
+	for range 2 {
 		for _, entry := range db.writeNodes {
 			entry.referenced.Store(false)
 		}
@@ -420,12 +420,6 @@ func TestStatsConcurrentReadersKeepCacheUnchanged(t *testing.T) {
 		}
 		if after := readStats(t, db); after != before {
 			t.Fatalf("readers changed statistics: %+v", after)
-		}
-		if round == 0 {
-			if len(db.writeNodes) < 2 {
-				t.Fatal("readers did not retain decoded pages")
-			}
-			continue
 		}
 		if len(db.writeNodes) != cacheSize {
 			t.Fatal("readers changed cache size")
@@ -645,8 +639,8 @@ func TestBucketStatsIncludesContinuationStorage(t *testing.T) {
 						return fmt.Errorf("continued bucket: got %+v, want %+v", got, expected)
 					}
 					var branchBytes, leafBytes, branchPages, leafPages int
-					var walk func(*btree.Node) error
-					walk = func(node *btree.Node) error {
+					var walk func(*btree.MutableNode) error
+					walk = func(node *btree.MutableNode) error {
 						used := len(btree.EncodeWALNode(node))
 						pages := (used + pageSize - 1) / pageSize
 						if node.IsLeaf() {
@@ -656,7 +650,7 @@ func TestBucketStatsIncludesContinuationStorage(t *testing.T) {
 							branchBytes += used
 							branchPages += pages
 							for _, id := range node.Children {
-								child, err := tx.store.ReadNode(id)
+								child, err := tx.store.decodedNode(id)
 								if err != nil {
 									return err
 								}
@@ -667,7 +661,7 @@ func TestBucketStatsIncludesContinuationStorage(t *testing.T) {
 						}
 						return nil
 					}
-					if err := walk(bucket.rootNode); err != nil {
+					if err := walk(testBucketRoot(t, bucket)); err != nil {
 						return err
 					}
 					if got.BranchInuse != branchBytes || got.LeafInuse != leafBytes || got.BranchAlloc != branchPages*pageSize || got.LeafAlloc != leafPages*pageSize {

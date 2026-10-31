@@ -180,24 +180,21 @@ func (bucket *Bucket) Stats() (BucketStats, error) {
 	if err := bucket.liveError(); err != nil {
 		return BucketStats{}, err
 	}
-	if err := bucket.loadRootNode(); err != nil {
-		return BucketStats{}, err
-	}
-	return bucket.tx.collectBucketStats(bucket.rootNode, make(map[page.ID]struct{}))
+	return bucket.tx.collectBucketStats(bucket.rootPageID, make(map[page.ID]struct{}))
 }
 
-func (tx *Tx) collectBucketStats(root *btree.Node, seen map[page.ID]struct{}) (BucketStats, error) {
+func (tx *Tx) collectBucketStats(root page.ID, seen map[page.ID]struct{}) (BucketStats, error) {
 	stats := BucketStats{BucketN: 1}
 	var nested BucketStats
 	pageSize := int(tx.meta.PageSize())
-	var walk func(*btree.Node, int) error
-	walk = func(node *btree.Node, depth int) error {
+	var walk func(btree.Node, int) error
+	walk = func(node btree.Node, depth int) error {
 		if _, exists := seen[node.PageID()]; exists {
 			return fmt.Errorf("statistics visit page %d twice: %w", node.PageID(), page.ErrInvalid)
 		}
 		seen[node.PageID()] = struct{}{}
 		stats.Depth = max(stats.Depth, depth)
-		pages := btree.NodePageCount(node, int64(pageSize))
+		pages := (node.EncodedSize() + pageSize - 1) / pageSize
 		if pages == 0 {
 			return fmt.Errorf("statistics page %d size: %w", node.PageID(), page.ErrInvalid)
 		}
@@ -206,7 +203,11 @@ func (tx *Tx) collectBucketStats(root *btree.Node, seen map[page.ID]struct{}) (B
 			stats.BranchPageN++
 			stats.BranchAlloc += pages * pageSize
 			stats.BranchInuse += inuse
-			for _, id := range node.Children {
+			for index := 0; index <= node.EntryCount(); index++ {
+				id, err := node.Child(index)
+				if err != nil {
+					return err
+				}
 				child, err := tx.store.ReadNode(id)
 				if err != nil {
 					return err
@@ -221,22 +222,21 @@ func (tx *Tx) collectBucketStats(root *btree.Node, seen map[page.ID]struct{}) (B
 		stats.LeafAlloc += pages * pageSize
 		stats.LeafInuse += inuse
 		for index := 0; index < node.EntryCount(); index++ {
-			entry := node.EntryAt(index)
+			entry, err := node.Entry(index)
+			if err != nil {
+				return err
+			}
 			stats.KeyBytes += len(entry.Key())
 			if entry.Flags()&btree.BucketLeafFlag == 0 {
 				stats.KeyN++
 				stats.ValueBytes += len(entry.Value())
 				continue
 			}
-			id, err := decodeBucketRootPageID(*entry)
+			id, err := decodeBucketRootPageID(entry)
 			if err != nil {
 				return err
 			}
-			child, err := tx.store.ReadNode(id)
-			if err != nil {
-				return err
-			}
-			childStats, err := tx.collectBucketStats(child, seen)
+			childStats, err := tx.collectBucketStats(id, seen)
 			if err != nil {
 				return err
 			}
@@ -244,7 +244,11 @@ func (tx *Tx) collectBucketStats(root *btree.Node, seen map[page.ID]struct{}) (B
 		}
 		return nil
 	}
-	if err := walk(root, 1); err != nil {
+	node, err := tx.store.ReadNode(root)
+	if err != nil {
+		return BucketStats{}, err
+	}
+	if err := walk(node, 1); err != nil {
 		return BucketStats{}, err
 	}
 	stats.Add(nested)

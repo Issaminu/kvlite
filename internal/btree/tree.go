@@ -8,52 +8,32 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
-// Store provides the page view, mutable-node ownership, and page allocation used by a [Tree].
+// Store supplies transaction-visible nodes and owns permission to edit them.
 type Store interface {
 	NodeReader
-	// PageSize returns the fixed encoded size of one tree page.
+	// PageSize returns the physical storage page size in bytes.
 	PageSize() int64
-	// ReadNode returns the node visible to the current operation.
-	// A returned node is read-only. WritableNode and DeleteLeafEntries return its private mutable version.
-	ReadNode(page.ID) (*Node, error)
-	// ReplaceLeafEntry stages a replacement without decoding the old leaf.
-	// skipIdentical permits an identical entry to remain unchanged.
-	// A false result keeps the ordinary read-and-update path.
-	ReplaceLeafEntry(pageID page.ID, entry Entry, skipIdentical bool) (bool, error)
-	// DeleteLeafEntry stages an empty replacement for a leaf containing only key.
-	// The empty leaf retains its old allocation count for repair. Nil keeps the ordinary deletion path.
-	DeleteLeafEntry(pageID page.ID, key []byte) (*Node, error)
-	// InsertLeafNeighbor stages a separate leaf beside an unchanged large leaf.
-	// before places the neighbor before the old leaf in key order.
-	// A nil neighbor keeps the ordinary insertion path.
-	InsertLeafNeighbor(pageID page.ID, entry Entry) (neighbor *Node, separator []byte, before bool, err error)
-	// SetParent records the immediate owner of child. A nil parent selects the metadata root.
-	// The store must keep these links private to the current write operation.
-	SetParent(child page.ID, parent *Node)
-	// WritableNode returns a private mutable version of node with the same page ID.
-	// Repeated calls for that page must return the same private node.
-	WritableNode(*Node) *Node
-	// DeleteLeafEntries returns the private leaf after removing selected entries.
-	// It must preserve the committed node and earlier write-batch callback images.
-	// firstIndex and rest contain distinct, ascending indexes from the visible leaf.
-	// A separate first index avoids allocating a list for single-key deletes.
-	// Repeated writes to that page must reuse the same private node.
-	// minimumSize permits spare entry slots below the delete-repair threshold.
-	// Zero selects a leaf root, which needs no merge reservation.
-	DeleteLeafEntries(*Node, int, []int, int64) *Node
-	// AllocatePage returns a page ID that is not in use by another node.
+	// Writable reports whether this transaction permits node and allocation changes.
+	Writable() bool
+	// EditNode returns a private writable node. Repeated edits reuse it.
+	// A read-only transaction returns an error.
+	EditNode(page.ID) (*MutableNode, error)
+	// AllocatePage returns a page ID that no other node uses.
 	// It returns an error when the store cannot allocate a page.
 	AllocatePage() (page.ID, error)
 	// FreePage retires a removed tree node and all of its continuation pages.
 	FreePage(page.ID) error
-	// StageNode makes a private node visible to later reads and records its final image for commit.
-	StageNode(*Node)
+	// StageNode publishes a newly created private node inside the transaction.
+	StageNode(*MutableNode)
 }
 
 // Tree performs B+tree lookup, insertion, deletion, and repair through a [Store].
-// It keeps no page state outside that store.
+// It owns traversal paths and parent links; Store owns node versions and write permission.
 type Tree struct {
-	store Store
+	store         Store
+	parents       map[page.ID]page.ID
+	parentsShared bool
+	readOnly      bool
 
 	// SkipIdenticalPuts keeps an identical entry clean when the caller requires no durable rewrite.
 	SkipIdenticalPuts bool
@@ -61,36 +41,70 @@ type Tree struct {
 
 // treePathStep records one move from a branch node to one child node.
 // parent is the branch node at the current level.
-// childIndex selects the next node in parent.Children.
+// childIndex selects the child of parent that the path follows.
 type treePathStep struct {
-	parent     *Node
+	parent     Node
 	childIndex int
 }
 
 // NewTree returns a tree that uses store for every node read, write, and page allocation.
 func NewTree(store Store) *Tree {
-	return &Tree{store: store}
+	return &Tree{store: store, readOnly: !store.Writable()}
 }
 
-func (tree *Tree) readChild(parent *Node, index int) (*Node, error) {
-	id := parent.Children[index]
+// Fork starts an independent tree traversal over a new transaction store.
+// Parent links remain shared until the first change, so a failed batch callback
+// cannot change the links retained by an earlier successful callback.
+func (tree *Tree) Fork(store Store) Tree {
+	return Tree{store: store, parents: tree.parents, parentsShared: true, SkipIdenticalPuts: tree.SkipIdenticalPuts, readOnly: !store.Writable()}
+}
+
+func (tree *Tree) setParent(child page.ID, parent page.ID) {
+	if tree.readOnly {
+		return
+	}
+	if previous, ok := tree.parents[child]; ok && previous == parent {
+		return
+	}
+	if tree.parents == nil {
+		tree.parents = make(map[page.ID]page.ID)
+	} else if tree.parentsShared {
+		copied := make(map[page.ID]page.ID, len(tree.parents)+1)
+		for id, owner := range tree.parents {
+			copied[id] = owner
+		}
+		tree.parents = copied
+	}
+	tree.parentsShared = false
+	tree.parents[child] = parent
+}
+
+// Parent returns the saved owner of id. Zero identifies the catalog root.
+func (tree *Tree) Parent(id page.ID) (page.ID, bool) {
+	parent, ok := tree.parents[id]
+	return parent, ok
+}
+
+func (tree *Tree) readChild(parent Node, index int) (Node, error) {
+	id, err := parent.Child(index)
+	if err != nil {
+		return Node{}, err
+	}
 	child, err := tree.store.ReadNode(id)
-	if err == nil && child != nil {
-		tree.store.SetParent(id, parent)
+	if err == nil {
+		tree.setParent(id, parent.PageID())
 	}
 	return child, err
 }
 
-// reparentChildren records links after a split, merge, or redistribution moves entries.
-// It visits only this changed node's references. It does not load the referenced nodes.
-func (tree *Tree) reparentChildren(parent *Node) error {
+func (tree *Tree) reparentChildren(parent *MutableNode) error {
 	return VisitNodeReferences(parent, func(child page.ID) error {
-		tree.store.SetParent(child, parent)
+		tree.setParent(child, parent.PageID())
 		return nil
 	}, nil)
 }
 
-func (tree *Tree) recordBucketParent(parent *Node, entry Entry) error {
+func (tree *Tree) recordBucketParent(parent page.ID, entry Entry) error {
 	if entry.Flags()&BucketLeafFlag == 0 {
 		return nil
 	}
@@ -98,36 +112,36 @@ func (tree *Tree) recordBucketParent(parent *Node, entry Entry) error {
 	if err != nil {
 		return err
 	}
-	tree.store.SetParent(id, parent)
+	tree.setParent(id, parent)
 	return nil
 }
 
-// FindEntryRef looks key up without copying the stored key or value.
-// It returns a zero entry with found false when the key is absent.
-// A found entry refers to read-only storage owned by root or the store. It must not outlive its owner.
-// Set includeKey to false when the caller does not use the entry key.
-// The store can then omit the key and does not copy a continued key.
+// FindEntryRef searches the tree at root without cursor state.
+// Returned bytes are read-only and borrow the transaction. includeKey allows
+// an encoded leaf to omit the matched key. A missing key returns found false.
 // An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
-func (tree *Tree) FindEntryRef(root *Node, key []byte, includeKey bool) (Entry, bool, error) {
+func (tree *Tree) FindEntryRef(root page.ID, key []byte, includeKey bool) (Entry, bool, error) {
 	if err := validateLookupKey(key); err != nil {
 		return Entry{}, false, err
 	}
-
-	entry, found, err := tree.Cursor(root).Find(key, includeKey)
-	if err == nil && found && root.IsLeaf() {
-		err = tree.recordBucketParent(root, entry)
+	for {
+		node, err := tree.store.ReadNode(root)
+		if err != nil {
+			return Entry{}, false, err
+		}
+		entry, found, child, err := node.Lookup(key, includeKey)
+		if err != nil {
+			return Entry{}, false, err
+		}
+		if child == 0 {
+			if found {
+				err = tree.recordBucketParent(root, entry)
+			}
+			return entry, found, err
+		}
+		tree.setParent(child, root)
+		root = child
 	}
-	return entry, found, err
-}
-
-// FindEntryRefFromPage starts at rootPageID without requiring a root Node.
-// A found entry refers to storage owned by the store.
-// includeKey has the same meaning as in [Tree.FindEntryRef].
-func (tree *Tree) FindEntryRefFromPage(rootPageID page.ID, key []byte, includeKey bool) (Entry, bool, error) {
-	if err := validateLookupKey(key); err != nil {
-		return Entry{}, false, err
-	}
-	return FindEntry(tree.store, rootPageID, key, includeKey)
 }
 
 // validateEntry checks the key and value limits before insertion changes a node.
@@ -142,101 +156,111 @@ func (tree *Tree) validateEntry(entry Entry) error {
 	return nil
 }
 
-// PutEntry inserts or replaces entry and returns the current root.
-// It validates the entry and checks leaf conflicts before it asks the store for a mutable node.
+// PutEntry inserts or replaces entry and returns the resulting root page.
+// It checks the entry limits and leaf conflicts before it asks the store for a writable node.
+// The store keeps all edits private until the enclosing transaction commits.
 // If page allocation fails after a node changes, the caller must discard its private transaction state.
-// The caller must use the returned root because a write can replace the root object or create a new root page.
-func (tree *Tree) PutEntry(root *Node, entry Entry) (*Node, error) {
+func (tree *Tree) PutEntry(root page.ID, entry Entry) (page.ID, error) {
 	if err := tree.validateEntry(entry); err != nil {
-		return nil, err
+		return 0, err
 	}
-
-	node := root
-	var path []treePathStep
-	// Find the target leaf and save each branch-to-child move.
-	// The split loop can use this local path without changing committed nodes.
-	for !node.IsLeaf() {
-		childIndex, err := node.FindChildIndex(entry.Key())
-		if err != nil {
-			return nil, err
-		}
-		path = append(path, treePathStep{parent: node, childIndex: childIndex})
-
-		child := node.Children[childIndex]
-		replaced, err := tree.store.ReplaceLeafEntry(child, entry, tree.SkipIdenticalPuts)
-		if err != nil {
-			return nil, err
-		}
-		if replaced {
-			// Commit preparation can move the replacement if it grows.
-			// Keep its immediate parent without decoding the old child.
-			tree.store.SetParent(child, node)
-			return root, nil
-		}
-
-		neighbor, separator, before, err := tree.store.InsertLeafNeighbor(child, entry)
-		if err != nil {
-			return nil, err
-		}
-		if neighbor != nil {
-			parent := tree.store.WritableNode(node)
-			if before {
-				parent.Children[childIndex] = neighbor.PageID()
-				parent.InsertSplitChild(childIndex, NewLeafNode(child), separator)
-			} else {
-				parent.InsertSplitChild(childIndex, neighbor, separator)
-			}
-			tree.store.SetParent(child, parent)
-			tree.store.SetParent(neighbor.PageID(), parent)
-			if parent.PageID() == root.PageID() {
-				root = parent
-			}
-			return tree.finishPut(root, parent, path[:len(path)-1], false)
-		}
-
-		node, err = tree.readChild(node, childIndex)
-		if err != nil {
-			return nil, err
-		}
-		if node == nil {
-			return nil, ErrKeyNotFound
-		}
-	}
-
-	// Check leaf-specific conflicts before WritableNode makes transaction-visible state mutable.
-	prepared, err := node.prepareInsert(entry)
+	node, path, err := tree.findLeaf(root, entry.Key())
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
-
-	if tree.SkipIdenticalPuts && prepared.found {
-		existing := node.entries[prepared.index]
-		if existing.flags == entry.flags && bytes.Equal(existing.value, entry.value) {
+	existing, found, _, err := node.Lookup(entry.Key(), true)
+	if err != nil {
+		return 0, err
+	}
+	if found {
+		if existing.flags&BucketLeafFlag != entry.flags&BucketLeafFlag {
+			return 0, ErrIncompatibleValue
+		}
+		if tree.SkipIdenticalPuts && existing.flags == entry.flags && bytes.Equal(existing.value, entry.value) {
 			return root, nil
 		}
 	}
-
-	// WritableNode clones and stages the leaf on its first write in this transaction.
-	// If the leaf is already dirty, WritableNode returns the existing private node.
-	node = tree.store.WritableNode(node)
-	// The dirty map already holds this pointer, so this change needs no second StageNode call.
-	node.applyInsert(prepared)
-	if err := tree.recordBucketParent(node, entry); err != nil {
-		return nil, err
+	// A large one-entry leaf need not change when a new neighboring key arrives.
+	// This is a tree split decision independent of how either node is stored.
+	if !found && entry.flags == 0 && node.EntryCount() == 1 {
+		old, err := node.Entry(0)
+		if err != nil {
+			return 0, err
+		}
+		if old.flags == 0 && int64(len(old.value)) > tree.store.PageSize() {
+			return tree.insertNeighbor(root, node, old, entry, path)
+		}
 	}
-	if node.PageID() == root.PageID() {
-		root = node
+	private, err := tree.store.EditNode(node.PageID())
+	if err != nil {
+		return 0, err
 	}
+	prepared, err := private.prepareInsert(entry)
+	if err != nil {
+		return 0, err
+	}
+	private.applyInsert(prepared)
+	if err := tree.recordBucketParent(private.PageID(), entry); err != nil {
+		return 0, err
+	}
+	return tree.finishPut(root, private, path, !prepared.found && prepared.index == private.EntryCount()-1)
+}
 
-	return tree.finishPut(root, node, path, !prepared.found && prepared.index == node.EntryCount()-1)
+// insertNeighbor puts entry in a new leaf beside node, which holds only the large entry old.
+// node does not change, so its large value is not copied or rewritten.
+// The new leaf goes before node when entry sorts first. The parent gets a separator for the new boundary.
+func (tree *Tree) insertNeighbor(root page.ID, node Node, old, entry Entry, path []treePathStep) (page.ID, error) {
+	id, err := tree.store.AllocatePage()
+	if err != nil {
+		return 0, err
+	}
+	neighbor := NewLeafNode(id)
+	if err := neighbor.InsertEntry(entry); err != nil {
+		return 0, err
+	}
+	tree.store.StageNode(neighbor)
+	before := bytes.Compare(entry.key, old.key) < 0
+	separator := neighbor.EntryAt(0).Key()
+	if before {
+		separator = old.key
+	}
+	if len(path) == 0 {
+		rootID, err := tree.store.AllocatePage()
+		if err != nil {
+			return 0, err
+		}
+		left, right := node.PageID(), neighbor.PageID()
+		if before {
+			left, right = right, left
+		}
+		parent := NewRootNode(rootID, left, right, separator)
+		tree.store.StageNode(parent)
+		tree.setParent(left, rootID)
+		tree.setParent(right, rootID)
+		return rootID, nil
+	}
+	step := path[len(path)-1]
+	parent, err := tree.store.EditNode(step.parent.PageID())
+	if err != nil {
+		return 0, err
+	}
+	if before {
+		parent.Children[step.childIndex] = neighbor.PageID()
+		parent.InsertSplitChild(step.childIndex, node.PageID(), separator)
+	} else {
+		parent.InsertSplitChild(step.childIndex, neighbor.PageID(), separator)
+	}
+	tree.setParent(node.PageID(), parent.PageID())
+	tree.setParent(neighbor.PageID(), parent.PageID())
+	return tree.finishPut(root, parent, path[:len(path)-1], false)
 }
 
 // finishPut splits the changed node and its ancestors as needed.
-func (tree *Tree) finishPut(root, node *Node, path []treePathStep, tailInsert bool) (*Node, error) {
+func (tree *Tree) finishPut(root page.ID, node *MutableNode, path []treePathStep, tailInsert bool) (page.ID, error) {
 	pageSize := tree.store.PageSize()
 	if tailInsert && node.NeedsSplit(pageSize) {
 		for _, step := range path {
-			if step.childIndex != len(step.parent.Children)-1 {
+			if step.childIndex != step.parent.EntryCount() {
 				tailInsert = false
 				break
 			}
@@ -248,24 +272,25 @@ func (tree *Tree) finishPut(root, node *Node, path []treePathStep, tailInsert bo
 			// Keep the left result in node and create a new root above both children.
 			rightNode, separator, err := tree.splitNode(node, pageSize, tailInsert)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 			rootPageID, err := tree.store.AllocatePage()
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
-			root = NewRootNode(rootPageID, node, rightNode, separator)
+			parent := NewRootNode(rootPageID, node.PageID(), rightNode.PageID(), separator)
+			root = rootPageID
 			// node is already staged. Only the new right node and new root need staging.
 			tree.store.StageNode(rightNode)
-			tree.store.StageNode(root)
-			tree.store.SetParent(node.PageID(), root)
-			tree.store.SetParent(rightNode.PageID(), root)
+			tree.store.StageNode(parent)
+			tree.setParent(node.PageID(), root)
+			tree.setParent(rightNode.PageID(), root)
 			// rightNode starts at root.Children[1].
 			// Split it again if one split did not make it small enough.
-			if err := tree.splitChildIntoSiblings(root, rightNode, 1, pageSize, false); err != nil {
-				return nil, err
+			if err := tree.splitChildIntoSiblings(parent, rightNode, 1, pageSize, false); err != nil {
+				return 0, err
 			}
-			node = root
+			node = parent
 			continue
 		}
 
@@ -276,17 +301,15 @@ func (tree *Tree) finishPut(root, node *Node, path []treePathStep, tailInsert bo
 		path = path[:lastStep]
 
 		// A child split adds a separator and a child page ID to its parent.
-		// WritableNode returns a staged private parent that this operation can change.
-		parent := tree.store.WritableNode(parentStep.parent)
-		if parent.PageID() == root.PageID() {
-			// The private root has the same page ID but a different object.
-			root = parent
+		// EditNode returns a staged private parent that this operation can change.
+		parent, err := tree.store.EditNode(parentStep.parent.PageID())
+		if err != nil {
+			return 0, err
 		}
-
 		// node is at parent.Children[parentStep.childIndex].
 		// Keep its left result in that slot and insert each new right sibling after it.
 		if err := tree.splitChildIntoSiblings(parent, node, parentStep.childIndex, pageSize, tailInsert); err != nil {
-			return nil, err
+			return 0, err
 		}
 		// New separators can make the parent too large, so check the parent next.
 		node = parent
@@ -296,12 +319,12 @@ func (tree *Tree) finishPut(root, node *Node, path []treePathStep, tailInsert bo
 
 // splitNode splits a private node that is known to be larger than one page.
 // It returns a page allocation error. Entry validation and the NeedsSplit check guarantee that the node can split, so a Split error is an internal tree invariant failure.
-func (tree *Tree) splitNode(node *Node, pageSize int64, tailInsert bool) (*Node, []byte, error) {
+func (tree *Tree) splitNode(node *MutableNode, pageSize int64, tailInsert bool) (*MutableNode, []byte, error) {
 	pageID, err := tree.store.AllocatePage()
 	if err != nil {
 		return nil, nil, err
 	}
-	var rightNode *Node
+	var rightNode *MutableNode
 	var separator []byte
 	last := node.EntryCount() - 1
 	if tailInsert && node.IsLeaf() && (last == 1 || node.EncodedSize()-node.entries[last].EncodedSize(true) <= int(pageSize)) {
@@ -327,15 +350,15 @@ func (tree *Tree) splitNode(node *Node, pageSize int64, tailInsert bool) (*Node,
 // child must be the private node at parent.Children[childIndex].
 // Each split keeps the left result at the current index and inserts the right result at the next index.
 // parent must also be private because each split adds one separator and one child page ID to it.
-func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pageSize int64, tailInsert bool) error {
+func (tree *Tree) splitChildIntoSiblings(parent, child *MutableNode, childIndex int, pageSize int64, tailInsert bool) error {
 	for child.NeedsSplit(pageSize) {
 		rightNode, separator, err := tree.splitNode(child, pageSize, tailInsert)
 		if err != nil {
 			return err
 		}
 		tree.store.StageNode(rightNode)
-		parent.InsertSplitChild(childIndex, rightNode, separator)
-		tree.store.SetParent(rightNode.PageID(), parent)
+		parent.InsertSplitChild(childIndex, rightNode.PageID(), separator)
+		tree.setParent(rightNode.PageID(), parent.PageID())
 		// If the right half is still too large, split it at its new index.
 		child = rightNode
 		childIndex++
@@ -345,14 +368,14 @@ func (tree *Tree) splitChildIntoSiblings(parent, child *Node, childIndex int, pa
 
 // DeleteEntry removes one non-bucket entry from the tree rooted at root.
 // It returns the replacement root and true when it removes the key.
-// root must be non-nil and must belong to this tree's store.
+// root must identify a node in this tree's store.
 // A missing key returns root, false, and nil without changing the tree.
 // An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
 // A key that identifies a nested bucket returns [ErrIncompatibleValue].
 // A successful delete can replace the root and retire unused pages through
 // [Store.FreePage]. If a store operation fails after mutation starts, the
 // caller must discard the private store changes.
-func (tree *Tree) DeleteEntry(root *Node, key []byte) (*Node, bool, error) {
+func (tree *Tree) DeleteEntry(root page.ID, key []byte) (page.ID, bool, error) {
 	return tree.deleteEntry(root, key, false)
 }
 
@@ -361,7 +384,7 @@ func (tree *Tree) DeleteEntry(root *Node, key []byte) (*Node, bool, error) {
 // A missing key has no effect. Duplicate keys have the same effect as one key.
 // If a key names a bucket, earlier leaves can already have changed.
 // The caller must discard the transaction when it returns an error.
-func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) {
+func (tree *Tree) DeleteEntries(root page.ID, keys [][]byte) (page.ID, bool, error) {
 	for _, key := range keys {
 		if err := validateLookupKey(key); err != nil {
 			return root, false, err
@@ -374,18 +397,18 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 	}
 	changed := false
 	for first := 0; first < len(ordered); {
-		node, path, deleted, err := tree.findDeleteLeaf(root, ordered[first], false)
+		node, path, err := tree.findLeaf(root, ordered[first])
 		if err != nil {
-			return nil, changed, err
-		}
-		if node == nil {
-			return nil, changed, ErrKeyNotFound
+			return 0, changed, err
 		}
 		var upper []byte
 		for index := len(path) - 1; index >= 0; index-- {
 			step := path[index]
 			if step.childIndex < step.parent.EntryCount() {
-				upper = step.parent.EntryAt(step.childIndex).Key()
+				upper, err = step.parent.separator(step.childIndex)
+				if err != nil {
+					return 0, changed, err
+				}
 				break
 			}
 		}
@@ -395,13 +418,7 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 		}
 		firstIndex, previousIndex := -1, -1
 		var rest []int
-		if deleted {
-			firstIndex = 0
-		}
 		for _, key := range ordered[first:last] {
-			if deleted {
-				break
-			}
 			index, found, err := node.prepareDelete(key, false)
 			if err != nil {
 				return root, changed, err
@@ -420,21 +437,14 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 			previousIndex = index
 		}
 		if firstIndex >= 0 {
-			var minimumSize int64
-			if len(path) > 0 {
-				minimumSize = tree.store.PageSize() / 4
+			leaf, err := tree.store.EditNode(node.PageID())
+			if err != nil {
+				return 0, changed, err
 			}
-			leaf := node
-			if !deleted {
-				leaf = tree.store.DeleteLeafEntries(node, firstIndex, rest, minimumSize)
-			}
-			if leaf.PageID() == root.PageID() {
-				root = leaf
-			}
-			var err error
+			leaf.DeleteLeafEntries(firstIndex, rest)
 			root, err = tree.repairAfterDelete(root, leaf, path)
 			if err != nil {
-				return nil, changed, err
+				return 0, changed, err
 			}
 			changed = true
 		}
@@ -446,84 +456,67 @@ func (tree *Tree) DeleteEntries(root *Node, keys [][]byte) (*Node, bool, error) 
 // DeleteBucketEntry removes one bucket entry and repairs its parent tree.
 // The caller must release the pages owned by that bucket.
 // If a store operation fails after mutation starts, the caller must discard its private store changes.
-func (tree *Tree) DeleteBucketEntry(root *Node, key []byte) (*Node, bool, error) {
+func (tree *Tree) DeleteBucketEntry(root page.ID, key []byte) (page.ID, bool, error) {
 	return tree.deleteEntry(root, key, true)
 }
 
-func (tree *Tree) deleteEntry(root *Node, key []byte, bucket bool) (*Node, bool, error) {
+func (tree *Tree) deleteEntry(root page.ID, key []byte, bucket bool) (page.ID, bool, error) {
 	if len(key) == 0 {
-		return nil, false, ErrKeyRequired
+		return 0, false, ErrKeyRequired
 	}
 	if len(key) > MaxKeySize {
-		return nil, false, ErrKeyTooLarge
+		return 0, false, ErrKeyTooLarge
 	}
 
-	node, path, deleted, err := tree.findDeleteLeaf(root, key, bucket)
-	if err != nil || node == nil {
+	node, path, err := tree.findLeaf(root, key)
+	if err != nil {
 		return root, false, err
 	}
 
-	deleteIndex := 0
-	if !deleted {
-		var found bool
-		deleteIndex, found, err = node.prepareDelete(key, bucket)
-		if err != nil || !found {
-			return root, found, err
-		}
+	deleteIndex, found, err := node.prepareDelete(key, bucket)
+	if err != nil || !found {
+		return root, found, err
 	}
-
-	var minimumSize int64
-	if len(path) > 0 {
-		minimumSize = tree.store.PageSize() / 4
+	leaf, err := tree.store.EditNode(node.PageID())
+	if err != nil {
+		return 0, false, err
 	}
-	leaf := node
-	if !deleted {
-		leaf = tree.store.DeleteLeafEntries(node, deleteIndex, nil, minimumSize)
-	}
-	if leaf.PageID() == root.PageID() {
-		root = leaf
-	}
+	leaf.DeleteLeafEntries(deleteIndex, nil)
 
 	// Retain valid lower boundaries and repair nodes that became under-full.
 	root, err = tree.repairAfterDelete(root, leaf, path)
 	if err != nil {
-		return nil, false, err
+		return 0, false, err
 	}
 	return root, true, nil
 }
 
-// findDeleteLeaf shares traversal and parent tracking for scalar and batch deletes.
-// deleted identifies an already-staged empty leaf that only needs ordinary repair.
-func (tree *Tree) findDeleteLeaf(root *Node, key []byte, bucket bool) (*Node, []treePathStep, bool, error) {
-	node := root
-	var path []treePathStep
-	for !node.IsLeaf() {
-		index, err := node.FindChildIndex(key)
-		if err != nil {
-			return nil, path, false, err
-		}
-		path = append(path, treePathStep{parent: node, childIndex: index})
-		if !bucket {
-			id := node.Children[index]
-			tree.store.SetParent(id, node)
-			leaf, err := tree.store.DeleteLeafEntry(id, key)
-			if err != nil || leaf != nil {
-				return leaf, path, leaf != nil, err
-			}
-		}
-		node, err = tree.readChild(node, index)
-		if err != nil || node == nil {
-			return node, path, false, err
-		}
+// findLeaf returns the leaf for key and the branch path from root to it.
+// It saves the parent of each node on that path, so that RepairMoved can find the parents later.
+func (tree *Tree) findLeaf(root page.ID, key []byte) (Node, []treePathStep, error) {
+	node, err := tree.store.ReadNode(root)
+	if err != nil {
+		return Node{}, nil, err
 	}
-	return node, path, false, nil
+	leaf, path, err := findLeaf(tree.store, node, key, nil)
+	if err != nil {
+		return Node{}, path, err
+	}
+	for index, step := range path {
+		child := leaf.PageID()
+		if index+1 < len(path) {
+			child = path[index+1].parent.PageID()
+		}
+		tree.setParent(child, step.parent.PageID())
+	}
+	return leaf, path, nil
 }
 
 // repairAfterDelete merges or redistributes under-full nodes after a deletion.
 // Separators are lower bounds: deleting a minimum key leaves its old boundary valid.
 // Redistribution writes the boundary that moves. Merges carry a parent boundary
 // into the combined branch, so they also preserve the same routing invariant.
-func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep) (*Node, error) {
+func (tree *Tree) repairAfterDelete(root page.ID, node *MutableNode, path []treePathStep) (page.ID, error) {
 	pageSize := tree.store.PageSize()
 	// Repair below one quarter of a page rather than moving entries after every delete.
 	minimumSize := pageSize / 4
@@ -534,9 +527,9 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep) (*Nod
 		if node.EntryCount() != 0 && int64(node.EncodedSize()) >= minimumSize {
 			return root, nil
 		}
-		parent := tree.store.WritableNode(step.parent)
-		if parent.PageID() == root.PageID() {
-			root = parent
+		parent, err := tree.store.EditNode(step.parent.PageID())
+		if err != nil {
+			return 0, err
 		}
 		// Remove an empty leaf without decoding or changing its neighbor.
 		if node.IsLeaf() && node.EntryCount() == 0 && len(parent.Children) > 1 {
@@ -546,46 +539,51 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep) (*Nod
 			parent.encodedSize = 0
 			parent.header.Checksum = 0
 			if err := tree.store.FreePage(node.PageID()); err != nil {
-				return nil, err
+				return 0, err
 			}
 			node = parent
 			continue
 		}
-		var left, right *Node
-		var err error
+		var left, right *MutableNode
 		if step.childIndex > 0 {
-			left, err = tree.readChild(parent, step.childIndex-1)
+			left, err = tree.readSibling(parent, step.childIndex-1)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 		}
 		if step.childIndex+1 < len(parent.Children) {
-			right, err = tree.readChild(parent, step.childIndex+1)
+			right, err = tree.readSibling(parent, step.childIndex+1)
 			if err != nil {
-				return nil, err
+				return 0, err
 			}
 		}
 		// Prefer a merge with the left neighbor when both fit. An empty branch must
 		// merge even if the combined image needs more than one storage page.
 		if left != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex-1, left, node) <= pageSize) {
-			left = tree.store.WritableNode(left)
+			left, err = tree.store.EditNode(left.PageID())
+			if err != nil {
+				return 0, err
+			}
 			mergeChildren(parent, step.childIndex-1, left, node)
 			if err := tree.reparentChildren(left); err != nil {
-				return nil, err
+				return 0, err
 			}
 			if err := tree.store.FreePage(node.PageID()); err != nil {
-				return nil, err
+				return 0, err
 			}
 			node = parent
 		} else if right != nil && (node.EntryCount() == 0 || mergedChildrenSize(parent, step.childIndex, node, right) <= pageSize) {
 			// A parent reached after a merge can still be a committed node.
-			node = tree.store.WritableNode(node)
+			node, err = tree.store.EditNode(node.PageID())
+			if err != nil {
+				return 0, err
+			}
 			mergeChildren(parent, step.childIndex, node, right)
 			if err := tree.reparentChildren(node); err != nil {
-				return nil, err
+				return 0, err
 			}
 			if err := tree.store.FreePage(right.PageID()); err != nil {
-				return nil, err
+				return 0, err
 			}
 			node = parent
 		} else {
@@ -598,44 +596,124 @@ func (tree *Tree) repairAfterDelete(root, node *Node, path []treePathStep) (*Nod
 				return root, nil
 			}
 			// Trials use copies. Apply the same rule only to private nodes.
-			node = tree.store.WritableNode(node)
+			node, err = tree.store.EditNode(node.PageID())
+			if err != nil {
+				return 0, err
+			}
 			if !useLeft {
-				right = tree.store.WritableNode(right)
+				right, err = tree.store.EditNode(right.PageID())
+				if err != nil {
+					return 0, err
+				}
 				if !redistributeChildren(parent, step.childIndex, node, right, pageSize, minimumSize) {
-					return nil, fmt.Errorf("selected right redistribution: %w", ErrRedistributionInvalid)
+					return 0, fmt.Errorf("selected right redistribution: %w", ErrRedistributionInvalid)
 				}
 				if err := tree.reparentChildren(node); err != nil {
-					return nil, err
+					return 0, err
 				}
 				if err := tree.reparentChildren(right); err != nil {
-					return nil, err
+					return 0, err
 				}
 			} else {
-				left = tree.store.WritableNode(left)
+				left, err = tree.store.EditNode(left.PageID())
+				if err != nil {
+					return 0, err
+				}
 				if !redistributeChildren(parent, step.childIndex-1, left, node, pageSize, minimumSize) {
-					return nil, fmt.Errorf("selected left redistribution: %w", ErrRedistributionInvalid)
+					return 0, fmt.Errorf("selected left redistribution: %w", ErrRedistributionInvalid)
 				}
 				if err := tree.reparentChildren(left); err != nil {
-					return nil, err
+					return 0, err
 				}
 				if err := tree.reparentChildren(node); err != nil {
-					return nil, err
+					return 0, err
 				}
 			}
 			return root, nil
 		}
 	}
 	// A branch with one child no longer needs to be a root.
-	if !root.IsLeaf() && len(root.Children) == 1 {
-		child, err := tree.readChild(root, 0)
+	current, err := tree.store.ReadNode(root)
+	if err != nil {
+		return 0, err
+	}
+	if !current.IsLeaf() && current.EntryCount() == 0 {
+		child, err := current.Child(0)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
-		if err := tree.store.FreePage(root.PageID()); err != nil {
-			return nil, err
+		if err := tree.store.FreePage(root); err != nil {
+			return 0, err
 		}
 		root = child
-		tree.store.SetParent(root.PageID(), nil)
+		tree.setParent(root, 0)
+	}
+	return root, nil
+}
+
+// readSibling returns the decoded child at index for a merge or redistribution check.
+// The result can borrow a committed node or an earlier callback's node, so the caller must not change it.
+// To change a sibling, the caller first gets a private copy with [Store.EditNode].
+func (tree *Tree) readSibling(parent *MutableNode, index int) (*MutableNode, error) {
+	node, err := tree.readChild(parent.ReadOnly(), index)
+	if err != nil {
+		return nil, err
+	}
+	return node.decode(tree.store.PageSize())
+}
+
+// RepairMoved updates saved parent references after storage assigns new node heads.
+// root identifies the catalog root; all other moved nodes must have a saved owner.
+// It returns the relocated catalog root. The changes remain private in Store.
+func (tree *Tree) RepairMoved(root page.ID, moved map[page.ID]page.ID) (page.ID, error) {
+	parents := make([]page.ID, 0, len(moved))
+	for old := range moved {
+		parent, ok := tree.parents[old]
+		if !ok || parent == 0 {
+			if old != root {
+				return 0, fmt.Errorf("moved node %d has no parent: %w", old, ErrInvalid)
+			}
+			continue
+		}
+		if replacement, ok := moved[parent]; ok {
+			parent = replacement
+		}
+		parents = append(parents, parent)
+	}
+	slices.Sort(parents)
+	for first := 0; first < len(parents); {
+		last := first + 1
+		for last < len(parents) && parents[last] == parents[first] {
+			last++
+		}
+		parent, err := tree.store.EditNode(parents[first])
+		if err != nil {
+			return 0, err
+		}
+		repaired, err := parent.ReplaceReferences(moved)
+		if err != nil {
+			return 0, err
+		}
+		if repaired != last-first {
+			return 0, fmt.Errorf("parent %d repaired %d moved children, want %d: %w", parent.PageID(), repaired, last-first, ErrInvalid)
+		}
+		first = last
+	}
+	// Apply the same relocation to the paths retained for subsequent preparation passes.
+	for old, target := range moved {
+		parent := tree.parents[old]
+		if replacement, ok := moved[parent]; ok {
+			parent = replacement
+		}
+		tree.setParent(target, parent)
+	}
+	for id, parent := range tree.parents {
+		if replacement, ok := moved[parent]; ok {
+			tree.setParent(id, replacement)
+		}
+	}
+	if target, ok := moved[root]; ok {
+		root = target
 	}
 	return root, nil
 }

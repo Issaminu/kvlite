@@ -106,7 +106,7 @@ func TestContinuedMainFileReads(t *testing.T) {
 			if fromWAL {
 				// WAL values differ from the main file. Get must use the WAL tree.
 				ids := []page.ID{db.meta.Root()}
-				walkNodes(t, db, mustBucketRoot(t, db, bucketName), func(node *btree.Node) { ids = append(ids, node.PageID()) })
+				walkNodes(t, db, mustBucketRoot(t, db, bucketName), func(node *btree.MutableNode) { ids = append(ids, node.PageID()) })
 				for _, id := range ids {
 					data, err := db.readMainNodePage(id)
 					if err != nil {
@@ -129,7 +129,6 @@ func TestContinuedMainFileReads(t *testing.T) {
 				clear(db.writeNodes)
 				db.writeNodeSlots = nil
 				db.nextWriteNodeSlot = 0
-				db.cacheWriteNode(db.rootNode)
 			}
 			if !mapped {
 				if err := db.unmapMainFile(); err != nil {
@@ -150,9 +149,9 @@ func TestContinuedMainFileReads(t *testing.T) {
 			if _, err := db.Get(bucketName, []byte("missing")); !errors.Is(err, ErrKeyNotFound) {
 				t.Fatalf("missing key: %v", err)
 			}
-			// Point reads must not decode the bucket's branch or leaves.
-			if len(db.writeNodes) != 1 {
-				t.Fatalf("point reads cached %d nodes, want only the catalog root", len(db.writeNodes))
+			// Point reads must not decode any node.
+			if len(db.writeNodes) != 0 {
+				t.Fatalf("point reads cached %d nodes, want none", len(db.writeNodes))
 			}
 			if err := db.View(func(tx *Tx) error {
 				bucket := mustBucket(t, tx, bucketName)
@@ -273,7 +272,7 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 			t.Fatal(err)
 		}
 	}
-	branch := btree.NewRootNode(0, left, right, entries[1].Key())
+	branch := btree.NewRootNode(0, left.PageID(), right.PageID(), entries[1].Key())
 	if err := catalog.InsertEntry(btree.NewEntry(btree.BucketLeafFlag, bucketName, page.EncodeID(branch.PageID()))); err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +288,7 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 	}
 	allocation := newAllocationBitmap(pageSize)
 	nextID := meta.Root()
-	for _, node := range []*btree.Node{catalog, branch, left, right} {
+	for _, node := range []*btree.MutableNode{catalog, branch, left, right} {
 		node.SetPageID(nextID)
 		nextID += page.ID(btree.NodePageCount(node, pageSize))
 	}
@@ -300,7 +299,7 @@ func writeContinuedReadDatabase(t *testing.T, checksums bool) (string, []byte, [
 		t.Fatal(err)
 	}
 	var damagedPageID page.ID
-	for _, node := range []*btree.Node{catalog, branch, left, right} {
+	for _, node := range []*btree.MutableNode{catalog, branch, left, right} {
 		ids := make([]page.ID, btree.NodePageCount(node, pageSize))
 		ids[0] = node.PageID()
 		for index := 1; index < len(ids); index++ {
@@ -386,24 +385,24 @@ func TestMakeWALCommitData_EncodesChangedMetadata(t *testing.T) {
 func TestWriteTx_PreservesOriginalNodeAcrossWriteBatchCallbacks(t *testing.T) {
 	meta := page.NewMeta(4096)
 	root := btree.NewLeafNode(meta.Root())
-	db := &DB{storage: storage{meta: meta, rootNode: root}}
+	db := &DB{storage: storage{meta: meta, memoryNodes: map[page.ID]*btree.MutableNode{root.PageID(): root}}}
 	base := btree.NewLeafNode(10)
 	if err := base.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("old"))); err != nil {
 		t.Fatal(err)
 	}
 
-	first := newWriteTx(db, meta, root, nil, nil)
-	middle := first.store.WritableNode(base)
+	first := newWriteTx(db, writeBatchState{meta: meta, dirty: nil, allocation: nil})
+	middle := testEditNode(t, &first.store, base)
 	if err := middle.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("mid"))); err != nil {
 		t.Fatal(err)
 	}
 
-	second := newWriteTx(db, first.meta, first.rootNode, first.store.dirty, nil)
-	middle, err := second.store.ReadNode(base.PageID())
-	if err != nil {
-		t.Fatal(err)
+	second := newWriteTx(db, writeBatchState{meta: first.meta, dirty: first.store.dirty, allocation: nil, tree: first.tree})
+	middle = second.store.privateNode(base.PageID())
+	if middle == nil {
+		t.Fatal("second callback did not see the node from the first callback")
 	}
-	latest := second.store.WritableNode(middle)
+	latest := testEditNode(t, &second.store, middle)
 	if err := latest.InsertEntry(btree.NewEntry(0, []byte("key"), []byte("new"))); err != nil {
 		t.Fatal(err)
 	}
@@ -485,45 +484,6 @@ func TestOpen_RecoversBytePatch(t *testing.T) {
 	}
 	if !bytes.Equal(got, []byte("new-value")) {
 		t.Fatalf("recovered value: got %q, want %q", got, "new-value")
-	}
-}
-
-func TestReadNode_ReusesOwnedCommittedNodeAfterMappingRefresh(t *testing.T) {
-	path := tempfile()
-	defer os.RemoveAll(path)
-	defer os.RemoveAll(path + "-wal")
-
-	db, err := openDB(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-
-	db.operationMu.Lock()
-	defer db.operationMu.Unlock()
-	if err := db.checkpointWAL(); err != nil {
-		t.Fatal(err)
-	}
-	clear(db.writeNodes)
-	db.writeNodeSlots = nil
-	db.nextWriteNodeSlot = 0
-
-	first, err := db.readNode(db.meta.Root())
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := db.readNode(db.meta.Root())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if first != second {
-		t.Fatal("second write-page read decoded a new node")
-	}
-	if err := db.refreshMainFileMapping(); err != nil {
-		t.Fatal(err)
-	}
-	if first.EntryCount() != second.EntryCount() {
-		t.Fatal("cached node changed after mapping refresh")
 	}
 }
 
@@ -683,18 +643,18 @@ func mustBucketValue(t *testing.T, bucket *Bucket, key []byte) []byte {
 	return value
 }
 
-func mustBucketRoot(t *testing.T, db *DB, name []byte) *btree.Node {
+func mustBucketRoot(t *testing.T, db *DB, name []byte) *btree.MutableNode {
 	t.Helper()
-	var root *btree.Node
+	var root *btree.MutableNode
 	if err := db.View(func(tx *Tx) error {
 		bucket, err := tx.Bucket(name)
 		if err != nil {
 			return err
 		}
-		if err := bucket.loadRootNode(); err != nil {
+		if err := testLoadRoot(t, bucket); err != nil {
 			return err
 		}
-		root = bucket.rootNode
+		root = testBucketRoot(t, bucket)
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -756,7 +716,7 @@ func TestBucketGet_ReadOnlyBranchDoesNotAllocate(t *testing.T) {
 			return err
 		}
 		value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
-		for index := 0; bucket.rootNode.IsLeaf(); index++ {
+		for index := 0; testBucketRoot(t, bucket).IsLeaf(); index++ {
 			key = fmt.Appendf(nil, "key-%04d", index)
 			if err := bucket.Put(key, value); err != nil {
 				return err
@@ -860,12 +820,12 @@ func TestBucketPut_ReusesTransactionOwnedRoot(t *testing.T) {
 
 	err = db.Update(func(tx *Tx) error {
 		bucket := mustBucket(t, tx, testBucketName)
-		committedRoot := bucket.rootNode
+		committedRoot := testBucketRoot(t, bucket)
 
 		if err := bucket.Put([]byte("first"), []byte("value")); err != nil {
 			return err
 		}
-		privateRoot := bucket.rootNode
+		privateRoot := testBucketRoot(t, bucket)
 		if privateRoot == committedRoot {
 			t.Fatal("first write did not give the transaction a private root")
 		}
@@ -873,7 +833,7 @@ func TestBucketPut_ReusesTransactionOwnedRoot(t *testing.T) {
 		if err := bucket.Put([]byte("second"), []byte("value")); err != nil {
 			return err
 		}
-		if bucket.rootNode != privateRoot {
+		if testBucketRoot(t, bucket) != privateRoot {
 			t.Fatal("second write copied the transaction-owned root again")
 		}
 		return nil
@@ -895,20 +855,20 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 
 	err = db.Update(func(tx *Tx) error {
 		bucket := mustBucket(t, tx, testBucketName)
-		rootPageID := bucket.rootNode.PageID()
+		rootPageID := testBucketRoot(t, bucket).PageID()
 		value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
 
-		for index := 0; bucket.rootNode.IsLeaf(); index++ {
+		for index := 0; testBucketRoot(t, bucket).IsLeaf(); index++ {
 			key := fmt.Appendf(nil, "key-%04d", index)
 			if err := bucket.Put(key, value); err != nil {
 				return err
 			}
 		}
 
-		if got := bucket.rootNode.PageID(); got == rootPageID {
+		if got := testBucketRoot(t, bucket).PageID(); got == rootPageID {
 			t.Fatalf("bucket root page ID after split: got old page %d, want a new page", got)
 		}
-		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, testBucketName, true)
+		entry, found, err := tx.tree.FindEntryRef(tx.meta.Root(), testBucketName, true)
 		if err != nil {
 			return err
 		}
@@ -919,7 +879,7 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got, want := catalogRoot, bucket.rootNode.PageID(); got != want {
+		if got, want := catalogRoot, testBucketRoot(t, bucket).PageID(); got != want {
 			t.Fatalf("catalog root page ID: got %d, want %d", got, want)
 		}
 		return nil
@@ -1145,16 +1105,16 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 }
 
 // walkNodes visits each node in a tree and checks that each child page can be read.
-func walkNodes(t *testing.T, db *DB, root *btree.Node, visit func(n *btree.Node)) {
+func walkNodes(t *testing.T, db *DB, root *btree.MutableNode, visit func(n *btree.MutableNode)) {
 	t.Helper()
-	var rec func(n *btree.Node)
-	rec = func(n *btree.Node) {
+	var rec func(n *btree.MutableNode)
+	rec = func(n *btree.MutableNode) {
 		visit(n)
 		if n.IsLeaf() {
 			return
 		}
 		for _, childPgid := range n.Children {
-			child, err := db.readNode(childPgid)
+			child, err := db.committedNode(childPgid)
 			if err != nil || child == nil {
 				t.Fatalf("walk: could not read child pgid %d (broken split wiring?): %v", childPgid, err)
 			}
@@ -1221,7 +1181,7 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 	}
 
 	pageBytes := int(db.meta.PageSize())
-	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.MutableNode) {
 		if sz := nd.EncodedSize(); sz > pageBytes {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page — split must keep every node <= a page", sz, pageBytes)
 		}
@@ -1255,7 +1215,7 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 		t.Fatal("root must be a branch after 400 entries")
 	}
 	leaves := 0
-	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.MutableNode) {
 		if nd.IsLeaf() {
 			leaves++
 		}
@@ -1307,7 +1267,7 @@ func TestSplit_Cascades(t *testing.T) {
 	if root.IsLeaf() {
 		t.Fatal("root must be a branch")
 	}
-	child, err := db.readNode(root.Children[0])
+	child, err := db.committedNode(root.Children[0])
 	if err != nil || child == nil {
 		t.Fatalf("could not read root's first child: %v", err)
 	}
@@ -3828,6 +3788,36 @@ func TestUpdate_OverwriteDoesNotCommitUnchangedMetadata(t *testing.T) {
 	}
 }
 
+// TestOpen_RejectsDamagedCatalogRoot checks that Open reads the complete catalog root.
+// A damaged entry makes Open fail, and not a later transaction.
+func TestOpen_RejectsDamagedCatalogRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	db, err := openDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	createBucket(t, db, []byte("second"))
+	root, pageSize := db.meta.Root(), db.meta.PageSize()
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Damage the first entry descriptor, which comes after the node header.
+	if _, err := file.WriteAt(bytes.Repeat([]byte{0xff}, 8), int64(root)*pageSize+btree.NodeHeaderSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if db, err := openDB(path); err == nil {
+		db.Close()
+		t.Fatal("Open accepted a damaged catalog root")
+	}
+}
+
 func TestReadNode_DoesNotChangeMainFileOffset(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := openDB(path)
@@ -3843,7 +3833,7 @@ func TestReadNode_DoesNotChangeMainFileOffset(t *testing.T) {
 	if _, err := db.file.(*os.File).Seek(offset, io.SeekStart); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.readNode(db.meta.Root()); err != nil {
+	if _, err := db.committedNode(db.meta.Root()); err != nil {
 		t.Fatal(err)
 	}
 	got, err := db.file.(*os.File).Seek(0, io.SeekCurrent)
@@ -3954,7 +3944,7 @@ func TestTx_UpdateCommitsAtomically(t *testing.T) {
 // an error must leave NO trace — every write in that txn is discarded, while data
 // committed by an EARLIER successful txn is untouched. The assertion runs on the
 // SAME open handle (no reopen), so it also catches the in-memory-rollback trap:
-// discarding the WAL buffer is not enough if db.rootNode was mutated in place.
+// discarding the WAL buffer is not enough if a committed node was mutated in place.
 func TestTx_UpdateRollsBackOnError(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -4253,13 +4243,12 @@ func TestTreePutEntry_DoesNotPublishPrivateRoot(t *testing.T) {
 	}
 	defer db.Close()
 
-	originalRoot := db.rootNode
 	originalMetaRoot := db.meta.Root()
 	value := bytes.Repeat([]byte("v"), int(db.meta.PageSize()/2))
 	committedBefore := db.wal.Stats().CommittedRecordCount
 
 	err = db.Update(func(tx *Tx) error {
-		root := tx.rootNode
+		root := tx.meta.Root()
 		newRoot, err := tx.tree.PutEntry(root, btree.NewEntry(0, []byte("a"), value))
 		if err != nil {
 			return err
@@ -4268,17 +4257,14 @@ func TestTreePutEntry_DoesNotPublishPrivateRoot(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if newRoot.IsLeaf() {
+		if testNode(t, &tx.store, newRoot).IsLeaf() {
 			t.Fatal("second entry did not split the root")
 		}
-		if newRoot.PageID() == root.PageID() {
-			t.Fatalf("private root page ID after split: got old page %d, want a new page", root.PageID())
+		if newRoot == root {
+			t.Fatalf("private root page ID after split: got old page %d, want a new page", root)
 		}
-		if tx.rootNode != root {
+		if tx.meta.Root() != root {
 			t.Fatal("tree engine published its private root through the transaction")
-		}
-		if db.rootNode != originalRoot {
-			t.Fatal("transaction changed the shared database root before commit")
 		}
 		if db.meta.Root() != originalMetaRoot {
 			t.Fatalf("transaction changed meta root before commit: got %d, want %d", db.meta.Root(), originalMetaRoot)
@@ -4292,8 +4278,8 @@ func TestTreePutEntry_DoesNotPublishPrivateRoot(t *testing.T) {
 	if !errors.Is(err, errDiscardTx) {
 		t.Fatalf("Update: got %v, want %v", err, errDiscardTx)
 	}
-	if db.rootNode != originalRoot {
-		t.Fatal("discarded transaction changed the database root")
+	if root, err := db.committedNode(originalMetaRoot); err != nil || !root.IsLeaf() {
+		t.Fatalf("discarded transaction changed the committed root node: %v", err)
 	}
 	if db.meta.Root() != originalMetaRoot {
 		t.Fatalf("discarded transaction changed meta root: got %d, want %d", db.meta.Root(), originalMetaRoot)
@@ -4843,7 +4829,7 @@ func TestDeleteBucketRepairsNestedParentRoot(t *testing.T) {
 				return err
 			}
 		}
-		if parent.rootNode.IsLeaf() {
+		if testBucketRoot(t, parent).IsLeaf() {
 			t.Fatal("parent tree did not split")
 		}
 		return nil
@@ -4861,7 +4847,7 @@ func TestDeleteBucketRepairsNestedParentRoot(t *testing.T) {
 				return err
 			}
 		}
-		if !parent.rootNode.IsLeaf() {
+		if !testBucketRoot(t, parent).IsLeaf() {
 			t.Fatal("parent root did not collapse")
 		}
 		_, err = parent.Bucket(name(count - 1))
@@ -4901,7 +4887,7 @@ func TestDeleteBucketRepairsCatalogRoot(t *testing.T) {
 				return err
 			}
 		}
-		if tx.rootNode.IsLeaf() {
+		if testNode(t, &tx.store, tx.meta.Root()).IsLeaf() {
 			t.Fatal("catalog tree did not split")
 		}
 		return nil
@@ -4914,7 +4900,7 @@ func TestDeleteBucketRepairsCatalogRoot(t *testing.T) {
 				return err
 			}
 		}
-		if !tx.rootNode.IsLeaf() || tx.rootNode.PageID() != tx.meta.Root() {
+		if !testNode(t, &tx.store, tx.meta.Root()).IsLeaf() {
 			t.Fatal("catalog root did not collapse into metadata")
 		}
 		_, err := tx.Bucket(name(count - 1))
@@ -5328,7 +5314,7 @@ func TestBucket_NestedInSplitParent(t *testing.T) {
 				return err
 			}
 		}
-		if parent.rootNode.IsLeaf() {
+		if testBucketRoot(t, parent).IsLeaf() {
 			t.Fatal("test setup: parent bucket tree did not split")
 		}
 		child, err := parent.CreateBucket([]byte("child"))
@@ -5484,7 +5470,7 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	}
 
 	// Every node must fit one page and hold at least one entry (no empty leaf).
-	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.MutableNode) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
@@ -5629,7 +5615,7 @@ func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 
 	// The big insert must grow the tree, and every resulting node must fit.
 	leaves := 0
-	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(nd *btree.MutableNode) {
 		if sz := nd.EncodedSize(); sz > page {
 			t.Fatalf("node serializes to %d bytes > one %d-byte page", sz, page)
 		}
@@ -5685,7 +5671,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 			return err
 		}
 		p := mustBucket(t, tx, []byte("p"))
-		rootPageID := p.rootNode.PageID()
+		rootPageID := testBucketRoot(t, p).PageID()
 
 		pageSize := int(db.meta.PageSize())
 		childName := bytes.Repeat([]byte("c"), 300) // The large name makes the bucket entry exceed the remaining space.
@@ -5698,7 +5684,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 		for i := 0; ; i++ {
 			k := fmt.Appendf(nil, "fill-%06d", i)
 			entrySize := 16 + len(k) + len(fillVal)
-			if p.rootNode.EncodedSize()+entrySize > pageSize {
+			if testBucketRoot(t, p).EncodedSize()+entrySize > pageSize {
 				break
 			}
 			if err := p.Put(k, fillVal); err != nil {
@@ -5706,7 +5692,7 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 			}
 			fillKeys = append(fillKeys, k)
 		}
-		if !p.rootNode.IsLeaf() {
+		if !testBucketRoot(t, p).IsLeaf() {
 			t.Fatal("setup error: p split during packing; it should still be one leaf")
 		}
 
@@ -5714,13 +5700,13 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 			return err
 		}
 
-		if p.rootNode.IsLeaf() {
+		if testBucketRoot(t, p).IsLeaf() {
 			t.Fatal("nested bucket creation did not split the full parent root")
 		}
-		if got := p.rootNode.PageID(); got == rootPageID {
+		if got := testBucketRoot(t, p).PageID(); got == rootPageID {
 			t.Fatalf("parent root page ID after split: got old page %d, want a new page", got)
 		}
-		entry, found, err := tx.tree.FindEntryRef(tx.rootNode, []byte("p"), true)
+		entry, found, err := tx.tree.FindEntryRef(tx.meta.Root(), []byte("p"), true)
 		if err != nil {
 			return err
 		}
@@ -5731,12 +5717,12 @@ func TestCreateBucket_ParentRootSplitUpdatesCatalog(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if got, want := catalogRoot, p.rootNode.PageID(); got != want {
+		if got, want := catalogRoot, testBucketRoot(t, p).PageID(); got != want {
 			t.Fatalf("catalog root page ID: got %d, want %d", got, want)
 		}
 
 		// Load a fresh handle through the updated catalog pointer.
-		p2, err := tx.loadBucket(tx.rootNode, []byte("p"), nil)
+		p2, err := tx.loadBucket(tx.meta.Root(), []byte("p"), nil)
 		if err != nil {
 			return err
 		}
@@ -5993,11 +5979,11 @@ func TestTreeFindEntryRef_DistinguishesEmptyValueFromMissing(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := bucket.loadRootNode(); err != nil {
+		if err := testLoadRoot(t, bucket); err != nil {
 			return err
 		}
-		root := bucket.rootNode
-		entry, found, err := tx.tree.FindEntryRef(root, []byte("present"), true)
+		root := testBucketRoot(t, bucket)
+		entry, found, err := tx.tree.FindEntryRef(root.PageID(), []byte("present"), true)
 		if err != nil {
 			return err
 		}
@@ -6008,7 +5994,7 @@ func TestTreeFindEntryRef_DistinguishesEmptyValueFromMissing(t *testing.T) {
 			t.Fatalf("stored empty value: got %v, want a non-nil empty slice", entry.Value())
 		}
 
-		_, found, err = tx.tree.FindEntryRef(root, []byte("missing"), true)
+		_, found, err = tx.tree.FindEntryRef(root.PageID(), []byte("missing"), true)
 		if err != nil {
 			return err
 		}
@@ -7168,7 +7154,7 @@ func TestWriteBatch_RetirementReusesPrivateAllocationPage(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			retiredPage = bucket.rootNode.PageID()
+			retiredPage = testBucketRoot(t, bucket).PageID()
 			if err := tx.DeleteBucket(name); err != nil {
 				return err
 			}
@@ -7605,7 +7591,7 @@ func TestView_DoesNotCreatePrivateNodeMaps(t *testing.T) {
 	defer db.Close()
 
 	if err := db.View(func(tx *Tx) error {
-		if tx.store.nodes != nil || tx.store.dirty != nil {
+		if tx.store.dirty != nil {
 			t.Fatal("read transaction created private node maps")
 		}
 		return nil
@@ -8546,7 +8532,7 @@ func TestPut_ContinuedTree(t *testing.T) {
 			check()
 			// Appending a key preserves each old branch's first separator, even if the branch moves.
 			oldBranches := make(map[string]int)
-			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.MutableNode) {
 				if !node.IsLeaf() {
 					oldBranches[string(node.EntryAt(0).Key())] = node.StoragePageCount()
 				}
@@ -8560,7 +8546,7 @@ func TestPut_ContinuedTree(t *testing.T) {
 			}
 			keys, values = append(keys, key), append(values, value)
 			grew := false
-			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.MutableNode) {
 				key := string(node.EntryAt(0).Key())
 				previous, found := oldBranches[key]
 				if !found {
@@ -8577,7 +8563,7 @@ func TestPut_ContinuedTree(t *testing.T) {
 				t.Fatal(err)
 			}
 			leaves, branches := 0, 0
-			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+			walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.MutableNode) {
 				if len(node.OverflowPages()) == 0 {
 					t.Fatal("large node has no continuation pages")
 				}
@@ -8647,7 +8633,7 @@ func TestPut_ConsecutivePageOwnership(t *testing.T) {
 					t.Fatalf("Get %s: %v", key, err)
 				}
 			}
-			findLeaf := func(key string) *btree.Node {
+			findLeaf := func(key string) *btree.MutableNode {
 				t.Helper()
 				node := mustBucketRoot(t, db, testBucketName)
 				for !node.IsLeaf() {
@@ -8655,7 +8641,7 @@ func TestPut_ConsecutivePageOwnership(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					node, err = db.readNode(child)
+					node, err = db.committedNode(child)
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -8792,7 +8778,7 @@ func TestPut_ContinuedCommitFailure(t *testing.T) {
 			t.Fatal(err)
 		}
 		root := mustBucketRoot(t, db, testBucketName)
-		original, err := db.readNode(root.PageID())
+		original, err := db.committedNode(root.PageID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -8804,7 +8790,7 @@ func TestPut_ContinuedCommitFailure(t *testing.T) {
 		if !errors.Is(err, errDiscardTx) {
 			t.Fatalf("commit error: %v", err)
 		}
-		current, err := db.readNode(root.PageID())
+		current, err := db.committedNode(root.PageID())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -8952,20 +8938,25 @@ func TestReadNode_ContinuedWALRecordUsesCommittedNode(t *testing.T) {
 	if !ok || record.Node == nil || record.Payload != nil {
 		t.Fatalf("leaf %d WAL record: found %t, decoded %t; want a committed node", leafPageID, ok, record.Node != nil)
 	}
-	var node *btree.Node
+	reader := db.storage.nodeReader()
+	var node btree.Node
 	allocations := testing.AllocsPerRun(10, func() {
-		node, err = db.readNode(leafPageID)
+		node, err = reader.ReadNode(leafPageID)
 		if err != nil {
 			panic(err)
 		}
 	})
-	if node != record.Node {
+	entry, err := node.Entry(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if &entry.Value()[0] != &record.Node.EntryAt(0).Value()[0] {
 		t.Fatal("read did not return the committed WAL node")
 	}
 	if allocations != 0 {
 		t.Fatalf("allocations for each continued WAL leaf read: got %.0f, want 0", allocations)
 	}
-	if got := node.EntryAt(0).Value(); !bytes.Equal(got, bytes.Repeat([]byte{4}, size)) {
+	if got := entry.Value(); !bytes.Equal(got, bytes.Repeat([]byte{4}, size)) {
 		t.Fatalf("continued WAL leaf value: got %d bytes starting %v, want the last commit", len(got), got[:min(len(got), 1)])
 	}
 }
@@ -9379,7 +9370,7 @@ func TestDeleteBucket_ContinuedReadFailure(t *testing.T) {
 		t.Fatal(err)
 	}
 	var tail page.ID
-	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.Node) {
+	walkNodes(t, db, mustBucketRoot(t, db, testBucketName), func(node *btree.MutableNode) {
 		if node.IsLeaf() {
 			ids := node.OverflowPages()
 			tail = ids[len(ids)-1]
@@ -9573,7 +9564,7 @@ func TestDelete_CompactPrivateLeafRollback(t *testing.T) {
 func TestDeleteLeafEntries_PreservesWriteBatchImages(t *testing.T) {
 	meta := page.NewMeta(4096)
 	root := btree.NewLeafNode(meta.Root())
-	db := &DB{storage: storage{meta: meta, rootNode: root}}
+	db := &DB{storage: storage{meta: meta, memoryNodes: map[page.ID]*btree.MutableNode{root.PageID(): root}}}
 	base := btree.NewLeafNode(10)
 	for _, key := range []string{"a", "b", "c", "d", "e", "f"} {
 		if err := base.InsertEntry(btree.NewEntry(0, []byte(key), []byte(key))); err != nil {
@@ -9581,19 +9572,19 @@ func TestDeleteLeafEntries_PreservesWriteBatchImages(t *testing.T) {
 		}
 	}
 	before := btree.EncodeWALNode(base)
-	first := newWriteTx(db, meta, root, nil, nil)
-	middle := first.store.DeleteLeafEntries(base, 1, []int{3}, 0)
-	if got := first.store.DeleteLeafEntries(middle, 2, nil, 0); got != middle {
+	first := newWriteTx(db, writeBatchState{meta: meta, dirty: nil, allocation: nil})
+	middle := testDeleteEntries(t, &first.store, base, 1, []int{3})
+	if got := testDeleteEntries(t, &first.store, middle, 2, nil); got != middle {
 		t.Fatal("later delete replaced the private node")
 	}
 	retained := btree.EncodeWALNode(middle)
-	failed := newWriteTx(db, meta, root, first.store.dirty, nil)
-	failed.store.DeleteLeafEntries(middle, 0, nil, 0)
+	failed := newWriteTx(db, writeBatchState{meta: meta, dirty: first.store.dirty, allocation: nil, tree: first.tree})
+	testDeleteEntries(t, &failed.store, middle, 0, nil)
 	if !bytes.Equal(btree.EncodeWALNode(middle), retained) || !bytes.Equal(btree.EncodeWALNode(base), before) {
 		t.Fatal("later callback changed an earlier node image")
 	}
-	last := newWriteTx(db, meta, root, first.store.dirty, nil)
-	final := last.store.DeleteLeafEntries(middle, 1, nil, 0)
+	last := newWriteTx(db, writeBatchState{meta: meta, dirty: first.store.dirty, allocation: nil, tree: first.tree})
+	final := testDeleteEntries(t, &last.store, middle, 1, nil)
 	nodes, _ := makeWALCommitData(last.store.dirty, meta, false)
 	if len(nodes) != 1 || nodes[0].Original != base || nodes[0].Final != final || final.EntryCount() != 2 {
 		t.Fatal("delete did not preserve the original and final WAL images")
@@ -9755,7 +9746,7 @@ func TestRecoveryOldHeadReusedInsideRawSpan(t *testing.T) {
 							return err
 						}
 						if i == 2 {
-							oldHead = bucket.rootNode.PageID()
+							oldHead = testBucketRoot(t, bucket).PageID()
 						}
 					}
 					return nil
@@ -9796,11 +9787,11 @@ func TestRecoveryOldHeadReusedInsideRawSpan(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					if err := bucket.loadRootNode(); err != nil {
+					if err := testLoadRoot(t, bucket); err != nil {
 						return err
 					}
-					newHead = bucket.rootNode.PageID()
-					spanCount = btree.NodePageCount(bucket.rootNode, tx.meta.PageSize())
+					newHead = testBucketRoot(t, bucket).PageID()
+					spanCount = btree.NodePageCount(testBucketRoot(t, bucket), tx.meta.PageSize())
 					return nil
 				}); err != nil {
 					t.Fatal(err)
@@ -10761,10 +10752,10 @@ func copyReplacementFixture(t *testing.T) (string, page.ID, []byte) {
 				return err
 			}
 		}
-		if bucket.rootNode.IsLeaf() {
+		if testBucketRoot(t, bucket).IsLeaf() {
 			return errors.New("fixture has no branch")
 		}
-		leafID = bucket.rootNode.Children[0]
+		leafID = testBucketRoot(t, bucket).Children[0]
 		return nil
 	})
 	closeErr := db.Close()
@@ -10775,7 +10766,7 @@ func copyReplacementFixture(t *testing.T) (string, page.ID, []byte) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	walkNodes(t, opened, mustBucketRoot(t, opened, testBucketName), func(node *btree.Node) {
+	walkNodes(t, opened, mustBucketRoot(t, opened, testBucketName), func(node *btree.MutableNode) {
 		if node.IsLeaf() {
 			entry, found, err := node.FindEntryRef([]byte("a"))
 			if err != nil {
@@ -10813,7 +10804,7 @@ func TestPutContinuedReplacementDoesNotDecodeOldLeaf(t *testing.T) {
 				if _, ok := db.cachedWriteNode(leafID); ok {
 					return errors.New("replacement materialized the old leaf")
 				}
-				if change, ok := tx.store.dirty[leafID]; !ok || change.original != nil || change.parent != bucket.rootNode {
+				if change, ok := tx.store.dirty[leafID]; !ok || change.original != nil || testParent(t, tx, leafID).PageID() != bucket.rootPageID {
 					return errors.New("replacement retained a decoded old value")
 				}
 				return rollback
@@ -11065,7 +11056,7 @@ func TestNeighborInsertKeepsOldLargeLeaf(t *testing.T) {
 							if _, ok := db.cachedWriteNode(oldID); ok {
 								return errors.New("neighbor insert decoded the old value")
 							}
-							if tx.store.nodes[oldID].node != nil {
+							if tx.store.dirty[oldID].final != nil {
 								return errors.New("neighbor insert kept a decoded old leaf")
 							}
 							if _, ok := tx.store.dirty[oldID]; ok {
@@ -11465,13 +11456,13 @@ func TestManagedPutMappedSameLength(t *testing.T) {
 					t.Fatal(err)
 				}
 				key := []byte("key-00")
-				var old *btree.Node
+				var old *btree.MutableNode
 				if err := db.View(func(tx *Tx) error {
 					bucket := mustBucket(t, tx, testBucketName)
-					if err := bucket.loadRootNode(); err != nil {
+					if err := testLoadRoot(t, bucket); err != nil {
 						return err
 					}
-					node := bucket.rootNode
+					node := testBucketRoot(t, bucket)
 					if branch && node.IsLeaf() {
 						return fmt.Errorf("fixture has no branch")
 					}
@@ -11480,7 +11471,7 @@ func TestManagedPutMappedSameLength(t *testing.T) {
 						if err != nil {
 							return err
 						}
-						node, err = tx.store.ReadNode(node.Children[index])
+						node, err = db.committedNode(node.Children[index])
 						if err != nil {
 							return err
 						}
@@ -11815,7 +11806,7 @@ type managedRootProbe struct {
 	seen, decoded bool
 }
 
-func (file *managedRootProbe) WriteNode(node *btree.Node, _ int64, _ bool) (bool, error) {
+func (file *managedRootProbe) WriteNode(node *btree.MutableNode, _ int64, _ bool) (bool, error) {
 	if node.HasBorrowedValues() {
 		file.seen = true
 		if cached := file.db.writeNodes[file.head]; cached != nil && cached.node != nil {
@@ -11831,7 +11822,7 @@ type borrowedValueProbe struct {
 	seen  bool
 }
 
-func (file *borrowedValueProbe) WriteNode(node *btree.Node, _ int64, _ bool) (bool, error) {
+func (file *borrowedValueProbe) WriteNode(node *btree.MutableNode, _ int64, _ bool) (bool, error) {
 	if node.HasBorrowedValues() {
 		for index := range node.EntryCount() {
 			value := node.EntryAt(index).Value()
@@ -11845,9 +11836,6 @@ func (file *borrowedValueProbe) WriteNode(node *btree.Node, _ int64, _ bool) (bo
 
 func assertNoBorrowedCommittedNodes(t *testing.T, db *DB) {
 	t.Helper()
-	if db.rootNode.HasBorrowedValues() {
-		t.Fatal("catalog root retained caller bytes")
-	}
 	for id, cached := range db.writeNodes {
 		if cached.node != nil && cached.node.HasBorrowedValues() {
 			t.Fatalf("cached node %d retained caller bytes", id)
@@ -12880,13 +12868,13 @@ func TestGetBatchGroupsDeepMainTreeWithAndWithoutMapping(t *testing.T) {
 			}
 			if err := db.View(func(tx *Tx) error {
 				bucket := mustBucket(t, tx, testBucketName)
-				if err := bucket.loadRootNode(); err != nil {
+				if err := testLoadRoot(t, bucket); err != nil {
 					return err
 				}
-				if bucket.rootNode.IsLeaf() {
+				if testBucketRoot(t, bucket).IsLeaf() {
 					t.Fatal("fixture has no branches")
 				}
-				child, err := db.readOnlyNode(bucket.rootNode.Children[0])
+				child, err := db.committedNode(testBucketRoot(t, bucket).Children[0])
 				if err != nil {
 					return err
 				}
@@ -13269,10 +13257,10 @@ func TestDBPutBatchMappedReplacements(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if err := bucket.loadRootNode(); err != nil {
+				if err := testLoadRoot(t, bucket); err != nil {
 					return err
 				}
-				id = bucket.rootNode.PageID()
+				id = testBucketRoot(t, bucket).PageID()
 				return nil
 			}); err != nil {
 				t.Fatal(err)
@@ -13384,6 +13372,18 @@ func TestDBPutBatchMappedPreflightChecksLaterLeaves(t *testing.T) {
 			if err != nil || !bytes.Equal(got, setup[0].Value) {
 				t.Fatalf("preflight failure changed an earlier leaf: %v", err)
 			}
+			copy(span, original)
+			if checksums {
+				bodyEnd := btree.NodeHeaderSize + int(binary.LittleEndian.Uint32(span[18:22]))
+				span[bodyEnd-1] ^= 1
+				if err := db.PutBatch(testBucketName, []KeyValue{{Key: setup[0].Key, Value: bytes.Repeat([]byte("z"), 128)}, {Key: last.Key, Value: bytes.Repeat([]byte("z"), 128)}}); !errors.Is(err, page.ErrChecksum) {
+					t.Fatalf("later leaf checksum was ignored: %v", err)
+				}
+				if got, err := db.Get(testBucketName, setup[0].Key); err != nil || !bytes.Equal(got, setup[0].Value) {
+					t.Fatalf("checksum failure changed an earlier value: %v", err)
+				}
+				copy(span, original)
+			}
 		})
 	}
 }
@@ -13478,7 +13478,7 @@ func TestDBPutBatchMappedContinuedReplacements(t *testing.T) {
 				if firstID == lastID {
 					t.Fatal("large fixture has only one leaf")
 				}
-				if _, err := db.readNode(firstID); err != nil {
+				if _, err := db.committedNode(firstID); err != nil {
 					t.Fatal(err)
 				}
 				writes := []KeyValue{{Key: setup[1].Key, Value: bytes.Repeat([]byte("c"), size)}, {Key: setup[0].Key, Value: bytes.Repeat([]byte("d"), size)}, {Key: setup[1].Key, Value: bytes.Repeat([]byte("e"), size)}}
@@ -13817,7 +13817,7 @@ func TestGetBatchAcrossCleanAndDirtyWriteViews(t *testing.T) {
 						t.Fatal("dirty read missed private writes")
 					}
 					// Model the next grouped callback: its own dirty map is empty, but it must see the prior callback's private image.
-					next := newWriteTx(db, tx.meta, tx.rootNode, tx.store.dirty, tx.allocation)
+					next := newWriteTx(db, writeBatchState{meta: tx.meta, dirty: tx.store.dirty, allocation: tx.allocation, tree: tx.tree})
 					defer func() { next.closed = true }()
 					inherited, err := mustBucket(t, next, testBucketName).GetBatch(keys)
 					if err != nil {
@@ -13892,8 +13892,8 @@ func TestSeparatorRecoveryAndMappedReads(t *testing.T) {
 					return err
 				}
 				var boundaries, rightMinima [][]byte
-				var walk func(*btree.Node) error
-				walk = func(node *btree.Node) error {
+				var walk func(*btree.MutableNode) error
+				walk = func(node *btree.MutableNode) error {
 					if node.IsLeaf() {
 						return nil
 					}
@@ -13901,14 +13901,14 @@ func TestSeparatorRecoveryAndMappedReads(t *testing.T) {
 						boundaries = append(boundaries, slices.Clone(node.EntryAt(i).Key()))
 					}
 					for childIndex, id := range node.Children {
-						child, err := tx.store.ReadNode(id)
+						child, err := tx.store.decodedNode(id)
 						if err != nil {
 							return err
 						}
 						if childIndex > 0 {
 							first := child
 							for !first.IsLeaf() {
-								first, err = tx.store.ReadNode(first.Children[0])
+								first, err = tx.store.decodedNode(first.Children[0])
 								if err != nil {
 									return err
 								}
@@ -13921,7 +13921,7 @@ func TestSeparatorRecoveryAndMappedReads(t *testing.T) {
 					}
 					return nil
 				}
-				if err := walk(bucket.rootNode); err != nil {
+				if err := walk(testBucketRoot(t, bucket)); err != nil {
 					return err
 				}
 				for _, key := range rightMinima {
@@ -14081,4 +14081,12 @@ func separatorFileKeys(kind string, count int) [][]byte {
 		keys[i] = key
 	}
 	return keys
+}
+
+func (db *DB) lookupCommittedPage(id page.ID, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
+	node, err := db.storage.nodeReader().ReadNode(id)
+	if err != nil {
+		return btree.Entry{}, false, 0, err
+	}
+	return node.Lookup(key, includeKey)
 }

@@ -607,7 +607,7 @@ type handledCheckpointWriter struct {
 	err   error
 }
 
-func (writer *handledCheckpointWriter) WriteNode(*btree.Node, int64, bool) (bool, error) {
+func (writer *handledCheckpointWriter) WriteNode(*btree.MutableNode, int64, bool) (bool, error) {
 	writer.calls++
 	return true, writer.err
 }
@@ -701,7 +701,7 @@ func (*handledCheckpointWriter) WriteAt([]byte, int64) (int, error) {
 	return 0, errors.New("handled node reached buffered writer")
 }
 
-func (writer *mixedCheckpointWriter) WriteNode(node *btree.Node, pageSize int64, checksums bool) (bool, error) {
+func (writer *mixedCheckpointWriter) WriteNode(node *btree.MutableNode, pageSize int64, checksums bool) (bool, error) {
 	writer.calls = append(writer.calls, node.PageID())
 	if !writer.handled[node.PageID()] {
 		return false, nil

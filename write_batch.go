@@ -43,10 +43,10 @@ type writeResult struct {
 // writeBatchState is the last state produced by successful callbacks in one batch. It stays private until the WAL commit succeeds.
 type writeBatchState struct {
 	meta       *page.Meta
-	rootNode   *btree.Node
 	dirty      map[page.ID]dirtyNode
 	allocation *allocationChanges
 	metaDirty  bool
+	tree       btree.Tree
 }
 
 // startWriteBatcher starts the request worker for a writable database in SyncFull mode. Other modes commit without this worker.
@@ -140,9 +140,8 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 		return
 	}
 	state := writeBatchState{
-		meta:     db.meta,
-		rootNode: db.rootNode,
-		dirty:    make(map[page.ID]dirtyNode),
+		meta:  db.meta,
+		dirty: make(map[page.ID]dirtyNode),
 	}
 	results := make([]writeResult, 0, len(requests))
 	hasPendingWrites := false
@@ -150,7 +149,7 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	for index := 0; index < len(requests); index++ {
 		request := requests[index]
 		// Create the Tx only after earlier requests finish so it starts from their successful state. Keeping it separate also lets a failed callback discard only its own changes.
-		tx := newWriteTx(db, state.meta, state.rootNode, state.dirty, state.allocation)
+		tx := newWriteTx(db, state)
 		result := executeWriteCallback(request.transaction, tx)
 		if result.err != nil || result.panicked || result.goexited {
 			// A failed callback discards its own changes. Its error can still depend on pending changes from earlier callbacks.
@@ -161,8 +160,8 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 			result.dependsOnCommit = hasPendingWrites || transactionChangedState
 			results = append(results, result)
 			if transactionChangedState {
+				state.tree = tx.tree
 				state.meta = tx.meta
-				state.rootNode = tx.rootNode
 				state.allocation = tx.allocation
 				state.metaDirty = state.metaDirty || tx.metaDirty
 				for pageID, dirty := range tx.store.dirty {
@@ -181,16 +180,7 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 	needsCheckpoint := false
 	if hasPendingWrites {
 		// Callbacks have finished, so commit owns preparation and publication of their combined state.
-		tx := Tx{
-			db:              db,
-			meta:            state.meta,
-			rootNode:        state.rootNode,
-			allocation:      state.allocation,
-			allocationOwned: state.allocation != nil,
-			metaDirty:       state.metaDirty,
-		}
-		tx.store.dirty = state.dirty
-		needsCheckpoint, commitErr = tx.commit()
+		needsCheckpoint, commitErr = newCommitTx(db, state).commit()
 	}
 
 	for index, request := range requests {

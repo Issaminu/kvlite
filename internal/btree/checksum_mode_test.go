@@ -21,7 +21,7 @@ func TestMainReaders_DisabledChecksumFields(t *testing.T) {
 				}
 				node := NewLeafNode(7)
 				if branch {
-					node = NewRootNode(7, NewLeafNode(9), NewLeafNode(10), key)
+					node = NewRootNode(7, NewLeafNode(9).PageID(), NewLeafNode(10).PageID(), key)
 				} else if err := node.InsertEntry(NewEntry(0, key, []byte("value"))); err != nil {
 					t.Fatal(err)
 				}

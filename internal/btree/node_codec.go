@@ -15,85 +15,6 @@ import (
 const encodedUint32Size = 4
 const checksumZeroBlockSize = 4096
 
-// NodeView reads a node without materializing its entries or child list.
-// It borrows an existing Node, a complete encoded image, or both for the same committed page.
-// The owner must keep that storage unchanged while the view is in use.
-type NodeView struct {
-	node  *Node
-	image []byte
-}
-
-func (view NodeView) entryCount() int {
-	if view.node != nil {
-		return len(view.node.entries)
-	}
-	return int(binary.LittleEndian.Uint32(view.image[10:14]))
-}
-
-// ViewNode borrows an existing node, including private transaction changes.
-func ViewNode(node *Node) NodeView {
-	return NodeView{node: node}
-}
-
-// PageID returns the head page of this node.
-func (view NodeView) PageID() page.ID {
-	if view.node != nil {
-		return view.node.PageID()
-	}
-	return page.ID(binary.LittleEndian.Uint64(view.image[2:10]))
-}
-
-// VisitReferences checks and visits child nodes, then physical continuation pages.
-// pageSize is the storage unit used by the reader; callbacks can stop with an error.
-func (view NodeView) VisitReferences(pageSize int64, visit, visitContinuation func(page.ID) error) error {
-	if view.node != nil {
-		return VisitNodeReferences(view.node, visit, visitContinuation)
-	}
-	if pageSize < NodeHeaderSize {
-		return ErrInvalid
-	}
-	if err := checkBody(view.image, NodeHeader{Type: mappedNodeType(view.image), EntryCount: uint32(view.entryCount())}, true, visit); err != nil {
-		return err
-	}
-	if visitContinuation != nil {
-		count := (uint64(len(view.image)) + uint64(pageSize) - 1) / uint64(pageSize)
-		for offset := uint64(1); offset < count; offset++ {
-			if err := visitContinuation(view.PageID() + page.ID(offset)); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// ViewNodeImage checks the encoded header and directory bounds and borrows its logical image.
-// data contains the complete padded main-file span or compact WAL payload.
-// wal selects the compact format; checksums applies only to main-file spans.
-func ViewNodeImage(data []byte, id page.ID, pageSize int64, wal, checksums bool) (NodeView, error) {
-	if _, _, ok := plainNodeHeader(data, id, pageSize, wal, checksums); ok {
-		size := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
-		image := data[:size:len(data)]
-		count := binary.LittleEndian.Uint32(image[10:14])
-		var err error
-		if mappedNodeType(image) == NodeTypeLeaf {
-			_, err = leafDataStart(uint64(size), count)
-		} else {
-			_, err = branchDataStart(uint64(size), count)
-		}
-		return NodeView{image: image}, err
-	}
-	image, h, err := nodeImage(data, id, pageSize, nil, wal, checksums)
-	if err != nil {
-		return NodeView{}, err
-	}
-	if h.Type == NodeTypeLeaf {
-		_, err = leafDataStart(uint64(len(image)), h.EntryCount)
-	} else {
-		_, err = branchDataStart(uint64(len(image)), h.EntryCount)
-	}
-	return NodeView{image: data[:len(image):len(data)]}, err
-}
-
 var checksumZeroBlock [checksumZeroBlockSize]byte
 
 // MaxNodeImageSize bounds a logical image before a reader allocates it.
@@ -255,16 +176,16 @@ func nodeImage(data []byte, id page.ID, pageSize int64, readPage func(page.ID) (
 
 // DecodeNode reads one leaf or branch. The node borrows data when data contains its full span.
 // The caller must keep these bytes unchanged for the node lifetime.
-func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), checksums bool) (*Node, error) {
+func DecodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), checksums bool) (*MutableNode, error) {
 	return decodeNode(data, id, pageSize, readPage, false, checksums)
 }
 
 // DecodeWALNode reads a complete compact logical image protected by its WAL record.
-func DecodeWALNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*Node, error) {
+func DecodeWALNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error)) (*MutableNode, error) {
 	return decodeNode(data, id, pageSize, readPage, true, false)
 }
 
-func decodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (*Node, error) {
+func decodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) ([]byte, error), forWAL, checksums bool) (*MutableNode, error) {
 	image, h, err := nodeImage(data, id, pageSize, readPage, forWAL, checksums)
 	if err != nil {
 		return nil, err
@@ -278,7 +199,7 @@ func decodeNode(data []byte, id page.ID, pageSize int64, readPage func(page.ID) 
 	return node, nil
 }
 
-func decodeBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
+func decodeBody(image []byte, h NodeHeader, exact bool) (*MutableNode, error) {
 	if h.Type == NodeTypeLeaf {
 		return decodeLeafBody(image, h, exact)
 	}
@@ -313,6 +234,19 @@ func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID
 	return
 }
 
+// ReadCheckedNodeSpan borrows a main-file node after storage checked its span.
+// data must be the complete padded span returned after NodeSpan and
+// CheckNodeChecksumMode. checksums still verifies the actual stored bytes.
+func ReadCheckedNodeSpan(data []byte, checksums bool) (Node, error) {
+	if checksums {
+		if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, true); err != nil {
+			return Node{}, err
+		}
+	}
+	size := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
+	return nodeFromImage(data[:size:len(data)])
+}
+
 // LookupCheckedNodeSpan searches a complete padded span with a checked header.
 // The caller must first use NodeSpan and CheckNodeChecksumMode to check the header.
 // The data length must equal the page count times the database page size.
@@ -339,7 +273,7 @@ func LookupCheckedNodeSpan(data, key []byte, includeKey, checksums bool) (entry 
 	return
 }
 
-// LookupEncodedWALNode searches a complete compact logical WAL image without a Node.
+// LookupEncodedWALNode searches a complete compact logical WAL image without a MutableNode.
 func LookupEncodedWALNode(data []byte, id page.ID, key []byte, pageSize int64, readPage func(page.ID) ([]byte, error), includeKey bool) (entry Entry, found bool, child page.ID, err error) {
 	found, child, err = lookupNode(data, id, key, pageSize, readPage, true, includeKey, false, &entry)
 	return
@@ -385,24 +319,24 @@ func visitNodeReferences(data []byte, id page.ID, pageSize int64, readPage func(
 	if err != nil {
 		return err
 	}
-	return (NodeView{image: image}).VisitReferences(pageSize, visit, visitContinuation)
+	return (Node{image: image}).VisitReferences(pageSize, visit, visitContinuation)
 }
 
 // EncodeWALNode returns the complete compact logical image with a zero checksum.
-func EncodeWALNode(node *Node) []byte {
+func EncodeWALNode(node *MutableNode) []byte {
 	data := make([]byte, WALNodeEncodedSize(node))
 	encodeWALNode(data, node)
 	return data
 }
-func WALNodeEncodedSize(node *Node) int { return node.EncodedSize() }
-func AppendEncodedWALNode(data []byte, node *Node) []byte {
+func WALNodeEncodedSize(node *MutableNode) int { return node.EncodedSize() }
+func AppendEncodedWALNode(data []byte, node *MutableNode) []byte {
 	at := len(data)
 	data = slices.Grow(data, node.EncodedSize())
 	data = data[:at+node.EncodedSize()]
 	encodeWALNode(data[at:], node)
 	return data
 }
-func encodeWALNode(data []byte, node *Node) {
+func encodeWALNode(data []byte, node *MutableNode) {
 
 	clear(data[nodeChecksumOffset : nodeChecksumOffset+encodedUint32Size])
 	putNodeHeader(data, node)
@@ -413,7 +347,7 @@ func encodeWALNode(data []byte, node *Node) {
 	}
 }
 
-func putNodeHeader(data []byte, node *Node) {
+func putNodeHeader(data []byte, node *MutableNode) {
 	binary.LittleEndian.PutUint16(data[:2], uint16(node.kind()))
 	binary.LittleEndian.PutUint64(data[2:10], uint64(node.PageID()))
 	binary.LittleEndian.PutUint32(data[10:14], uint32(node.EntryCount()))
@@ -424,7 +358,7 @@ func putNodeHeader(data []byte, node *Node) {
 // The destination must have exactly NodePageCount(node, pageSize)*pageSize bytes.
 // It must not overlap the node's key or value bytes. The function does not retain dst.
 // The node and its stored page count remain unchanged.
-func EncodeNodeInto(dst []byte, node *Node, pageSize int64, checksums bool) error {
+func EncodeNodeInto(dst []byte, node *MutableNode, pageSize int64, checksums bool) error {
 	if node == nil || pageSize < NodeHeaderSize || page.IsMetaID(node.PageID()) {
 		return ErrInvalid
 	}
@@ -446,14 +380,14 @@ func EncodeNodeInto(dst []byte, node *Node, pageSize int64, checksums bool) erro
 }
 
 // EncodeNode returns a compact logical image. Its checksum covers the complete padded span.
-func EncodeNode(node *Node, pageSize int64) []byte {
+func EncodeNode(node *MutableNode, pageSize int64) []byte {
 	data := EncodeWALNode(node)
 	span := int64(NodePageCount(node, pageSize)) * pageSize
 	node.header.Checksum = pageChecksum(data, span, nodeChecksumOffset)
 	binary.LittleEndian.PutUint32(data[14:18], node.header.Checksum)
 	return data
 }
-func nodePayloadSize(node *Node) int {
+func nodePayloadSize(node *MutableNode) int {
 	if node.IsLeaf() {
 		return leafPayloadSize(node)
 	}
@@ -461,7 +395,7 @@ func nodePayloadSize(node *Node) int {
 }
 
 // NodePageCount returns the number of consecutive pages used by node.
-func NodePageCount(node *Node, pageSize int64) int {
+func NodePageCount(node *MutableNode, pageSize int64) int {
 	if pageSize < NodeHeaderSize {
 		return 0
 	}
@@ -469,23 +403,23 @@ func NodePageCount(node *Node, pageSize int64) int {
 }
 
 // EncodeNodePages returns the consecutive physical pages of node. Only the head has a header.
-func EncodeNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
+func EncodeNodePages(node *MutableNode, pageSize int64, ids []page.ID) ([][]byte, error) {
 	return encodeNodePages(node, pageSize, ids, false, nil)
 }
-func EncodeWALNodePages(node *Node, pageSize int64, ids []page.ID) ([][]byte, error) {
+func EncodeWALNodePages(node *MutableNode, pageSize int64, ids []page.ID) ([][]byte, error) {
 	return encodeNodePages(node, pageSize, ids, true, nil)
 }
-func WALNodePagesEncodedSize(node *Node, pageSize int64) int {
+func WALNodePagesEncodedSize(node *MutableNode, pageSize int64) int {
 	if NodePageCount(node, pageSize) == 0 {
 		return 0
 	}
 	return node.EncodedSize()
 }
-func EncodeWALNodePagesInto(node *Node, pageSize int64, ids []page.ID, pages [][]byte) error {
+func EncodeWALNodePagesInto(node *MutableNode, pageSize int64, ids []page.ID, pages [][]byte) error {
 	_, err := encodeNodePages(node, pageSize, ids, true, pages)
 	return err
 }
-func encodeNodePages(node *Node, pageSize int64, ids []page.ID, forWAL bool, pages [][]byte) ([][]byte, error) {
+func encodeNodePages(node *MutableNode, pageSize int64, ids []page.ID, forWAL bool, pages [][]byte) ([][]byte, error) {
 	count := NodePageCount(node, pageSize)
 	if count == 0 || len(ids) != count || ids[0] != node.PageID() || page.IsMetaID(ids[0]) {
 		return nil, ErrInvalid
@@ -542,7 +476,7 @@ func verifyPageIDAndSetChecksum(data []byte, id page.ID, headerSize, offset int,
 }
 
 // WriteNode writes the complete consecutive span. shouldPad includes its final zero padding.
-func WriteNode(w io.Writer, node *Node, pageSize int64, shouldPad, dataPageChecksums bool) error {
+func WriteNode(w io.Writer, node *MutableNode, pageSize int64, shouldPad, dataPageChecksums bool) error {
 	count := NodePageCount(node, pageSize)
 	if count == 0 {
 		return ErrNodeTooLarge

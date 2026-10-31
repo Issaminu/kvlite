@@ -84,9 +84,9 @@ type RecordHeader struct {
 type NodeRecord struct {
 	// Original is the committed node before the transaction.
 	// It can be nil for a new page or when the caller requires a complete image.
-	Original *btree.Node
+	Original *btree.MutableNode
 	// Final is the private node image to commit.
-	Final *btree.Node
+	Final *btree.MutableNode
 }
 
 // AllocationRecord carries one complete allocation segment page to [WAL.Commit].
@@ -144,7 +144,7 @@ func appendEncodedPayloadRecord(data []byte, header RecordHeader, payload []byte
 	return appendRecordChecksum(data, headerStart, payloadStart, checksumSeed)
 }
 
-func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.Node, checksumSeed uint32) []byte {
+func appendEncodedNodeRecord(data []byte, header RecordHeader, node *btree.MutableNode, checksumSeed uint32) []byte {
 	headerStart := len(data)
 	data = appendRecordHeader(data, header, btree.WALNodeEncodedSize(node))
 	payloadStart := len(data)

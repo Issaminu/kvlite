@@ -20,7 +20,7 @@ import (
 // node_codec.go contains the shared header, whole-node checksum, and consecutive-page storage rules.
 const branchEntryDescriptorSize = 2 * encodedUint32Size
 
-func branchPayloadSize(node *Node) int {
+func branchPayloadSize(node *MutableNode) int {
 	size := page.IDSize
 	for _, entry := range node.entries {
 		size += branchEntryDescriptorSize + page.IDSize + len(entry.key)
@@ -28,17 +28,17 @@ func branchPayloadSize(node *Node) int {
 	return size
 }
 
-func branchBodyOffset(node *Node) int {
+func branchBodyOffset(node *MutableNode) int {
 	return NodeHeaderSize + len(node.entries)*branchEntryDescriptorSize
 }
 
-func branchDirectorySize(node *Node) int {
+func branchDirectorySize(node *MutableNode) int {
 	return len(node.entries)*branchEntryDescriptorSize + (len(node.entries)+1)*page.IDSize
 }
 
 // putBranchDirectory writes one descriptor for each separator, then every child page ID, into dst.
 // The separator keys follow the directory in entry order.
-func putBranchDirectory(dst []byte, node *Node) {
+func putBranchDirectory(dst []byte, node *MutableNode) {
 	children := node.Children[:len(node.entries)+1]
 	childrenStart := len(node.entries) * branchEntryDescriptorSize
 	offset := NodeHeaderSize + childrenStart + len(children)*page.IDSize
@@ -56,7 +56,7 @@ func putBranchDirectory(dst []byte, node *Node) {
 
 // putBranchBody writes the directory and keys of one logical branch.
 // image has the compact size of the node and starts with its header.
-func putBranchBody(image []byte, node *Node) {
+func putBranchBody(image []byte, node *MutableNode) {
 	offset := NodeHeaderSize + branchDirectorySize(node)
 	putBranchDirectory(image[NodeHeaderSize:offset], node)
 	for _, entry := range node.entries {
@@ -101,7 +101,7 @@ func branchDataStart(imageSize uint64, count uint32) (uint64, error) {
 // decodeBranchBody decodes every child ID and separator of one contiguous branch image.
 // The separator keys borrow image. h becomes the node header.
 // exact requires the last key to end at the end of image.
-func decodeBranchBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
+func decodeBranchBody(image []byte, h NodeHeader, exact bool) (*MutableNode, error) {
 	dataStart, err := branchDataStart(uint64(len(image)), h.EntryCount)
 	if err != nil {
 		return nil, err
@@ -133,10 +133,10 @@ func decodeBranchBody(image []byte, h NodeHeader, exact bool) (*Node, error) {
 	if exact && next != imageSize {
 		return nil, errBodySize
 	}
-	return &Node{header: h, entries: entries, Children: children}, nil
+	return &MutableNode{header: h, entries: entries, Children: children}, nil
 }
 
-// checkBranchBody checks every child ID and separator of one contiguous branch image in the same way as decodeBranchBody, without a Node.
+// checkBranchBody checks every child ID and separator of one contiguous branch image in the same way as decodeBranchBody, without a MutableNode.
 // visit receives each child page ID. visit can be nil.
 func checkBranchBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) error) error {
 	dataStart, err := branchDataStart(uint64(len(image)), h.EntryCount)
@@ -176,10 +176,15 @@ func checkBranchBody(image []byte, h NodeHeader, exact bool, visit func(page.ID)
 // lookupBranchBody returns the child that routes key in a contiguous branch image.
 // That child is on the right side of the last separator that is not larger than key, so a key equal to a separator goes right.
 // It reads only the separators on the search path.
-func lookupBranchBody(image []byte, entryCount uint32, key []byte) (page.ID, error) {
+func lookupBranchBody(image []byte, entryCount uint32, key []byte) (child page.ID, err error) {
+	_, child, err = searchBranchBody(image, entryCount, key)
+	return
+}
+
+func searchBranchBody(image []byte, entryCount uint32, key []byte) (int, page.ID, error) {
 	dataStart, err := branchDataStart(uint64(len(image)), entryCount)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	count, imageSize := int(entryCount), uint64(len(image))
 	// Find the first separator that is larger than key. Its index is also the index of the child.
@@ -188,7 +193,7 @@ func lookupBranchBody(image []byte, entryCount uint32, key []byte) (page.ID, err
 		middle := (low + high) / 2
 		start, end := branchKey(image, middle)
 		if !validKey(start, end, dataStart, imageSize) {
-			return 0, entryError(middle)
+			return 0, 0, entryError(middle)
 		}
 		if bytes.Compare(image[start:end], key) <= 0 {
 			low = middle + 1
@@ -198,7 +203,7 @@ func lookupBranchBody(image []byte, entryCount uint32, key []byte) (page.ID, err
 	}
 	child, ok := branchChild(image, count, low)
 	if !ok {
-		return 0, childError(low)
+		return 0, 0, childError(low)
 	}
-	return child, nil
+	return low, child, nil
 }

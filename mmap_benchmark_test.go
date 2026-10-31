@@ -170,7 +170,7 @@ func benchmarkLargeUniformGets(b *testing.B, db *DB, keys [][]byte) {
 }
 
 // BenchmarkCursorSeekParallel measures parallel read transactions that seek and read ten entries.
-// Read-only cursors get decoded nodes from the shared node cache, so each visited node takes its lock.
+// Read-only cursors borrow encoded nodes from the transaction-pinned storage.
 func BenchmarkCursorSeekParallel(b *testing.B) {
 	path, db, keys := prepareLargeGetBenchmark(b)
 	if err := db.Close(); err != nil {
@@ -201,7 +201,7 @@ func BenchmarkCursorSeekParallel(b *testing.B) {
 			return err
 		})
 	}
-	// Read every leaf once so the measured reads hit the node cache.
+	// Read every leaf once to warm its mapped storage before measurement.
 	for start := 0; start < len(keys)-10; start += 64 {
 		if err := seek(start); err != nil {
 			b.Fatal(err)

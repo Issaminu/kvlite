@@ -98,7 +98,7 @@ func TestVisitMappedLeafRange_RejectsInvalidInput(t *testing.T) {
 
 	left := NewLeafNode(page.ID(8))
 	right := NewLeafNode(page.ID(9))
-	branch := NewRootNode(page.ID(10), left, right, []byte("middle"))
+	branch := NewRootNode(page.ID(10), left.PageID(), right.PageID(), []byte("middle"))
 	data = EncodeNode(branch, testNodePageSize)
 	if err := VisitMappedLeafRange(data, branch.PageID(), nil, nil, func(uint32, []byte, []byte) error { return nil }, true, nil); !errors.Is(err, ErrNotLeafNode) {
 		t.Fatalf("branch error: got %v, want ErrNotLeafNode", err)
@@ -134,7 +134,7 @@ func TestVisitMappedLeafReverse(t *testing.T) {
 	if err := VisitMappedLeafReverse(data, leaf.PageID()+1, func(uint32, []byte, []byte) error { return nil }, true, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("wrong page: got %v, want ErrInvalid", err)
 	}
-	branch := NewRootNode(page.ID(10), NewLeafNode(page.ID(8)), NewLeafNode(page.ID(9)), []byte("b"))
+	branch := NewRootNode(page.ID(10), NewLeafNode(page.ID(8)).PageID(), NewLeafNode(page.ID(9)).PageID(), []byte("b"))
 	if err := VisitMappedLeafReverse(EncodeNode(branch, testNodePageSize), branch.PageID(), func(uint32, []byte, []byte) error { return nil }, true, nil); !errors.Is(err, ErrNotLeafNode) {
 		t.Fatalf("branch: got %v, want ErrNotLeafNode", err)
 	}
@@ -258,116 +258,6 @@ func TestLeafCodec_RejectsBucketEntryWithoutRootID(t *testing.T) {
 			}
 			if err := ValidateWALNode(image, 8); !errors.Is(err, ErrInvalid) {
 				t.Fatalf("WAL validation: %v", err)
-			}
-		}
-	}
-}
-
-func TestReplaceMappedLeafOwnsReplacementAndKeepsOldSpan(t *testing.T) {
-	const pageSize int64 = 4096
-	for _, checksums := range []bool{false, true} {
-		node := NewLeafNode(50)
-		oldValue := bytes.Repeat([]byte("a"), 64<<10)
-		if err := node.InsertEntry(NewEntry(0, []byte("key"), oldValue)); err != nil {
-			t.Fatal(err)
-		}
-		count := NodePageCount(node, pageSize)
-		data := make([]byte, int64(count)*pageSize)
-		if err := EncodeNodeInto(data, node, pageSize, checksums); err != nil {
-			t.Fatal(err)
-		}
-		before := bytes.Clone(data)
-		key, value := []byte("key"), []byte("new value")
-		replacement, handled, err := ReplaceMappedLeaf(data, node.PageID(), pageSize, checksums, NewEntry(0, key, value), false)
-		if err != nil || !handled || replacement == nil {
-			t.Fatalf("replacement: handled=%t error=%v", handled, err)
-		}
-		key[0], value[0] = 'x', 'x'
-		entry, found, err := replacement.FindEntryRef([]byte("key"))
-		if err != nil || !found || !bytes.Equal(entry.Value(), []byte("new value")) {
-			t.Fatalf("replacement borrowed input: found=%t error=%v", found, err)
-		}
-		if replacement.StoragePageCount() != count || NodePageCount(replacement, pageSize) != 1 {
-			t.Fatal("replacement lost the old allocation before commit preparation")
-		}
-		if !bytes.Equal(data, before) {
-			t.Fatal("replacement changed committed bytes")
-		}
-		for _, skipIdentical := range []bool{false, true} {
-			replacement, handled, err := ReplaceMappedLeaf(data, node.PageID(), pageSize, checksums, NewEntry(0, []byte("key"), oldValue), skipIdentical)
-			if err != nil || !handled || (replacement == nil) != skipIdentical {
-				t.Fatalf("identical entry, skip=%t: handled=%t error=%v", skipIdentical, handled, err)
-			}
-		}
-		if replacement, handled, err := ReplaceMappedLeaf(data, node.PageID(), pageSize, checksums, NewEntry(0, []byte("missing"), nil), false); replacement != nil || handled || err != nil {
-			t.Fatalf("missing key: handled=%t error=%v", handled, err)
-		}
-		if _, _, err := ReplaceMappedLeaf(data, node.PageID(), pageSize, checksums, NewEntry(BucketLeafFlag, []byte("key"), page.EncodeID(80)), false); !errors.Is(err, ErrIncompatibleValue) {
-			t.Fatalf("bucket conflict: %v", err)
-		}
-		if _, _, err := ReplaceMappedLeaf(data[:len(data)-1], node.PageID(), pageSize, checksums, NewEntry(0, []byte("key"), nil), false); !errors.Is(err, ErrInvalid) {
-			t.Fatalf("truncated span: %v", err)
-		}
-		if checksums {
-			data[len(data)-1] ^= 1
-			if _, _, err := ReplaceMappedLeaf(data, node.PageID(), pageSize, true, NewEntry(0, []byte("key"), nil), false); !errors.Is(err, page.ErrChecksum) {
-				t.Fatalf("corrupt tail: %v", err)
-			}
-		}
-	}
-}
-
-func TestReplaceMappedLeafValidatesEntryBeforeReplacement(t *testing.T) {
-	const pageSize int64 = 4096
-	node := NewLeafNode(50)
-	if err := node.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("a"), 64<<10))); err != nil {
-		t.Fatal(err)
-	}
-	data := make([]byte, int64(NodePageCount(node, pageSize))*pageSize)
-	if err := EncodeNodeInto(data, node, pageSize, false); err != nil {
-		t.Fatal(err)
-	}
-	// The descriptor names bytes beyond the complete image. An entry with the
-	// same key must not hide that corruption by replacing the old value.
-	binary.LittleEndian.PutUint32(data[NodeHeaderSize+12:NodeHeaderSize+16], uint32(len(data)))
-	before := bytes.Clone(data)
-	if _, _, err := ReplaceMappedLeaf(data, node.PageID(), pageSize, false, NewEntry(0, []byte("key"), []byte("new")), false); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("invalid descriptor: %v", err)
-	}
-	if !bytes.Equal(data, before) {
-		t.Fatal("invalid image changed before rejection")
-	}
-}
-
-func TestMappedLeafNeighborKeepsOldSpan(t *testing.T) {
-	const pageSize = 128
-	for _, checksums := range []bool{false, true} {
-		for _, key := range []string{"a", "m", "z"} {
-			node := NewLeafNode(7)
-			if err := node.InsertEntry(NewEntry(0, []byte("m"), bytes.Repeat([]byte("v"), 512))); err != nil {
-				t.Fatal(err)
-			}
-			node.SetStoragePageCount(NodePageCount(node, pageSize))
-			data := make([]byte, node.StoragePageCount()*pageSize)
-			if err := EncodeNodeInto(data, node, pageSize, checksums); err != nil {
-				t.Fatal(err)
-			}
-			beforeData := bytes.Clone(data)
-			separator, before, eligible, err := MappedLeafNeighbor(data, node.PageID(), pageSize, checksums, []byte(key))
-			if err != nil || eligible != (key != "m") || before != (key == "a") {
-				t.Fatalf("key %s: eligible=%t before=%t error=%v", key, eligible, before, err)
-			}
-			if !bytes.Equal(data, beforeData) {
-				t.Fatal("neighbor check changed old span")
-			}
-			if before {
-				if string(separator) != "m" {
-					t.Fatal("left neighbor lost the old separator")
-				}
-				data[NodeHeaderSize+leafEntryDescriptorSize] = 'x'
-				if string(separator) != "m" {
-					t.Fatal("separator retained mapped key bytes")
-				}
 			}
 		}
 	}
@@ -555,5 +445,39 @@ func TestPrepareMappedPutDoesNotChangeLeaf(t *testing.T) {
 	var entry Entry
 	if _, _, _, err := PrepareMappedPut(data, pageSize, []byte("c"), 5, &entry); err == nil || !bytes.Equal(data, before) {
 		t.Fatalf("preflight accepted or changed a malformed leaf: %v", err)
+	}
+}
+
+func TestInsertEntryOwnsCopiedImageBytes(t *testing.T) {
+	const pageSize = 256
+	original := NewLeafNode(3)
+	if err := original.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
+		t.Fatal(err)
+	}
+	image := make([]byte, pageSize)
+	if err := EncodeNodeInto(image, original, pageSize, false); err != nil {
+		t.Fatal(err)
+	}
+	view, err := ReadNodeImage(image, 3, pageSize, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	source, err := view.Clone(pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	destination := NewLeafNode(4)
+	if err := destination.InsertEntry(*source.EntryAt(0)); err != nil {
+		t.Fatal(err)
+	}
+	clear(image)
+	stored := destination.EntryAt(0)
+	key, value := stored.Key(), stored.Value()
+	if string(key) != "key" || string(value) != "value" {
+		t.Fatal("inserted entry still borrows the encoded image")
+	}
+	destination.OwnImageBytes()
+	if &stored.Key()[0] != &key[0] || &stored.Value()[0] != &value[0] {
+		t.Fatal("image ownership copied an entry whose bytes insertion already owns")
 	}
 }

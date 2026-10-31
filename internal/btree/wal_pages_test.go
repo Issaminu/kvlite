@@ -16,7 +16,7 @@ func TestEncodeWALNodePagesInto(t *testing.T) {
 			t.Run(fmt.Sprintf("bytes=%d/branch=%t", size, branch), func(t *testing.T) {
 				node := NewLeafNode(3)
 				if branch {
-					node = NewRootNode(3, NewLeafNode(4), NewLeafNode(5), make([]byte, size))
+					node = NewRootNode(3, NewLeafNode(4).PageID(), NewLeafNode(5).PageID(), make([]byte, size))
 				} else if err := node.InsertEntry(NewEntry(0, []byte("key"), make([]byte, size))); err != nil {
 					t.Fatal(err)
 				}

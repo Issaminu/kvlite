@@ -68,7 +68,7 @@ func TestPlainNodeHeader_AcceptsOnlyPagesThatReadNodeHeaderAccepts(t *testing.T)
 }
 
 func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
-	original := &Node{
+	original := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 1),
 		entries:  []Entry{{key: []byte("middle")}},
 		Children: []page.ID{2, 3},
@@ -87,7 +87,7 @@ func TestNodeClone_DoesNotShareEntryOrChildLists(t *testing.T) {
 }
 
 func TestNodeClone_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
-	original := &Node{
+	original := &MutableNode{
 		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
@@ -95,12 +95,12 @@ func TestNodeClone_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 		},
 	}
 
-	var clone *Node
-	// The Node holds its header, so one allocation covers both. The second one holds the entry list.
+	var clone *MutableNode
+	// The MutableNode holds its header, so one allocation covers both. The second one holds the entry list.
 	if got := testing.AllocsPerRun(100, func() {
 		clone = original.Clone()
 	}); got != 2 {
-		t.Fatalf("Node.Clone allocations: got %v, want 2", got)
+		t.Fatalf("MutableNode.Clone allocations: got %v, want 2", got)
 	}
 	if clone == nil || len(clone.entries) != 2 {
 		t.Fatalf("cloned entries: got %+v", clone)
@@ -115,7 +115,7 @@ func TestNodeSplit_DoesNotRequireDatabase(t *testing.T) {
 		rightPgid page.ID = 3  // Page 3 is the next page allocated for the split.
 	)
 
-	node := &Node{
+	node := &MutableNode{
 		header: newNodeHeader(NodeTypeLeaf, leftPgid),
 		entries: []Entry{
 			{key: []byte("a"), value: make([]byte, valueSize)},
@@ -221,7 +221,7 @@ func TestLookupMappedNode_ChecksOrdinaryPageChecksum(t *testing.T) {
 		t.Run(fmt.Sprintf("branch=%t", branch), func(t *testing.T) {
 			node := NewLeafNode(7)
 			if branch {
-				node = NewRootNode(7, NewLeafNode(8), NewLeafNode(9), []byte("middle"))
+				node = NewRootNode(7, NewLeafNode(8).PageID(), NewLeafNode(9).PageID(), []byte("middle"))
 			} else if err := node.InsertEntry(NewEntry(0, []byte("key"), []byte("value"))); err != nil {
 				t.Fatal(err)
 			}
@@ -246,7 +246,7 @@ func TestUncheckedNodePages_KeepStructuralChecks(t *testing.T) {
 				}
 				node := NewLeafNode(7)
 				if branch {
-					node = NewRootNode(7, NewLeafNode(8), NewLeafNode(9), key)
+					node = NewRootNode(7, NewLeafNode(8).PageID(), NewLeafNode(9).PageID(), key)
 				} else if err := node.InsertEntry(NewEntry(0, key, value)); err != nil {
 					t.Fatal(err)
 				}
@@ -332,7 +332,7 @@ func resealNodeForTest(data []byte, pageSize int64) {
 }
 
 func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
-	node := &Node{
+	node := &MutableNode{
 		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
@@ -341,7 +341,7 @@ func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 	}
 	encoded := EncodeNode(node, testNodePageSize)
 
-	var decoded *Node
+	var decoded *MutableNode
 	var decodeErr error
 	if got := testing.AllocsPerRun(100, func() {
 		decoded, decodeErr = DecodeNode(encoded, node.PageID(), testNodePageSize, nil, true)
@@ -357,7 +357,7 @@ func TestDecodeNode_AllocatesOnlyNodeHeaderAndEntryList(t *testing.T) {
 }
 
 func TestDecodeNode_EntrySlicesCannotGrowIntoEncodedData(t *testing.T) {
-	node := &Node{
+	node := &MutableNode{
 		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: []byte("one")},
@@ -390,7 +390,7 @@ func TestDecodeNode_RejectsEntryCountLargerThanInputCanContain(t *testing.T) {
 }
 
 func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
-	nodes := []*Node{
+	nodes := []*MutableNode{
 		{
 			header: newNodeHeader(NodeTypeLeaf, 0),
 			entries: []Entry{
@@ -418,7 +418,7 @@ func TestNodeEncodedSize_MatchesEncodingWithoutAllocating(t *testing.T) {
 }
 
 func TestNodeSavedSizeTracksMutations(t *testing.T) {
-	check := func(node *Node) {
+	check := func(node *MutableNode) {
 		t.Helper()
 		want := NodeHeaderSize + nodePayloadSize(node)
 		if got := node.EncodedSize(); got != want {
@@ -456,13 +456,13 @@ func TestNodeSavedSizeTracksMutations(t *testing.T) {
 	}
 	check(leaf)
 	check(right)
-	parent := NewRootNode(10, leaf, right, separator)
+	parent := NewRootNode(10, leaf.PageID(), right.PageID(), separator)
 	check(parent)
-	parent.InsertSplitChild(1, NewLeafNode(11), []byte("zz"))
+	parent.InsertSplitChild(1, NewLeafNode(11).PageID(), []byte("zz"))
 	check(parent)
 	parent.setSeparator(0, []byte("middle"))
 	check(parent)
-	parent.InsertSplitChild(2, NewLeafNode(12), []byte("zzz"))
+	parent.InsertSplitChild(2, NewLeafNode(12).PageID(), []byte("zzz"))
 	check(parent)
 	branchRight, _, err := parent.Split(13, 64)
 	if err != nil {
@@ -481,7 +481,7 @@ func TestNodeSavedSizeTracksMutations(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	parent = NewRootNode(22, left, right, []byte("m"))
+	parent = NewRootNode(22, left.PageID(), right.PageID(), []byte("m"))
 	check(left)
 	check(right)
 	check(parent)
@@ -495,11 +495,11 @@ func TestNodeSavedSizeTracksMutations(t *testing.T) {
 	check(left)
 	check(parent)
 
-	left = NewRootNode(30, NewLeafNode(40), NewLeafNode(41), []byte("a"))
-	right = NewRootNode(31, NewLeafNode(42), NewLeafNode(43), []byte("n-longer"))
-	right.InsertSplitChild(1, NewLeafNode(44), []byte("u-long"))
-	right.InsertSplitChild(2, NewLeafNode(45), []byte("z"))
-	parent = NewRootNode(32, left, right, []byte("m"))
+	left = NewRootNode(30, NewLeafNode(40).PageID(), NewLeafNode(41).PageID(), []byte("a"))
+	right = NewRootNode(31, NewLeafNode(42).PageID(), NewLeafNode(43).PageID(), []byte("n-longer"))
+	right.InsertSplitChild(1, NewLeafNode(44).PageID(), []byte("u-long"))
+	right.InsertSplitChild(2, NewLeafNode(45).PageID(), []byte("z"))
+	parent = NewRootNode(32, left.PageID(), right.PageID(), []byte("m"))
 	check(left)
 	check(right)
 	check(parent)
@@ -515,7 +515,7 @@ func TestNodeSavedSizeTracksMutations(t *testing.T) {
 }
 
 func TestEncodeNode_AllocatesOneOutputBuffer(t *testing.T) {
-	node := &Node{
+	node := &MutableNode{
 		header: newNodeHeader(NodeTypeLeaf, 0),
 		entries: []Entry{
 			{key: []byte("alpha"), value: bytes.Repeat([]byte("a"), 128)},
@@ -563,11 +563,11 @@ func TestWriteNode_CompletesPartialWrites(t *testing.T) {
 	}
 }
 
-// TestNodeLayout_StaysInSizeClass guards the Node size. Each clone allocates one Node, which holds its header.
-// A new field can move Node into a larger allocation size class and make every clone larger.
+// TestNodeLayout_StaysInSizeClass guards the MutableNode size. Each clone allocates one MutableNode, which holds its header.
+// A new field can move MutableNode into a larger allocation size class and make every clone larger.
 func TestNodeLayout_StaysInSizeClass(t *testing.T) {
-	if size := unsafe.Sizeof(Node{}); size > 112 {
-		t.Fatalf("Node size: got %d bytes, want at most 112", size)
+	if size := unsafe.Sizeof(MutableNode{}); size > 112 {
+		t.Fatalf("MutableNode size: got %d bytes, want at most 112", size)
 	}
 }
 
@@ -826,7 +826,7 @@ func TestLookupEncodedWALNode_UsesLeafDirectoryBinarySearch(t *testing.T) {
 }
 
 func TestLookupEncodedWALNode_UsesBranchDirectoryBinarySearch(t *testing.T) {
-	root := &Node{
+	root := &MutableNode{
 		header: newNodeHeader(NodeTypeBranch, 7),
 		entries: []Entry{
 			{key: []byte("b")}, {key: []byte("d")}, {key: []byte("f")}, {key: []byte("h")},
@@ -888,7 +888,7 @@ func TestVisitNodeReferencesChecksMappedAndWALPages(t *testing.T) {
 func TestVisitNodeReferencesReadsBranchChildren(t *testing.T) {
 	left := NewLeafNode(3)
 	right := NewLeafNode(4)
-	branch := NewRootNode(2, left, right, []byte("middle"))
+	branch := NewRootNode(2, left.PageID(), right.PageID(), []byte("middle"))
 	data := EncodeNode(branch, 4096)
 	var refs []page.ID
 	err := VisitMappedNodeReferences(data, 2, 4096, nil, func(id page.ID) error {
@@ -959,7 +959,7 @@ func TestLookupEncodedWALNode_FindsLeafEntryWithoutAllocating(t *testing.T) {
 }
 
 func TestLookupEncodedWALNode_SelectsBranchChild(t *testing.T) {
-	root := &Node{
+	root := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 8),
 		entries:  []Entry{{key: []byte("m")}, {key: []byte("t")}},
 		Children: []page.ID{9, 10, 11},
@@ -1039,7 +1039,7 @@ func TestNodePageCount_RequiresOnlyTheNodeHeader(t *testing.T) {
 }
 
 func TestNodePages_FileRoundTrip(t *testing.T) {
-	branch := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), []byte("a"))
+	branch := NewRootNode(8, NewLeafNode(20).PageID(), NewLeafNode(21).PageID(), []byte("a"))
 	branch.entries = []Entry{
 		NewEntry(0, bytes.Repeat([]byte("a"), 50), nil),
 		NewEntry(0, bytes.Repeat([]byte("b"), 50), nil),
@@ -1144,9 +1144,9 @@ func TestNodePages_CompleteMappedLookupNeedsNoPageReads(t *testing.T) {
 	if err := leaf.InsertEntry(NewEntry(0, []byte("key"), bytes.Repeat([]byte("v"), 2048))); err != nil {
 		t.Fatal(err)
 	}
-	branch := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), bytes.Repeat([]byte("k"), MaxKeySize))
+	branch := NewRootNode(8, NewLeafNode(20).PageID(), NewLeafNode(21).PageID(), bytes.Repeat([]byte("k"), MaxKeySize))
 	for _, testCase := range []struct {
-		node   *Node
+		node   *MutableNode
 		forWAL bool
 	}{{leaf, false}, {branch, false}, {leaf, true}, {branch, true}} {
 		node, forWAL := testCase.node, testCase.forWAL
@@ -1336,7 +1336,7 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 					}
 					return nil, ErrInvalid
 				}
-				var decoded *Node
+				var decoded *MutableNode
 				if forWAL {
 					decoded, err = DecodeWALNode(bytes.Join(pages, nil), node.PageID(), pageSize, read)
 				} else {
@@ -1397,8 +1397,8 @@ func TestVisitNodeSpanReferences(t *testing.T) {
 					node := NewLeafNode(7)
 					expected := []page.ID{9}
 					if branch {
-						node = NewRootNode(7, NewLeafNode(3), NewLeafNode(4), bytes.Repeat([]byte("a"), int(pageSize)+7))
-						node.InsertSplitChild(1, NewLeafNode(5), bytes.Repeat([]byte("z"), int(pageSize)+7))
+						node = NewRootNode(7, NewLeafNode(3).PageID(), NewLeafNode(4).PageID(), bytes.Repeat([]byte("a"), int(pageSize)+7))
+						node.InsertSplitChild(1, NewLeafNode(5).PageID(), bytes.Repeat([]byte("z"), int(pageSize)+7))
 						expected = []page.ID{3, 4, 5}
 					} else {
 						if err := node.InsertEntry(NewEntry(BucketLeafFlag, bytes.Repeat([]byte("a"), int(pageSize)+7), page.EncodeID(9))); err != nil {
@@ -1527,7 +1527,8 @@ func TestLeafDeletionCopiesOnlyRetainedEntries(t *testing.T) {
 			for i := len(indexes) - 1; i >= 0; i-- {
 				want.entries = slices.Delete(want.entries, indexes[i], indexes[i]+1)
 			}
-			private := base.CloneWithoutLeafEntries(indexes[0], indexes[1:], 0)
+			private := base.Clone()
+			private.DeleteLeafEntries(indexes[0], indexes[1:])
 			if !bytes.Equal(EncodeWALNode(private), EncodeWALNode(want)) || private.EncodedSize() != want.EncodedSize() {
 				t.Fatal("private copy changed retained leaf entries")
 			}
@@ -1562,7 +1563,8 @@ func TestLeafDeletionKeepsCapacityForMerge(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	private := base.CloneWithoutLeafEntries(0, []int{1, 2}, 64)
+	private := base.Clone()
+	private.DeleteLeafEntries(0, []int{1, 2})
 	if private.EntryCount() != 2 || cap(private.entries) < base.EntryCount() || private.EncodedSize() != 58 {
 		t.Fatal("underfull leaf did not keep merge capacity and its exact size")
 	}
@@ -1572,7 +1574,7 @@ func TestLeafDeletionKeepsCapacityForMerge(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	parent := NewRootNode(4, private, right, []byte("f"))
+	parent := NewRootNode(4, private.PageID(), right.PageID(), []byte("f"))
 	storage := &private.entries[0]
 	mergeChildren(parent, 0, private, right)
 	if &private.entries[0] != storage || private.EntryCount() != 4 || private.EncodedSize() != 94 {
@@ -1581,7 +1583,8 @@ func TestLeafDeletionKeepsCapacityForMerge(t *testing.T) {
 	if base.EntryCount() != 5 || string(base.EntryAt(0).Key()) != "a" {
 		t.Fatal("reserved merge changed the committed leaf")
 	}
-	empty := base.CloneWithoutLeafEntries(0, []int{1, 2, 3, 4}, 64)
+	empty := base.Clone()
+	empty.DeleteLeafEntries(0, []int{1, 2, 3, 4})
 	if empty.EntryCount() != 0 || cap(empty.entries) < base.EntryCount() || empty.EncodedSize() != NodeHeaderSize {
 		t.Fatal("empty leaf lost capacity needed by successive merges")
 	}
@@ -1603,14 +1606,14 @@ func BenchmarkDeleteLeaf(b *testing.B) {
 					b.Fatal(err)
 				}
 			}
-			store := &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*Node), dirty: make(map[page.ID]*Node)}
-			tree := NewTree(store)
+			store := &memoryTreeStore{pageSize: 4096, nodes: make(map[page.ID]*MutableNode), dirty: make(map[page.ID]*MutableNode)}
+			tree := newTestTree(store)
 			b.ReportAllocs()
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
 				store.nodes[3] = base
 				clear(store.dirty)
-				var root *Node
+				var root *MutableNode
 				var changed bool
 				var err error
 				if c.single {
@@ -1637,9 +1640,9 @@ func TestNodeCodecRejectsWrongTypeBeforeContinuationPages(t *testing.T) {
 	if err := leaf.InsertEntry(NewEntry(0, []byte("k"), []byte("v"))); err != nil {
 		t.Fatal(err)
 	}
-	branch := NewRootNode(8, NewLeafNode(20), NewLeafNode(21), []byte("k"))
+	branch := NewRootNode(8, NewLeafNode(20).PageID(), NewLeafNode(21).PageID(), []byte("k"))
 	for name, test := range map[string]struct {
-		node *Node
+		node *MutableNode
 		tag  NodeType
 	}{
 		"unknown type":           {leaf, 7},
@@ -1686,7 +1689,7 @@ func TestNodeSpanWriterLayout(t *testing.T) {
 					var body bytes.Buffer
 					if branch {
 						key := bytes.Repeat([]byte("k"), size)
-						node = NewRootNode(8, NewLeafNode(20), NewLeafNode(21), key)
+						node = NewRootNode(8, NewLeafNode(20).PageID(), NewLeafNode(21).PageID(), key)
 						for _, value := range []uint32{22 + 8 + 16, uint32(len(key))} {
 							if err := binary.Write(&body, binary.LittleEndian, value); err != nil {
 								t.Fatal(err)
@@ -1792,7 +1795,7 @@ func TestNodeSpanStorageCountStaysPrivate(t *testing.T) {
 	if !bytes.Equal(EncodeWALNode(node), before) {
 		t.Fatal("allocated page count changed the serialized node")
 	}
-	if node.Clone().StoragePageCount() != 7 || node.CloneWithoutLeafEntries(0, nil, 0).StoragePageCount() != 7 {
+	if node.Clone().StoragePageCount() != 7 {
 		t.Fatal("a private clone lost the old allocated page count")
 	}
 }
@@ -1896,7 +1899,7 @@ func TestNodeSpanReaderReferencesAndScans(t *testing.T) {
 		t.Run(fmt.Sprintf("branch=%t", branch), func(t *testing.T) {
 			node := NewLeafNode(8)
 			if branch {
-				node = NewRootNode(8, NewLeafNode(1000), NewLeafNode(2000), key)
+				node = NewRootNode(8, NewLeafNode(1000).PageID(), NewLeafNode(2000).PageID(), key)
 			} else if err := node.InsertEntry(NewEntry(0, key, value)); err != nil {
 				t.Fatal(err)
 			}
@@ -2017,13 +2020,13 @@ func TestEncodeNodeInto_ReplacesPoisonedSpan(t *testing.T) {
 	const pageSize int64 = 4096
 	for _, test := range []struct {
 		name string
-		node *Node
+		node *MutableNode
 	}{
 		{"empty leaf", NewLeafNode(50)},
-		{"small leaf", &Node{header: newNodeHeader(NodeTypeLeaf, 50), entries: []Entry{{key: []byte("key"), value: []byte("value")}}}},
-		{"large leaf", &Node{header: newNodeHeader(NodeTypeLeaf, 50), entries: []Entry{{key: []byte("key"), value: bytes.Repeat([]byte{0x3c}, 65536)}}}},
-		{"small branch", &Node{header: newNodeHeader(NodeTypeBranch, 50), entries: []Entry{{key: []byte("middle")}}, Children: []page.ID{80, 90}}},
-		{"large branch", &Node{header: newNodeHeader(NodeTypeBranch, 50), entries: []Entry{{key: bytes.Repeat([]byte("m"), MaxKeySize)}}, Children: []page.ID{80, 90}}},
+		{"small leaf", &MutableNode{header: newNodeHeader(NodeTypeLeaf, 50), entries: []Entry{{key: []byte("key"), value: []byte("value")}}}},
+		{"large leaf", &MutableNode{header: newNodeHeader(NodeTypeLeaf, 50), entries: []Entry{{key: []byte("key"), value: bytes.Repeat([]byte{0x3c}, 65536)}}}},
+		{"small branch", &MutableNode{header: newNodeHeader(NodeTypeBranch, 50), entries: []Entry{{key: []byte("middle")}}, Children: []page.ID{80, 90}}},
+		{"large branch", &MutableNode{header: newNodeHeader(NodeTypeBranch, 50), entries: []Entry{{key: bytes.Repeat([]byte("m"), MaxKeySize)}}, Children: []page.ID{80, 90}}},
 	} {
 		for _, checksums := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s/checksums=%t", test.name, checksums), func(t *testing.T) {
@@ -2066,7 +2069,7 @@ func TestEncodeNodeInto_RejectsInvalidSpan(t *testing.T) {
 	node := NewLeafNode(50)
 	for _, test := range []struct {
 		name     string
-		node     *Node
+		node     *MutableNode
 		size     int
 		pageSize int64
 	}{
@@ -2077,7 +2080,7 @@ func TestEncodeNodeInto_RejectsInvalidSpan(t *testing.T) {
 		{"long span", node, 4097, 4096},
 		{"extra page", node, 8192, 4096},
 		{"metadata head", NewLeafNode(page.Meta0ID), 4096, 4096},
-		{"overflowing span", &Node{header: newNodeHeader(NodeTypeLeaf, ^page.ID(0)), entries: []Entry{{key: []byte("k"), value: make([]byte, 4096)}}}, 8192, 4096},
+		{"overflowing span", &MutableNode{header: newNodeHeader(NodeTypeLeaf, ^page.ID(0)), entries: []Entry{{key: []byte("k"), value: make([]byte, 4096)}}}, 8192, 4096},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			dst := bytes.Repeat([]byte{0xa5}, test.size)
@@ -2167,7 +2170,7 @@ func TestNodeInsertEntryMaintainsKnownEncodedSize(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, half := range []*Node{node, right} {
+			for _, half := range []*MutableNode{node, right} {
 				half.CacheEncodedSize()
 				entry := half.EntryAt(0)
 				if err := half.InsertEntry(NewEntry(entry.Flags(), entry.Key(), []byte("after split"))); err != nil {
@@ -2176,6 +2179,207 @@ func TestNodeInsertEntryMaintainsKnownEncodedSize(t *testing.T) {
 				if got, want := half.EncodedSize(), half.computeEncodedSize(); got != want || half.encodedSize != want {
 					t.Fatalf("split size: got %d, saved %d, want %d", got, half.encodedSize, want)
 				}
+			}
+		})
+	}
+}
+
+func TestNodeImageEditOwnsOnlySurvivingBytes(t *testing.T) {
+	const pageSize = 128
+	original := NewLeafNode(20)
+	for _, entry := range []Entry{
+		NewEntry(0, []byte("a"), bytes.Repeat([]byte("a"), 512)),
+		NewEntry(0, []byte("b"), bytes.Repeat([]byte("b"), 512)),
+		NewEntry(0, []byte("c"), nil),
+	} {
+		if err := original.InsertEntry(entry); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := make([]byte, NodePageCount(original, pageSize)*pageSize)
+	if err := EncodeNodeInto(data, original, pageSize, false); err != nil {
+		t.Fatal(err)
+	}
+	before := bytes.Clone(data)
+	view, err := ReadNodeImage(data, 20, pageSize, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	private, err := view.Clone(pageSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := private.InsertEntry(NewEntry(0, []byte("a"), []byte("replacement"))); err != nil {
+		t.Fatal(err)
+	}
+	private.DeleteLeafEntries(2, nil)
+	private.OwnImageBytes()
+	if !bytes.Equal(data, before) {
+		t.Fatal("private edit changed original storage")
+	}
+	// Once surviving entries are owned, the encoded source can be unmapped or overwritten.
+	clear(data)
+	if string(private.EntryAt(0).Value()) != "replacement" || !bytes.Equal(private.EntryAt(1).Value(), bytes.Repeat([]byte("b"), 512)) {
+		t.Fatal("edited node still borrowed an encoded image")
+	}
+	if private.EntryAt(0).borrowedImage || private.EntryAt(1).borrowedImage || private.EntryAt(0).borrowedKey || private.EntryAt(1).borrowedKey {
+		t.Fatal("surviving entries retain image ownership flags")
+	}
+}
+
+func TestNodeEntryRejectsOrderAndPackingErrors(t *testing.T) {
+	const pageSize = 256
+	original := NewLeafNode(20)
+	for _, key := range []string{"a", "b"} {
+		if err := original.InsertEntry(NewEntry(0, []byte(key), nil)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	data := make([]byte, pageSize)
+	if err := EncodeNodeInto(data, original, pageSize, false); err != nil {
+		t.Fatal(err)
+	}
+	_, start, _, _ := leafSpan(data, 1)
+	data[start] = 'a'
+	view, err := ReadNodeImage(data, 20, pageSize, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := view.Entry(1); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("Entry accepted unordered keys: %v", err)
+	}
+}
+
+func TestNodeChildrenValidateOnlyRequiredMetadata(t *testing.T) {
+	const pageSize = 256
+	branch := NewRootNode(20, 21, 22, []byte("middle"))
+	data := make([]byte, pageSize)
+	if err := EncodeNodeInto(data, branch, pageSize, false); err != nil {
+		t.Fatal(err)
+	}
+	// Unbounded traversal uses child references without consulting separator offsets.
+	binary.LittleEndian.PutUint32(data[NodeHeaderSize:NodeHeaderSize+4], ^uint32(0))
+	node, err := ReadNodeImage(data, 20, pageSize, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var children []page.ID
+	if err := visitNodeChildren(node, nil, nil, false, func(id page.ID) error { children = append(children, id); return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(children, []page.ID{21, 22}) {
+		t.Fatalf("children: %v", children)
+	}
+	if err := visitNodeChildren(node, []byte("a"), nil, false, func(page.ID) error { return nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("bounded traversal accepted an invalid separator: %v", err)
+	}
+	if err := node.VisitReferences(pageSize, func(page.ID) error { return nil }, nil); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("integrity check accepted an invalid separator: %v", err)
+	}
+	// Child references are required even when no separator is consulted.
+	binary.LittleEndian.PutUint64(data[NodeHeaderSize+branchEntryDescriptorSize:NodeHeaderSize+branchEntryDescriptorSize+page.IDSize], 0)
+	called := false
+	if err := visitNodeChildren(node, nil, nil, false, func(page.ID) error { called = true; return nil }); !errors.Is(err, ErrInvalid) || called {
+		t.Fatalf("invalid child reached traversal: called=%v error=%v", called, err)
+	}
+}
+
+func TestNodeOperationsRejectInvalidDirectories(t *testing.T) {
+	const pageSize = 256
+	for _, branch := range []bool{false, true} {
+		t.Run(fmt.Sprint(branch), func(t *testing.T) {
+			source := NewLeafNode(20)
+			if branch {
+				source = NewRootNode(20, 21, 22, []byte("middle"))
+			} else if err := source.InsertEntry(NewEntry(0, []byte("key"), nil)); err != nil {
+				t.Fatal(err)
+			}
+			data := make([]byte, pageSize)
+			if err := EncodeNodeInto(data, source, pageSize, false); err != nil {
+				t.Fatal(err)
+			}
+			binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], ^uint32(0))
+			node, err := ReadNodeImage(data, 20, pageSize, false, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			operations := map[string]func() error{
+				"lookup": func() error { _, _, _, err := node.Lookup([]byte("key"), true); return err },
+				"clone":  func() error { _, err := node.Clone(pageSize); return err },
+				"check":  func() error { return node.VisitReferences(pageSize, func(page.ID) error { return nil }, nil) },
+			}
+			if branch {
+				operations["child"] = func() error { _, err := node.Child(0); return err }
+				operations["separator"] = func() error { _, err := node.separator(0); return err }
+				operations["children"] = func() error { return visitNodeChildren(node, nil, nil, false, func(page.ID) error { return nil }) }
+			} else {
+				operations["entry"] = func() error { _, err := node.Entry(0); return err }
+				operations["range"] = func() error { return node.visitRange(nil, nil, func(uint32, []byte, []byte) error { return nil }) }
+				operations["reverse"] = func() error { return node.visitReverse(func(uint32, []byte, []byte) error { return nil }) }
+				operations["cursor"] = func() error {
+					cursor := NewCursor(&cursorViewReader{views: map[page.ID]Node{20: node}}, 20)
+					_, err := cursor.First()
+					return err
+				}
+			}
+			for name, operation := range operations {
+				t.Run(name, func(t *testing.T) {
+					if err := operation(); !errors.Is(err, ErrInvalid) {
+						t.Fatalf("invalid directory: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func visitNodeChildren(node Node, start, end []byte, reverse bool, visit func(page.ID) error) error {
+	children, err := node.children(start, end, reverse)
+	if err != nil {
+		return err
+	}
+	for child, ok := children.next(); ok; child, ok = children.next() {
+		if err := visit(child); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestNodeCloneKeepsDecodedSourceUnchanged(t *testing.T) {
+	leaf := NewLeafNode(20)
+	if err := leaf.InsertEntry(NewEntry(0, []byte("key"), []byte("original"))); err != nil {
+		t.Fatal(err)
+	}
+	branch := &MutableNode{
+		header:   newNodeHeader(NodeTypeBranch, 30),
+		entries:  []Entry{{key: []byte("middle")}},
+		Children: []page.ID{31, 32},
+	}
+	for name, source := range map[string]*MutableNode{"leaf": leaf, "branch": branch} {
+		t.Run(name, func(t *testing.T) {
+			before := EncodeWALNode(source)
+			private, err := source.ReadOnly().Clone(256)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if private == source {
+				t.Fatal("read-only node returned its mutable backing object")
+			}
+			private.SetPageID(99)
+			if private.IsLeaf() {
+				if err := private.InsertEntry(NewEntry(0, []byte("key"), []byte("changed"))); err != nil {
+					t.Fatal(err)
+				}
+				if err := private.InsertEntry(NewEntry(0, []byte("next"), nil)); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				private.Children[0] = 50
+				private.setSeparator(0, []byte("next"))
+			}
+			if !bytes.Equal(EncodeWALNode(source), before) {
+				t.Fatal("editing a private copy changed the read-only source")
 			}
 		})
 	}

@@ -30,8 +30,7 @@ func (tx *Tx) cacheBucket(b *Bucket) {
 type Bucket struct {
 	tx           *Tx
 	name         []byte
-	rootPageID   page.ID // Set only while a read-only bucket has not loaded rootNode.
-	rootNode     *btree.Node
+	rootPageID   page.ID
 	parentBucket *Bucket
 	child        *Bucket            // First nested handle, kept without a map.
 	children     map[string]*Bucket // Other nested handles in this transaction.
@@ -76,7 +75,7 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 // writeBackRoot updates the existing fixed-size root pointer after the root page changes.
 // The transaction already loaded this entry before it changed the bucket tree.
 func (bucket *Bucket) writeBackRoot() {
-	entry := btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(bucket.rootNode.PageID()))
+	entry := btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(bucket.rootPageID))
 	var err error
 	if bucket.parentBucket == nil {
 		err = bucket.tx.putCatalogEntry(entry)
@@ -89,10 +88,10 @@ func (bucket *Bucket) writeBackRoot() {
 }
 
 // setRoot records a tree change and updates the bucket entry if the root page changed.
-func (bucket *Bucket) setRoot(newRoot *btree.Node) {
-	oldRootPageID := bucket.rootNode.PageID()
-	bucket.rootNode = newRoot
-	if newRoot.PageID() != oldRootPageID {
+func (bucket *Bucket) setRoot(newRoot page.ID) {
+	oldRootPageID := bucket.rootPageID
+	bucket.rootPageID = newRoot
+	if newRoot != oldRootPageID {
 		bucket.writeBackRoot()
 	}
 	bucket.treeVersion++
@@ -142,7 +141,7 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	bucket := &Bucket{
 		tx:           tx,
 		name:         slices.Clone(bucketName),
-		rootNode:     rootNode,
+		rootPageID:   rootNode.PageID(),
 		parentBucket: parent,
 	}
 
@@ -195,7 +194,7 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if b, ok := tx.buckets[string(bucketName)]; ok {
 		return b, nil
 	}
-	bucket, err := tx.loadBucket(tx.rootNode, bucketName, nil)
+	bucket, err := tx.loadBucket(tx.meta.Root(), bucketName, nil)
 	if err != nil || bucket == nil {
 		return bucket, err
 	}
@@ -203,10 +202,10 @@ func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	return bucket, nil
 }
 
-// loadBucket reads a bucket entry and opens the tree that it names. It returns (nil, nil) when no entry exists and [ErrIncompatibleValue] when the name belongs to a plain value.
-func (tx *Tx) loadBucket(rootNode *btree.Node, bucketName []byte, parent *Bucket) (*Bucket, error) {
+// loadBucket reads a bucket entry from the tree at parentRoot and opens the tree that the entry names. It returns (nil, nil) when no entry exists and [ErrIncompatibleValue] when the name belongs to a plain value.
+func (tx *Tx) loadBucket(parentRoot page.ID, bucketName []byte, parent *Bucket) (*Bucket, error) {
 	// The bucket keeps the stored name, so the lookup must return the key.
-	entry, found, err := tx.tree.FindEntryRef(rootNode, bucketName, true)
+	entry, found, err := tx.tree.FindEntryRef(parentRoot, bucketName, true)
 	if err != nil {
 		return nil, err
 	}
@@ -221,15 +220,7 @@ func (tx *Tx) openBucket(entry btree.Entry, parent *Bucket) (*Bucket, error) {
 	if err != nil {
 		return nil, err
 	}
-	if tx.readOnly {
-		return &Bucket{tx: tx, name: entry.Key(), rootPageID: rootPageID, parentBucket: parent}, nil
-	}
-
-	rootNode, err := tx.store.ReadNode(rootPageID)
-	if err != nil {
-		return nil, err
-	}
-	return &Bucket{tx: tx, name: entry.Key(), rootNode: rootNode, parentBucket: parent}, nil
+	return &Bucket{tx: tx, name: entry.Key(), rootPageID: rootPageID, parentBucket: parent}, nil
 }
 
 func decodeBucketRootPageID(entry btree.Entry) (page.ID, error) {
@@ -373,7 +364,7 @@ func (bucket *Bucket) putBatch(entries []KeyValue, managed bool) error {
 }
 
 func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
-	newRoot, err := bucket.tx.tree.PutEntry(bucket.rootNode, entry)
+	newRoot, err := bucket.tx.tree.PutEntry(bucket.rootPageID, entry)
 	if err != nil {
 		return err
 	}
@@ -391,7 +382,7 @@ func (bucket *Bucket) Delete(key []byte) error {
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
-	newRoot, deleted, err := bucket.tx.tree.DeleteEntry(bucket.rootNode, key)
+	newRoot, deleted, err := bucket.tx.tree.DeleteEntry(bucket.rootPageID, key)
 	if err != nil || !deleted {
 		return err
 	}
@@ -413,8 +404,8 @@ func (bucket *Bucket) DeleteBatch(keys [][]byte) error {
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
-	newRoot, changed, err := bucket.tx.tree.DeleteEntries(bucket.rootNode, keys)
-	if !changed || newRoot == nil {
+	newRoot, changed, err := bucket.tx.tree.DeleteEntries(bucket.rootPageID, keys)
+	if !changed || newRoot == 0 {
 		return err
 	}
 	bucket.setRoot(newRoot)
@@ -467,26 +458,24 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 	}
 
 	// Read every owned page before changing the parent entry. A read error leaves the tree unchanged.
-	pages, err := tx.collectBucketPages(target.rootNode.PageID())
+	pages, err := tx.collectBucketPages(target.rootPageID)
 	if err != nil {
 		return err
 	}
 	if parent == nil {
-		oldRootPageID := tx.rootNode.PageID()
-		newRoot, found, err := tx.tree.DeleteBucketEntry(tx.rootNode, bucketName)
+		newRoot, found, err := tx.tree.DeleteBucketEntry(tx.meta.Root(), bucketName)
 		if err != nil {
 			return err
 		}
 		if !found {
 			return ErrBucketNotFound
 		}
-		tx.rootNode = newRoot
-		if newRoot.PageID() != oldRootPageID {
-			tx.writableMeta().SetRoot(newRoot.PageID())
+		if newRoot != tx.meta.Root() {
+			tx.writableMeta().SetRoot(newRoot)
 			tx.metaDirty = true
 		}
 	} else {
-		newRoot, found, err := tx.tree.DeleteBucketEntry(parent.rootNode, bucketName)
+		newRoot, found, err := tx.tree.DeleteBucketEntry(parent.rootPageID, bucketName)
 		if err != nil {
 			return err
 		}
@@ -502,7 +491,6 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 		if err := tx.writableAllocation().retire(pageID); err != nil {
 			return err
 		}
-		delete(tx.store.nodes, pageID)
 		delete(tx.store.dirty, pageID)
 	}
 	target.deleted = true
@@ -614,62 +602,14 @@ func (bucket *Bucket) GetBatch(keys [][]byte) ([][]byte, error) {
 	if !slices.IsSortedFunc(keys, bytes.Compare) {
 		slices.SortFunc(order, func(a, b int) int { return bytes.Compare(keys[a], keys[b]) })
 	}
-	// A clean write transaction still reads committed pages. Its later writes stay private until the callback returns.
-	mainOnly := bucket.tx.readOnly || (len(bucket.tx.store.dirty) == 0 && len(bucket.tx.store.baseDirty) == 0 &&
-		!bucket.tx.metaDirty && (bucket.tx.allocation == nil || !bucket.tx.allocation.changed()))
-	if db := bucket.tx.db; mainOnly && db.wal != nil && db.wal.Stats().CommittedRecordCount == 0 {
-		root := bucket.rootPageID
-		if bucket.rootNode != nil {
-			root = bucket.rootNode.PageID()
-		}
-		if err := db.readMainBatch(root, keys, order, values); err != nil {
-			return nil, err
-		}
-		return values, nil
-	}
-	cursor, err := bucket.Cursor()
-	if err != nil {
+	if err := btree.ReadBatch(bucket.tx.nodeReader(), bucket.rootPageID, keys, order, values); err != nil {
 		return nil, err
-	}
-	for position, index := range order {
-		if position > 0 && bytes.Equal(keys[index], keys[order[position-1]]) {
-			values[index] = values[order[position-1]]
-			continue
-		}
-		key, value, err := cursor.result(cursor.treeCursor.SeekForward(keys[index]))
-		if err != nil {
-			return nil, err
-		}
-		if bytes.Equal(key, keys[index]) {
-			if value == nil {
-				return nil, ErrIncompatibleValue
-			}
-			values[index] = value
-		}
 	}
 	return values, nil
 }
 
-// findEntry finds key in bucket. includeKey has the same meaning as in [btree.Tree.FindEntryRef].
+// findEntry finds key in bucket through the transaction's view of the tree.
+// includeKey has the same meaning as in [btree.Tree.FindEntryRef].
 func (bucket *Bucket) findEntry(key []byte, includeKey bool) (btree.Entry, bool, error) {
-	if bucket.rootNode != nil {
-		return bucket.tx.tree.FindEntryRef(bucket.rootNode, key, includeKey)
-	}
-	return bucket.tx.tree.FindEntryRefFromPage(bucket.rootPageID, key, includeKey)
-}
-
-func (bucket *Bucket) loadRootNode() error {
-	if err := bucket.liveError(); err != nil {
-		return err
-	}
-	if bucket.rootNode != nil {
-		return nil
-	}
-	rootNode, err := bucket.tx.store.ReadNode(bucket.rootPageID)
-	if err != nil {
-		return err
-	}
-	bucket.rootNode = rootNode
-	bucket.rootPageID = page.Meta0ID
-	return nil
+	return bucket.tx.tree.FindEntryRef(bucket.rootPageID, key, includeKey)
 }

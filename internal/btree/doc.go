@@ -1,12 +1,19 @@
 // Package btree implements B+tree nodes and tree operations through a Store.
 //
-// Leaf code is in leaf_node.go and leaf_codec.go.
-// Branch code is in branch_node.go and branch_codec.go.
-// Shared node data, decoded reads, and balance rules are in node.go.
-// node_codec.go contains what leaves and branches share: the node header, checksums, page encoding, the entry rules, and the entry points for decode, lookup, and reference checks.
-// leaf_codec.go and branch_codec.go contain the descriptor layout of their type, the code that writes it, and one entry loop for each read operation.
-// Tree reads, inserts, deletes, and repair are in tree.go.
-// Ordered reads are in cursor.go.
+// Node provides read-only search and entry access over encoded or decoded storage.
+// MutableNode holds private editable lists. A transaction supplies permission through Store.EditNode and owns surviving image bytes before persistence.
+// Entry keeps each leaf key, value, and kind together.
+//
+// NodeReader has one read operation. Storage resolves committed memory, WAL,
+// and main-file data. The transaction overlays its own and earlier batch edits.
+// Tree owns traversal, parent links, splitting, merging, and reference repair.
+// Cursor keeps only a path and position; nodeEntries owns encoded entry bounds.
+//
+// node.go contains read-facing operations; mutable_node.go contains editable
+// node data and local balance operations. Node encoding stays in node_codec.go,
+// leaf_codec.go, and branch_codec.go. Tree operations live in tree.go.
+// Searches that keep no state (point, batch, and range reads) live in search.go.
+// Ordered cursor movement lives in cursor.go.
 //
 // The body codecs support both decoded nodes and direct reads from encoded bytes.
 // A node uses one header followed by its body in consecutive pages.

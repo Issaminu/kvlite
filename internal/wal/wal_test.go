@@ -27,7 +27,7 @@ func TestWALValidationErrors(t *testing.T) {
 	if _, err := log.appendNodeRecord(nil, &NodeRecord{Original: btree.NewLeafNode(1), Final: btree.NewLeafNode(2)}, 1); !errors.Is(err, ErrNodePageMismatch) {
 		t.Fatalf("changed node page ID: got %v, want ErrNodePageMismatch", err)
 	}
-	if _, err := log.CommittedPageToNode(&CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
+	if _, err := decodeCommittedNode(log, &CommittedPage{}); !errors.Is(err, ErrRecordPayloadRequired) {
 		t.Fatalf("page without payload: got %v, want ErrRecordPayloadRequired", err)
 	}
 }
@@ -846,7 +846,7 @@ func TestWALCommit_EncodesPatchForBranchNode(t *testing.T) {
 	}
 	defer walFile.Close()
 
-	base := btree.NewRootNode(2, btree.NewLeafNode(3), btree.NewLeafNode(4), []byte("middle"))
+	base := btree.NewRootNode(2, btree.NewLeafNode(3).PageID(), btree.NewLeafNode(4).PageID(), []byte("middle"))
 	target := base.Clone()
 	target.Children[1] = 5
 	log := New(Config{File: walFile, PageSize: 128, CheckpointThresholdBytes: 1 << 20})
@@ -1374,24 +1374,22 @@ func TestCommittedPageToNodeRejectsInvalidNodeImage(t *testing.T) {
 				binary.LittleEndian.PutUint32(image[18:22], 0)
 			}
 			record := CommittedPage{Header: RecordHeader{Type: RecordTypeNode, PageID: node.PageID()}, Payload: image}
-			if _, err := log.CommittedPageToNode(&record); !errors.Is(err, want) {
+			if _, err := decodeCommittedNode(log, &record); !errors.Is(err, want) {
 				t.Fatalf("decode %s: got %v, want %v", fault, err, want)
 			}
-			if fault == "missing" {
-				want = btree.ErrInvalid
-			}
-			if _, _, _, err := log.LookupCommittedPage(&record, []byte("key"), true); !errors.Is(err, want) {
+
+			if _, _, _, err := lookupCommittedNode(log, &record, []byte("key"), true); !errors.Is(err, want) {
 				t.Fatalf("lookup %s: got %v, want %v", fault, err, want)
 			}
 		})
 	}
 }
 
-func setNativeSpan(node *btree.Node, pageSize int64) {
+func setNativeSpan(node *btree.MutableNode, pageSize int64) {
 	node.SetStoragePageCount(btree.NodePageCount(node, pageSize))
 }
 
-func nativeLeaf(t *testing.T, id page.ID, size int, pageSize int64) *btree.Node {
+func nativeLeaf(t *testing.T, id page.ID, size int, pageSize int64) *btree.MutableNode {
 	t.Helper()
 	node := btree.NewLeafNode(id)
 	if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), bytes.Repeat([]byte{'a'}, size))); err != nil {
@@ -1443,7 +1441,7 @@ func TestNativeSpanOneRecordAndPatchOwnership(t *testing.T) {
 	}
 	clear(log.encodingBuffer[:cap(log.encodingBuffer)])
 	current, _ := log.Lookup(target.PageID())
-	entry, found, _, err := log.LookupCommittedPage(&current, []byte("key"), true)
+	entry, found, _, err := lookupCommittedNode(log, &current, []byte("key"), true)
 	if err != nil || !found || !bytes.Equal(entry.Value(), value) {
 		t.Fatalf("published bytes changed: %v", err)
 	}
@@ -1554,7 +1552,7 @@ func TestWALCommittedPageCountIncludesNodeTails(t *testing.T) {
 		t.Fatalf("empty WAL page count: got %d, want 0", got)
 	}
 	leaf := nativeLeaf(t, 20, 3*pageSize, pageSize)
-	branch := btree.NewRootNode(40, btree.NewLeafNode(100), btree.NewLeafNode(101), bytes.Repeat([]byte("k"), 2*pageSize))
+	branch := btree.NewRootNode(40, btree.NewLeafNode(100).PageID(), btree.NewLeafNode(101).PageID(), bytes.Repeat([]byte("k"), 2*pageSize))
 	setNativeSpan(branch, pageSize)
 	if leaf.StoragePageCount() != 4 || branch.StoragePageCount() != 3 {
 		t.Fatal("fixture must contain a four-page leaf and a three-page branch")
@@ -1664,4 +1662,20 @@ func TestWALForceSyncFlushesCleanStateAndStopsOnFailure(t *testing.T) {
 	if _, err := log.Commit(nil, nil, nil, nil); err != stopped {
 		t.Fatalf("failed log accepted commit: %v", err)
 	}
+}
+
+func decodeCommittedNode(log *WAL, record *CommittedPage) (*btree.MutableNode, error) {
+	node, err := record.ReadNode(log.pageSize)
+	if err != nil {
+		return nil, err
+	}
+	return node.Clone(log.pageSize)
+}
+
+func lookupCommittedNode(log *WAL, record *CommittedPage, key []byte, includeKey bool) (btree.Entry, bool, page.ID, error) {
+	node, err := record.ReadNode(log.pageSize)
+	if err != nil {
+		return btree.Entry{}, false, 0, err
+	}
+	return node.Lookup(key, includeKey)
 }

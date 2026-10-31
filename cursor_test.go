@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"os"
 	"testing"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -801,9 +802,9 @@ func TestCursor_EmptyLeaves(t *testing.T) {
 				}
 				// Eight leaves form a complete tree. Only leaves b and f have data.
 				// The other leaves include empty subtrees and empty boundary leaves.
-				var build func(int, int, page.ID) (*btree.Node, error)
-				build = func(first, end int, id page.ID) (*btree.Node, error) {
-					var node *btree.Node
+				var build func(int, int, page.ID) (*btree.MutableNode, error)
+				build = func(first, end int, id page.ID) (*btree.MutableNode, error) {
+					var node *btree.MutableNode
 					if end-first == 1 {
 						node = btree.NewLeafNode(id)
 						if !empty && (first == 1 || first == 5) {
@@ -814,7 +815,7 @@ func TestCursor_EmptyLeaves(t *testing.T) {
 						}
 					} else {
 						middle := (first + end) / 2
-						children := make([]*btree.Node, 2)
+						children := make([]*btree.MutableNode, 2)
 						for i, bounds := range [][2]int{{first, middle}, {middle, end}} {
 							childID, err := tx.store.AllocatePage()
 							if err != nil {
@@ -825,16 +826,16 @@ func TestCursor_EmptyLeaves(t *testing.T) {
 								return nil, err
 							}
 						}
-						node = btree.NewRootNode(id, children[0], children[1], []byte{byte('a' + middle)})
+						node = btree.NewRootNode(id, children[0].PageID(), children[1].PageID(), []byte{byte('a' + middle)})
 					}
 					tx.store.StageNode(node)
 					return node, nil
 				}
-				root, err := build(0, 8, bucket.rootNode.PageID())
+				root, err := build(0, 8, testBucketRoot(t, bucket).PageID())
 				if err != nil {
 					return err
 				}
-				bucket.setRoot(root)
+				bucket.setRoot(root.PageID())
 				return nil
 			}); err != nil {
 				t.Fatal(err)
@@ -1038,6 +1039,117 @@ func TestBucketScans_ContinuedAfterReopen(t *testing.T) {
 							t.Fatal(err)
 						}
 					}
+				}
+			})
+		}
+	}
+}
+
+func TestCursorEncodedReadsDoNotPopulateNodeCaches(t *testing.T) {
+	for _, source := range []string{"main", "wal"} {
+		for _, checksums := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/checksums=%t", source, checksums), func(t *testing.T) {
+				path := t.TempDir() + "/database"
+				db, err := Open(path, 0600, &Options{Synchronous: SyncNone, DataPageChecksums: checksums, CheckpointThresholdBytes: ^uint64(0)})
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { db.Close() }()
+				const count = 1000
+				value := bytes.Repeat([]byte("v"), 256)
+				if err := db.Update(func(tx *Tx) error {
+					bucket, err := tx.CreateBucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					for i := 0; i < count; i++ {
+						if err := bucket.Put(fmt.Appendf(nil, "key-%04d", i), value); err != nil {
+							return err
+						}
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if source == "wal" {
+					// Copy a completed commit before Close checkpoints it, then recover encoded WAL images.
+					snapshot := t.TempDir() + "/snapshot"
+					for _, suffix := range []string{"", "-wal"} {
+						data, err := os.ReadFile(path + suffix)
+						if err != nil {
+							t.Fatal(err)
+						}
+						if err := os.WriteFile(snapshot+suffix, data, 0600); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := db.Close(); err != nil {
+						t.Fatal(err)
+					}
+					path = snapshot
+				} else if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				db, err = Open(path, 0600, &Options{ReadOnly: true})
+				if err != nil {
+					t.Fatal(err)
+				}
+				// Start with empty decoded caches so traversal must use the persisted images.
+				db.operationMu.Lock()
+				db.writeNodes = make(map[page.ID]*writeNodeCacheEntry)
+				db.writeNodeSlots = nil
+				db.nextWriteNodeSlot = 0
+				db.operationMu.Unlock()
+				if err := db.View(func(tx *Tx) error {
+					bucket, err := tx.Bucket(testBucketName)
+					if err != nil {
+						return err
+					}
+					if bucket.rootPageID == 0 {
+						t.Fatal("read-only bucket decoded its root")
+					}
+					if source == "wal" {
+						record, ok := db.wal.Lookup(bucket.rootPageID)
+						if !ok || record.Node != nil || len(record.Payload) == 0 {
+							t.Fatal("fixture did not recover an encoded WAL bucket root")
+						}
+					}
+					before := len(db.writeNodes)
+					cursor, err := bucket.Cursor()
+					if err != nil {
+						return err
+					}
+					for _, reverse := range []bool{false, true} {
+						first, next := cursor.First, cursor.Next
+						if reverse {
+							first, next = cursor.Last, cursor.Prev
+						}
+						key, got, err := first()
+						for i := 0; i < count; i++ {
+							index := i
+							if reverse {
+								index = count - 1 - i
+							}
+							want := fmt.Appendf(nil, "key-%04d", index)
+							if err != nil || !bytes.Equal(key, want) || !bytes.Equal(got, value) {
+								t.Fatalf("entry %d reverse=%t: %q error=%v", i, reverse, key, err)
+							}
+							key, got, err = next()
+						}
+						if err != nil || key != nil || got != nil {
+							t.Fatalf("end: %q %v", key, err)
+						}
+					}
+					key, _, err := cursor.Seek([]byte("key-0500x"))
+					if err != nil || string(key) != "key-0501" {
+						t.Fatalf("lower bound: %q %v", key, err)
+					}
+					if len(db.writeNodes) != before || len(tx.store.dirty) != 0 {
+						t.Fatal("cursor populated a decoded-node cache")
+					}
+					return nil
+				}); err != nil {
+					t.Fatal(err)
 				}
 			})
 		}

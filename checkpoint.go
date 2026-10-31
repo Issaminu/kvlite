@@ -146,7 +146,7 @@ func (db *storage) writeDirectPages(meta *page.Meta, nodes []wal.NodeRecord, all
 // The caller holds the operation write lock. Transaction nodes keep their key and
 // value bytes outside the file mapping, so encoding cannot overwrite its input.
 // A span outside the visible mapping uses the ordinary writer without changes here.
-func (file directMappedFile) WriteNode(node *btree.Node, pageSize int64, checksums bool) (bool, error) {
+func (file directMappedFile) WriteNode(node *btree.MutableNode, pageSize int64, checksums bool) (bool, error) {
 	if node == nil || pageSize < btree.NodeHeaderSize {
 		return false, ErrInvalid
 	}

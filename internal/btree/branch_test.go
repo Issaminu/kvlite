@@ -8,7 +8,7 @@ import (
 )
 
 func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
-	node := &Node{
+	node := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 0),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{2, 3},
@@ -40,7 +40,7 @@ func TestNodeCodec_UsesFixedBranchPayloadLayout(t *testing.T) {
 }
 
 func TestLookupMappedNode_SelectsBranchChild(t *testing.T) {
-	root := &Node{
+	root := &MutableNode{
 		header:   newNodeHeader(NodeTypeBranch, 8),
 		entries:  []Entry{{key: []byte("m")}},
 		Children: []page.ID{9, 10},
