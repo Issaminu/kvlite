@@ -260,8 +260,13 @@ func (cursor *Cursor) Entry() (flags uint32, key, value []byte) {
 	if !cursor.entries.valid {
 		return 0, nil, nil
 	}
-	entry := cursor.leaf.entryAtPosition(cursor.entries)
-	return entry.flags, entry.key, entry.value
+	// Return the fields directly, because Next calls Entry for every key of a scan.
+	if cursor.leaf.node != nil {
+		entry := &cursor.leaf.node.entries[cursor.entries.index]
+		return entry.flags, entry.key, entry.value
+	}
+	position, image := &cursor.entries, cursor.leaf.image
+	return position.flags, image[position.keyStart:position.keyEnd:position.keyEnd], image[position.keyEnd:position.valueEnd:position.valueEnd]
 }
 
 // Find searches for an exact key without changing the cursor's iteration position.
