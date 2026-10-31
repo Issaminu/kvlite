@@ -835,8 +835,7 @@ func TestCursor_EmptyLeaves(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				bucket.setRoot(root.PageID())
-				return nil
+				return bucket.setRoot(root.PageID())
 			}); err != nil {
 				t.Fatal(err)
 			}

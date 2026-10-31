@@ -888,6 +888,77 @@ func TestBucketPut_RootSplitUpdatesCatalog(t *testing.T) {
 	}
 }
 
+// errInjectedRead is the error that failMainPageReadFS returns.
+var errInjectedRead = errors.New("injected read error")
+
+// failMainPageReadFS fails each read of one main-file page while armed is true.
+// Its files are not *os.File values, so KVLite does not map them and reads every page with ReadAt.
+type failMainPageReadFS struct {
+	fileio.OSFS
+	name   string
+	offset int64
+	armed  bool
+}
+
+func (fsys *failMainPageReadFS) OpenFile(name string, flag int, perm os.FileMode) (fileio.File, error) {
+	file, err := fsys.OSFS.OpenFile(name, flag, perm)
+	if err != nil || name != fsys.name {
+		return file, err
+	}
+	return &failMainPageReadFile{File: file, fsys: fsys}, nil
+}
+
+type failMainPageReadFile struct {
+	fileio.File
+	fsys *failMainPageReadFS
+}
+
+func (file *failMainPageReadFile) ReadAt(p []byte, offset int64) (int, error) {
+	if file.fsys.armed && offset == file.fsys.offset {
+		return 0, errInjectedRead
+	}
+	return file.File.ReadAt(p, offset)
+}
+
+// TestBucketPut_RootSplitReturnsCatalogReadError checks that a failed catalog read during a bucket root split returns an error.
+// A write transaction keeps no node that it reads, so the new bucket root goes into the catalog through a new catalog read.
+// Blackout found that an I/O error in that read made KVLite panic.
+func TestBucketPut_RootSplitReturnsCatalogReadError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "database")
+	fsys := &failMainPageReadFS{name: path}
+	// SyncNormal runs the callback on this goroutine, so a panic fails this test directly.
+	db, err := open(path, 0600, &Options{Synchronous: SyncNormal}, fsys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	createBucket(t, db, testBucketName)
+	// After a checkpoint, reads come from the main file and not from WAL records in memory.
+	if err := db.Checkpoint(); err != nil {
+		t.Fatal(err)
+	}
+	fsys.offset = int64(db.meta.Root()) * db.meta.PageSize()
+
+	err = db.Update(func(tx *Tx) error {
+		bucket := mustBucket(t, tx, testBucketName)
+		fsys.armed = true
+		value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
+		for index := range 64 {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%04d", index), value); err != nil {
+				return err
+			}
+		}
+		return errors.New("the bucket root did not split")
+	})
+	fsys.armed = false
+	if !errors.Is(err, errInjectedRead) {
+		t.Fatalf("Update: got %v, want the injected read error", err)
+	}
+	if _, err := db.Get(testBucketName, []byte("key-0000")); !errors.Is(err, ErrKeyNotFound) {
+		t.Fatalf("the failed transaction left a change: %v", err)
+	}
+}
+
 func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})

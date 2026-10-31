@@ -2,6 +2,7 @@ package kvlite
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -73,28 +74,27 @@ func (bucket *Bucket) cacheChild(b *Bucket) {
 }
 
 // writeBackRoot updates the existing fixed-size root pointer after the root page changes.
-// The transaction already loaded this entry before it changed the bucket tree.
-func (bucket *Bucket) writeBackRoot() {
+// It reads the parent tree again, so a storage error can stop it.
+// The bucket tree has already changed then, so the caller must discard the transaction.
+func (bucket *Bucket) writeBackRoot() error {
 	entry := btree.NewEntry(btree.BucketLeafFlag, bucket.name, page.EncodeID(bucket.rootPageID))
-	var err error
 	if bucket.parentBucket == nil {
-		err = bucket.tx.putCatalogEntry(entry)
-	} else {
-		err = bucket.parentBucket.putBucketEntry(entry)
+		return bucket.tx.putCatalogEntry(entry)
 	}
-	if err != nil {
-		panic("kvlite: failed to update an existing bucket root pointer: " + err.Error())
-	}
+	return bucket.parentBucket.putBucketEntry(entry)
 }
 
 // setRoot records a tree change and updates the bucket entry if the root page changed.
-func (bucket *Bucket) setRoot(newRoot page.ID) {
+// An error leaves the bucket tree changed, so the caller must discard the transaction.
+func (bucket *Bucket) setRoot(newRoot page.ID) error {
 	oldRootPageID := bucket.rootPageID
 	bucket.rootPageID = newRoot
+	var err error
 	if newRoot != oldRootPageID {
-		bucket.writeBackRoot()
+		err = bucket.writeBackRoot()
 	}
 	bucket.treeVersion++
+	return err
 }
 
 // CreateBucket creates a top-level bucket named bucketName in a writable transaction. The new bucket is part of the transaction, so [DB.Update] commits or rolls it back with the other changes in that transaction.
@@ -368,8 +368,7 @@ func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 	if err != nil {
 		return err
 	}
-	bucket.setRoot(newRoot)
-	return nil
+	return bucket.setRoot(newRoot)
 }
 
 // Delete removes one plain key and value from this bucket in the current write transaction. Later reads in the same transaction see the change. Other database operations see it after [DB.Update] commits.
@@ -386,8 +385,7 @@ func (bucket *Bucket) Delete(key []byte) error {
 	if err != nil || !deleted {
 		return err
 	}
-	bucket.setRoot(newRoot)
-	return nil
+	return bucket.setRoot(newRoot)
 }
 
 // DeleteBatch removes plain keys from this bucket in the current write transaction.
@@ -408,8 +406,8 @@ func (bucket *Bucket) DeleteBatch(keys [][]byte) error {
 	if !changed || newRoot == 0 {
 		return err
 	}
-	bucket.setRoot(newRoot)
-	return err
+	// A partial change can fail after earlier leaves changed. Record the new root and report both errors.
+	return errors.Join(err, bucket.setRoot(newRoot))
 }
 
 // DeleteBucket removes a top-level bucket and all of its contents in this write transaction.
@@ -482,7 +480,9 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 		if !found {
 			return ErrBucketNotFound
 		}
-		parent.setRoot(newRoot)
+		if err := parent.setRoot(newRoot); err != nil {
+			return err
+		}
 	}
 
 	// pages is the complete checked physical ownership set, including continuations.
