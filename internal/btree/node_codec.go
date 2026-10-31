@@ -214,7 +214,7 @@ func checkBody(image []byte, h NodeHeader, exact bool, visit func(page.ID) error
 
 // ValidateWALNode checks a complete compact image. The WAL checksum must already be valid.
 func ValidateWALNode(data []byte, id page.ID) error {
-	if len(data) < NodeHeaderSize || len(data) > MaxNodeImageSize || binary.LittleEndian.Uint32(data[14:18]) != 0 || page.ID(binary.LittleEndian.Uint64(data[2:10])) != id || page.IsMetaID(id) {
+	if len(data) < NodeHeaderSize || int64(len(data)) > MaxNodeImageSize || binary.LittleEndian.Uint32(data[14:18]) != 0 || page.ID(binary.LittleEndian.Uint64(data[2:10])) != id || page.IsMetaID(id) {
 		return ErrInvalid
 	}
 	kind := mappedNodeType(data)
@@ -363,7 +363,7 @@ func EncodeNodeInto(dst []byte, node *MutableNode, pageSize int64, checksums boo
 		return ErrInvalid
 	}
 	size := node.EncodedSize()
-	if size < NodeHeaderSize || size > MaxNodeImageSize {
+	if size < NodeHeaderSize || int64(size) > MaxNodeImageSize {
 		return ErrInvalid
 	}
 	count := NodePageCount(node, pageSize)

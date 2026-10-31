@@ -132,7 +132,7 @@ func prepareCursorBucket(t *testing.T, db *DB) {
 		if err != nil {
 			return err
 		}
-		for index := 0; index < 40; index++ {
+		for index := range 40 {
 			key := fmt.Appendf(nil, "key-%02d", index)
 			value := bytes.Repeat([]byte{byte(index + 1)}, 1024)
 			if err := bucket.Put(key, value); err != nil {
@@ -171,7 +171,7 @@ func TestCursor_Traversal(t *testing.T) {
 		if err != nil || !bytes.Equal(key, []byte("empty")) {
 			t.Fatalf("first key: got %q err=%v, want empty", key, err)
 		}
-		for index := 0; index < 40; index++ {
+		for index := range 40 {
 			key, _, err = cursor.Next()
 			want := fmt.Appendf(nil, "key-%02d", index)
 			if err != nil || !bytes.Equal(key, want) {
@@ -1062,7 +1062,7 @@ func TestCursorEncodedReadsDoNotPopulateNodeCaches(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					for i := 0; i < count; i++ {
+					for i := range count {
 						if err := bucket.Put(fmt.Appendf(nil, "key-%04d", i), value); err != nil {
 							return err
 						}
@@ -1125,7 +1125,7 @@ func TestCursorEncodedReadsDoNotPopulateNodeCaches(t *testing.T) {
 							first, next = cursor.Last, cursor.Prev
 						}
 						key, got, err := first()
-						for i := 0; i < count; i++ {
+						for i := range count {
 							index := i
 							if reverse {
 								index = count - 1 - i

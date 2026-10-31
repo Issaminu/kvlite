@@ -3,6 +3,7 @@ package btree
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/page"
@@ -70,9 +71,7 @@ func (tree *Tree) setParent(child page.ID, parent page.ID) {
 		tree.parents = make(map[page.ID]page.ID)
 	} else if tree.parentsShared {
 		copied := make(map[page.ID]page.ID, len(tree.parents)+1)
-		for id, owner := range tree.parents {
-			copied[id] = owner
-		}
+		maps.Copy(copied, tree.parents)
 		tree.parents = copied
 	}
 	tree.parentsShared = false
@@ -402,8 +401,7 @@ func (tree *Tree) DeleteEntries(root page.ID, keys [][]byte) (page.ID, bool, err
 			return 0, changed, err
 		}
 		var upper []byte
-		for index := len(path) - 1; index >= 0; index-- {
-			step := path[index]
+		for _, step := range slices.Backward(path) {
 			if step.childIndex < step.parent.EntryCount() {
 				upper, err = step.parent.separator(step.childIndex)
 				if err != nil {

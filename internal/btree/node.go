@@ -3,6 +3,7 @@ package btree
 import (
 	"bytes"
 	"encoding/binary"
+	"slices"
 
 	"github.com/Issaminu/kvlite/internal/page"
 )
@@ -258,8 +259,20 @@ func ReadNodeImage(data []byte, id page.ID, pageSize int64, wal, checksums bool)
 }
 
 func nodeFromImage(image []byte) (Node, error) {
+	// The image must hold the complete entry directory.
+	// Later steps can then use EntryCount without an overflow, also where int has 32 bits.
+	count := binary.LittleEndian.Uint32(image[10:14])
+	var err error
+	if mappedNodeType(image) == NodeTypeBranch {
+		_, err = branchDataStart(uint64(len(image)), count)
+	} else {
+		_, err = leafDataStart(uint64(len(image)), count)
+	}
+	if err != nil {
+		return Node{}, err
+	}
 	// Empty nodes have no entry access through which to check unused body bytes.
-	if binary.LittleEndian.Uint32(image[10:14]) == 0 {
+	if count == 0 {
 		emptySize := NodeHeaderSize
 		if mappedNodeType(image) == NodeTypeBranch {
 			emptySize += page.IDSize
@@ -284,11 +297,6 @@ func (entries *nodeEntries) position(node Node, index int) error {
 	if node.node != nil {
 		entries.index, entries.valid = index, true
 		return nil
-	}
-	if !entries.valid {
-		if _, err := leafDataStart(uint64(len(node.image)), uint32(node.EntryCount())); err != nil {
-			return err
-		}
 	}
 	// Adjacent movement reuses the entry bounds that the previous step already checked.
 	forward := entries.valid && index == entries.index+1
@@ -356,8 +364,7 @@ func (node Node) visitReverse(visit func(uint32, []byte, []byte) error) error {
 	if node.node == nil {
 		return visitLeafReverse(node.image, visit)
 	}
-	for index := len(node.node.entries) - 1; index >= 0; index-- {
-		entry := node.node.entries[index]
+	for _, entry := range slices.Backward(node.node.entries) {
 		if err := visit(entry.flags, entry.key, entry.value); err != nil {
 			return err
 		}
@@ -380,9 +387,6 @@ func (node Node) children(start, end []byte, reverse bool) (childIterator, error
 				return childIterator{}, err
 			}
 		} else {
-			if _, err := branchDataStart(uint64(len(node.image)), uint32(count)); err != nil {
-				return childIterator{}, err
-			}
 			for index := 0; index <= count; index++ {
 				if _, ok := branchChild(node.image, count, index); !ok {
 					return childIterator{}, childError(index)

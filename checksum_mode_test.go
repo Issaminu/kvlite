@@ -75,7 +75,7 @@ func TestSetDataPageChecksums_RoundTrip(t *testing.T) {
 					return err
 				}
 				for i := range 100 {
-					if err := b.Put([]byte(fmt.Sprintf("key/%03d", i)), bytes.Repeat([]byte("a"), 128)); err != nil {
+					if err := b.Put(fmt.Appendf(nil, "key/%03d", i), bytes.Repeat([]byte("a"), 128)); err != nil {
 						return err
 					}
 				}
@@ -397,7 +397,7 @@ func TestSetDataPageChecksums_InterruptedBatchRecovery(t *testing.T) {
 			return err
 		}
 		for i := range 400 {
-			if err := b.Put([]byte(fmt.Sprintf("key/%03d", i)), bytes.Repeat([]byte{byte(i)}, 3000)); err != nil {
+			if err := b.Put(fmt.Appendf(nil, "key/%03d", i), bytes.Repeat([]byte{byte(i)}, 3000)); err != nil {
 				return err
 			}
 		}
@@ -478,7 +478,7 @@ func TestSetDataPageChecksums_InterruptedBatchRecovery(t *testing.T) {
 			t.Fatal("recovery published enabled mode")
 		}
 		for i := range 400 {
-			got, err := copy.Get([]byte("bucket"), []byte(fmt.Sprintf("key/%03d", i)))
+			got, err := copy.Get([]byte("bucket"), fmt.Appendf(nil, "key/%03d", i))
 			if err != nil || !bytes.Equal(got, bytes.Repeat([]byte{byte(i)}, 3000)) {
 				t.Fatalf("recovered key %d: %d bytes, %v", i, len(got), err)
 			}

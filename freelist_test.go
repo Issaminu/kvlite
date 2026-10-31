@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -1251,7 +1252,7 @@ func TestAllocationSpanAvoidsReservedStorage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for step := page.ID(0); step < 4; step++ {
+	for step := range page.ID(4) {
 		if !changes.allocated(head+step) || changes.isSegmentPage(head+step) {
 			t.Fatal("span uses free or reserved storage")
 		}
@@ -1335,7 +1336,7 @@ func TestAllocationSpanSearchReusesEarlierSpace(t *testing.T) {
 		}
 		changes := newAllocationChanges(bitmap)
 		for _, start := range []page.ID{root + 20, root + 40} {
-			for offset := page.ID(0); offset < 6; offset++ {
+			for offset := range page.ID(6) {
 				changes.release(start + offset)
 			}
 		}
@@ -1442,7 +1443,7 @@ func TestAllocationNodeSpanCrossesLogicalFrame(t *testing.T) {
 	if err != nil || head != boundary-2 {
 		t.Fatalf("cross-frame span=%d error=%v", head, err)
 	}
-	for offset := page.ID(0); offset < 4; offset++ {
+	for offset := range page.ID(4) {
 		if !changes.allocated(head+offset) || changes.isSegmentPage(head+offset) {
 			t.Fatal("cross-frame span has invalid ownership")
 		}
@@ -1576,7 +1577,7 @@ func TestNativeNodeSpanRepairsNestedRootAndKeepsRollbackPrivate(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := testLoadRoot(t, child); err != nil {
+		if err := testLoadRoot(child); err != nil {
 			return err
 		}
 		if testBucketRoot(t, child).PageID() == oldHead {
@@ -1708,7 +1709,7 @@ func TestNativeNodeSpanRepairsUnchangedBranch(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := testLoadRoot(t, bucket); err != nil {
+		if err := testLoadRoot(bucket); err != nil {
 			return err
 		}
 		branch = testBucketRoot(t, bucket)
@@ -1761,7 +1762,7 @@ func TestNativeNodeSpanGrowsAndShrinksInPlace(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := testLoadRoot(t, bucket); err != nil {
+		if err := testLoadRoot(bucket); err != nil {
 			return err
 		}
 		head = testBucketRoot(t, bucket).PageID()
@@ -1893,9 +1894,7 @@ func TestNativeNodeSpanBatchParentChanges(t *testing.T) {
 			if !bytes.Equal(first.store.dirty[oldHead].final.EntryAt(0).Value(), value) {
 				t.Fatal("a write after reparenting changed an earlier callback's image")
 			}
-			for id, change := range second.store.dirty {
-				first.store.dirty[id] = change
-			}
+			maps.Copy(first.store.dirty, second.store.dirty)
 			prepared := newCommitTx(db, writeBatchState{meta: second.meta, dirty: first.store.dirty, allocation: second.allocation, tree: second.tree})
 			if err := prepared.prepareCommit(); err != nil {
 				t.Fatal(err)
@@ -1962,9 +1961,7 @@ func TestNativeNodeSpanBatchCatalogRootCollapse(t *testing.T) {
 	if !testNode(t, &second.store, second.meta.Root()).IsLeaf() || testParent(t, second, oldRoot) != nil {
 		t.Fatal("promoted catalog root kept its old branch parent")
 	}
-	for id, change := range second.store.dirty {
-		first.store.dirty[id] = change
-	}
+	maps.Copy(first.store.dirty, second.store.dirty)
 	prepared := newCommitTx(db, writeBatchState{meta: second.meta, dirty: first.store.dirty, allocation: second.allocation, tree: second.tree})
 	if err := prepared.prepareCommit(); err != nil {
 		t.Fatal(err)
@@ -1987,15 +1984,15 @@ func TestAllocationBitmapOwnsNodeSpanChecksAllBits(t *testing.T) {
 	bitmap := newAllocationBitmap(4096)
 	start := page.NewMeta(4096).Root() + 1
 	for _, count := range []int{1, 2, 7, 8, 9, 17, 63, 64, 65, 128, 257} {
-		for offset := page.ID(0); offset < 8; offset++ {
+		for offset := range page.ID(8) {
 			head := start + offset
-			for i := 0; i < count; i++ {
+			for i := range count {
 				bitmap.markAllocated(head + page.ID(i))
 			}
 			if !bitmap.ownsNodeSpan(head, count) {
 				t.Fatalf("allocated span %d+%d was rejected", head, count)
 			}
-			for i := 0; i < count; i++ {
+			for i := range count {
 				id := head + page.ID(i)
 				segment := bitmap.writableSegment(bitmap.segmentIndex(id))
 				clearAllocationBit(segment.bitmapBits(), id%bitmap.pagesPerSegment())
@@ -2020,7 +2017,7 @@ func TestAllocationBitmapOwnsNodeSpanChecksAllBits(t *testing.T) {
 func TestAllocationBitmapOwnsNodeSpanAcrossFrames(t *testing.T) {
 	bitmap := newAllocationBitmap(4096)
 	head := bitmap.pagesPerSegment() - 7
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		bitmap.markAllocated(head + page.ID(i))
 	}
 	if !bitmap.ownsNodeSpan(head, 20) {
@@ -2061,7 +2058,7 @@ func checkReleaseWords(t *testing.T, base *allocationBitmap) {
 	heads := []page.ID{0, 64, (dataStart + 63) / 64 * 64, (width - 1) / 64 * 64,
 		width / 64 * 64, base.pagesPerGroup() / 64 * 64, (coverage - 1) / 64 * 64, (coverage + 63) / 64 * 64}
 	for _, head := range heads {
-		for bit := page.ID(0); bit < 64; bit++ {
+		for bit := range page.ID(64) {
 			id := head + bit
 			if id < coverage && bit%3 != 0 && !base.isSegmentPage(id) {
 				base.markAllocated(id)
@@ -2077,9 +2074,9 @@ func checkReleaseWords(t *testing.T, base *allocationBitmap) {
 			start := newAllocationChanges(base)
 			start.spanCount, start.spanCursor = 17, coverage-1
 			left, right := start.clone(), start.clone()
-			for repeat := 0; repeat < 2; repeat++ {
+			for repeat := range 2 {
 				left.releaseWord(head/64, mask)
-				for bit := page.ID(0); bit < 64; bit++ {
+				for bit := range page.ID(64) {
 					if mask&(uint64(1)<<bit) != 0 {
 						right.release(head + bit)
 					}
@@ -2091,7 +2088,7 @@ func checkReleaseWords(t *testing.T, base *allocationBitmap) {
 			metaLeft, metaRight := page.NewMeta(4096), page.NewMeta(4096)
 			metaLeft.SetLastPage(coverage - 1)
 			metaRight.SetLastPage(coverage - 1)
-			for repeat := 0; repeat < 2; repeat++ {
+			for repeat := range 2 {
 				left.finalize(metaLeft)
 				right.finalize(metaRight)
 				if !reflect.DeepEqual(left, right) || !reflect.DeepEqual(metaLeft, metaRight) ||

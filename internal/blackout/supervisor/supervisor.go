@@ -172,16 +172,12 @@ func (s *supervisor) serve(current *build, follow *follower, ticks <-chan time.T
 	}
 	reportDone := make(chan struct{})
 	var report sync.WaitGroup
-	report.Add(1)
-	go func() {
-		defer report.Done()
+	report.Go(func() {
 		s.reportLoop(reportDone)
-	}()
-	s.background.Add(1)
-	go func() {
-		defer s.background.Done()
+	})
+	s.background.Go(func() {
 		s.shrinker()
-	}()
+	})
 
 	for s.runSeeds(current, follow, ticks) {
 		s.logf("a new commit is checked out; wait for the running workers")
@@ -272,12 +268,10 @@ func (s *supervisor) runSeeds(current *build, follow *follower, ticks <-chan tim
 		}
 		chosen := pickLane(s.lanes, rand.IntN(totalWeight(s.lanes)))
 		seed := newSeed()
-		s.workers.Add(1)
-		go func() {
-			defer s.workers.Done()
+		s.workers.Go(func() {
 			outcome, err := s.execute(current, seed, chosen.Steps)
 			s.handleSeed(current, outcome, err)
-		}()
+		})
 	}
 }
 

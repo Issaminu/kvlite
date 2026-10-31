@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -267,7 +267,7 @@ func BenchmarkDeleteVisibility(b *testing.B) {
 			iteration++
 		}
 		validateExpectedState(b, engine, nil)
-		sort.Slice(readDurations, func(left, right int) bool { return readDurations[left] < readDurations[right] })
+		slices.Sort(readDurations)
 		b.ReportMetric(float64(deleteDuration.Nanoseconds())/float64(operations), "delete-ack-ns")
 		b.ReportMetric(float64(readDurations[operations/2].Nanoseconds()), "post-ack-miss-p50-ns")
 		b.ReportMetric(float64(readDurations[operations*95/100].Nanoseconds()), "post-ack-miss-p95-ns")

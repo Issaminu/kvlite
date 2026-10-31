@@ -1302,8 +1302,8 @@ func TestNodePages_LookupAcrossBoundaries(t *testing.T) {
 					node.header.Type = NodeTypeBranch
 					node.Children = []page.ID{1000}
 				}
-				for i := 0; i < 12; i++ {
-					key := append([]byte(fmt.Sprintf("%06d", i)), bytes.Repeat([]byte{'k'}, i%3*35+1)...)
+				for i := range 12 {
+					key := append(fmt.Appendf(nil, "%06d", i), bytes.Repeat([]byte{'k'}, i%3*35+1)...)
 					value := bytes.Repeat([]byte{'v'}, []int{0, 1, 80, 257}[i%4])
 					if branch {
 						value = nil
@@ -1524,8 +1524,8 @@ func TestLeafDeletionCopiesOnlyRetainedEntries(t *testing.T) {
 			base.CacheEncodedSize()
 			before := EncodeWALNode(base)
 			want := base.Clone()
-			for i := len(indexes) - 1; i >= 0; i-- {
-				want.entries = slices.Delete(want.entries, indexes[i], indexes[i]+1)
+			for _, indexe := range slices.Backward(indexes) {
+				want.entries = slices.Delete(want.entries, indexe, indexe+1)
 			}
 			private := base.Clone()
 			private.DeleteLeafEntries(indexes[0], indexes[1:])
@@ -2284,52 +2284,41 @@ func TestNodeChildrenValidateOnlyRequiredMetadata(t *testing.T) {
 	}
 }
 
-func TestNodeOperationsRejectInvalidDirectories(t *testing.T) {
+// TestReadNodeRejectsOversizedDirectory checks that both node readers reject an entry count that the image cannot hold.
+// The 0x80000000 count is negative as a 32-bit int, so a later EntryCount would make a damaged node look empty there.
+func TestReadNodeRejectsOversizedDirectory(t *testing.T) {
 	const pageSize = 256
 	for _, branch := range []bool{false, true} {
-		t.Run(fmt.Sprint(branch), func(t *testing.T) {
-			source := NewLeafNode(20)
-			if branch {
-				source = NewRootNode(20, 21, 22, []byte("middle"))
-			} else if err := source.InsertEntry(NewEntry(0, []byte("key"), nil)); err != nil {
-				t.Fatal(err)
-			}
-			data := make([]byte, pageSize)
-			if err := EncodeNodeInto(data, source, pageSize, false); err != nil {
-				t.Fatal(err)
-			}
-			binary.LittleEndian.PutUint32(data[nodeEntryCountOffset:nodeChecksumOffset], ^uint32(0))
-			node, err := ReadNodeImage(data, 20, pageSize, false, false)
-			if err != nil {
-				t.Fatal(err)
-			}
-			operations := map[string]func() error{
-				"lookup": func() error { _, _, _, err := node.Lookup([]byte("key"), true); return err },
-				"clone":  func() error { _, err := node.Clone(pageSize); return err },
-				"check":  func() error { return node.VisitReferences(pageSize, func(page.ID) error { return nil }, nil) },
-			}
-			if branch {
-				operations["child"] = func() error { _, err := node.Child(0); return err }
-				operations["separator"] = func() error { _, err := node.separator(0); return err }
-				operations["children"] = func() error { return visitNodeChildren(node, nil, nil, false, func(page.ID) error { return nil }) }
-			} else {
-				operations["entry"] = func() error { _, err := node.Entry(0); return err }
-				operations["range"] = func() error { return node.visitRange(nil, nil, func(uint32, []byte, []byte) error { return nil }) }
-				operations["reverse"] = func() error { return node.visitReverse(func(uint32, []byte, []byte) error { return nil }) }
-				operations["cursor"] = func() error {
-					cursor := NewCursor(&cursorViewReader{views: map[page.ID]Node{20: node}}, 20)
-					_, err := cursor.First()
-					return err
+		source := NewLeafNode(20)
+		if branch {
+			source = NewRootNode(20, 21, 22, []byte("middle"))
+		} else if err := source.InsertEntry(NewEntry(0, []byte("key"), nil)); err != nil {
+			t.Fatal(err)
+		}
+		data := make([]byte, pageSize)
+		if err := EncodeNodeInto(data, source, pageSize, false); err != nil {
+			t.Fatal(err)
+		}
+		size := NodeHeaderSize + int(binary.LittleEndian.Uint32(data[18:22]))
+		// The first count that does not fit is one more than the image can hold.
+		firstTooLarge := uint32((size - NodeHeaderSize) / leafEntryDescriptorSize)
+		if branch {
+			firstTooLarge = uint32((size-NodeHeaderSize-page.IDSize)/(branchEntryDescriptorSize+page.IDSize)) + 1
+		} else {
+			firstTooLarge++
+		}
+		for _, count := range []uint32{firstTooLarge, 1 << 31, ^uint32(0)} {
+			t.Run(fmt.Sprintf("branch=%t/count=%d", branch, count), func(t *testing.T) {
+				image := slices.Clone(data)
+				binary.LittleEndian.PutUint32(image[nodeEntryCountOffset:nodeChecksumOffset], count)
+				if _, err := ReadNodeImage(image[:size], 20, pageSize, false, false); !errors.Is(err, ErrInvalid) {
+					t.Fatalf("ReadNodeImage accepted the directory: %v", err)
 				}
-			}
-			for name, operation := range operations {
-				t.Run(name, func(t *testing.T) {
-					if err := operation(); !errors.Is(err, ErrInvalid) {
-						t.Fatalf("invalid directory: %v", err)
-					}
-				})
-			}
-		})
+				if _, err := ReadCheckedNodeSpan(image, false); !errors.Is(err, ErrInvalid) {
+					t.Fatalf("ReadCheckedNodeSpan accepted the directory: %v", err)
+				}
+			})
+		}
 	}
 }
 

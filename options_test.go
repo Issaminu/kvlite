@@ -7,7 +7,7 @@ import (
 )
 
 func TestOptions_DoesNotExposePageSize(t *testing.T) {
-	if _, ok := reflect.TypeOf(Options{}).FieldByName("PageSize"); ok {
+	if _, ok := reflect.TypeFor[Options]().FieldByName("PageSize"); ok {
 		t.Fatal("Options exposes PageSize")
 	}
 }

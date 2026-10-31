@@ -37,7 +37,7 @@ func TestCheckpoint_ReturnsFreeTailPagesToOS(t *testing.T) {
 					return err
 				}
 				for index := range 256 {
-					if err := bucket.Put([]byte(fmt.Sprintf("key-%04d", index)), make([]byte, 512)); err != nil {
+					if err := bucket.Put(fmt.Appendf(nil, "key-%04d", index), make([]byte, 512)); err != nil {
 						return err
 					}
 				}
@@ -60,7 +60,7 @@ func TestCheckpoint_ReturnsFreeTailPagesToOS(t *testing.T) {
 					return err
 				}
 				for index := range 256 {
-					if err := bucket.Delete([]byte(fmt.Sprintf("key-%04d", index))); err != nil {
+					if err := bucket.Delete(fmt.Appendf(nil, "key-%04d", index)); err != nil {
 						return err
 					}
 				}
@@ -163,7 +163,7 @@ func TestCheckpoint_ReplacesTheMappingAfterTheMainFileGrows(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for index := 0; index < 128; index++ {
+		for index := range 128 {
 			if err := bucket.Put([]byte{byte(index + 1)}, make([]byte, 256)); err != nil {
 				return err
 			}

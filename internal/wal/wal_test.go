@@ -1452,7 +1452,9 @@ func TestNativeSpanOneRecordAndPatchOwnership(t *testing.T) {
 
 func TestNativeSpanRecordBounds(t *testing.T) {
 	const pageSize = 4096
-	header := appendRecordHeader(nil, RecordHeader{Type: RecordTypeNode, PageID: 20, TxID: 1}, MaxNodeImageSize+1)
+	header := appendRecordHeader(nil, RecordHeader{Type: RecordTypeNode, PageID: 20, TxID: 1}, 0)
+	// The size does not fit in a 32-bit int, so the test writes it into the header directly.
+	binary.LittleEndian.PutUint32(header[len(header)-4:], MaxNodeImageSize+1)
 	if _, err := DecodeWALRecord(bytes.NewReader(header), pageSize, 0); !errors.Is(err, page.ErrChecksum) {
 		t.Fatalf("unbounded node record: %v", err)
 	}

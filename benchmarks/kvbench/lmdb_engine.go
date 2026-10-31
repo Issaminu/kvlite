@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"strings"
 
 	"github.com/PowerDNS/lmdb-go/lmdb"
@@ -331,9 +332,7 @@ func (engine *lmdbEngine) PrepareCollections(_ context.Context, paths [][][]byte
 		return nil
 	})
 	if err == nil {
-		for name, db := range handles {
-			engine.collections[name] = db
-		}
+		maps.Copy(engine.collections, handles)
 	}
 	return err
 }

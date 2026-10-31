@@ -175,7 +175,7 @@ func TestTreePutEntry_AcceptsKeyBeyondOnePage(t *testing.T) {
 	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		key := bytes.Repeat([]byte{byte('a' + i)}, 256)
 		var err error
 		root, err = tree.PutEntry(root, NewEntry(0, key, []byte("value")))
@@ -183,7 +183,7 @@ func TestTreePutEntry_AcceptsKeyBeyondOnePage(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		key := bytes.Repeat([]byte{byte('a' + i)}, 256)
 		entry, found, err := tree.FindEntryRef(root, key, true)
 		if err != nil || !found || !bytes.Equal(entry.Value(), []byte("value")) {
@@ -217,7 +217,7 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 	root := NewLeafNode(rootPageID)
 	store.StageNode(root)
 
-	for index := 0; index < entryCount; index++ {
+	for index := range entryCount {
 		key := fmt.Appendf(nil, "key-%03d", index)
 		value := fmt.Appendf(nil, "value-%03d", index)
 		var err error
@@ -230,7 +230,7 @@ func TestTree_PutAndFindWithoutDatabase(t *testing.T) {
 		t.Fatal("tree did not create a branch root")
 	}
 
-	for index := 0; index < entryCount; index++ {
+	for index := range entryCount {
 		key := fmt.Appendf(nil, "key-%03d", index)
 		want := fmt.Appendf(nil, "value-%03d", index)
 		entry, found, err := tree.FindEntryRef(root, key, true)
@@ -1224,8 +1224,8 @@ func TestFenceDeletesAndRefillsOldGaps(t *testing.T) {
 				remaining = append(remaining, key)
 			}
 			slices.Sort(remaining)
-			for i := len(remaining) - 1; i >= 0; i-- {
-				remove([]byte(remaining[i]))
+			for i, r := range slices.Backward(remaining) {
+				remove([]byte(r))
 				if i%32 == 0 {
 					checkSeparatorTree(t, tree, store, root, reference)
 				}

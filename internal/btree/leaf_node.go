@@ -126,17 +126,6 @@ func (n *MutableNode) InsertEntry(entry Entry) error {
 	return nil
 }
 
-func (n *MutableNode) prepareDelete(key []byte, bucket bool) (int, bool, error) {
-	index, found, err := n.findKeyIndex(key)
-	if err != nil || !found {
-		return 0, found, err
-	}
-	if (n.entries[index].flags&BucketLeafFlag != 0) != bucket {
-		return 0, false, ErrIncompatibleValue
-	}
-	return index, true, nil
-}
-
 // DeleteLeafEntries removes selected entries from a private leaf in one pass.
 // n must be a leaf owned by the caller. firstIndex and rest must contain
 // distinct, ascending entry indexes. It clears unused entry slots.

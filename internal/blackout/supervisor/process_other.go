@@ -22,7 +22,7 @@ func killProcess(cmd *exec.Cmd) {
 }
 
 // killedBySystem reports false, because the supervisor cannot tell on this system who stopped a process.
-func killedBySystem(state *os.ProcessState) bool {
+func killedBySystem(*os.ProcessState) bool {
 	return false
 }
 

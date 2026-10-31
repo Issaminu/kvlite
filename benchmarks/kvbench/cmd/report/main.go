@@ -178,7 +178,7 @@ func checkCase(path, name string, expected int) error {
 }
 
 func sampleCount(environment string) (int, error) {
-	for _, line := range strings.Split(environment, "\n") {
+	for line := range strings.SplitSeq(environment, "\n") {
 		if value, ok := strings.CutPrefix(line, "Measured samples: "); ok {
 			n, err := strconv.Atoi(strings.TrimSpace(value))
 			if err == nil && n > 0 {
@@ -511,7 +511,7 @@ func listCases(dir string, output io.Writer, engines ...string) error {
 }
 
 func roundCount(environment string) (int, error) {
-	for _, line := range strings.Split(environment, "\n") {
+	for line := range strings.SplitSeq(environment, "\n") {
 		if value, ok := strings.CutPrefix(line, "Measured rounds: "); ok {
 			n, err := strconv.Atoi(strings.TrimSpace(value))
 			if err == nil && n > 0 {
@@ -533,8 +533,8 @@ func firstHotspot(h []hotspot) string {
 		{"github.com/PowerDNS/lmdb-go/lmdb", "lmdb"},
 		{"github.com/redis/go-redis/v9", "redis"},
 	} {
-		if strings.HasPrefix(name, item.prefix) {
-			name = item.label + strings.TrimPrefix(name, item.prefix)
+		if after, ok := strings.CutPrefix(name, item.prefix); ok {
+			name = item.label + after
 			break
 		}
 	}
@@ -560,7 +560,7 @@ func sampledCPU(path string, repeats int) (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		_, value, ok := strings.Cut(line, "Total samples = ")
 		if !ok {
 			continue
@@ -584,7 +584,7 @@ func readTop(path string, cumulative bool, engine string) ([]hotspot, error) {
 		return nil, err
 	}
 	var top []hotspot
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 6 || fields[0] == "flat" || !strings.HasSuffix(fields[1], "%") || !strings.HasSuffix(fields[4], "%") || (engine != "" && !engineFunction(fields[5], engine)) {
 			continue
@@ -623,7 +623,7 @@ func readProfiles(dir string, r report) ([]caseProfile, error) {
 		}
 	}
 	var profiles []caseProfile
-	for _, line := range strings.Split(strings.TrimSpace(string(index)), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(string(index)), "\n") {
 		fields := strings.Split(line, "\t")
 		if len(fields) != 6 || fields[0] != fmt.Sprintf("%04d", len(profiles)+1) || known[fields[1]+"\x00"+fields[2]].Engine != fields[3] {
 			return nil, fmt.Errorf("invalid profile index row %q", line)
@@ -684,7 +684,7 @@ func readProfiles(dir string, r report) ([]caseProfile, error) {
 // profiledEngines reads the "Profiled engines" line of environment.txt.
 // It returns nil when the line is absent, which means that every engine was profiled.
 func profiledEngines(environment string) []string {
-	for _, line := range strings.Split(environment, "\n") {
+	for line := range strings.SplitSeq(environment, "\n") {
 		if value, ok := strings.CutPrefix(line, "Profiled engines: "); ok {
 			return strings.Fields(value)
 		}

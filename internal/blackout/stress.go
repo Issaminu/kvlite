@@ -136,16 +136,14 @@ func (run *stressRun) err() error {
 func (run *stressRun) parallel(body func(client int)) {
 	var group sync.WaitGroup
 	for client := range run.clients {
-		group.Add(1)
-		go func() {
-			defer group.Done()
+		group.Go(func() {
 			defer func() {
 				if value := recover(); value != nil {
 					run.fail("client %d: panic: %v", client, value)
 				}
 			}()
 			body(client)
-		}()
+		})
 	}
 	group.Wait()
 }

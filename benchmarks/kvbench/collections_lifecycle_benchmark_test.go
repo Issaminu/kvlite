@@ -26,9 +26,10 @@ func BenchmarkCollections(b *testing.B) {
 			}
 			paths := makeCollectionPaths(count, depth)
 			model := "native-buckets"
-			if environment.kind == EngineRedis {
+			switch environment.kind {
+			case EngineRedis:
 				model = "logical-prefixes"
-			} else if environment.kind == EngineLMDB {
+			case EngineLMDB:
 				model = "flat-named-databases"
 			}
 			name := fmt.Sprintf("%s/collections=%d/depth=%d/model=%s/%s", environment.mode, count, depth, model, environment.kind)

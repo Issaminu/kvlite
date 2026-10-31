@@ -277,7 +277,7 @@ func (changes *allocationChanges) retireSpan(head page.ID, count int) error {
 	if count <= 0 || page.ID(count)-1 > ^page.ID(0)-head {
 		return fmt.Errorf("retire invalid span %d/%d: %w", head, count, page.ErrInvalid)
 	}
-	for offset := 0; offset < count; offset++ {
+	for offset := range count {
 		id := head + page.ID(offset)
 		if id < firstTreePageID || changes.isSegmentPage(id) {
 			return fmt.Errorf("retire reserved page %d: %w", id, page.ErrInvalid)
@@ -790,9 +790,9 @@ func highestSetBit(data []byte) (int, bool) {
 // highestAllocated returns the highest page ID whose allocation bit is set.
 func (bitmap *allocationBitmap) highestAllocated() page.ID {
 	pagesPerSegment := bitmap.pagesPerSegment()
-	for index := len(bitmap.segments) - 1; index >= 0; index-- {
+	for index, segment := range slices.Backward(bitmap.segments) {
 		firstPage := page.ID(index) * pagesPerSegment
-		if bit, found := highestSetBit(bitmap.segments[index].bitmapBits()); found {
+		if bit, found := highestSetBit(segment.bitmapBits()); found {
 			return firstPage + page.ID(bit)
 		}
 	}

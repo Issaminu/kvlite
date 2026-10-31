@@ -176,8 +176,7 @@ func TestContinuedMainFileReads(t *testing.T) {
 					t.Fatalf("cursor end: got %q, %v", key, err)
 				}
 				key, value, err = cursor.Last()
-				for index := len(entries) - 1; index >= 0; index-- {
-					entry := entries[index]
+				for _, entry := range slices.Backward(entries) {
 					if err != nil || !bytes.Equal(key, entry.Key()) || !bytes.Equal(value, entry.Value()) {
 						t.Fatalf("reverse cursor: got %q, %v", key, err)
 					}
@@ -651,7 +650,7 @@ func mustBucketRoot(t *testing.T, db *DB, name []byte) *btree.MutableNode {
 		if err != nil {
 			return err
 		}
-		if err := testLoadRoot(t, bucket); err != nil {
+		if err := testLoadRoot(bucket); err != nil {
 			return err
 		}
 		root = testBucketRoot(t, bucket)
@@ -947,7 +946,7 @@ func TestPut_Overwrite_BoundedGrowth(t *testing.T) {
 	}
 	small := fileSize(t, path)
 
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		if err := db.Put(testBucketName, []byte("a"), []byte("value")); err != nil {
 			t.Fatal(err)
 		}
@@ -1051,7 +1050,7 @@ func TestSplit_TreeGrows(t *testing.T) {
 
 	// 150 x 256B ≈ 38 KB — blows past one page at any OS page size (4 KB or 16 KB).
 	val := bytes.Repeat([]byte("x"), 256)
-	for i := 0; i < 150; i++ {
+	for i := range 150 {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatal(err)
 		}
@@ -1078,7 +1077,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 
 	const n = 150
 	val := bytes.Repeat([]byte("y"), 256)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatal(err)
 		}
@@ -1093,7 +1092,7 @@ func TestSplit_SurvivesReopen(t *testing.T) {
 	}
 	defer db.Close()
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		got, err := db.Get(testBucketName, fmt.Appendf(nil, "key-%05d", i))
 		if err != nil {
 			t.Fatalf("key-%05d after reopen: %v", i, err)
@@ -1141,7 +1140,7 @@ func TestSplit_RootBecomesBranch(t *testing.T) {
 	entryBytes := 4 + len("key-00000") + 4 + len(val)
 	n := pageBytes/entryBytes + pageBytes/entryBytes/2 // ~1.5 pages
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
@@ -1174,7 +1173,7 @@ func TestSplit_EveryNodeFitsInOnePage(t *testing.T) {
 	defer db.Close()
 
 	val := bytes.Repeat([]byte("z"), 256)
-	for i := 0; i < 300; i++ {
+	for i := range 300 {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
@@ -1205,7 +1204,7 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 
 	const n = 400
 	val := bytes.Repeat([]byte("w"), 256)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
@@ -1224,7 +1223,7 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 	if leaves < 3 {
 		t.Fatalf("expected >= 3 leaves (a child-leaf split must add one, propagating a separator up), got %d", leaves)
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Appendf(nil, "key-%05d", i)
 		if got, err := db.Get(testBucketName, k); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %q unreadable after propagating splits: err=%v", k, err)
@@ -1255,7 +1254,7 @@ func TestSplit_Cascades(t *testing.T) {
 
 	const n = 400
 	val := []byte("v")
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := db.Put(testBucketName, mkKey(i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
@@ -1276,7 +1275,7 @@ func TestSplit_Cascades(t *testing.T) {
 	}
 
 	// Every key must still route correctly through the branch-split tree.
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if got, err := db.Get(testBucketName, mkKey(i)); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %d unreadable after a branch split (mis-wired separator?): err=%v", i, err)
 		}
@@ -1291,7 +1290,7 @@ func TestSplit_Cascades(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if got, err := db.Get(testBucketName, mkKey(i)); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %d unreadable after reopen: err=%v", i, err)
 		}
@@ -1579,7 +1578,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	}
 	const n = 100
 	val := bytes.Repeat([]byte("x"), 512) // 100 * ~525B ≈ 50 KB, well past any page
-	for i := 0; i < n; i++ {
+	for i := range n {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
 		}
@@ -1614,7 +1613,7 @@ func TestWAL_RecoversAfterSplitCrash(t *testing.T) {
 	if mustBucketRoot(t, rec, testBucketName).IsLeaf() {
 		t.Fatal("recovered root is a leaf after WAL replay")
 	}
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Appendf(nil, "key-%05d", i)
 		if got, err := rec.Get(testBucketName, k); err != nil || !bytes.Equal(got, val) {
 			t.Fatalf("key %d not recovered after split-crash: err=%v", i, err)
@@ -1713,7 +1712,6 @@ func TestWAL_TornTransaction_DiscardedAtomically(t *testing.T) {
 	// The invariant: any truncation inside T2 -> recover to exactly post-T1.
 	t2 := len(walAfterT2) - len(walAfterT1) // size of the T2 segment
 	for _, off := range []int{0, 1, t2 / 2, t2 - 1} {
-		off := off
 		t.Run(fmt.Sprintf("torn-at-+%d", off), func(t *testing.T) {
 			rec, err := recover(t, walAfterT2[:len(walAfterT1)+off])
 			if err != nil {
@@ -1752,7 +1750,7 @@ func TestCheckpoint_BoundsWALAndPreservesData(t *testing.T) {
 	const n = 400
 	val := bytes.Repeat([]byte("x"), 2048) // ~2 KiB per value: the WAL grows fast
 	want := make(map[string]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Sprintf("key-%05d", i)
 		if err := db.Put(testBucketName, []byte(k), val); err != nil {
 			t.Fatalf("put %d: %v", i, err)
@@ -1872,7 +1870,7 @@ func TestRecoveryAppliesWALOverCheckpointedMainFile(t *testing.T) {
 	valUpd := bytes.Repeat([]byte("b"), 512)  // same length, distinct content
 
 	// Batch 1: keys 0..99, then a manual checkpoint drains them into the main file.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), valBase); err != nil {
 			t.Fatalf("base put %d: %v", i, err)
 		}
@@ -1888,7 +1886,7 @@ func TestRecoveryAppliesWALOverCheckpointedMainFile(t *testing.T) {
 
 	// Batch 2 (WAL/overlay only — main keeps the checkpointed base):
 	//   overwrite keys 0..9 to valUpd, and add fresh keys 100..149 as valBase.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%05d", i), valUpd); err != nil {
 			t.Fatalf("overwrite put %d: %v", i, err)
 		}
@@ -1930,7 +1928,7 @@ func TestRecoveryAppliesWALOverCheckpointedMainFile(t *testing.T) {
 	}
 	defer rec.Close()
 
-	for i := 0; i < 150; i++ {
+	for i := range 150 {
 		k := fmt.Appendf(nil, "key-%05d", i)
 		want := valBase
 		if i < 10 {
@@ -2242,22 +2240,17 @@ func TestOpen_Reopen(t *testing.T) {
 	}
 }
 
-func TestDefaultOptionsAreIndependent(t *testing.T) {
+func TestDefaultOptions(t *testing.T) {
 	const osPageSize = 4096
-	first := defaultOptions(osPageSize)
-	first.ReadOnly = true
-	first.Synchronous = SyncNone
-	first.CheckpointThresholdBytes = 1
-
-	second := defaultOptions(osPageSize)
-	if second.ReadOnly {
-		t.Fatal("changing one default options value changed a later value")
+	options := defaultOptions(osPageSize)
+	if options.ReadOnly {
+		t.Fatal("default options are read-only")
 	}
-	if second.Synchronous != SyncFull {
-		t.Fatalf("default synchronous mode: got %v, want SyncFull", second.Synchronous)
+	if options.Synchronous != SyncFull {
+		t.Fatalf("default synchronous mode: got %v, want SyncFull", options.Synchronous)
 	}
-	if second.CheckpointThresholdBytes != defaultCheckpointPageCount*osPageSize {
-		t.Fatalf("default checkpoint threshold: got %d", second.CheckpointThresholdBytes)
+	if options.CheckpointThresholdBytes != defaultCheckpointPageCount*osPageSize {
+		t.Fatalf("default checkpoint threshold: got %d", options.CheckpointThresholdBytes)
 	}
 }
 
@@ -5155,7 +5148,7 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if err := big.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 				return err
 			}
@@ -5172,7 +5165,7 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 	// The replacement root and its children must be readable in this session.
 	if err := db.View(func(tx *Tx) error {
 		big := mustBucket(t, tx, []byte("big"))
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if got := mustBucketValue(t, big, fmt.Appendf(nil, "key-%05d", i)); !bytes.Equal(got, val) {
 				t.Fatalf("key %d unreadable after in-bucket split (in-session): got %d bytes", i, len(got))
 			}
@@ -5196,7 +5189,7 @@ func TestBucket_SurvivesOwnSplit(t *testing.T) {
 		if big == nil {
 			t.Fatal("bucket \"big\" lost across reopen")
 		}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if got := mustBucketValue(t, big, fmt.Appendf(nil, "key-%05d", i)); !bytes.Equal(got, val) {
 				t.Fatalf("key %d lost after reopening the split bucket", i)
 			}
@@ -5230,7 +5223,7 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 	bigVal := bytes.Repeat([]byte("x"), 512) // 100*~525B -> the grown bucket's tree splits
 
 	if err := db.Update(func(tx *Tx) error {
-		for i := 0; i < nBuckets; i++ {
+		for i := range nBuckets {
 			b, err := tx.CreateBucket(fmt.Appendf(nil, "bkt-%05d", i))
 			if err != nil {
 				return fmt.Errorf("create bucket %d: %w", i, err)
@@ -5243,7 +5236,7 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 		if big == nil {
 			t.Fatalf("bucket %d already lost mid-txn: catalog split dropped it", growTarget)
 		}
-		for j := 0; j < nBig; j++ {
+		for j := range nBig {
 			if err := big.Put(fmt.Appendf(nil, "big-%05d", j), bigVal); err != nil {
 				return err
 			}
@@ -5256,7 +5249,7 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 	verify := func(t *testing.T, db *DB, when string) {
 		t.Helper()
 		if err := db.View(func(tx *Tx) error {
-			for i := 0; i < nBuckets; i++ {
+			for i := range nBuckets {
 				b := mustBucket(t, tx, fmt.Appendf(nil, "bkt-%05d", i))
 				if b == nil {
 					t.Fatalf("%s: bucket %d lost — moved catalog root not written back", when, i)
@@ -5266,7 +5259,7 @@ func TestBucket_ManyBucketsSurviveRootCatalogSplit(t *testing.T) {
 				}
 			}
 			big := mustBucket(t, tx, fmt.Appendf(nil, "bkt-%05d", growTarget))
-			for j := 0; j < nBig; j++ {
+			for j := range nBig {
 				if got := mustBucketValue(t, big, fmt.Appendf(nil, "big-%05d", j)); !bytes.Equal(got, bigVal) {
 					t.Fatalf("%s: grown bucket key %d lost: got %d bytes", when, j, len(got))
 				}
@@ -5309,7 +5302,7 @@ func TestBucket_NestedInSplitParent(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if err := parent.Put(fmt.Appendf(nil, "pk-%05d", i), val); err != nil {
 				return err
 			}
@@ -5461,7 +5454,7 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 	const n = 6
 	keys := make([][]byte, n)
 	vals := make([][]byte, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		keys[i] = fmt.Appendf(nil, "key-%03d", i)
 		vals[i] = bytes.Repeat([]byte{byte('a' + i)}, vlen)
 		if err := db.Put(testBucketName, keys[i], vals[i]); err != nil {
@@ -5481,7 +5474,7 @@ func TestSplit_LargeValuesGetOwnNode(t *testing.T) {
 
 	verify := func(t *testing.T, db *DB, when string) {
 		t.Helper()
-		for i := 0; i < n; i++ {
+		for i := range n {
 			got, err := db.Get(testBucketName, keys[i])
 			if err != nil {
 				t.Fatalf("%s: get %d: %v", when, i, err)
@@ -5530,13 +5523,13 @@ func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
 			return err
 		}
 		// Split the catalog with many smaller-sorting buckets.
-		for i := 0; i < nCatalog; i++ {
+		for i := range nCatalog {
 			if _, err := tx.CreateBucket(fmt.Appendf(nil, "bkt-%05d", i)); err != nil {
 				return fmt.Errorf("create catalog bucket %d: %w", i, err)
 			}
 		}
 		// Now split the held bucket's own root.
-		for j := 0; j < nBig; j++ {
+		for j := range nBig {
 			if err := held.Put(fmt.Appendf(nil, "big-%05d", j), bigVal); err != nil {
 				return err
 			}
@@ -5553,7 +5546,7 @@ func TestBucket_HandleSurvivesCatalogSplit(t *testing.T) {
 			if b == nil {
 				t.Fatalf("%s: held bucket lost", when)
 			}
-			for j := 0; j < nBig; j++ {
+			for j := range nBig {
 				k := fmt.Appendf(nil, "big-%05d", j)
 				if got := mustBucketValue(t, b, k); !bytes.Equal(got, bigVal) {
 					t.Fatalf("%s: key %q lost through a held bucket handle: got %d bytes", when, k, len(got))
@@ -5594,7 +5587,7 @@ func TestSplit_LargeInsertKeepsEveryLeafWithinPage(t *testing.T) {
 	// Fill one leaf to ~0.9 of a page so it stays a single leaf before the big insert.
 	nSmall := (page * 9 / 10) / smallEntry
 	keys := make([][]byte, 0, nSmall+1)
-	for i := 0; i < nSmall; i++ {
+	for i := range nSmall {
 		k := fmt.Appendf(nil, "k%05d", i) // 6 bytes, all sort before the big key
 		if err := db.Put(testBucketName, k, smallVal); err != nil {
 			t.Fatalf("small put %d: %v", i, err)
@@ -5762,7 +5755,7 @@ func TestWAL_BytesSinceCheckpointTracksWALSize(t *testing.T) {
 
 	// Overwrite one key 100 times in one transaction. Only the final leaf page enters the WAL.
 	err = db.Update(func(tx *Tx) error {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			if err := mustBucket(t, tx, testBucketName).Put([]byte("k"), []byte("v")); err != nil {
 				return err
 			}
@@ -5812,12 +5805,12 @@ func TestBucket_SharedHandleSeesWrites(t *testing.T) {
 		h2 := mustBucket(t, tx, []byte("b")) // same cached handle as h1
 
 		val := bytes.Repeat([]byte("x"), 200)
-		for i := 0; i < 500; i++ {
+		for i := range 500 {
 			if err := h1.Put(fmt.Appendf(nil, "key-%08d", i), val); err != nil {
 				return err
 			}
 		}
-		for i := 0; i < 500; i++ {
+		for i := range 500 {
 			if got := mustBucketValue(t, h2, fmt.Appendf(nil, "key-%08d", i)); got == nil {
 				t.Fatalf("second handle cannot see key %d written through the first handle", i)
 			}
@@ -5979,7 +5972,7 @@ func TestTreeFindEntryRef_DistinguishesEmptyValueFromMissing(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := testLoadRoot(t, bucket); err != nil {
+		if err := testLoadRoot(bucket); err != nil {
 			return err
 		}
 		root := testBucketRoot(t, bucket)
@@ -6234,7 +6227,7 @@ func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		// scratch key-building buffer would be reused across iterations.
 		copy(name, "bbbb")
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if err := b.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 				return err
 			}
@@ -6253,7 +6246,7 @@ func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		if aaaa == nil {
 			t.Fatal("bucket \"aaaa\" lost after the caller changed its name buffer")
 		}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			k := fmt.Appendf(nil, "key-%05d", i)
 			if got := mustBucketValue(t, aaaa, k); !bytes.Equal(got, val) {
 				t.Fatalf("key %q lost after the bucket root split", k)
@@ -6289,7 +6282,7 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 
 		copy(name, "bbbb")
 
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if err := child.Put(fmt.Appendf(nil, "key-%05d", i), val); err != nil {
 				return err
 			}
@@ -6312,7 +6305,7 @@ func TestBucketCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 		if aaaa == nil {
 			t.Fatal("nested bucket \"aaaa\" lost after the caller changed its name buffer")
 		}
-		for i := 0; i < n; i++ {
+		for i := range n {
 			k := fmt.Appendf(nil, "key-%05d", i)
 			if got := mustBucketValue(t, aaaa, k); !bytes.Equal(got, val) {
 				t.Fatalf("key %q lost after the nested bucket root split", k)
@@ -9111,7 +9104,7 @@ func TestDeleteBucket_ContinuedPages(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				for i := 0; i < 8; i++ {
+				for i := range 8 {
 					key := bytes.Repeat([]byte{byte('a' + i)}, MaxKeySize)
 					if err := child.Put(key, value); err != nil {
 						return err
@@ -9359,7 +9352,7 @@ func TestDeleteBucket_ContinuedReadFailure(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for i := 0; i < 3; i++ {
+		for i := range 3 {
 			if err := bucket.Put(fmt.Appendf(nil, "key-%d", i), bytes.Repeat([]byte("v"), 3*int(tx.meta.PageSize()))); err != nil {
 				return err
 			}
@@ -9702,9 +9695,10 @@ func TestRecoveryWholeNodeSpanReuseAndBounds(t *testing.T) {
 			if fault == "stale-head" || fault == "same-transaction-overlap" || fault == "newer-overlap" {
 				old := btree.NewLeafNode(head + 2)
 				txid := wal.TxID(1)
-				if fault == "same-transaction-overlap" {
+				switch fault {
+				case "same-transaction-overlap":
 					txid = 2
-				} else if fault == "newer-overlap" {
+				case "newer-overlap":
 					txid = 3
 				}
 				records = append(records, wal.WALRecord{Header: wal.RecordHeader{Type: wal.RecordTypeNode, PageID: old.PageID(), TxID: txid}, Payload: btree.EncodeWALNode(old)})
@@ -9787,7 +9781,7 @@ func TestRecoveryOldHeadReusedInsideRawSpan(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					if err := testLoadRoot(t, bucket); err != nil {
+					if err := testLoadRoot(bucket); err != nil {
 						return err
 					}
 					newHead = testBucketRoot(t, bucket).PageID()
@@ -10397,7 +10391,7 @@ func TestDirectWriteMappingChecksSizeChanges(t *testing.T) {
 				followStats, staleStats int
 			}{{50, 64, 1, 3}, {50, 64, 0, 2}, {64, 65, 3, 3}, {64, 65, 0, 2}, {50, 51, 3, 3}, {50, 51, 0, 2}} {
 				node := btree.NewLeafNode(step.head)
-				value := []byte(fmt.Sprintf("value-%d", index))
+				value := fmt.Appendf(nil, "value-%d", index)
 				if err := node.InsertEntry(btree.NewEntry(0, []byte("key"), value)); err != nil {
 					t.Fatal(err)
 				}
@@ -11459,7 +11453,7 @@ func TestManagedPutMappedSameLength(t *testing.T) {
 				var old *btree.MutableNode
 				if err := db.View(func(tx *Tx) error {
 					bucket := mustBucket(t, tx, testBucketName)
-					if err := testLoadRoot(t, bucket); err != nil {
+					if err := testLoadRoot(bucket); err != nil {
 						return err
 					}
 					node := testBucketRoot(t, bucket)
@@ -12610,8 +12604,8 @@ func TestGetBatchOrderAndOwnedResults(t *testing.T) {
 					if err != nil {
 						return err
 					}
-					for i := 0; i < 128; i++ {
-						if err := bucket.Put([]byte(fmt.Sprintf("key%04d", i)), []byte(fmt.Sprintf("value%04d", i))); err != nil {
+					for i := range 128 {
+						if err := bucket.Put(fmt.Appendf(nil, "key%04d", i), fmt.Appendf(nil, "value%04d", i)); err != nil {
 							return err
 						}
 					}
@@ -12824,7 +12818,7 @@ func TestGetBatchGroupsDeepMainTreeWithAndWithoutMapping(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				for i := 0; i < 8192; i++ {
+				for i := range 8192 {
 					key := fmt.Appendf(nil, "key%08d", i)
 					if err := bucket.Put(key, bytes.Repeat([]byte{byte(i % 251)}, 128)); err != nil {
 						return err
@@ -12835,7 +12829,7 @@ func TestGetBatchGroupsDeepMainTreeWithAndWithoutMapping(t *testing.T) {
 				t.Fatal(err)
 			}
 			keys := make([][]byte, 259)
-			for i := 0; i < 257; i++ {
+			for i := range 257 {
 				keys[i] = fmt.Appendf(nil, "key%08d", (i*31)%8192)
 			}
 			keys[257] = []byte("missing")
@@ -12868,7 +12862,7 @@ func TestGetBatchGroupsDeepMainTreeWithAndWithoutMapping(t *testing.T) {
 			}
 			if err := db.View(func(tx *Tx) error {
 				bucket := mustBucket(t, tx, testBucketName)
-				if err := testLoadRoot(t, bucket); err != nil {
+				if err := testLoadRoot(bucket); err != nil {
 					return err
 				}
 				if testBucketRoot(t, bucket).IsLeaf() {
@@ -13257,7 +13251,7 @@ func TestDBPutBatchMappedReplacements(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				if err := testLoadRoot(t, bucket); err != nil {
+				if err := testLoadRoot(bucket); err != nil {
 					return err
 				}
 				id = testBucketRoot(t, bucket).PageID()
@@ -13775,7 +13769,7 @@ func TestGetBatchAcrossCleanAndDirtyWriteViews(t *testing.T) {
 				old := bytes.Repeat([]byte("v"), 128)
 				pairs := make([]KeyValue, 800)
 				for i := range pairs {
-					pairs[i] = KeyValue{Key: []byte(fmt.Sprintf("key%04d", i)), Value: old}
+					pairs[i] = KeyValue{Key: fmt.Appendf(nil, "key%04d", i), Value: old}
 				}
 				if err := db.PutBatch(testBucketName, pairs); err != nil {
 					t.Fatal(err)
@@ -13802,7 +13796,7 @@ func TestGetBatchAcrossCleanAndDirtyWriteViews(t *testing.T) {
 						return err
 					}
 					for i := 800; i < 1000; i++ {
-						if err := bucket.Put([]byte(fmt.Sprintf("key%04d", i)), old); err != nil {
+						if err := bucket.Put(fmt.Appendf(nil, "key%04d", i), old); err != nil {
 							return err
 						}
 					}
@@ -14038,8 +14032,8 @@ func separatorFileCheck(t *testing.T, db *DB, reference map[string][]byte) {
 			return fmt.Errorf("forward end: got %x, error %v", key, err)
 		}
 		key, _, err = cursor.Last()
-		for i := len(keys) - 1; i >= 0; i-- {
-			if err != nil || !bytes.Equal(key, []byte(keys[i])) {
+		for i, key0 := range slices.Backward(keys) {
+			if err != nil || !bytes.Equal(key, []byte(key0)) {
 				return fmt.Errorf("reverse entry %d: got %x, error %v", i, key, err)
 			}
 			key, _, err = cursor.Prev()

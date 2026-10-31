@@ -1,6 +1,7 @@
 package kvlite
 
 import (
+	"maps"
 	"runtime"
 	"sync"
 
@@ -164,9 +165,7 @@ func (db *DB) executeWriteBatch(requests []*writeRequest) {
 				state.meta = tx.meta
 				state.allocation = tx.allocation
 				state.metaDirty = state.metaDirty || tx.metaDirty
-				for pageID, dirty := range tx.store.dirty {
-					state.dirty[pageID] = dirty
-				}
+				maps.Copy(state.dirty, tx.store.dirty)
 				hasPendingWrites = true
 			}
 		}

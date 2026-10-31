@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -116,4 +117,11 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	if left, _ := os.ReadDir(filepath.Join(out, "tmp")); len(left) != 0 {
 		t.Fatalf("the runs left %d working directories", len(left))
 	}
+}
+
+// commentsOf returns a copy of the comments of an issue.
+func (fake *fakeGitHub) commentsOf(number int) []string {
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	return slices.Clone(fake.comments[number])
 }

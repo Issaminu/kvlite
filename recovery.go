@@ -156,8 +156,7 @@ func committedWALRecords(records []wal.WALRecord) []wal.WALRecord {
 // metaFromCommittedRecords returns the newest valid metadata from committed WAL records. It returns nil when the records do not contain metadata.
 func metaFromCommittedRecords(committed []wal.WALRecord) (*page.Meta, error) {
 	// Scan backward because the newest committed transaction contains the latest metadata generation.
-	for index := len(committed) - 1; index >= 0; index-- {
-		record := committed[index]
+	for _, record := range slices.Backward(committed) {
 		if record.Header.Type != wal.RecordTypeMeta || !page.IsMetaID(record.Header.PageID) {
 			continue
 		}

@@ -174,7 +174,7 @@ func TestNodeCodec_UsesFixedLeafPayloadLayout(t *testing.T) {
 		t.Fatalf("decoded leaf entry: flags=%d key=%q value=%q", entry.Flags(), entry.Key(), entry.Value())
 	}
 
-	for size := 0; size < len(encoded); size++ {
+	for size := range encoded {
 		if _, err := DecodeNode(encoded[:size], node.PageID(), testNodePageSize, nil, true); err == nil {
 			t.Errorf("decode %d-byte leaf prefix: expected an error", size)
 		}

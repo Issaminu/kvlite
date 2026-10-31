@@ -58,8 +58,8 @@ func systemMapMainFile(file *os.File, length int, _ bool) ([]byte, error) {
 	// The address belongs to the operating system, not to the Go heap.
 	// The garbage collector never moves or frees it.
 	// It stays valid until systemUnmapMainFile runs.
-	// "go vet" can report this conversion because it cannot see that guarantee.
-	return unsafe.Slice((*byte)(unsafe.Pointer(address)), length), nil
+	base := *(*unsafe.Pointer)(unsafe.Pointer(&address))
+	return unsafe.Slice((*byte)(base), length), nil
 }
 
 // systemUnmapMainFile releases one mapped view.

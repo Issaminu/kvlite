@@ -414,8 +414,8 @@ func (model *stateModel) stateAt(index int) dbState {
 	state := cloneState(model.state)
 	for commit := len(model.commits) - 1; commit >= index-model.floor; commit-- {
 		undo := model.commits[commit].undo
-		for change := len(undo) - 1; change >= 0; change-- {
-			undoChange(state, undo[change])
+		for _, change := range slices.Backward(undo) {
+			undoChange(state, change)
 		}
 	}
 	return state
@@ -463,28 +463,30 @@ func (model *stateModel) resolve(recovered dbState, lowest int, allowBranches bo
 		model.branches = slices.DeleteFunc(model.branches, func(other branchRecord) bool { return other.parent >= parent })
 		return fmt.Sprintf("state %d plus the commit whose result was unknown", parent), true, nil
 	}
-	report := fmt.Sprintf("recovered state matches no allowed state %d..%d (branches allowed: %t, %d branches)",
+	var report strings.Builder
+	fmt.Fprintf(&report, "recovered state matches no allowed state %d..%d (branches allowed: %t, %d branches)",
 		lowest, model.latest, allowBranches, len(model.branches))
-	for index := len(model.past) - 1; index >= 0; index-- {
-		if model.past[index] == hash {
+	for index, pastHash := range slices.Backward(model.past) {
+		if pastHash == hash {
 			// Only the hash matches, because the model keeps no content before the floor.
-			report += fmt.Sprintf("\nthe recovered state has the hash of older state %d, so recovery possibly lost %d acknowledged commits", index, lowest-index)
+			fmt.Fprintf(&report, "\nthe recovered state has the hash of older state %d, so recovery possibly lost %d acknowledged commits", index, lowest-index)
 			break
 		}
 	}
-	report += "\ndifference from the latest state:\n" + stateDiff(model.state, recovered)
+	report.WriteString("\ndifference from the latest state:\n")
+	report.WriteString(stateDiff(model.state, recovered))
 	for _, branch := range model.branches {
 		// The difference from each branch helps to find a commit that recovery kept only in part.
 		expected := model.stateAt(branch.parent)
 		for _, mutation := range branch.mutations {
 			applyChange(expected, mutation)
 		}
-		report += fmt.Sprintf("\ndifference from state %d plus the %d changes of the commit whose result was unknown:\n%s", branch.parent, len(branch.mutations), stateDiff(expected, recovered))
+		fmt.Fprintf(&report, "\ndifference from state %d plus the %d changes of the commit whose result was unknown:\n%s", branch.parent, len(branch.mutations), stateDiff(expected, recovered))
 		for index, mutation := range branch.mutations[:min(len(branch.mutations), 10)] {
-			report += fmt.Sprintf("\n  change %d: %s bucket %q key %s, %d-byte value", index, mutationNames[mutation.kind], mutation.path, shortKey(mutation.key), len(mutation.value))
+			fmt.Fprintf(&report, "\n  change %d: %s bucket %q key %s, %d-byte value", index, mutationNames[mutation.kind], mutation.path, shortKey(mutation.key), len(mutation.value))
 		}
 	}
-	return "", false, errors.New(report)
+	return "", false, errors.New(report.String())
 }
 
 // find returns the state that equals recovered: the index of an acknowledged state from lowest to latest, or a branch.

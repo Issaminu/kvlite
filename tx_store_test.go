@@ -8,6 +8,7 @@ import (
 	"github.com/Issaminu/kvlite/internal/page"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 )
 
@@ -84,8 +85,8 @@ func TestLargeLeafDeleteRollbackRetirementAndRecovery(t *testing.T) {
 					}
 				}
 				all := make([][]byte, 0, len(entries)+2)
-				for i := len(entries) - 1; i >= 0; i-- {
-					all = append(all, entries[i].Key)
+				for _, entrie := range slices.Backward(entries) {
+					all = append(all, entrie.Key)
 				}
 				all = append(all, entries[48].Key, []byte("missing"))
 				if err := db.Update(func(tx *Tx) error {
@@ -215,7 +216,7 @@ func testNode(t *testing.T, store *txTreeStore, id page.ID) *btree.MutableNode {
 	}
 	return node
 }
-func testLoadRoot(t *testing.T, bucket *Bucket) error {
+func testLoadRoot(bucket *Bucket) error {
 	_, err := bucket.tx.store.ReadNode(bucket.rootPageID)
 	return err
 }

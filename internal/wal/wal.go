@@ -25,8 +25,10 @@ const (
 	// maxRetainedPendingPages is the largest pending-page list kept across commits, about 2 MiB of CommittedPage values.
 	maxRetainedPendingPages = 1 << 15
 
-	walFileMagic      uint32 = 0x4c57564b // The little-endian bytes spell "KVWL".
-	walFileHeaderSize        = 20
+	walFileMagic uint32 = 0x4c57564b // The little-endian bytes spell "KVWL".
+
+	// walFileHeaderSize is the byte length of the WAL file header below.
+	walFileHeaderSize = 20
 )
 
 // A non-empty WAL file starts with this header:

@@ -208,7 +208,7 @@ func TestRecovery_PartialCheckpoint(t *testing.T) {
 					return err
 				}
 				for index := range 35 {
-					if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), bytes.Repeat([]byte{byte(index + 1)}, 80)); err != nil {
+					if err := bucket.Put(fmt.Appendf(nil, "key-%03d", index), bytes.Repeat([]byte{byte(index + 1)}, 80)); err != nil {
 						return err
 					}
 				}
@@ -246,7 +246,7 @@ func TestRecovery_PartialCheckpoint(t *testing.T) {
 				}
 			} else {
 				for index := 25; index <= 26; index++ {
-					if err := db.Put(testBucketName, []byte(fmt.Sprintf("key-%03d", index)), bytes.Repeat([]byte{byte(index + 100)}, 80)); err != nil {
+					if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%03d", index), bytes.Repeat([]byte{byte(index + 100)}, 80)); err != nil {
 						t.Fatal(err)
 					}
 				}
@@ -284,7 +284,7 @@ func TestRecovery_PartialCheckpoint(t *testing.T) {
 					}
 					defer recovered.Close()
 					for index := range 35 {
-						key := []byte(fmt.Sprintf("key-%03d", index))
+						key := fmt.Appendf(nil, "key-%03d", index)
 						got, err := recovered.Get(testBucketName, key)
 						if test.deleting && (index == 15 || index == 20) {
 							if !errors.Is(err, ErrKeyNotFound) {
@@ -551,7 +551,7 @@ func TestRecovery_DamagedMetadataPageSizeKeepsCommittedData(t *testing.T) {
 	// The checkpoint writes only when the damaged page size divides the file size, so the file gets a multiple of 3 pages.
 	keys := 0
 	for keys == 0 || (db.meta.LastPage()+1)%3 != 0 {
-		if err := db.Put(testBucketName, []byte(fmt.Sprintf("key-%03d", keys)), value); err != nil {
+		if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%03d", keys), value); err != nil {
 			t.Fatal(err)
 		}
 		keys++
@@ -580,7 +580,7 @@ func TestRecovery_DamagedMetadataPageSizeKeepsCommittedData(t *testing.T) {
 	checkKeys := func(db *DB, when string) {
 		t.Helper()
 		for index := range keys {
-			got, err := db.Get(testBucketName, []byte(fmt.Sprintf("key-%03d", index)))
+			got, err := db.Get(testBucketName, fmt.Appendf(nil, "key-%03d", index))
 			if err != nil || !bytes.Equal(got, value) {
 				t.Fatalf("%s: key %d: got %d bytes, error %v", when, index, len(got), err)
 			}
@@ -640,7 +640,7 @@ func TestRecovery_FindsMetadataPage1AfterPage0Damage(t *testing.T) {
 			value := bytes.Repeat([]byte{'v'}, 3000)
 			const keys = 8
 			for index := range keys {
-				if err := db.Put(testBucketName, []byte(fmt.Sprintf("key-%03d", index)), value); err != nil {
+				if err := db.Put(testBucketName, fmt.Appendf(nil, "key-%03d", index), value); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -684,7 +684,7 @@ func TestRecovery_FindsMetadataPage1AfterPage0Damage(t *testing.T) {
 				t.Fatalf("page size: got %d, want %d", got, databasePageSize)
 			}
 			for index := range keys {
-				got, err := reopened.Get(testBucketName, []byte(fmt.Sprintf("key-%03d", index)))
+				got, err := reopened.Get(testBucketName, fmt.Appendf(nil, "key-%03d", index))
 				if err != nil || !bytes.Equal(got, value) {
 					t.Fatalf("key %d: got %d bytes, error %v", index, len(got), err)
 				}
@@ -962,7 +962,7 @@ func TestEntryPatchWALRecoversInReadOnlyAndWritableModes(t *testing.T) {
 			return err
 		}
 		for index := range 50 {
-			if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), []byte("value")); err != nil {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%03d", index), []byte("value")); err != nil {
 				return err
 			}
 		}
@@ -1082,7 +1082,7 @@ func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 			return err
 		}
 		for index := range 50 {
-			if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), []byte("value")); err != nil {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%03d", index), []byte("value")); err != nil {
 				return err
 			}
 		}
@@ -1149,7 +1149,7 @@ func TestEntryPatchWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 			return err
 		}
 		for index := range 50 {
-			if err := bucket.Put([]byte(fmt.Sprintf("key-%03d", index)), []byte("value")); err != nil {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%03d", index), []byte("value")); err != nil {
 				return err
 			}
 		}

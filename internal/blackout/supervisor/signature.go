@@ -65,7 +65,7 @@ func signatureText(kind, firstLine, output string) string {
 // stackFrames returns the names of the first limit functions of modulePath in a Go traceback.
 // It uses the first goroutine that has such a function, and it drops arguments, file names, and line numbers.
 func stackFrames(output string, limit int) []string {
-	for _, block := range strings.Split(output, "\n\n") {
+	for block := range strings.SplitSeq(output, "\n\n") {
 		block = strings.TrimLeft(block, "\n")
 		if !strings.HasPrefix(block, "goroutine ") {
 			continue

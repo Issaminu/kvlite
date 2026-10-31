@@ -65,8 +65,8 @@ func TestStatsStorageAndWriteCounters(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for i := 0; i < 200; i++ {
-			if err := bucket.Put([]byte(fmt.Sprintf("key-%04d", i)), bytes.Repeat([]byte("v"), 128)); err != nil {
+		for i := range 200 {
+			if err := bucket.Put(fmt.Appendf(nil, "key-%04d", i), bytes.Repeat([]byte("v"), 128)); err != nil {
 				return err
 			}
 		}
@@ -98,7 +98,7 @@ func TestStatsStorageAndWriteCounters(t *testing.T) {
 		}
 		keys := make([][]byte, 200)
 		for i := range keys {
-			keys[i] = []byte(fmt.Sprintf("key-%04d", i))
+			keys[i] = fmt.Appendf(nil, "key-%04d", i)
 		}
 		return bucket.DeleteBatch(keys)
 	}); err != nil {
@@ -149,7 +149,7 @@ func TestStatsWriteBatchCountsOneCommit(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if err := b.Put([]byte(fmt.Sprintf("key-%d", i)), []byte("value")); err != nil {
+			if err := b.Put(fmt.Appendf(nil, "key-%d", i), []byte("value")); err != nil {
 				return err
 			}
 			if i == 1 {
@@ -364,8 +364,8 @@ func TestStatsConcurrentReadersKeepCacheUnchanged(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for i := 0; i < recordCount; i++ {
-			if err := b.Put([]byte(fmt.Sprintf("%04d", i)), bytes.Repeat([]byte("v"), 128)); err != nil {
+		for i := range recordCount {
+			if err := b.Put(fmt.Appendf(nil, "%04d", i), bytes.Repeat([]byte("v"), 128)); err != nil {
 				return err
 			}
 		}
@@ -458,8 +458,8 @@ func TestBucketStatsIncludesNestedAndUncommittedData(t *testing.T) {
 				if err != nil {
 					return err
 				}
-				for i := 0; i < 100; i++ {
-					if err := child.Put([]byte(fmt.Sprintf("%04d", i)), bytes.Repeat([]byte("v"), valueSize)); err != nil {
+				for i := range 100 {
+					if err := child.Put(fmt.Appendf(nil, "%04d", i), bytes.Repeat([]byte("v"), valueSize)); err != nil {
 						return err
 					}
 				}
@@ -612,7 +612,7 @@ func TestBucketStatsIncludesContinuationStorage(t *testing.T) {
 					key := []byte("key")
 					value := bytes.Repeat([]byte("v"), 3*pageSize)
 					if largeKeys {
-						key = append(bytes.Repeat([]byte("k"), pageSize), []byte(fmt.Sprintf("%08d", i))...)
+						key = append(bytes.Repeat([]byte("k"), pageSize), fmt.Appendf(nil, "%08d", i)...)
 						value = []byte("v")
 					}
 					if err := bucket.Put(key, value); err != nil {

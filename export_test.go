@@ -103,9 +103,10 @@ func BlackoutAbandon(db *DB) {
 
 // BlackoutQuiesce waits until the write worker finishes its current batch, including the checkpoint after it.
 // The worker holds operationMu until then.
+// The critical section is empty on purpose: getting the lock is the wait.
 func BlackoutQuiesce(db *DB) {
 	db.operationMu.Lock()
-	db.operationMu.Unlock()
+	defer db.operationMu.Unlock()
 }
 
 // BlackoutBatchResult is the result of one callback of [BlackoutBatch].

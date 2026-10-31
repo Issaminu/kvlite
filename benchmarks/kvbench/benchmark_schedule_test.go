@@ -168,7 +168,7 @@ func TestDeleteBenchmarkCasesUseUniqueKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 		seen := make(map[string]struct{}, keyCount)
-		for index := 0; index < keyCount; index++ {
+		for index := range keyCount {
 			key := string(pairs[index].Key)
 			if _, exists := seen[key]; exists {
 				t.Fatalf("%s repeats key %x", benchmarkCase.name, pairs[index].Key)

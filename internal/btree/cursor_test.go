@@ -39,7 +39,7 @@ func newCursorTestTree(t *testing.T, entryCount int) (*testTree, *MutableNode) {
 	tree := newTestTree(store)
 	root := NewLeafNode(1)
 	store.StageNode(root)
-	for index := 0; index < entryCount; index++ {
+	for index := range entryCount {
 		key := fmt.Appendf(nil, "key-%03d", index)
 		value := fmt.Appendf(nil, "value-%03d", index)
 		var err error
@@ -95,7 +95,7 @@ func TestCursor_MultiLevel(t *testing.T) {
 
 	cursor := tree.Cursor(root)
 	found, err := cursor.First()
-	for index := 0; index < entryCount; index++ {
+	for index := range entryCount {
 		wantKey := fmt.Appendf(nil, "key-%03d", index)
 		wantValue := fmt.Appendf(nil, "value-%03d", index)
 		requireCursorEntry(t, cursor, found, err, wantKey, wantValue)
@@ -358,7 +358,7 @@ func TestCursorEncodedAndMixedViews(t *testing.T) {
 	tree := newTestTree(store)
 	root := NewLeafNode(2)
 	store.StageNode(root)
-	for index := 0; index < 100; index++ {
+	for index := range 100 {
 		key := fmt.Appendf(nil, "key-%03d", index)
 		var err error
 		root, err = tree.PutEntry(root, NewEntry(0, key, key))
@@ -391,7 +391,7 @@ func TestCursorEncodedAndMixedViews(t *testing.T) {
 			}
 			cursor := NewCursor(reader, root.PageID())
 			found, err := cursor.First()
-			for index := 0; index < 100; index++ {
+			for index := range 100 {
 				key := fmt.Appendf(nil, "key-%03d", index)
 				requireCursorEntry(t, &cursor, found, err, key, key)
 				found, err = cursor.Next()

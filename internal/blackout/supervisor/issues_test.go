@@ -8,7 +8,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -61,13 +60,6 @@ func (fake *fakeGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unexpected call "+r.Method+" "+r.URL.Path, http.StatusNotFound)
 	}
-}
-
-// commentsOf returns a copy of the comments of an issue.
-func (fake *fakeGitHub) commentsOf(number int) []string {
-	fake.mu.Lock()
-	defer fake.mu.Unlock()
-	return slices.Clone(fake.comments[number])
 }
 
 func TestIssueTrackerFilesOneIssueForEachError(t *testing.T) {
