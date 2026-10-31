@@ -1,14 +1,15 @@
 # KVLite benchmarks
 
-This report compares KVLite with bbolt and Redis at the public call boundary. It contains the median of 15 measured runs at the complete `large --workloads=all --storage=volume` scale. The same run then profiled every KVLite case.
+This report compares KVLite with bbolt, LMDB, and Redis at the public call boundary. It contains the median of 15 measured runs at the complete `large --workloads=all --storage=volume` scale. The same run then profiled every KVLite case.
 
 | Item | Value |
 | --- | --- |
-| Run time | `2026-10-21T01:10:07Z` |
-| Timing duration | 2 hours 25 minutes 29 seconds |
-| Profile capture | 1 hour 4 minutes 40 seconds, KVLite cases only |
-| KVLite | `21969938edfef3fa74d1e1920cc4e9d297da415c`; the only untracked file was a Markdown note outside the build |
+| Run time | `2026-10-31T04:13:27Z` |
+| Timing duration | 4 hours 12 minutes, including the warm-up round and the correctness tests |
+| Profile capture | 38 minutes 49 seconds, KVLite cases only |
+| KVLite | `158e97b060a3d506112fb2ad2857951c4e61d209`, clean working tree |
 | bbolt | `v1.4.3` |
+| LMDB | `0.9.35` through `github.com/PowerDNS/lmdb-go v1.9.4` |
 | Redis | `8.8.0` |
 | Platform | Linux `arm64`, four CPUs in containers |
 | Scale | `large --workloads=all --storage=volume --profile-engines=kvlite` |
@@ -19,69 +20,67 @@ This report compares KVLite with bbolt and Redis at the public call boundary. It
 
 A higher throughput value is better. A lower latency or life-cycle value is better. This section shows cases where KVLite had the best median.
 
-| Category | Mode and workload | KVLite | bbolt | Redis | Highlight |
-| --- | --- | ---: | ---: | ---: | --- |
-| Point read | Read-only, random, 128-byte value, eight clients | 5,892,288 keys/s | 942,708 keys/s | 239,126 keys/s | **KVLite: 6.25x bbolt; 24.64x Redis** |
-| Point-read p99 | Read-only, eight clients | 1.00 µs | 5.71 µs | 100.42 µs | **KVLite: 5.71x advantage over bbolt; 100.42x over Redis** |
-| Point update | Durable, random, 128-byte value, one client, batch of 100 | 107,962 keys/s | 22,566 keys/s | 51,327 keys/s | **KVLite: 4.78x bbolt; 2.10x Redis** |
-| Point insert | Durable, random, 128-byte value, one client, batch of 100 | 95,009 keys/s | 18,065 keys/s | 47,223 keys/s | **KVLite: 5.26x bbolt; 2.01x Redis** |
-| Mixed work | Durable, 95% reads, eight clients | 96,657 operations/s | 8,584 operations/s | 13,956 operations/s | **KVLite: 11.26x bbolt; 6.93x Redis** |
-| Mixed work | No commit sync, 95% reads, eight clients | 1,835,915 operations/s | 363,121 operations/s | 226,411 operations/s | **KVLite: 5.06x bbolt; 8.11x Redis** |
-| Key delete | No commit sync, random, one client | 385,900 keys/s | 77,531 keys/s | 107,542 keys/s | **KVLite: 4.98x bbolt; 3.59x Redis** |
-| Large-key read | Read-only, random, 32 KiB key, one client | 75,805 keys/s | 64,127 keys/s | 37,584 keys/s | **KVLite: 1.18x bbolt; 2.02x Redis** |
-| Clean open | Life cycle | 91.55 µs | 2.54 ms | Not comparable | **KVLite: 27.69x advantage over bbolt** |
+| Category | Mode and workload | KVLite | bbolt | LMDB | Redis | Highlight |
+| --- | --- | ---: | ---: | ---: | ---: | --- |
+| Point read | Read-only, random, 128-byte value, eight clients | 6,390,380 keys/s | 956,215 keys/s | 3,547,695 keys/s | 240,688 keys/s | **KVLite: 6.68x bbolt; 1.80x LMDB; 26.55x Redis** |
+| Point-read p99 | Read-only, eight clients | 0.71 µs | 6.38 µs | 1.50 µs | 101.13 µs | **KVLite: 8.99x advantage over bbolt; 2.11x over LMDB** |
+| Point-read p99 | Read-only, 32 clients | 0.71 µs | 159.29 µs | 1.46 µs | 471.29 µs | **KVLite: 224.67x advantage over bbolt; 2.06x over LMDB** |
+| Point update | Durable, random, 128-byte value, one client, batch of 100 | 116,043 keys/s | 18,117 keys/s | 15,742 keys/s | 42,932 keys/s | **KVLite: 6.41x bbolt; 7.37x LMDB; 2.70x Redis** |
+| Point insert | Durable, random, 128-byte value, one client, batch of 100 | 103,029 keys/s | 17,082 keys/s | 13,036 keys/s | 39,067 keys/s | **KVLite: 6.03x bbolt; 7.90x LMDB; 2.64x Redis** |
+| Mixed work | Durable, 95% reads, eight clients | 116,890 operations/s | 63,195 operations/s | 15,942 operations/s | 10,233 operations/s | **KVLite: 1.85x bbolt; 7.33x LMDB; 11.42x Redis** |
+| Large-key read | Read-only, random, 32 KiB key, one client | 114,901 keys/s | 67,294 keys/s | Not supported | 35,984 keys/s | **KVLite: 1.71x bbolt; 3.19x Redis** |
+| Create and load | Life cycle | 49.00 ms | 65.68 ms | 55.52 ms | Not comparable | **KVLite: 1.34x advantage over bbolt; 1.13x over LMDB** |
 
-These ratios apply only to the named workloads and public call boundaries. KVLite did not lead every case. bbolt read 64 KiB values 1.31x faster and 1 MiB values 1.65x faster. Redis led seven of 13 no-commit-sync insert cases and seven of 13 durable insert cases. The full tables show every case.
+These ratios apply only to the named workloads and public call boundaries. KVLite did not lead every case. LMDB led 67 of 84 no-commit-sync cases. bbolt read 64 KiB values 1.30x faster and 1 MiB values 1.31x faster. bbolt opened a clean database 5.65x faster, and LMDB 3.06x faster. The full tables show every case.
 
 ## Scope
 
 This run measured every workload group and every case variant at the large scale. It covers point operations, deletion, transactions, enumeration, ordered operations, access distributions, latency, collections, storage size, and embedded life-cycle operations.
 
-The run includes large-entry cases. These cases use 64 KiB values, 1 MiB values, or 32 KiB keys. A large entry needs continuation pages in KVLite.
+The run includes large-entry cases. These cases use 64 KiB values, 1 MiB values, or 32 KiB keys. A large entry needs continuation pages in KVLite. LMDB skips the 32 KiB key cases, because its key limit is 511 bytes.
 
 ## Fairness and API boundaries
 
 The runner gave each engine the same fixed operation schedule and data set. It ran the engines serially. It changed the engine order and durability-mode order between measured rounds. Each engine used the same four-CPU set and Docker storage class.
 
-| Logical operation | KVLite | bbolt | Redis |
-| --- | --- | --- | --- |
-| Point read | `DB.Get` | One `DB.View` transaction | `GET` |
-| Grouped read | One read transaction | One read transaction | `MGET` |
-| Point write, one client | `DB.Put` | `DB.Update` | `SET` |
-| Point write, many clients | `DB.Put` | Durable: `DB.Batch`; no commit sync: `DB.Update` | `SET` |
-| Batch write | One write transaction | One write transaction | `MULTI` and `EXEC` |
-| Mixed transaction | One write transaction | One write transaction | `MULTI` and `EXEC` |
-| Key delete | `DB.Delete` | Durable, many clients: `DB.Batch`; other cases: `DB.Update` | `DEL` |
-| Batch delete | `Bucket.DeleteBatch` in one write transaction | One write transaction | One variadic `DEL` |
-| Prefix enumeration | Ordered prefix scan | Ordered prefix cursor | `SCAN` and `MGET` |
-| Full reverse scan | `Bucket.ScanReverse` | Cursor `Last` and `Prev` | No result |
+| Logical operation | KVLite | bbolt | LMDB | Redis |
+| --- | --- | --- | --- | --- |
+| Point read | `DB.Get` | One read transaction | One read transaction | `GET` |
+| Batch read | `DB.GetBatch` | One read transaction | One read transaction | `MGET` |
+| Point write or delete | `DB.Put` or `DB.Delete` | `DB.Update`; concurrent durable calls use `DB.Batch` | One write transaction | `SET` or `DEL` |
+| Batch write | `DB.PutBatch` | One write transaction | One write transaction with a cursor | `MSET` |
+| Batch delete | `DB.DeleteBatch` | One write transaction | One write transaction | One variadic `DEL` |
+| Mixed transaction | Bucket batch methods in one `DB.Update` | One write transaction | One write transaction | `MULTI` and `EXEC` |
+| Prefix enumeration | Ordered prefix scan | Ordered prefix cursor | Ordered prefix cursor | `SCAN` and `MGET` |
+| Collection storage | Nested buckets | Nested buckets | Named databases | Key prefixes |
 
-bbolt does not provide a direct `DB.Get` call. Use the grouped read results when one transaction must contain several reads. Both KVLite and the bbolt adapter return a value copy. Redis includes its client, server, and local network path. These are public call comparisons. They do not compare identical internal operations.
+Point and batch reads return owned values in every adapter. Redis includes its client, server, and local network path. These are public call comparisons. They do not compare identical internal operations.
 
 ## Durability modes
 
-| Mode | KVLite | bbolt | Redis |
-| --- | --- | --- | --- |
-| Durable | `SyncFull` | `NoSync=false`; `NoGrowSync=false`; `NoFreelistSync=false` | AOF with `appendfsync always` |
-| No commit sync | `SyncNone` | `NoSync=true`; `NoGrowSync=true`; `NoFreelistSync=false` | AOF with `appendfsync no` |
+| Mode | KVLite | bbolt | LMDB | Redis |
+| --- | --- | --- | --- | --- |
+| Durable | `SyncFull` | `NoSync=false`; `NoGrowSync=false` | Default synchronized commits | AOF with `appendfsync always` |
+| No commit sync | `SyncNone`, WAL enabled | `NoSync=true`; `NoGrowSync=true` | `NoSync` and `WriteMap` | AOF with `appendfsync no` |
 
-A successful durable write waits for the durability boundary of its engine. In no-commit-sync mode, no engine asks storage to sync during commit. Durable and no-commit-sync results have different guarantees. This report keeps them separate.
+A successful durable write waits for the durability boundary of its engine. In no-commit-sync mode, no engine asks storage to sync during commit. Durable and no-commit-sync results have different guarantees. This report keeps them separate. In no-commit-sync mode, KVLite still writes each commit to its WAL, and LMDB writes directly into its mapped file.
 
-The harness opens KVLite with the default `DataPageChecksums=false`. KVLite therefore does not calculate or check checksums for leaf, branch, and continuation pages in this run. Metadata pages, allocation pages, and WAL records keep their checksums. With data-page checksums on, KVLite point reads and scans are 2.5 to 4.9 times slower than with the default.
+The harness opens KVLite with the default `DataPageChecksums=false`. KVLite therefore does not calculate or check checksums for leaf, branch, and continuation pages in this run. Metadata pages, allocation pages, and WAL records keep their checksums.
 
 ## Test environment
 
 - CPU set: `0-3`
 - Go: `go1.26.7 linux/arm64`
-- KVLite: `21969938edfef3fa74d1e1920cc4e9d297da415c`
+- KVLite: `158e97b060a3d506112fb2ad2857951c4e61d209`
 - bbolt: `v1.4.3`
+- LMDB: `0.9.35`, Go binding `github.com/PowerDNS/lmdb-go v1.9.4`, 1 GiB map
 - Redis client: `go-redis v9.22.0`
 - Redis server: `8.8.0`, `jemalloc-5.3.0`
-- Container system: OrbStack with Linux kernel `7.2.9-orbstack-00391-g2b298d05fbd4`
+- Container system: OrbStack with Linux kernel `7.2.12-orbstack-00394-gbecdd6130068`
 - Storage driver: `overlay2`
 - Host: Apple M4 Max; 14 CPUs visible to the container system
 - CPUs assigned to each measured process and its Redis server: four
-- Go container memory limit: 12,613,708,800 bytes
+- Go container memory limit: 12,613,757,952 bytes
 - Benchmark data storage: temporary Docker volume
 
 The Docker volume path includes the OrbStack virtual machine and the host storage path. It does not prove bare-metal device performance. Other containers were active on the host. CPU assignment reduced direct CPU competition. Other host work could still affect the results.
@@ -92,77 +91,73 @@ The runner first completed its correctness tests. It then completed one unrecord
 
 The runner recorded 15 fixed-work rounds. It changed the engine order and durability-mode order between rounds. Pure reads ran once per round because commit-sync settings do not affect them.
 
-The large scale uses 10,000 records for its main cases. It uses 100,000 point reads, 1,000 single-client point writes, 3,200 concurrent point writes, and 10,000 mixed operations. Large-entry cases use 512 records, 5,000 reads, and 1,000 writes. The 1 MiB value case uses 64 records and 1,000 reads. Read-latency cases use 1,000,000 recorded operations and 10,000 unrecorded fixture warm-up reads. Update-latency cases use 10,000 operations. Mixed-latency cases use 100,000 operations.
+Setup, fixture loading, final stored-data checks, and close operations were outside the core timers. Before a timed write workload in the acknowledged-operation, focused-write, and key-deletion cases, the harness makes one untimed commit on the new handle. The named life-cycle cases measure open, close, and recovery work separately.
 
-Setup, fixture loading, final stored-data checks, and close operations were outside the core timers. Before a timed write workload in the acknowledged-operation, focused-write, and key-deletion cases, the harness makes one untimed commit on the new handle. The named life-cycle cases measure open, close, and recovery work separately. The runner ran each life-cycle case in its own process. Before the timed recovery open, the harness waits until the killed helper process releases its file lock.
-
-After the 15 timed rounds, the runner profiled every KVLite case again with 15 repeats. It recorded CPU profiles, allocation profiles, and execution traces. The profile pass does not change the timing values in this report. KVLite rows also report WAL commits, WAL bytes, write calls, and storage bytes written per operation.
+After the 15 timed rounds, the runner profiled every KVLite case again with 15 repeats. It recorded CPU profiles, allocation profiles, and execution traces. The profile pass does not change the timing values in this report.
 
 ## Changes since the previous report
 
-The previous report measured `689a4dc` on 2026-10-17. This run measures 20 library commits after it. Three commits make reads and WAL encoding faster (`7a2fb49`, `4d293f4`, `b57c899`). One commit adds a file-system interface for simulated storage (`568ef83`). Most other commits fix crash, recovery, and storage-failure behavior that the Blackout simulation found, or support that simulation.
+The previous committed report measured `2196993` on 2026-10-21. The raw samples of a later full capture on 2026-10-29 were kept, so this section compares with that capture. It measured the work that came before the node-ownership refactor (`af7bd3d`). This run measures that refactor and three later commits: `ef6d32e`, which stops a transaction after a write fails part way, `f7300d0` (documentation), and `158e97b` (CI only).
 
-The harness also changed. Commit `d1d7f67` adds the untimed warm-up commit that the Method section describes. Before this change, a timed write workload with few commits also measured the first-commit work of a new handle. The kernel and the container system did not change.
+The table gives the geometric mean of the median time ratio, this run over the 2026-10-29 capture, for each workload group. A ratio below 1 means a lower time. The code of bbolt, LMDB, and Redis did not change, so their columns show host drift.
 
-The raw samples of the previous run were not kept. The table below therefore compares medians, without significance tests. A ratio below 1 means a lower time. Each ratio is the geometric mean of the main metric of each case in the group.
+| Workload group | Cases | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Point reads | 14 | 0.903 | 0.986 | 0.970 | 0.976 |
+| Batch reads | 14 | 0.941 | 0.998 | 0.999 | 0.962 |
+| Read transactions | 4 | 0.895 | 1.017 | 0.962 | 0.979 |
+| Enumeration and ordered operations | 14 | 1.063 | 0.999 | 0.990 | 0.990 |
+| Access-distribution reads | 4 | 0.924 | 1.007 | 1.005 | 0.973 |
+| No-commit-sync point updates | 21 | 0.952 | 1.018 | 0.962 | 0.988 |
+| No-commit-sync point inserts | 13 | 0.992 | 0.979 | 0.966 | 1.012 |
+| No-commit-sync batch writes | 9 | 1.048 | 0.905 | 0.992 | 0.943 |
+| Durable point updates | 21 | 1.124 | 1.076 | 1.220 | 1.204 |
+| Durable point inserts | 13 | 1.082 | 1.060 | 1.210 | 1.066 |
+| Durable batch writes | 9 | 1.166 | 0.946 | 1.273 | 1.026 |
+| Key deletion | 20 | 1.027 | 1.022 | 0.970 | 1.101 |
+| Life cycle | 4 | 0.898 | 0.909 | 0.970 | No result |
+| All KVLite rows | 227 | 0.999 | 1.028 | 1.012 | 1.040 |
 
-| Workload group | KVLite time ratio | bbolt time ratio | Redis time ratio |
-| --- | ---: | ---: | ---: |
-| Point reads | 0.886 | 1.016 | 1.045 |
-| Read transactions | 0.973 | 1.000 | 0.989 |
-| Access-distribution reads | 0.974 | 1.013 | 1.020 |
-| Ordered operations | 1.021 | 1.005 | No result |
-| No-commit-sync point updates | 1.022 | 1.023 | 0.987 |
-| No-commit-sync point inserts | 1.090 | 0.994 | 1.008 |
-| No-commit-sync mixed work | 1.140 | 0.950 | 1.031 |
-| Durable point updates | 1.074 | 1.046 | 0.808 |
-| Durable point inserts | 1.108 | 1.180 | 0.777 |
-| Durable mixed work | 1.291 | 0.838 | 0.917 |
-| Durable mixed transactions | 1.090 | 1.219 | 0.741 |
-| Life cycle | 1.209 | 0.925 | No result |
-| All 197 time and rate rows | 1.060 | 0.999 | 0.937 |
+LMDB took 21% to 27% more time and Redis 3% to 20% more time in the durable write groups, but their code and settings did not change. So the durable write groups mix code changes with storage-sync drift.
 
-Redis times went down by 19% to 26% in the durable point-update, point-insert, and mixed-transaction groups, but the Redis server and its settings did not change. So the host was not equal between the two runs, and the median ratios mix code changes with host changes. KVLite led 17 fewer durable cases than in the previous report, and Redis led 18 more.
+Paired runs then measured the library of the 2026-10-29 capture and the library of `158e97b` in one container, with a second copy of one build as a same-binary control. These runs show the code effects below.
 
-To separate code from host, paired runs measured the library of `689a4dc` and the library of `fafae4c` in one container. `fafae4c` has the same library code as the measured commit. Both builds used the current harness. Ten interleaved rounds covered every KVLite case. A second copy of the `fafae4c` build ran as a control, so the noise of each case is known. Focused runs with 14 to 30 rounds then checked each case that looked different, and bisected over the commits.
+- **Reads are faster.** Point reads of small values are 8% to 14% faster in the full run. Unbounded scans, batch reads, read transactions, and collection reads are 7% to 20% faster. The refactor reads committed nodes in their encoded form, so a read no longer decodes branch nodes or fills a node cache.
+- **Bounded scans were slower.** `Enumeration/selectivity=0` took 1.91 times as long, `selectivity=1` 1.20 times as long, and `range/selectivity=1` 1.21 times as long. A bounded scan checked every separator key of each branch that it entered. The old code checked only the separators that it read. A tested patch restores that rule and adds a test for the end bound. In six paired rounds with all patches, the patched code is equal to the old code in these cases (0.97 to 1.18, not significant).
+- **Long cursor walks were slower.** `seek-and-read=100` took 1.13 times as long, and `seek-and-read=1000` 1.20 times as long. Each `Cursor.Next` made two calls instead of one, and `Cursor.Entry` built a full entry value. Two tested patches move the entry checks back into the cursor step and return the cursor fields directly. In 12 paired rounds with both patches, `seek-and-read=100` is 2.9% faster than the old code (p = 0.009), and `seek-and-read=1000` is equal (p = 0.885). In the six-round check of all patches, `seek-and-read=1000` was 2.2% slower (p = 0.005).
+- **No-commit-sync batch writes were slower.** `PutBatch replace` with 256 keys took 1.34 times as long, and updates and inserts with batches of 100 or 1,000 up to 1.26 times as long. Each write allocated its tree path on the heap, and `PutEntry` searched the leaf twice. Two tested patches use a stack array for the path again and search the leaf once. In eight paired rounds, the batch update and insert cases are now equal to the old code (0.95 to 1.02, mostly not significant). In the six-round check of all patches, the update batch of 1,000 keys was 8% slower (p = 0.045), and `PutBatch replace` with 256 keys was 13% slower (p = 0.005). The remaining `PutBatch` cost is GC work: the patched code runs 650 GC cycles where the old code runs 588, because the smaller live heap gives a lower GC goal.
+- **Durable large-value writes did not get slower.** The full run showed 1.9 to 3.2 times longer durable writes of 64 KiB values, but bbolt was also 1.2 to 2.0 times slower in those cases, and the samples of both engines had two groups of times. KVLite now writes fewer bytes for a 64 KiB insert: 0.64 times the storage bytes and 0.73 times the WAL bytes. In 12 paired rounds, the 64 KiB insert is 2.3 times faster (p = 0.023), and the other large-value, reopen, and update-latency cases show no significant change.
+- **Random deletes are slower.** In paired runs, a single random delete takes 1.10 times as long, and a delete batch of 100 keys 1.16 times as long. The patches above do not change these cases. The causes are small: the first edit copies the whole leaf before it removes the entry, each write transaction creates a parent map when it opens a bucket, and commit starts one more map iteration. A patch that makes one allocation for the borrowed bytes of a node, instead of one for each key and each value, removed 45% of the allocations but did not change the time.
 
-- **Reads are faster.** In the paired runs, single-client point reads of small values are 8% to 10% faster (p ≤ 0.008 in three of four cases), and absent-key reads 11% to 13% faster (p ≤ 0.0005). In paired micro benchmarks, a point read is 7% to 10% faster, an absent-key read 9% to 10% faster, and 100 reads in one transaction 6% to 8% faster. Commit `7a2fb49` passes the 56-byte result entry by pointer in the lookup functions, so the compiler no longer copies it through the stack at each return. `lookupNode` goes from 392 to 264 machine instructions.
-- **The WAL format did not change.** WAL bytes per operation are within 1% in every case. Multi-client cases show small differences in commits per operation, because group-commit batches depend on timing.
-- **The recovery open after a killed process is 1.89 times slower.** It went from 3.53 ms to 6.68 ms in the paired runs (p < 0.001) and from 2.91 ms to 4.99 ms in the full runs. Two durability fixes cause it. Commit `3358ef6` writes the recovered WAL records again during open, so a later failed sync cannot hide lost data. It added 39% (p = 0.017). Commit `fafae4c` syncs the cleared WAL before open returns, so a power failure cannot bring back records that recovery did not apply. It added 34% in a focused test with 24 rounds (p < 0.001). A test that counts file operations shows one more WAL write and one more WAL sync per recovery open, and the rewrite makes the existing WAL sync flush real data. Both commits add these flushes to a rare path.
-- **Creating, loading, and closing a database is 16% slower** (p = 0.015). The bisection shows small steps at commits `0c09824`, `f028de9`, and `73a88c5`, and each step alone is within the noise. A new database now starts with a WAL commit and a checkpoint, and each new WAL generation syncs its header before its first record. The counting test shows that creating a database and making its first commit now take six syncs instead of three, including the directory sync. Since `0c09824`, the first commit of every new handle also takes one more WAL sync. The full runs show 45.19 ms before and 48.54 ms now.
-- **Open and close are 3.2% slower in a micro benchmark** (20.45 µs before, p = 0.015). Commit `fafae4c` first tries to open an existing WAL, and then creates it. A clean open therefore makes one more failed open call. The KVBench open cases cannot resolve this difference. On the benchmark volume, the failed open call costs about 0.28 µs, and its error adds two allocations.
-- **The forward full scan is 7.3% slower, but the scan code does not cause it.** The only scan change, the flag check of `0f883ba`, made this case 1.6% faster. The time went up at commits that do not touch the scan path: by 3.9% at the harness commit `d1d7f67` and by 9.9% at the open commit `fafae4c`. Between `9a12749` and `fafae4c`, the machine code of the scan functions is the same after address masking. A range scan over all entries calls the same functions and moved by at most 3%. This is a code-placement effect.
-
-The paired runs did not confirm the other cases that looked slower in the median table. Durable multi-client inserts, updates, and mixed work had paired ratios from 0.68 to 1.30, and none was significant (p > 0.05). The durable update latency maximum went up because some rounds had sync stalls of 240 ms to 527 ms. bbolt had stalls of the same size in other rounds. Reopen after deletion (24 paired rounds), key deletion (20 rounds), and 64 KiB and 1 MiB value reads (20 rounds) did not change.
+The patches are not part of `158e97b`. The full results below show the measured commit without them.
 
 ## Interpretation
 
 These statements apply only to this run and its tested workloads.
 
-- KVLite led 75 of 118 durable cases. bbolt led eight. Redis led 35.
-- KVLite led 44 of 71 no-commit-sync cases. bbolt led six. Redis led 21.
+- KVLite led 98 of 143 durable cases. Redis led 28. bbolt led 11. LMDB led six.
+- KVLite led 13 of 84 no-commit-sync cases. LMDB led 67. Redis led four.
 - Each count uses one main metric for each case: the median time per operation, or p99 for latency cases. It excludes storage-size metrics.
-- KVLite led 40 of 43 read cases, including point reads, read transactions, scans, ordered reads, access distributions, collection reads, and read latency. bbolt led 64 KiB value reads, 1 MiB value reads, and `seek-and-read=1000`.
-- KVLite led 10 of 21 durable point-update cases and six of 13 durable point-insert cases. Redis led the other cases. In 14 of these 18 Redis cases, KVLite was within 17% of Redis.
-- KVLite led 13 of 21 no-commit-sync point-update cases and five of 13 no-commit-sync point-insert cases. Redis led most of the other cases.
-- KVLite led acknowledged mixed work in five of seven durable cases and six of seven no-commit-sync cases. bbolt led the cases with 64 KiB values. Redis led the durable case with 50% reads and one client.
-- KVLite led all six no-commit-sync mixed-transaction cases. Redis led five of six durable mixed-transaction cases.
-- KVLite led 13 of 28 deletion, reuse, and reopen cases across both modes. Redis led 14. bbolt led one.
-- KVLite opened a clean database 27.69x faster than bbolt. The recovery open after a killed process took 4.99 ms for KVLite and 2.92 ms for bbolt. bbolt closed after writes 200x faster, because KVLite checkpoints its WAL during close.
+- KVLite led 38 of 43 read cases. bbolt led 64 KiB value reads, 1 MiB value reads, `Enumeration/selectivity=0`, `seek-and-read=100`, and `seek-and-read=1000`. The tested patches above fix the last three cases.
+- KVLite led 11 of 21 durable point-update cases and eight of 13 durable point-insert cases. Redis led most of the other cases.
+- LMDB led 17 of 21 no-commit-sync point-update cases and all 13 no-commit-sync point-insert cases. In this mode, LMDB writes into its mapped file, and KVLite still writes and encodes a WAL record for each commit.
+- KVLite led six of seven durable mixed-work cases. LMDB led the case with 64 KiB values.
+- LMDB led 16 of 32 deletion, reuse, and reopen cases. KVLite led nine. Redis led seven.
+- KVLite created and loaded a database 1.34 times faster than bbolt. A clean open took 81.29 µs for KVLite, 14.38 µs for bbolt, and 26.54 µs for LMDB. In a micro benchmark, the creation of the new WAL takes about 40% of a clean KVLite open, and the read of the allocation bitmap about 32%. The patches do not change the open time (paired micro benchmark, not significant). The recovery open after a killed process took 5.06 ms for KVLite and 16.38 µs for bbolt. bbolt closed after writes 250 times faster, because KVLite checkpoints its WAL during close.
 
 ## Limits
 
 - This is one run on one container host. It is not a bare-metal Linux result.
 - Docker volume storage includes the OrbStack virtual machine and host storage path. It does not isolate physical-device sync latency.
-- Durable write times depend on storage sync latency. That latency changed by more than four times between rounds of the same binary.
-- The raw samples of the previous run were not kept. The comparison with that run uses medians only. The paired runs are the evidence for code changes.
-- Each timed run opens a new handle. The acknowledged-operation, focused-write, and key-deletion cases start their timers after one commit. Other cases with timed writes, such as mixed transactions, latency, collections, page reuse, and tail reclamation, still include the first commit of the handle. That commit syncs the WAL header and the directory.
+- Durable write times depend on storage sync latency. The durable groups of LMDB and Redis changed by up to 27% between this run and the 2026-10-29 capture with the same code.
+- The tested patches were measured in paired runs of selected cases, not in a new full run.
+- Each timed run opens a new handle. The acknowledged-operation, focused-write, and key-deletion cases start their timers after one commit. Other cases with timed writes still include the first commit of the handle.
 - Read tests use a warm operating-system cache. The suite does not claim cold-cache performance.
-- KVLite ran with the default `DataPageChecksums=false`. With data-page checksums on, KVLite point reads and scans are much slower.
-- The suite does not rank combined CPU use or peak resident memory across embedded and client-server designs.
+- KVLite ran with the default `DataPageChecksums=false`.
+- The suite does not rank combined CPU use or peak resident memory across embedded and client-server designs. Go allocation figures exclude LMDB's native C allocations and Redis server allocations.
 - Redis has no result for ordered cursor or embedded life-cycle operations. A Redis profile covers its Go client process, not the Redis server.
 - KVLite performs a final checkpoint during close. The close-after-writes case does not compare the same work across the embedded engines.
-- Persistent byte counts cover different file designs and maintenance rules. They are not a direct storage-efficiency ranking.
+- Persistent byte counts cover different file designs and maintenance rules. LMDB reserves a 1 GiB map. These counts are not a direct storage-efficiency ranking.
 
 ## Reproduce
 
@@ -171,7 +166,7 @@ cd benchmarks/kvbench
 ./run-docker.sh large --workloads=all --storage=volume --profile-engines=kvlite
 ```
 
-The runner uses pinned Go and Redis container images. The Go module pins bbolt and the Redis client. Omit `--profile-engines` for a timing-only run.
+The runner uses pinned Go and Redis container images. The Go module pins bbolt, the LMDB binding, and the Redis client. Omit `--profile-engines` for a timing-only run.
 
 ## Full results
 
@@ -181,337 +176,345 @@ Every value is the median of 15 measured runs.
 
 #### Durable
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| read/random/hits=0/misses=above/value=128/clients=1 | 8,257,236 keys/s | 1,677,808 keys/s | 142,091 keys/s |
-| read/random/hits=0/misses=below/value=128/clients=1 | 8,192,203 keys/s | 1,853,854 keys/s | 143,241 keys/s |
-| read/random/hits=0/misses=between/value=128/clients=1 | 6,753,285 keys/s | 1,760,228 keys/s | 142,004 keys/s |
-| read/random/hits=50/value=128/clients=1 | 4,826,508 keys/s | 1,522,881 keys/s | 150,691 keys/s |
-| read/random/hits=100/value=128/clients=8 | 5,892,288 keys/s | 942,708 keys/s | 239,126 keys/s |
-| read/random/hits=100/value=128/clients=32 | 4,322,788 keys/s | 892,717 keys/s | 308,659 keys/s |
-| read/random/key=32768/value=128/clients=1 | 75,805 keys/s | 64,127 keys/s | 37,584 keys/s |
-| read/random/value=32/clients=1 | 4,284,665 keys/s | 1,369,643 keys/s | 169,917 keys/s |
-| read/random/value=128/clients=1 | 3,904,999 keys/s | 1,341,297 keys/s | 164,750 keys/s |
-| read/random/value=1024/clients=1 | 1,940,663 keys/s | 1,349,848 keys/s | 154,812 keys/s |
-| read/random/value=3072/clients=1 | 1,580,916 keys/s | 1,082,009 keys/s | 127,709 keys/s |
-| read/random/value=65536/clients=1 | 178,123 keys/s | 232,680 keys/s | 48,176 keys/s |
-| read/random/value=1048576/clients=1 | 16,601 keys/s | 27,334 keys/s | 6,200 keys/s |
-| read/sequential/hits=100/value=128/clients=1 | 5,468,777 keys/s | 1,437,837 keys/s | 160,055 keys/s |
-| update/random/grow=32-1024/clients=1 | 1,551 keys/s | 705 keys/s | 1,651 keys/s |
-| update/random/grow=32-1024/clients=1/batch=100 | 30,658 keys/s | 13,722 keys/s | 38,005 keys/s |
-| update/random/grow=128-65536/clients=1 | 1,211 keys/s | 806 keys/s | 1,306 keys/s |
-| update/random/shrink=1024-32/clients=1 | 1,889 keys/s | 931 keys/s | 2,075 keys/s |
-| update/random/shrink=1024-32/clients=1/batch=100 | 45,007 keys/s | 13,025 keys/s | 50,228 keys/s |
-| update/random/shrink=65536-128/clients=1 | 1,866 keys/s | 912 keys/s | 1,902 keys/s |
-| update/random/value=32/clients=1 | 1,734 keys/s | 843 keys/s | 1,834 keys/s |
-| update/random/value=128/clients=1 | 1,806 keys/s | 941 keys/s | 1,748 keys/s |
-| update/random/value=128/clients=1/batch=10 | 17,080 keys/s | 5,433 keys/s | 16,718 keys/s |
-| update/random/value=128/clients=1/batch=100 | 107,962 keys/s | 22,566 keys/s | 51,327 keys/s |
-| update/random/value=128/clients=1/batch=1000 | 397,354 keys/s | 110,563 keys/s | 312,346 keys/s |
-| update/random/value=128/clients=8 | 10,587 keys/s | 395 keys/s | 11,546 keys/s |
-| update/random/value=128/clients=8/batch=100 | 249,774 keys/s | 20,965 keys/s | 196,830 keys/s |
-| update/random/value=128/clients=32 | 33,161 keys/s | 1,381 keys/s | 31,120 keys/s |
-| update/random/value=128/clients=32/batch=100 | 460,044 keys/s | 19,386 keys/s | 433,735 keys/s |
-| update/random/value=1024/clients=1 | 1,785 keys/s | 910 keys/s | 1,739 keys/s |
-| update/random/value=3072/clients=1 | 1,282 keys/s | 860 keys/s | 1,627 keys/s |
-| update/random/value=65536/clients=1 | 796 keys/s | 874 keys/s | 1,218 keys/s |
-| update/sequential/value=128/clients=1/batch=10 | 16,121 keys/s | 8,195 keys/s | 16,271 keys/s |
-| update/sequential/value=128/clients=1/batch=100 | 115,231 keys/s | 58,939 keys/s | 60,356 keys/s |
-| update/sequential/value=128/clients=1/batch=1000 | 647,310 keys/s | 323,479 keys/s | 369,874 keys/s |
-| insert/random/value=128/clients=1 | 1,937 keys/s | 942 keys/s | 2,033 keys/s |
-| insert/random/value=128/clients=1/batch=10 | 15,009 keys/s | 3,532 keys/s | 17,463 keys/s |
-| insert/random/value=128/clients=1/batch=100 | 95,009 keys/s | 18,065 keys/s | 47,223 keys/s |
-| insert/random/value=128/clients=1/batch=1000 | 399,567 keys/s | 216,468 keys/s | 386,721 keys/s |
-| insert/random/value=128/clients=8 | 11,655 keys/s | 406 keys/s | 9,099 keys/s |
-| insert/random/value=128/clients=8/batch=100 | 231,516 keys/s | 16,949 keys/s | 227,163 keys/s |
-| insert/random/value=128/clients=32 | 27,561 keys/s | 1,452 keys/s | 31,194 keys/s |
-| insert/random/value=128/clients=32/batch=100 | 428,275 keys/s | 19,087 keys/s | 478,862 keys/s |
-| insert/random/value=65536/clients=1 | 865 keys/s | 833 keys/s | 1,354 keys/s |
-| insert/sequential/value=128/clients=1 | 1,912 keys/s | 943 keys/s | 1,962 keys/s |
-| insert/sequential/value=128/clients=1/batch=10 | 14,991 keys/s | 7,736 keys/s | 17,553 keys/s |
-| insert/sequential/value=128/clients=1/batch=100 | 114,371 keys/s | 67,259 keys/s | 50,318 keys/s |
-| insert/sequential/value=128/clients=1/batch=1000 | 620,252 keys/s | 293,659 keys/s | 355,644 keys/s |
-| mixed/read=50/value=128/clients=1 | 3,256 operations/s | 1,750 operations/s | 3,466 operations/s |
-| mixed/read=50/value=128/clients=8 | 18,991 operations/s | 791 operations/s | 12,271 operations/s |
-| mixed/read=50/value=128/clients=32 | 47,953 operations/s | 2,796 operations/s | 33,187 operations/s |
-| mixed/read=95/value=128/clients=1 | 31,719 operations/s | 14,148 operations/s | 10,278 operations/s |
-| mixed/read=95/value=128/clients=8 | 96,657 operations/s | 8,584 operations/s | 13,956 operations/s |
-| mixed/read=95/value=128/clients=32 | 246,991 operations/s | 27,161 operations/s | 20,319 operations/s |
-| mixed/read=95/value=65536/clients=1 | 11,637 operations/s | 14,735 operations/s | 7,642 operations/s |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| read/random/hits=0/misses=above/value=128/clients=1 | 8,720,773 keys/s | 1,668,405 keys/s | 2,526,363 keys/s | 142,535 keys/s |
+| read/random/hits=0/misses=below/value=128/clients=1 | 8,221,018 keys/s | 1,792,965 keys/s | 2,544,477 keys/s | 143,885 keys/s |
+| read/random/hits=0/misses=between/value=128/clients=1 | 6,967,484 keys/s | 1,672,400 keys/s | 2,363,136 keys/s | 142,833 keys/s |
+| read/random/hits=50/value=128/clients=1 | 5,349,380 keys/s | 1,502,331 keys/s | 2,112,389 keys/s | 152,233 keys/s |
+| read/random/hits=100/value=128/clients=8 | 6,390,380 keys/s | 956,215 keys/s | 3,547,695 keys/s | 240,688 keys/s |
+| read/random/hits=100/value=128/clients=32 | 5,951,327 keys/s | 877,602 keys/s | 3,889,282 keys/s | 318,877 keys/s |
+| read/random/key=32768/value=128/clients=1 | 114,901 keys/s | 67,294 keys/s | — | 35,984 keys/s |
+| read/random/value=32/clients=1 | 4,625,536 keys/s | 1,294,525 keys/s | 2,071,021 keys/s | 170,552 keys/s |
+| read/random/value=128/clients=1 | 4,294,046 keys/s | 1,336,584 keys/s | 1,962,634 keys/s | 159,952 keys/s |
+| read/random/value=1024/clients=1 | 2,639,441 keys/s | 1,366,678 keys/s | 1,414,305 keys/s | 154,884 keys/s |
+| read/random/value=3072/clients=1 | 1,646,756 keys/s | 1,192,037 keys/s | 1,172,392 keys/s | 133,881 keys/s |
+| read/random/value=65536/clients=1 | 166,718 keys/s | 217,272 keys/s | 168,066 keys/s | 48,905 keys/s |
+| read/random/value=1048576/clients=1 | 18,108 keys/s | 23,710 keys/s | 22,671 keys/s | 6,401 keys/s |
+| read/sequential/hits=100/value=128/clients=1 | 6,021,497 keys/s | 1,551,388 keys/s | 2,314,728 keys/s | 168,675 keys/s |
+| update/random/grow=32-1024/clients=1 | 1,447 keys/s | 752 keys/s | 696 keys/s | 1,479 keys/s |
+| update/random/grow=32-1024/clients=1/batch=100 | 23,773 keys/s | 12,239 keys/s | 12,294 keys/s | 33,165 keys/s |
+| update/random/grow=128-65536/clients=1 | 367 keys/s | 437 keys/s | 239 keys/s | 387 keys/s |
+| update/random/shrink=1024-32/clients=1 | 1,569 keys/s | 885 keys/s | 820 keys/s | 1,971 keys/s |
+| update/random/shrink=1024-32/clients=1/batch=100 | 36,528 keys/s | 12,621 keys/s | 13,289 keys/s | 47,131 keys/s |
+| update/random/shrink=65536-128/clients=1 | 1,800 keys/s | 730 keys/s | 789 keys/s | 1,651 keys/s |
+| update/random/value=32/clients=1 | 1,246 keys/s | 695 keys/s | 812 keys/s | 1,601 keys/s |
+| update/random/value=128/clients=1 | 1,485 keys/s | 883 keys/s | 858 keys/s | 1,466 keys/s |
+| update/random/value=128/clients=1/batch=10 | 15,995 keys/s | 3,463 keys/s | 3,825 keys/s | 12,363 keys/s |
+| update/random/value=128/clients=1/batch=100 | 116,043 keys/s | 18,117 keys/s | 15,742 keys/s | 42,932 keys/s |
+| update/random/value=128/clients=1/batch=1000 | 305,413 keys/s | 107,607 keys/s | 164,712 keys/s | 331,677 keys/s |
+| update/random/value=128/clients=8 | 10,890 keys/s | 5,188 keys/s | 817 keys/s | 9,802 keys/s |
+| update/random/value=128/clients=8/batch=100 | 207,703 keys/s | 20,591 keys/s | 20,275 keys/s | 227,503 keys/s |
+| update/random/value=128/clients=32 | 34,448 keys/s | 9,640 keys/s | 750 keys/s | 9,730 keys/s |
+| update/random/value=128/clients=32/batch=100 | 384,196 keys/s | 19,672 keys/s | 14,853 keys/s | 424,357 keys/s |
+| update/random/value=1024/clients=1 | 1,528 keys/s | 916 keys/s | 807 keys/s | 1,408 keys/s |
+| update/random/value=3072/clients=1 | 1,356 keys/s | 836 keys/s | 815 keys/s | 436 keys/s |
+| update/random/value=65536/clients=1 | 437 keys/s | 368 keys/s | 192 keys/s | 1,043 keys/s |
+| update/sequential/value=128/clients=1/batch=10 | 15,743 keys/s | 6,342 keys/s | 8,158 keys/s | 11,657 keys/s |
+| update/sequential/value=128/clients=1/batch=100 | 106,842 keys/s | 28,719 keys/s | 27,041 keys/s | 41,553 keys/s |
+| update/sequential/value=128/clients=1/batch=1000 | 610,716 keys/s | 253,247 keys/s | 258,829 keys/s | 389,031 keys/s |
+| insert/random/value=128/clients=1 | 1,701 keys/s | 844 keys/s | 842 keys/s | 1,860 keys/s |
+| insert/random/value=128/clients=1/batch=10 | 14,673 keys/s | 1,998 keys/s | 2,043 keys/s | 11,201 keys/s |
+| insert/random/value=128/clients=1/batch=100 | 103,029 keys/s | 17,082 keys/s | 13,036 keys/s | 39,067 keys/s |
+| insert/random/value=128/clients=1/batch=1000 | 267,430 keys/s | 190,847 keys/s | 194,401 keys/s | 376,454 keys/s |
+| insert/random/value=128/clients=8 | 11,870 keys/s | 4,078 keys/s | 404 keys/s | 7,466 keys/s |
+| insert/random/value=128/clients=8/batch=100 | 175,439 keys/s | 16,090 keys/s | 14,906 keys/s | 221,008 keys/s |
+| insert/random/value=128/clients=32 | 33,798 keys/s | 7,470 keys/s | 781 keys/s | 10,566 keys/s |
+| insert/random/value=128/clients=32/batch=100 | 335,070 keys/s | 15,647 keys/s | 14,106 keys/s | 531,629 keys/s |
+| insert/random/value=65536/clients=1 | 375 keys/s | 521 keys/s | 276 keys/s | 1,277 keys/s |
+| insert/sequential/value=128/clients=1 | 1,827 keys/s | 934 keys/s | 876 keys/s | 1,787 keys/s |
+| insert/sequential/value=128/clients=1/batch=10 | 15,647 keys/s | 5,253 keys/s | 7,342 keys/s | 12,660 keys/s |
+| insert/sequential/value=128/clients=1/batch=100 | 107,812 keys/s | 30,416 keys/s | 20,259 keys/s | 39,016 keys/s |
+| insert/sequential/value=128/clients=1/batch=1000 | 490,103 keys/s | 230,177 keys/s | 228,233 keys/s | 341,434 keys/s |
+| mixed/read=50/value=128/clients=1 | 4,365 operations/s | 1,285 operations/s | 689 operations/s | 3,226 operations/s |
+| mixed/read=50/value=128/clients=8 | 22,660 operations/s | 7,241 operations/s | 1,477 operations/s | 10,717 operations/s |
+| mixed/read=50/value=128/clients=32 | 57,882 operations/s | 11,111 operations/s | 1,676 operations/s | 29,270 operations/s |
+| mixed/read=95/value=128/clients=1 | 32,229 operations/s | 14,020 operations/s | 15,988 operations/s | 9,683 operations/s |
+| mixed/read=95/value=128/clients=8 | 116,890 operations/s | 63,195 operations/s | 15,942 operations/s | 10,233 operations/s |
+| mixed/read=95/value=128/clients=32 | 267,301 operations/s | 70,967 operations/s | 14,804 operations/s | 15,828 operations/s |
+| mixed/read=95/value=65536/clients=1 | 9,377 operations/s | 7,777 operations/s | 15,741 operations/s | 9,573 operations/s |
 
 #### No commit sync
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| update/random/grow=32-1024/clients=1 | 199,634 keys/s | 88,097 keys/s | 106,633 keys/s |
-| update/random/grow=32-1024/clients=1/batch=100 | 268,251 keys/s | 245,391 keys/s | 679,034 keys/s |
-| update/random/grow=128-65536/clients=1 | 28,359 keys/s | 28,413 keys/s | 28,883 keys/s |
-| update/random/shrink=1024-32/clients=1 | 378,080 keys/s | 87,382 keys/s | 93,263 keys/s |
-| update/random/shrink=1024-32/clients=1/batch=100 | 603,841 keys/s | 288,593 keys/s | 1,078,828 keys/s |
-| update/random/shrink=65536-128/clients=1 | 143,767 keys/s | 48,098 keys/s | 126,341 keys/s |
-| update/random/value=32/clients=1 | 402,877 keys/s | 61,613 keys/s | 113,204 keys/s |
-| update/random/value=128/clients=1 | 315,667 keys/s | 84,896 keys/s | 94,887 keys/s |
-| update/random/value=128/clients=1/batch=10 | 829,210 keys/s | 194,482 keys/s | 534,930 keys/s |
-| update/random/value=128/clients=1/batch=100 | 983,485 keys/s | 429,232 keys/s | 1,255,235 keys/s |
-| update/random/value=128/clients=1/batch=1000 | 1,228,717 keys/s | 555,735 keys/s | 1,378,480 keys/s |
-| update/random/value=128/clients=8 | 283,724 keys/s | 56,203 keys/s | 176,170 keys/s |
-| update/random/value=128/clients=8/batch=100 | 698,736 keys/s | 312,685 keys/s | 1,141,665 keys/s |
-| update/random/value=128/clients=32 | 275,872 keys/s | 48,577 keys/s | 197,714 keys/s |
-| update/random/value=128/clients=32/batch=100 | 707,746 keys/s | 385,617 keys/s | 1,279,234 keys/s |
-| update/random/value=1024/clients=1 | 276,446 keys/s | 89,394 keys/s | 92,777 keys/s |
-| update/random/value=3072/clients=1 | 223,637 keys/s | 82,477 keys/s | 84,148 keys/s |
-| update/random/value=65536/clients=1 | 25,669 keys/s | 36,445 keys/s | 33,281 keys/s |
-| update/sequential/value=128/clients=1/batch=10 | 1,975,042 keys/s | 609,675 keys/s | 523,100 keys/s |
-| update/sequential/value=128/clients=1/batch=100 | 3,218,735 keys/s | 1,897,665 keys/s | 1,299,588 keys/s |
-| update/sequential/value=128/clients=1/batch=1000 | 3,536,699 keys/s | 2,706,668 keys/s | 1,359,751 keys/s |
-| insert/random/value=128/clients=1 | 472,928 keys/s | 66,028 keys/s | 97,163 keys/s |
-| insert/random/value=128/clients=1/batch=10 | 403,826 keys/s | 164,999 keys/s | 463,394 keys/s |
-| insert/random/value=128/clients=1/batch=100 | 579,313 keys/s | 314,425 keys/s | 900,164 keys/s |
-| insert/random/value=128/clients=1/batch=1000 | 1,051,181 keys/s | 819,185 keys/s | 955,581 keys/s |
-| insert/random/value=128/clients=8 | 157,029 keys/s | 41,363 keys/s | 186,833 keys/s |
-| insert/random/value=128/clients=8/batch=100 | 333,282 keys/s | 224,439 keys/s | 996,054 keys/s |
-| insert/random/value=128/clients=32 | 176,765 keys/s | 36,297 keys/s | 216,590 keys/s |
-| insert/random/value=128/clients=32/batch=100 | 406,911 keys/s | 300,152 keys/s | 1,104,118 keys/s |
-| insert/random/value=65536/clients=1 | 23,705 keys/s | 24,305 keys/s | 31,502 keys/s |
-| insert/sequential/value=128/clients=1 | 453,698 keys/s | 71,852 keys/s | 108,348 keys/s |
-| insert/sequential/value=128/clients=1/batch=10 | 794,574 keys/s | 420,271 keys/s | 458,782 keys/s |
-| insert/sequential/value=128/clients=1/batch=100 | 1,767,280 keys/s | 1,849,334 keys/s | 854,554 keys/s |
-| insert/sequential/value=128/clients=1/batch=1000 | 3,666,250 keys/s | 2,594,023 keys/s | 993,050 keys/s |
-| mixed/read=50/value=128/clients=1 | 739,015 operations/s | 163,248 operations/s | 137,322 operations/s |
-| mixed/read=50/value=128/clients=8 | 512,203 operations/s | 85,305 operations/s | 218,433 operations/s |
-| mixed/read=50/value=128/clients=32 | 459,866 operations/s | 68,051 operations/s | 239,468 operations/s |
-| mixed/read=95/value=128/clients=1 | 2,200,984 operations/s | 646,899 operations/s | 155,451 operations/s |
-| mixed/read=95/value=128/clients=8 | 1,835,915 operations/s | 363,121 operations/s | 226,411 operations/s |
-| mixed/read=95/value=128/clients=32 | 1,126,682 operations/s | 376,979 operations/s | 248,503 operations/s |
-| mixed/read=95/value=65536/clients=1 | 162,413 operations/s | 202,205 operations/s | 46,958 operations/s |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| update/random/grow=32-1024/clients=1 | 172,535 keys/s | 86,527 keys/s | 616,060 keys/s | 105,065 keys/s |
+| update/random/grow=32-1024/clients=1/batch=100 | 251,537 keys/s | 258,562 keys/s | 1,209,406 keys/s | 1,018,728 keys/s |
+| update/random/grow=128-65536/clients=1 | 54,285 keys/s | 29,297 keys/s | 232,053 keys/s | 28,905 keys/s |
+| update/random/shrink=1024-32/clients=1 | 410,422 keys/s | 87,856 keys/s | 534,613 keys/s | 85,640 keys/s |
+| update/random/shrink=1024-32/clients=1/batch=100 | 602,718 keys/s | 293,451 keys/s | 1,085,749 keys/s | 1,805,525 keys/s |
+| update/random/shrink=65536-128/clients=1 | 437,371 keys/s | 42,714 keys/s | 208,199 keys/s | 133,217 keys/s |
+| update/random/value=32/clients=1 | 161,371 keys/s | 62,953 keys/s | 1,365,231 keys/s | 102,611 keys/s |
+| update/random/value=128/clients=1 | 341,843 keys/s | 80,282 keys/s | 1,006,869 keys/s | 89,086 keys/s |
+| update/random/value=128/clients=1/batch=10 | 621,096 keys/s | 179,815 keys/s | 2,451,793 keys/s | 793,806 keys/s |
+| update/random/value=128/clients=1/batch=100 | 626,841 keys/s | 434,935 keys/s | 2,822,134 keys/s | 2,249,796 keys/s |
+| update/random/value=128/clients=1/batch=1000 | 942,164 keys/s | 577,170 keys/s | 2,828,183 keys/s | 2,966,844 keys/s |
+| update/random/value=128/clients=8 | 247,738 keys/s | 56,087 keys/s | 1,085,956 keys/s | 178,586 keys/s |
+| update/random/value=128/clients=8/batch=100 | 418,899 keys/s | 317,988 keys/s | 2,685,924 keys/s | 1,816,508 keys/s |
+| update/random/value=128/clients=32 | 211,942 keys/s | 48,237 keys/s | 1,187,823 keys/s | 195,080 keys/s |
+| update/random/value=128/clients=32/batch=100 | 547,146 keys/s | 358,810 keys/s | 2,525,034 keys/s | 2,636,878 keys/s |
+| update/random/value=1024/clients=1 | 345,618 keys/s | 88,048 keys/s | 525,616 keys/s | 91,077 keys/s |
+| update/random/value=3072/clients=1 | 299,715 keys/s | 82,444 keys/s | 406,313 keys/s | 79,028 keys/s |
+| update/random/value=65536/clients=1 | 56,799 keys/s | 35,871 keys/s | 116,692 keys/s | 30,861 keys/s |
+| update/sequential/value=128/clients=1/batch=10 | 1,616,769 keys/s | 555,985 keys/s | 5,147,987 keys/s | 704,441 keys/s |
+| update/sequential/value=128/clients=1/batch=100 | 2,745,343 keys/s | 2,030,479 keys/s | 7,254,388 keys/s | 2,384,297 keys/s |
+| update/sequential/value=128/clients=1/batch=1000 | 2,781,509 keys/s | 2,322,113 keys/s | 7,953,412 keys/s | 3,130,484 keys/s |
+| insert/random/value=128/clients=1 | 527,118 keys/s | 68,491 keys/s | 1,214,294 keys/s | 92,068 keys/s |
+| insert/random/value=128/clients=1/batch=10 | 436,491 keys/s | 173,327 keys/s | 2,294,272 keys/s | 567,260 keys/s |
+| insert/random/value=128/clients=1/batch=100 | 525,979 keys/s | 312,059 keys/s | 2,613,719 keys/s | 1,402,900 keys/s |
+| insert/random/value=128/clients=1/batch=1000 | 789,287 keys/s | 739,245 keys/s | 2,904,165 keys/s | 1,919,113 keys/s |
+| insert/random/value=128/clients=8 | 224,203 keys/s | 40,111 keys/s | 1,195,305 keys/s | 182,290 keys/s |
+| insert/random/value=128/clients=8/batch=100 | 370,378 keys/s | 241,768 keys/s | 2,459,358 keys/s | 1,551,661 keys/s |
+| insert/random/value=128/clients=32 | 179,950 keys/s | 35,934 keys/s | 1,340,117 keys/s | 216,637 keys/s |
+| insert/random/value=128/clients=32/batch=100 | 438,062 keys/s | 264,360 keys/s | 2,531,581 keys/s | 1,804,930 keys/s |
+| insert/random/value=65536/clients=1 | 55,658 keys/s | 23,324 keys/s | 150,372 keys/s | 30,132 keys/s |
+| insert/sequential/value=128/clients=1 | 527,826 keys/s | 72,706 keys/s | 1,426,548 keys/s | 103,417 keys/s |
+| insert/sequential/value=128/clients=1/batch=10 | 1,344,542 keys/s | 394,591 keys/s | 5,374,145 keys/s | 591,245 keys/s |
+| insert/sequential/value=128/clients=1/batch=100 | 2,051,801 keys/s | 1,763,132 keys/s | 7,394,503 keys/s | 1,524,022 keys/s |
+| insert/sequential/value=128/clients=1/batch=1000 | 2,612,239 keys/s | 2,894,931 keys/s | 7,703,383 keys/s | 1,928,864 keys/s |
+| mixed/read=50/value=128/clients=1 | 772,690 operations/s | 156,142 operations/s | 1,640,551 operations/s | 137,564 operations/s |
+| mixed/read=50/value=128/clients=8 | 545,872 operations/s | 81,896 operations/s | 1,372,847 operations/s | 219,755 operations/s |
+| mixed/read=50/value=128/clients=32 | 473,605 operations/s | 69,687 operations/s | 689,032 operations/s | 235,670 operations/s |
+| mixed/read=95/value=128/clients=1 | 1,951,360 operations/s | 629,290 operations/s | 1,876,468 operations/s | 155,065 operations/s |
+| mixed/read=95/value=128/clients=8 | 1,054,849 operations/s | 381,239 operations/s | 1,736,755 operations/s | 227,218 operations/s |
+| mixed/read=95/value=128/clients=32 | 1,267,008 operations/s | 412,327 operations/s | 1,899,484 operations/s | 271,830 operations/s |
+| mixed/read=95/value=65536/clients=1 | 189,338 operations/s | 187,098 operations/s | 200,749 operations/s | 47,649 operations/s |
 
 ### Key deletion: durable
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `existing/random/clients=1` | `ack-keys/s` | 1,615 ack-keys/s | 666 ack-keys/s | 1,615 ack-keys/s |
-| `existing/random/clients=1` | `persistent-B` | 6,574,889 B | 4,194,304 B | 2,080,573 B |
-| `existing/random/clients=1/batch=100` | `ack-keys/s` | 95,383 ack-keys/s | 38,968 ack-keys/s | 133,092 ack-keys/s |
-| `existing/random/clients=1/batch=100` | `persistent-B` | 6,199,461 B | 4,194,304 B | 1,952,073 B |
-| `existing/random/clients=1/batch=1000` | `ack-keys/s` | 560,027 ack-keys/s | 239,392 ack-keys/s | 766,084 ack-keys/s |
-| `existing/random/clients=1/batch=1000` | `persistent-B` | 5,779,016 B | 8,388,608 B | 1,950,733 B |
-| `existing/random/clients=8` | `ack-keys/s` | 10,362 ack-keys/s | 403 ack-keys/s | 10,236 ack-keys/s |
-| `existing/random/clients=8` | `persistent-B` | 6,340,705 B | 4,194,304 B | 2,080,573 B |
-| `existing/random/value=65536/clients=1` | `ack-keys/s` | 956 ack-keys/s | 816 ack-keys/s | 1,564 ack-keys/s |
-| `existing/random/value=65536/clients=1` | `persistent-B` | 39,244,474 B | 51,425,280 B | 33,652,922 B |
-| `existing/sequential/clients=1` | `ack-keys/s` | 1,659 ack-keys/s | 650 ack-keys/s | 1,299 ack-keys/s |
-| `existing/sequential/clients=1` | `persistent-B` | 5,835,030 B | 4,194,304 B | 2,080,573 B |
-| `existing/sequential/clients=1/batch=100` | `ack-keys/s` | 128,351 ack-keys/s | 87,212 ack-keys/s | 88,347 ack-keys/s |
-| `existing/sequential/clients=1/batch=100` | `persistent-B` | 3,741,426 B | 4,194,304 B | 1,952,073 B |
-| `missing/random/clients=1` | `ack-keys/s` | 376,709 ack-keys/s | 812 ack-keys/s | 165,335 ack-keys/s |
-| `missing/random/clients=1` | `persistent-B` | 3,487,704 B | 4,194,304 B | 1,720,573 B |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `existing/random/clients=1` | `ack-keys/s` | 1,477 ack-keys/s | 561 ack-keys/s | 694 ack-keys/s | 1,412 ack-keys/s |
+| `existing/random/clients=1` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,724,480 B | 1,950,625 B |
+| `existing/random/clients=1/batch=100` | `ack-keys/s` | 102,646 ack-keys/s | 38,350 ack-keys/s | 38,060 ack-keys/s | 123,663 ack-keys/s |
+| `existing/random/clients=1/batch=100` | `persistent-B` | 18,526,208 B | 4,194,304 B | 2,588,736 B | 1,822,125 B |
+| `existing/random/clients=1/batch=1000` | `ack-keys/s` | 596,143 ack-keys/s | 206,756 ack-keys/s | 343,598 ack-keys/s | 411,199 ack-keys/s |
+| `existing/random/clients=1/batch=1000` | `persistent-B` | 18,526,208 B | 8,388,608 B | 4,841,536 B | 1,820,785 B |
+| `existing/random/clients=8` | `ack-keys/s` | 10,381 ack-keys/s | 3,242 ack-keys/s | 417 ack-keys/s | 9,635 ack-keys/s |
+| `existing/random/clients=8` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,728,576 B | 1,950,625 B |
+| `existing/random/value=65536/clients=1` | `ack-keys/s` | 1,356 ack-keys/s | 639 ack-keys/s | 830 ack-keys/s | 1,514 ack-keys/s |
+| `existing/random/value=65536/clients=1` | `persistent-B` | 54,640,640 B | 51,425,280 B | 35,872,832 B | 33,711,836 B |
+| `existing/random/value=65536/clients=1/batch=32` | `ack-keys/s` | 18,155 ack-keys/s | 5,996 ack-keys/s | 20,537 ack-keys/s | 22,998 ack-keys/s |
+| `existing/random/value=65536/clients=1/batch=32` | `persistent-B` | 54,640,640 B | 51,425,280 B | 35,872,832 B | 33,714,620 B |
+| `existing/sequential/clients=1` | `ack-keys/s` | 1,573 ack-keys/s | 358 ack-keys/s | 611 ack-keys/s | 1,082 ack-keys/s |
+| `existing/sequential/clients=1` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,728,576 B | 1,950,625 B |
+| `existing/sequential/clients=1/batch=100` | `ack-keys/s` | 129,427 ack-keys/s | 87,147 ack-keys/s | 84,549 ack-keys/s | 49,390 ack-keys/s |
+| `existing/sequential/clients=1/batch=100` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,728,576 B | 1,822,125 B |
+| `existing/sequential/value=65536/clients=1/batch=32` | `ack-keys/s` | 18,700 ack-keys/s | 12,044 ack-keys/s | 13,610 ack-keys/s | 19,579 ack-keys/s |
+| `existing/sequential/value=65536/clients=1/batch=32` | `persistent-B` | 54,640,640 B | 51,425,280 B | 35,872,832 B | 33,714,620 B |
+| `missing/random/clients=1` | `ack-keys/s` | 496,779 ack-keys/s | 839 ack-keys/s | 3,785,258 ack-keys/s | 157,135 ack-keys/s |
+| `missing/random/clients=1` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,720,384 B | 1,590,625 B |
 
 ### Key deletion: no-commit-sync
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `existing/random/clients=1` | `ack-keys/s` | 385,900 ack-keys/s | 77,531 ack-keys/s | 107,542 ack-keys/s |
-| `existing/random/clients=1` | `persistent-B` | 6,574,889 B | 4,194,304 B | 2,080,573 B |
-| `existing/random/clients=1/batch=100` | `ack-keys/s` | 766,209 ack-keys/s | 481,387 ack-keys/s | 2,778,163 ack-keys/s |
-| `existing/random/clients=1/batch=100` | `persistent-B` | 6,199,461 B | 4,194,304 B | 1,952,073 B |
-| `existing/random/clients=1/batch=1000` | `ack-keys/s` | 1,650,303 ack-keys/s | 889,156 ack-keys/s | 3,170,975 ack-keys/s |
-| `existing/random/clients=1/batch=1000` | `persistent-B` | 5,779,016 B | 6,045,696 B | 1,950,733 B |
-| `existing/random/clients=8` | `ack-keys/s` | 274,525 ack-keys/s | 56,396 ack-keys/s | 231,807 ack-keys/s |
-| `existing/random/clients=8` | `persistent-B` | 6,575,577 B | 4,194,304 B | 2,080,573 B |
-| `existing/random/value=65536/clients=1` | `ack-keys/s` | 22,513 ack-keys/s | 25,252 ack-keys/s | 121,630 ack-keys/s |
-| `existing/random/value=65536/clients=1` | `persistent-B` | 39,244,474 B | 51,425,280 B | 33,652,922 B |
-| `existing/sequential/clients=1` | `ack-keys/s` | 454,405 ack-keys/s | 79,821 ack-keys/s | 117,287 ack-keys/s |
-| `existing/sequential/clients=1` | `persistent-B` | 5,835,030 B | 4,194,304 B | 2,080,573 B |
-| `existing/sequential/clients=1/batch=100` | `ack-keys/s` | 3,856,503 ack-keys/s | 2,778,807 ack-keys/s | 2,568,542 ack-keys/s |
-| `existing/sequential/clients=1/batch=100` | `persistent-B` | 3,741,426 B | 4,194,304 B | 1,952,073 B |
-| `missing/random/clients=1` | `ack-keys/s` | 3,080,991 ack-keys/s | 245,147 ack-keys/s | 170,769 ack-keys/s |
-| `missing/random/clients=1` | `persistent-B` | 3,487,704 B | 4,194,304 B | 1,720,573 B |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `existing/random/clients=1` | `ack-keys/s` | 477,916 ack-keys/s | 79,865 ack-keys/s | 1,231,047 ack-keys/s | 108,267 ack-keys/s |
+| `existing/random/clients=1` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,950,625 B |
+| `existing/random/clients=1/batch=100` | `ack-keys/s` | 750,925 ack-keys/s | 485,684 ack-keys/s | 2,886,035 ack-keys/s | 2,642,234 ack-keys/s |
+| `existing/random/clients=1/batch=100` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,822,125 B |
+| `existing/random/clients=1/batch=1000` | `ack-keys/s` | 1,622,264 ack-keys/s | 849,565 ack-keys/s | 2,747,626 ack-keys/s | 3,079,520 ack-keys/s |
+| `existing/random/clients=1/batch=1000` | `persistent-B` | 18,526,208 B | 6,045,696 B | 1,073,750,080 B | 1,820,785 B |
+| `existing/random/clients=8` | `ack-keys/s` | 321,564 ack-keys/s | 56,546 ack-keys/s | 1,030,109 ack-keys/s | 219,574 ack-keys/s |
+| `existing/random/clients=8` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,950,625 B |
+| `existing/random/value=65536/clients=1` | `ack-keys/s` | 171,853 ack-keys/s | 26,030 ack-keys/s | 190,106 ack-keys/s | 133,086 ack-keys/s |
+| `existing/random/value=65536/clients=1` | `persistent-B` | 54,640,640 B | 51,425,280 B | 1,073,750,080 B | 33,711,836 B |
+| `existing/random/value=65536/clients=1/batch=32` | `ack-keys/s` | 409,154 ack-keys/s | 45,926 ack-keys/s | 1,052,322 ack-keys/s | 984,771 ack-keys/s |
+| `existing/random/value=65536/clients=1/batch=32` | `persistent-B` | 54,640,640 B | 51,425,280 B | 1,073,750,080 B | 33,714,620 B |
+| `existing/sequential/clients=1` | `ack-keys/s` | 426,761 ack-keys/s | 83,615 ack-keys/s | 1,187,014 ack-keys/s | 116,549 ack-keys/s |
+| `existing/sequential/clients=1` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,950,625 B |
+| `existing/sequential/clients=1/batch=100` | `ack-keys/s` | 8,041,352 ack-keys/s | 2,374,223 ack-keys/s | 4,971,256 ack-keys/s | 2,403,397 ack-keys/s |
+| `existing/sequential/clients=1/batch=100` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,822,125 B |
+| `existing/sequential/value=65536/clients=1/batch=32` | `ack-keys/s` | 474,875 ack-keys/s | 333,094 ack-keys/s | 1,223,627 ack-keys/s | 956,857 ack-keys/s |
+| `existing/sequential/value=65536/clients=1/batch=32` | `persistent-B` | 54,640,640 B | 51,425,280 B | 1,073,750,080 B | 33,714,620 B |
+| `missing/random/clients=1` | `ack-keys/s` | 2,190,786 ack-keys/s | 251,395 ack-keys/s | 4,148,061 ack-keys/s | 168,090 ack-keys/s |
+| `missing/random/clients=1` | `persistent-B` | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,590,625 B |
 
 ### Bucket deletion: durable
 
-| Case | Metric | KVLite | bbolt |
-| --- | --- | ---: | ---: |
-| `top-level/buckets=100/keys-per-bucket=100` | `buckets/s` | 1,535 buckets/s | 949 buckets/s |
-| `top-level/buckets=100/keys-per-bucket=100` | `persistent-B` | 3,734,992 B | 4,194,304 B |
+| Case | Metric | KVLite | bbolt | LMDB |
+| --- | --- | ---: | ---: | ---: |
+| `top-level/buckets=100/keys-per-bucket=100` | `buckets/s` | 1,618 buckets/s | 892 buckets/s | 765 buckets/s |
+| `top-level/buckets=100/keys-per-bucket=100` | `persistent-B` | 18,919,424 B | 4,194,304 B | 2,113,600 B |
 
 ### Bucket deletion: no-commit-sync
 
-| Case | Metric | KVLite | bbolt |
-| --- | --- | ---: | ---: |
-| `top-level/buckets=100/keys-per-bucket=100` | `buckets/s` | 82,472 buckets/s | 56,626 buckets/s |
-| `top-level/buckets=100/keys-per-bucket=100` | `persistent-B` | 3,734,992 B | 4,194,304 B |
+| Case | Metric | KVLite | bbolt | LMDB |
+| --- | --- | ---: | ---: | ---: |
+| `top-level/buckets=100/keys-per-bucket=100` | `buckets/s` | 111,311 buckets/s | 65,020 buckets/s | 259,039 buckets/s |
+| `top-level/buckets=100/keys-per-bucket=100` | `persistent-B` | 18,919,424 B | 4,194,304 B | 1,073,750,080 B |
 
 ### Read after delete: durable
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `post-ack-miss` | `delete-ack-ns` | 663.57 µs | 1.18 ms | 598.54 µs |
-| `post-ack-miss` | `post-ack-miss-p50-ns` | 1.12 µs | 1.46 µs | 14.00 µs |
-| `post-ack-miss` | `post-ack-miss-p95-ns` | 1.54 µs | 2.58 µs | 26.50 µs |
-| `post-ack-miss` | `post-ack-miss-p99-ns` | 2.00 µs | 7.12 µs | 34.11 µs |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `post-ack-miss` | `delete-ack-ns` | 671.94 µs | 1.78 ms | 3.76 ms | 667.41 µs |
+| `post-ack-miss` | `post-ack-miss-p50-ns` | 917 ns | 1.46 µs | 2.12 µs | 13.67 µs |
+| `post-ack-miss` | `post-ack-miss-p95-ns` | 1.25 µs | 14.46 µs | 27.95 µs | 23.43 µs |
+| `post-ack-miss` | `post-ack-miss-p99-ns` | 1.54 µs | 21.29 µs | 57.47 µs | 34.92 µs |
 
 ### Read after delete: no-commit-sync
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `post-ack-miss` | `delete-ack-ns` | 2.62 µs | 20.79 µs | 7.21 µs |
-| `post-ack-miss` | `post-ack-miss-p50-ns` | 291 ns | 584 ns | 6.75 µs |
-| `post-ack-miss` | `post-ack-miss-p95-ns` | 375 ns | 2.04 µs | 8.71 µs |
-| `post-ack-miss` | `post-ack-miss-p99-ns` | 542 ns | 3.17 µs | 13.96 µs |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `post-ack-miss` | `delete-ack-ns` | 2.42 µs | 21.18 µs | 1.19 µs | 7.24 µs |
+| `post-ack-miss` | `post-ack-miss-p50-ns` | 250 ns | 583 ns | 500 ns | 6.67 µs |
+| `post-ack-miss` | `post-ack-miss-p95-ns` | 292 ns | 1.96 µs | 584 ns | 8.50 µs |
+| `post-ack-miss` | `post-ack-miss-p99-ns` | 334 ns | 3.08 µs | 708 ns | 13.92 µs |
 
 ### Page reuse: durable
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `random-half/batch=100` | `cycle-keys/s` | 60,603 cycle-keys/s | 22,991 cycle-keys/s | 114,953 cycle-keys/s |
-| `random-half/batch=100` | `loaded-persistent-B` | 13,881,344 B | 16,777,216 B | 5,560,401 B |
-| `random-half/batch=100` | `post-delete-persistent-B` | 15,461,506 B | 16,777,216 B | 5,676,151 B |
-| `random-half/batch=100` | `active-post-reinsert-persistent-B` | 17,670,623 B | 16,777,216 B | 8,457,601 B |
-| `random-half/batch=100` | `stable-post-reinsert-persistent-B` | 13,881,344 B | 16,777,216 B | — |
-| `random-half/batch=100` | `reuse-active-growth-B` | 3,789,279 B | 0 B | 2,897,200 B |
-| `random-half/batch=100` | `reuse-stable-growth-B` | 0 B | 0 B | — |
-| `random-half/batch=100` | `reinsert-pages-reused` | 1,035 | — | — |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `random-half/batch=100` | `cycle-keys/s` | 70,407 cycle-keys/s | 18,818 cycle-keys/s | 14,072 cycle-keys/s | 98,671 cycle-keys/s |
+| `random-half/batch=100` | `loaded-persistent-B` | 6,029,312 B | 16,777,216 B | 6,942,784 B | 5,430,281 B |
+| `random-half/batch=100` | `post-delete-persistent-B` | 9,252,425 B | 16,777,216 B | 7,962,688 B | 5,546,031 B |
+| `random-half/batch=100` | `active-post-reinsert-persistent-B` | 11,111,272 B | 16,777,216 B | 12,140,608 B | 8,261,831 B |
+| `random-half/batch=100` | `stable-post-reinsert-persistent-B` | 9,986,048 B | 16,777,216 B | 12,140,608 B | — |
+| `random-half/batch=100` | `reuse-active-growth-B` | 5,081,960 B | 0 B | 5,197,824 B | 2,831,550 B |
+| `random-half/batch=100` | `reuse-stable-growth-B` | 3,956,736 B | 0 B | 5,197,824 B | — |
+| `random-half/batch=100` | `reinsert-pages-reused` | 82 | — | — | — |
 
 ### Page reuse: no-commit-sync
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `random-half/batch=100` | `cycle-keys/s` | 471,107 cycle-keys/s | 345,682 cycle-keys/s | 1,043,144 cycle-keys/s |
-| `random-half/batch=100` | `loaded-persistent-B` | 13,881,344 B | 16,777,216 B | 5,560,401 B |
-| `random-half/batch=100` | `post-delete-persistent-B` | 15,461,506 B | 16,777,216 B | 5,676,151 B |
-| `random-half/batch=100` | `active-post-reinsert-persistent-B` | 17,670,623 B | 16,777,216 B | 8,457,601 B |
-| `random-half/batch=100` | `stable-post-reinsert-persistent-B` | 13,881,344 B | 16,777,216 B | — |
-| `random-half/batch=100` | `reuse-active-growth-B` | 3,789,279 B | 0 B | 2,897,200 B |
-| `random-half/batch=100` | `reuse-stable-growth-B` | 0 B | 0 B | — |
-| `random-half/batch=100` | `reinsert-pages-reused` | 1,035 | — | — |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `random-half/batch=100` | `cycle-keys/s` | 582,225 cycle-keys/s | 344,464 cycle-keys/s | 1,640,616 cycle-keys/s | 1,369,924 cycle-keys/s |
+| `random-half/batch=100` | `loaded-persistent-B` | 6,029,312 B | 16,777,216 B | 1,073,750,080 B | 5,430,281 B |
+| `random-half/batch=100` | `post-delete-persistent-B` | 9,252,425 B | 16,777,216 B | 1,073,750,080 B | 5,546,031 B |
+| `random-half/batch=100` | `active-post-reinsert-persistent-B` | 11,111,272 B | 16,777,216 B | 1,073,750,080 B | 8,261,831 B |
+| `random-half/batch=100` | `stable-post-reinsert-persistent-B` | 9,986,048 B | 16,777,216 B | 1,073,750,080 B | — |
+| `random-half/batch=100` | `reuse-active-growth-B` | 5,081,960 B | 0 B | 0 B | 2,831,550 B |
+| `random-half/batch=100` | `reuse-stable-growth-B` | 3,956,736 B | 0 B | 0 B | — |
+| `random-half/batch=100` | `reinsert-pages-reused` | 82 | — | — | — |
 
 ### Repeated page reuse: durable
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `ten-cycles/batch=100` | `cycle-keys/s` | 41,427 cycle-keys/s | 22,240 cycle-keys/s | 102,547 cycle-keys/s |
-| `ten-cycles/batch=100` | `loaded-persistent-B` | 8,556,544 B | 16,777,216 B | 5,560,401 B |
-| `ten-cycles/batch=100` | `peak-persistent-B` | 12,638,038 B | 16,777,216 B | 34,532,401 B |
-| `ten-cycles/batch=100` | `active-final-persistent-B` | 10,360,028 B | 16,777,216 B | 34,532,401 B |
-| `ten-cycles/batch=100` | `stable-final-persistent-B` | 8,519,680 B | 16,777,216 B | — |
-| `ten-cycles/batch=100` | `stable-growth-B` | -36,864 B | 0 B | — |
-| `ten-cycles/batch=100` | `pages-reused` | 7,679 | — | — |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `ten-cycles/batch=100` | `cycle-keys/s` | 29,334 cycle-keys/s | 19,784 cycle-keys/s | 12,189 cycle-keys/s | 43,305 cycle-keys/s |
+| `ten-cycles/batch=100` | `loaded-persistent-B` | 8,847,360 B | 16,777,216 B | 14,983,232 B | 5,430,281 B |
+| `ten-cycles/batch=100` | `peak-persistent-B` | 13,729,122 B | 16,777,216 B | 14,983,232 B | 33,745,781 B |
+| `ten-cycles/batch=100` | `active-final-persistent-B` | 11,231,409 B | 16,777,216 B | 14,983,232 B | 33,745,781 B |
+| `ten-cycles/batch=100` | `stable-final-persistent-B` | 8,744,960 B | 16,777,216 B | 14,983,232 B | — |
+| `ten-cycles/batch=100` | `stable-growth-B` | -102,400 B | 0 B | 0 B | — |
+| `ten-cycles/batch=100` | `pages-reused` | 10,083 | — | — | — |
 
 ### Repeated page reuse: no-commit-sync
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `ten-cycles/batch=100` | `cycle-keys/s` | 699,857 cycle-keys/s | 489,325 cycle-keys/s | 1,550,842 cycle-keys/s |
-| `ten-cycles/batch=100` | `loaded-persistent-B` | 8,556,544 B | 16,777,216 B | 5,560,401 B |
-| `ten-cycles/batch=100` | `peak-persistent-B` | 12,322,505 B | 16,777,216 B | 34,532,401 B |
-| `ten-cycles/batch=100` | `active-final-persistent-B` | 10,360,028 B | 16,777,216 B | 34,532,401 B |
-| `ten-cycles/batch=100` | `stable-final-persistent-B` | 8,519,680 B | 16,777,216 B | — |
-| `ten-cycles/batch=100` | `stable-growth-B` | -36,864 B | 0 B | — |
-| `ten-cycles/batch=100` | `pages-reused` | 7,679 | — | — |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `ten-cycles/batch=100` | `cycle-keys/s` | 656,887 cycle-keys/s | 500,929 cycle-keys/s | 2,394,211 cycle-keys/s | 2,346,201 cycle-keys/s |
+| `ten-cycles/batch=100` | `loaded-persistent-B` | 8,847,360 B | 16,777,216 B | 1,073,750,080 B | 5,430,281 B |
+| `ten-cycles/batch=100` | `peak-persistent-B` | 13,729,122 B | 16,777,216 B | 1,073,750,080 B | 33,745,781 B |
+| `ten-cycles/batch=100` | `active-final-persistent-B` | 11,231,409 B | 16,777,216 B | 1,073,750,080 B | 33,745,781 B |
+| `ten-cycles/batch=100` | `stable-final-persistent-B` | 8,744,960 B | 16,777,216 B | 1,073,750,080 B | — |
+| `ten-cycles/batch=100` | `stable-growth-B` | -102,400 B | 0 B | 0 B | — |
+| `ten-cycles/batch=100` | `pages-reused` | 10,083 | — | — | — |
 
 ### Tail reclamation: durable
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `upper-half/batch=100` | `ack-keys/s` | 44,841 ack-keys/s | 62,541 ack-keys/s | 70,049 ack-keys/s |
-| `upper-half/batch=100` | `loaded-persistent-B` | 13,881,344 B | 16,777,216 B | 5,560,401 B |
-| `upper-half/batch=100` | `post-delete-persistent-B` | 14,013,230 B | 16,777,216 B | 5,676,151 B |
-| `upper-half/batch=100` | `final-persistent-B` | 6,955,008 B | 16,777,216 B | 5,676,151 B |
-| `upper-half/batch=100` | `close-ns` | 2.39 ms | 75.29 µs | — |
-| `upper-half/batch=100` | `reopen-ns` | 171.17 µs | 1.28 ms | — |
-| `upper-half/batch=100` | `tail-pages-reclaimed` | 1,691 | — | — |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `upper-half/batch=100` | `ack-keys/s` | 38,383 ack-keys/s | 47,033 ack-keys/s | 66,269 ack-keys/s | 50,182 ack-keys/s |
+| `upper-half/batch=100` | `loaded-persistent-B` | 6,029,312 B | 16,777,216 B | 6,942,784 B | 5,430,281 B |
+| `upper-half/batch=100` | `post-delete-persistent-B` | 22,806,528 B | 16,777,216 B | 6,946,880 B | 5,546,031 B |
+| `upper-half/batch=100` | `final-persistent-B` | 3,059,712 B | 16,777,216 B | 6,946,880 B | 5,546,031 B |
+| `upper-half/batch=100` | `close-ns` | 3.29 ms | 65.04 µs | 29.00 µs | — |
+| `upper-half/batch=100` | `reopen-ns` | 191.85 µs | 37.84 µs | 41.08 µs | — |
+| `upper-half/batch=100` | `tail-pages-reclaimed` | 725 | — | — | — |
 
 ### Tail reclamation: no-commit-sync
 
-| Case | Metric | KVLite | bbolt | Redis |
-| --- | --- | ---: | ---: | ---: |
-| `upper-half/batch=100` | `ack-keys/s` | 1,665,338 ack-keys/s | 1,738,714 ack-keys/s | 2,629,735 ack-keys/s |
-| `upper-half/batch=100` | `loaded-persistent-B` | 13,881,344 B | 16,777,216 B | 5,560,401 B |
-| `upper-half/batch=100` | `post-delete-persistent-B` | 14,013,230 B | 16,777,216 B | 5,676,151 B |
-| `upper-half/batch=100` | `final-persistent-B` | 6,955,008 B | 16,777,216 B | 5,676,151 B |
-| `upper-half/batch=100` | `close-ns` | 123.79 µs | 61.58 µs | — |
-| `upper-half/batch=100` | `reopen-ns` | 84.79 µs | 43.62 µs | — |
-| `upper-half/batch=100` | `tail-pages-reclaimed` | 1,691 | — | — |
+| Case | Metric | KVLite | bbolt | LMDB | Redis |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `upper-half/batch=100` | `ack-keys/s` | 3,899,517 ack-keys/s | 1,887,305 ack-keys/s | 3,689,574 ack-keys/s | 2,275,629 ack-keys/s |
+| `upper-half/batch=100` | `loaded-persistent-B` | 6,029,312 B | 16,777,216 B | 1,073,750,080 B | 5,430,281 B |
+| `upper-half/batch=100` | `post-delete-persistent-B` | 22,806,528 B | 16,777,216 B | 1,073,750,080 B | 5,546,031 B |
+| `upper-half/batch=100` | `final-persistent-B` | 3,059,712 B | 16,777,216 B | 1,073,750,080 B | 5,546,031 B |
+| `upper-half/batch=100` | `close-ns` | 279.09 µs | 63.00 µs | 22.46 µs | — |
+| `upper-half/batch=100` | `reopen-ns` | 77.63 µs | 34.75 µs | 30.29 µs | — |
+| `upper-half/batch=100` | `tail-pages-reclaimed` | 725 | — | — | — |
 
 ### Reopen after deletion: durable
 
-| Case | Metric | KVLite | bbolt |
-| --- | --- | ---: | ---: |
-| `alternating-half` | `reopen-ns` | 147.12 µs | 1.39 ms |
+| Case | Metric | KVLite | bbolt | LMDB |
+| --- | --- | ---: | ---: | ---: |
+| `alternating-half` | `reopen-ns` | 164.83 µs | 32.08 µs | 30.00 µs |
 
 ### Reopen after deletion: no-commit-sync
 
-| Case | Metric | KVLite | bbolt |
-| --- | --- | ---: | ---: |
-| `alternating-half` | `reopen-ns` | 87.75 µs | 37.87 µs |
+| Case | Metric | KVLite | bbolt | LMDB |
+| --- | --- | ---: | ---: | ---: |
+| `alternating-half` | `reopen-ns` | 78.46 µs | 33.58 µs | 30.79 µs |
 
 ### Transactions
 
 #### Read-only
 
-| Keys per transaction | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| 1 | 1,761,135 keys/s | 1,081,721 keys/s | 150,267 keys/s |
-| 10 | 2,961,278 keys/s | 1,903,251 keys/s | 970,624 keys/s |
-| 100 | 3,151,661 keys/s | 2,004,847 keys/s | 1,997,351 keys/s |
-| 1,000 | 3,141,960 keys/s | 1,991,282 keys/s | 2,492,511 keys/s |
+| Keys per transaction | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 1,904,856 keys/s | 1,019,643 keys/s | 1,552,848 keys/s | 149,220 keys/s |
+| 10 | 3,021,739 keys/s | 1,790,525 keys/s | 2,976,231 keys/s | 929,281 keys/s |
+| 100 | 3,426,969 keys/s | 2,058,985 keys/s | 3,332,356 keys/s | 2,169,098 keys/s |
+| 1,000 | 3,770,502 keys/s | 1,989,835 keys/s | 3,422,592 keys/s | 2,263,618 keys/s |
 
 #### Durable mixed transactions
 
-| Read share | Operations per transaction | KVLite | bbolt | Redis |
-| ---: | ---: | ---: | ---: | ---: |
-| 95% | 10 | 12,585 operations/s | 7,055 operations/s | 15,181 operations/s |
-| 95% | 100 | 87,531 operations/s | 61,209 operations/s | 143,021 operations/s |
-| 95% | 1,000 | 577,250 operations/s | 303,260 operations/s | 623,945 operations/s |
-| 50% | 10 | 13,526 operations/s | 3,520 operations/s | 16,423 operations/s |
-| 50% | 100 | 97,744 operations/s | 19,476 operations/s | 131,117 operations/s |
-| 50% | 1,000 | 456,117 operations/s | 124,005 operations/s | 431,785 operations/s |
+| Read share | Operations per transaction | KVLite | bbolt | LMDB | Redis |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 95% | 10 | 9,531 operations/s | 8,459 operations/s | 7,068 operations/s | 14,113 operations/s |
+| 95% | 100 | 96,227 operations/s | 63,083 operations/s | 71,169 operations/s | 147,014 operations/s |
+| 95% | 1,000 | 454,188 operations/s | 312,506 operations/s | 425,033 operations/s | 563,732 operations/s |
+| 50% | 10 | 11,642 operations/s | 3,222 operations/s | 7,070 operations/s | 14,879 operations/s |
+| 50% | 100 | 93,163 operations/s | 25,302 operations/s | 36,427 operations/s | 74,002 operations/s |
+| 50% | 1,000 | 439,221 operations/s | 126,897 operations/s | 194,769 operations/s | 381,336 operations/s |
 
 #### No-commit-sync mixed transactions
 
-| Read share | Operations per transaction | KVLite | bbolt | Redis |
-| ---: | ---: | ---: | ---: | ---: |
-| 95% | 10 | 1,206,271 operations/s | 635,953 operations/s | 582,129 operations/s |
-| 95% | 100 | 1,630,169 operations/s | 1,465,689 operations/s | 1,311,886 operations/s |
-| 95% | 1,000 | 1,903,327 operations/s | 1,684,108 operations/s | 1,218,496 operations/s |
-| 50% | 10 | 1,038,748 operations/s | 322,575 operations/s | 431,459 operations/s |
-| 50% | 100 | 1,291,368 operations/s | 616,656 operations/s | 889,998 operations/s |
-| 50% | 1,000 | 1,540,729 operations/s | 892,067 operations/s | 1,300,531 operations/s |
+| Read share | Operations per transaction | KVLite | bbolt | LMDB | Redis |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 95% | 10 | 1,496,026 operations/s | 642,707 operations/s | 2,625,669 operations/s | 457,253 operations/s |
+| 95% | 100 | 1,914,402 operations/s | 1,381,499 operations/s | 2,927,679 operations/s | 1,113,137 operations/s |
+| 95% | 1,000 | 2,523,856 operations/s | 1,628,353 operations/s | 2,935,100 operations/s | 1,052,284 operations/s |
+| 50% | 10 | 1,034,893 operations/s | 326,913 operations/s | 2,372,359 operations/s | 403,173 operations/s |
+| 50% | 100 | 1,061,155 operations/s | 610,028 operations/s | 2,769,002 operations/s | 890,729 operations/s |
+| 50% | 1,000 | 1,268,583 operations/s | 837,501 operations/s | 2,558,605 operations/s | 1,408,723 operations/s |
 
 ### Enumeration
 
 The 0% case returns no entries. This report omits its entries-per-second value because that rate does not apply.
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| selectivity=1 | 102,925,598 entries/s | 59,784,052 entries/s | 153,284 entries/s |
-| selectivity=10 | 134,158,372 entries/s | 106,534,269 entries/s | 916,364 entries/s |
-| selectivity=100 | 222,435,919 entries/s | 96,136,629 entries/s | 1,684,628 entries/s |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| selectivity=1 | 84,359,809 entries/s | 63,249,755 entries/s | 23,272,587 entries/s | 159,890 entries/s |
+| selectivity=10 | 129,917,119 entries/s | 108,825,569 entries/s | 26,129,972 entries/s | 917,339 entries/s |
+| selectivity=100 | 220,547,682 entries/s | 99,070,353 entries/s | 26,506,647 entries/s | 1,691,745 entries/s |
 
 ### Ordered operations
 
 Redis does not provide the required ordered-cursor API. The 0% range case returns no entries. This report omits its entries-per-second value.
 
-| Case | KVLite | bbolt |
-| --- | ---: | ---: |
-| full-forward | 223,266,726 entries/s | 102,842,805 entries/s |
-| full-reverse | 246,115,759 entries/s | 111,000,693 entries/s |
-| range/selectivity=1 | 109,167,892 entries/s | 68,528,659 entries/s |
-| range/selectivity=10 | 132,767,069 entries/s | 98,083,723 entries/s |
-| range/selectivity=100 | 222,368,743 entries/s | 101,660,130 entries/s |
-| seek-and-read=1 | 2,302,385 entries/s | 927,603 entries/s |
-| seek-and-read=10 | 19,228,796 entries/s | 9,119,927 entries/s |
-| seek-and-read=100 | 65,084,417 entries/s | 54,471,352 entries/s |
-| seek-and-read=1000 | 85,934,942 entries/s | 95,107,526 entries/s |
+| Case | KVLite | bbolt | LMDB |
+| --- | ---: | ---: | ---: |
+| full-forward | 232,653,884 entries/s | 103,965,012 entries/s | 26,632,385 entries/s |
+| full-reverse | 253,432,084 entries/s | 109,938,729 entries/s | 27,333,369 entries/s |
+| range/selectivity=1 | 83,492,479 entries/s | 66,625,699 entries/s | 23,072,102 entries/s |
+| range/selectivity=10 | 129,677,698 entries/s | 93,105,481 entries/s | 25,776,086 entries/s |
+| range/selectivity=100 | 227,267,479 entries/s | 96,981,459 entries/s | 26,692,476 entries/s |
+| seek-and-read=1 | 1,617,597 entries/s | 931,228 entries/s | 1,522,865 entries/s |
+| seek-and-read=10 | 13,796,231 entries/s | 9,242,973 entries/s | 9,897,703 entries/s |
+| seek-and-read=100 | 56,663,336 entries/s | 58,297,147 entries/s | 22,909,198 entries/s |
+| seek-and-read=1000 | 72,789,374 entries/s | 94,569,042 entries/s | 26,506,022 entries/s |
 
 ### Access distribution
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| records=10000/hot-80-20 | 3,875,633 reads/s | 1,002,331 reads/s | 163,313 reads/s |
-| records=10000/uniform | 3,703,829 reads/s | 874,449 reads/s | 162,641 reads/s |
-| records=100000/hot-80-20 | 2,353,761 reads/s | 1,263,522 reads/s | 156,621 reads/s |
-| records=100000/uniform | 1,918,291 reads/s | 1,162,819 reads/s | 154,120 reads/s |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| records=10000/hot-80-20 | 3,979,838 reads/s | 994,063 reads/s | 1,983,623 reads/s | 165,669 reads/s |
+| records=10000/uniform | 4,103,135 reads/s | 934,120 reads/s | 1,903,572 reads/s | 163,802 reads/s |
+| records=100000/hot-80-20 | 2,860,792 reads/s | 1,285,698 reads/s | 1,557,555 reads/s | 156,821 reads/s |
+| records=100000/uniform | 2,321,121 reads/s | 1,151,886 reads/s | 1,317,083 reads/s | 155,517 reads/s |
 
 ### Collections
 
@@ -519,25 +522,25 @@ KVLite and bbolt use native buckets. Redis uses logical key prefixes.
 
 #### Durable
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| write/collections=1/depth=1 | 45,749 keys/s | 64,468 keys/s | 34,682 keys/s |
-| write/collections=1/depth=3 | 56,040 keys/s | 53,404 keys/s | 42,516 keys/s |
-| write/collections=100/depth=1 | 48,237 keys/s | 54,191 keys/s | 41,782 keys/s |
-| write/collections=100/depth=3 | 53,335 keys/s | 42,982 keys/s | 44,348 keys/s |
-| read/collections=1/depth=1 | 1,748,492 reads/s | 825,505 reads/s | 158,292 reads/s |
-| read/collections=1/depth=3 | 1,394,178 reads/s | 609,201 reads/s | 156,792 reads/s |
-| read/collections=100/depth=1 | 1,482,613 reads/s | 776,432 reads/s | 156,034 reads/s |
-| read/collections=100/depth=3 | 1,195,636 reads/s | 649,494 reads/s | 154,195 reads/s |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| write/collections=1/depth=1 | 41,385 keys/s | 34,705 keys/s | — | 39,804 keys/s |
+| write/collections=1/depth=3 | 50,566 keys/s | 31,646 keys/s | — | 40,197 keys/s |
+| write/collections=100/depth=1 | 45,716 keys/s | 32,814 keys/s | — | 41,129 keys/s |
+| write/collections=100/depth=3 | 44,381 keys/s | 30,923 keys/s | — | 40,573 keys/s |
+| read/collections=1/depth=1 | 1,884,970 reads/s | 777,882 reads/s | — | 151,519 reads/s |
+| read/collections=1/depth=3 | 1,566,283 reads/s | 590,653 reads/s | — | 155,245 reads/s |
+| read/collections=100/depth=1 | 1,447,125 reads/s | 758,338 reads/s | — | 155,914 reads/s |
+| read/collections=100/depth=3 | 1,203,803 reads/s | 626,001 reads/s | — | 154,129 reads/s |
 
 #### No commit sync
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| write/collections=1/depth=1 | 1,726,308 keys/s | 1,034,823 keys/s | 874,385 keys/s |
-| write/collections=1/depth=3 | 1,370,982 keys/s | 940,078 keys/s | 720,832 keys/s |
-| write/collections=100/depth=1 | 1,741,920 keys/s | 2,219,017 keys/s | 603,885 keys/s |
-| write/collections=100/depth=3 | 1,767,597 keys/s | 2,291,104 keys/s | 489,125 keys/s |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| write/collections=1/depth=1 | 1,715,628 keys/s | 1,153,440 keys/s | — | 952,715 keys/s |
+| write/collections=1/depth=3 | 1,469,897 keys/s | 1,289,379 keys/s | — | 748,611 keys/s |
+| write/collections=100/depth=1 | 2,749,799 keys/s | 1,689,761 keys/s | — | 649,718 keys/s |
+| write/collections=100/depth=3 | 2,750,661 keys/s | 2,269,557 keys/s | — | 482,882 keys/s |
 
 ### Latency
 
@@ -547,67 +550,82 @@ The large scale reports one, eight, and 32 clients.
 
 | Operation | Clients | Engine | p50 | p95 | p99 | Maximum |
 | --- | ---: | --- | ---: | ---: | ---: | ---: |
-| Read | 1 | KVLite | 250 ns | 333 ns | 459 ns | 303.79 µs |
-| Read | 1 | bbolt | 458 ns | 750 ns | 1.54 µs | 1.21 ms |
-| Read | 1 | Redis | 5.79 µs | 6.79 µs | 12.46 µs | 4.35 ms |
-| Read | 8 | KVLite | 416 ns | 666 ns | 1.00 µs | 18.43 ms |
-| Read | 8 | bbolt | 541 ns | 1.50 µs | 5.71 µs | 24.51 ms |
-| Read | 8 | Redis | 29.87 µs | 64.79 µs | 100.42 µs | 9.03 ms |
-| Read | 32 | KVLite | 416 ns | 584 ns | 958 ns | 61.42 ms |
-| Read | 32 | bbolt | 625 ns | 38.88 µs | 159.50 µs | 32.59 ms |
-| Read | 32 | Redis | 60.54 µs | 245.66 µs | 462.29 µs | 12.01 ms |
-| Update | 1 | KVLite | 555.57 µs | 1.55 ms | 2.96 ms | 242.19 ms |
-| Update | 1 | bbolt | 1.07 ms | 1.43 ms | 1.78 ms | 12.21 ms |
-| Update | 1 | Redis | 531.13 µs | 791.25 µs | 1.34 ms | 9.20 ms |
-| Update | 8 | KVLite | 584.66 µs | 1.43 ms | 2.33 ms | 5.47 ms |
-| Update | 8 | bbolt | 19.88 ms | 24.71 ms | 28.20 ms | 43.55 ms |
-| Update | 8 | Redis | 596.70 µs | 1.23 ms | 2.14 ms | 5.80 ms |
-| Update | 32 | KVLite | 705.16 µs | 2.00 ms | 3.67 ms | 5.78 ms |
-| Update | 32 | bbolt | 23.02 ms | 29.92 ms | 32.26 ms | 36.53 ms |
-| Update | 32 | Redis | 977.78 µs | 2.14 ms | 2.98 ms | 4.32 ms |
-| Mixed | 1 | KVLite | 583 ns | 198.83 µs | 642.16 µs | 7.00 ms |
-| Mixed | 1 | bbolt | 750 ns | 325.66 µs | 1.11 ms | 8.26 ms |
-| Mixed | 1 | Redis | 6.46 µs | 413.69 µs | 1.11 ms | 10.21 ms |
-| Mixed | 8 | KVLite | 458 ns | 565.29 µs | 928.48 µs | 5.80 ms |
-| Mixed | 8 | bbolt | 3.12 µs | 6.18 ms | 20.78 ms | 40.27 ms |
-| Mixed | 8 | Redis | 74.87 µs | 1.86 ms | 2.77 ms | 17.00 ms |
-| Mixed | 32 | KVLite | 375 ns | 686.62 µs | 1.51 ms | 9.57 ms |
-| Mixed | 32 | bbolt | 3.00 µs | 9.13 ms | 24.04 ms | 33.98 ms |
-| Mixed | 32 | Redis | 1.05 ms | 3.40 ms | 4.52 ms | 9.85 ms |
+| Read | 1 | KVLite | 250 ns | 292 ns | 458 ns | 168.42 µs |
+| Read | 1 | bbolt | 417 ns | 709 ns | 1.46 µs | 2.16 ms |
+| Read | 1 | LMDB | 500 ns | 583 ns | 750 ns | 417.21 µs |
+| Read | 1 | Redis | 5.62 µs | 6.92 µs | 11.79 µs | 4.37 ms |
+| Read | 8 | KVLite | 375 ns | 500 ns | 709 ns | 20.99 ms |
+| Read | 8 | bbolt | 500 ns | 1.58 µs | 6.38 µs | 21.21 ms |
+| Read | 8 | LMDB | 625 ns | 1.12 µs | 1.50 µs | 32.20 ms |
+| Read | 8 | Redis | 28.83 µs | 65.17 µs | 101.13 µs | 9.08 ms |
+| Read | 32 | KVLite | 375 ns | 541 ns | 709 ns | 59.21 ms |
+| Read | 32 | bbolt | 625 ns | 34.67 µs | 159.29 µs | 29.41 ms |
+| Read | 32 | LMDB | 625 ns | 1.12 µs | 1.46 µs | 95.01 ms |
+| Read | 32 | Redis | 59.75 µs | 240.42 µs | 471.29 µs | 13.11 ms |
+| Update | 1 | KVLite | 595.45 µs | 1.63 ms | 3.67 ms | 215.88 ms |
+| Update | 1 | bbolt | 1.22 ms | 1.84 ms | 3.24 ms | 67.79 ms |
+| Update | 1 | LMDB | 1.17 ms | 1.81 ms | 2.27 ms | 47.96 ms |
+| Update | 1 | Redis | 604.10 µs | 2.57 ms | 3.43 ms | 73.52 ms |
+| Update | 8 | KVLite | 649.95 µs | 1.12 ms | 2.16 ms | 6.09 ms |
+| Update | 8 | bbolt | 1.83 ms | 3.39 ms | 4.74 ms | 9.73 ms |
+| Update | 8 | LMDB | 1.21 ms | 8.55 ms | 17.16 ms | 4.40 s |
+| Update | 8 | Redis | 659.24 µs | 1.56 ms | 2.26 ms | 5.51 ms |
+| Update | 32 | KVLite | 763.50 µs | 1.61 ms | 3.13 ms | 6.71 ms |
+| Update | 32 | bbolt | 3.57 ms | 4.30 ms | 5.93 ms | 11.27 ms |
+| Update | 32 | LMDB | 1.20 ms | 34.64 ms | 684.46 ms | 9.28 s |
+| Update | 32 | Redis | 1.28 ms | 2.90 ms | 4.41 ms | 7.81 ms |
+| Mixed | 1 | KVLite | 292 ns | 2.25 µs | 5.33 µs | 5.34 ms |
+| Mixed | 1 | bbolt | 708 ns | 562.62 µs | 1.55 ms | 17.78 ms |
+| Mixed | 1 | LMDB | 709 ns | 77.42 µs | 1.36 ms | 16.03 ms |
+| Mixed | 1 | Redis | 16.71 µs | 722.08 µs | 2.36 ms | 21.66 ms |
+| Mixed | 8 | KVLite | 292 ns | 27.42 µs | 626.21 µs | 5.22 ms |
+| Mixed | 8 | bbolt | 667 ns | 1.27 ms | 4.88 ms | 17.86 ms |
+| Mixed | 8 | LMDB | 792 ns | 878.77 µs | 25.42 ms | 483.70 ms |
+| Mixed | 8 | Redis | 124.34 µs | 2.63 ms | 4.17 ms | 29.44 ms |
+| Mixed | 32 | KVLite | 292 ns | 207.64 µs | 1.63 ms | 10.95 ms |
+| Mixed | 32 | bbolt | 916 ns | 3.13 ms | 32.51 ms | 83.70 ms |
+| Mixed | 32 | LMDB | 750 ns | 899.13 µs | 76.60 ms | 991.71 ms |
+| Mixed | 32 | Redis | 1.74 ms | 4.10 ms | 5.83 ms | 22.67 ms |
 
 #### No commit sync
 
 | Operation | Clients | Engine | p50 | p95 | p99 | Maximum |
 | --- | ---: | --- | ---: | ---: | ---: | ---: |
-| Update | 1 | KVLite | 1.62 µs | 3.54 µs | 5.54 µs | 297.12 µs |
-| Update | 1 | bbolt | 8.54 µs | 14.50 µs | 20.71 µs | 3.36 ms |
-| Update | 1 | Redis | 6.96 µs | 8.50 µs | 14.29 µs | 353.04 µs |
-| Update | 8 | KVLite | 1.67 µs | 3.71 µs | 6.75 µs | 6.73 ms |
-| Update | 8 | bbolt | 8.79 µs | 15.88 µs | 3.64 ms | 9.13 ms |
-| Update | 8 | Redis | 29.38 µs | 72.12 µs | 92.80 µs | 4.24 ms |
-| Update | 32 | KVLite | 1.67 µs | 3.79 µs | 2.35 ms | 8.21 ms |
-| Update | 32 | bbolt | 8.96 µs | 2.59 ms | 6.78 ms | 11.74 ms |
-| Update | 32 | Redis | 113.04 µs | 257.12 µs | 349.82 µs | 2.51 ms |
-| Mixed | 1 | KVLite | 292 ns | 1.46 µs | 2.17 µs | 237.13 µs |
-| Mixed | 1 | bbolt | 459 ns | 7.67 µs | 10.33 µs | 3.33 ms |
-| Mixed | 1 | Redis | 5.67 µs | 7.50 µs | 11.83 µs | 2.74 ms |
-| Mixed | 8 | KVLite | 292 ns | 1.54 µs | 3.25 µs | 9.68 ms |
-| Mixed | 8 | bbolt | 542 ns | 9.42 µs | 26.12 µs | 15.20 ms |
-| Mixed | 8 | Redis | 31.04 µs | 65.29 µs | 96.94 µs | 6.20 ms |
-| Mixed | 32 | KVLite | 292 ns | 1.58 µs | 4.29 µs | 14.84 ms |
-| Mixed | 32 | bbolt | 583 ns | 11.54 µs | 927.99 µs | 21.99 ms |
-| Mixed | 32 | Redis | 72.58 µs | 238.62 µs | 386.00 µs | 8.08 ms |
+| Update | 1 | KVLite | 1.29 µs | 3.38 µs | 5.71 µs | 287.75 µs |
+| Update | 1 | bbolt | 8.46 µs | 14.25 µs | 20.83 µs | 4.06 ms |
+| Update | 1 | LMDB | 625 ns | 833 ns | 1.67 µs | 12.96 µs |
+| Update | 1 | Redis | 7.33 µs | 9.67 µs | 14.79 µs | 66.58 µs |
+| Update | 8 | KVLite | 1.46 µs | 3.58 µs | 7.83 µs | 7.52 ms |
+| Update | 8 | bbolt | 8.58 µs | 15.79 µs | 3.55 ms | 9.76 ms |
+| Update | 8 | LMDB | 584 ns | 1.33 µs | 3.79 µs | 4.40 ms |
+| Update | 8 | Redis | 33.38 µs | 68.54 µs | 97.67 µs | 3.23 ms |
+| Update | 32 | KVLite | 1.42 µs | 3.88 µs | 2.51 ms | 9.18 ms |
+| Update | 32 | bbolt | 8.67 µs | 2.94 ms | 6.79 ms | 10.68 ms |
+| Update | 32 | LMDB | 625 ns | 1.46 µs | 9.17 µs | 6.40 ms |
+| Update | 32 | Redis | 90.79 µs | 244.34 µs | 409.51 µs | 3.53 ms |
+| Mixed | 1 | KVLite | 291 ns | 458 ns | 1.08 µs | 295.98 µs |
+| Mixed | 1 | bbolt | 500 ns | 7.54 µs | 10.50 µs | 4.06 ms |
+| Mixed | 1 | LMDB | 500 ns | 667 ns | 1.29 µs | 173.42 µs |
+| Mixed | 1 | Redis | 5.58 µs | 7.50 µs | 11.79 µs | 3.59 ms |
+| Mixed | 8 | KVLite | 291 ns | 459 ns | 1.92 µs | 10.23 ms |
+| Mixed | 8 | bbolt | 542 ns | 9.21 µs | 26.25 µs | 15.90 ms |
+| Mixed | 8 | LMDB | 583 ns | 1.38 µs | 4.04 µs | 15.30 ms |
+| Mixed | 8 | Redis | 30.46 µs | 64.29 µs | 97.17 µs | 6.37 ms |
+| Mixed | 32 | KVLite | 291 ns | 459 ns | 2.88 µs | 13.36 ms |
+| Mixed | 32 | bbolt | 542 ns | 11.58 µs | 947.97 µs | 20.85 ms |
+| Mixed | 32 | LMDB | 583 ns | 1.38 µs | 2.71 µs | 50.61 ms |
+| Mixed | 32 | Redis | 64.25 µs | 245.17 µs | 426.34 µs | 7.37 ms |
 
 ### Life cycle
 
 Redis does not have the same embedded life-cycle boundary.
 
-| Case | KVLite | bbolt |
-| --- | ---: | ---: |
-| close-after-writes | 2.05 ms | 10.21 µs |
-| create-load-close | 48.54 ms | 56.00 ms |
-| open-clean | 91.55 µs | 2.54 ms |
-| recover-after-process-kill | 4.99 ms | 2.92 ms |
+| Case | KVLite | bbolt | LMDB |
+| --- | ---: | ---: | ---: |
+| close-after-writes | 2.38 ms | 9.50 µs | 14.21 µs |
+| create-load-close | 49.00 ms | 65.68 ms | 55.52 ms |
+| open-clean | 81.29 µs | 14.38 µs | 26.54 µs |
+| recover-after-process-kill | 5.06 ms | 16.38 µs | 28.16 µs |
 
 ### Persistent bytes
 
@@ -615,106 +633,106 @@ Redis does not have the same embedded life-cycle boundary.
 
 #### Durable
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| read/random/hits=0/misses=above/value=128/clients=1 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/hits=0/misses=below/value=128/clients=1 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/hits=0/misses=between/value=128/clients=1 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/hits=50/value=128/clients=1 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/hits=100/value=128/clients=8 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/hits=100/value=128/clients=32 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/key=32768/value=128/clients=1 | 37,728,256 B | 52,056,064 B | 16,858,764 B |
-| read/random/value=32/clients=1 | 1,359,872 B | 2,097,152 B | 750,401 B |
-| read/random/value=128/clients=1 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| read/random/value=1024/clients=1 | 41,619,456 B | 35,549,184 B | 10,690,401 B |
-| read/random/value=3072/clients=1 | 41,627,648 B | 58,118,144 B | 31,170,401 B |
-| read/random/value=65536/clients=1 | 35,700,736 B | 51,425,280 B | 33,578,124 B |
-| read/random/value=1048576/clients=1 | 67,653,632 B | 84,045,824 B | 67,112,076 B |
-| read/sequential/hits=100/value=128/clients=1 | 3,485,696 B | 4,194,304 B | 1,720,401 B |
-| update/random/grow=32-1024/clients=1 | 3,904,151 B | 4,194,304 B | 1,819,476 B |
-| update/random/grow=32-1024/clients=1/batch=100 | 23,491,011 B | 33,640,448 B | 11,443,376 B |
-| update/random/grow=128-65536/clients=1 | 36,556,544 B | 50,573,312 B | 65,670,376 B |
-| update/random/shrink=1024-32/clients=1 | 41,752,600 B | 35,549,184 B | 10,766,470 B |
-| update/random/shrink=1024-32/clients=1/batch=100 | 42,695,143 B | 35,549,184 B | 11,444,370 B |
-| update/random/shrink=65536-128/clients=1 | 35,937,726 B | 51,425,280 B | 33,815,706 B |
-| update/random/value=32/clients=1 | 2,031,954 B | 2,097,152 B | 825,476 B |
-| update/random/value=128/clients=1 | 4,682,885 B | 4,194,304 B | 1,892,573 B |
-| update/random/value=128/clients=1/batch=10 | 5,457,093 B | 4,194,304 B | 3,469,573 B |
-| update/random/value=128/clients=1/batch=100 | 5,421,529 B | 4,194,304 B | 3,443,473 B |
-| update/random/value=128/clients=1/batch=1000 | 5,328,254 B | 8,388,608 B | 3,440,863 B |
-| update/random/value=128/clients=8 | 5,198,535 B | 4,194,304 B | 2,270,973 B |
-| update/random/value=128/clients=8/batch=100 | 5,345,099 B | 4,194,304 B | 3,443,473 B |
-| update/random/value=128/clients=32 | 5,189,677 B | 4,194,304 B | 2,270,973 B |
-| update/random/value=128/clients=32/batch=100 | 5,231,416 B | 4,194,304 B | 3,443,473 B |
-| update/random/value=1024/clients=1 | 42,744,600 B | 35,549,184 B | 11,760,470 B |
-| update/random/value=3072/clients=1 | 44,802,840 B | 58,118,144 B | 34,290,518 B |
-| update/random/value=65536/clients=1 | 36,298,896 B | 51,425,280 B | 99,225,706 B |
-| update/sequential/value=128/clients=1/batch=10 | 5,212,464 B | 4,194,304 B | 3,469,573 B |
-| update/sequential/value=128/clients=1/batch=100 | 5,129,407 B | 4,194,304 B | 3,443,473 B |
-| update/sequential/value=128/clients=1/batch=1000 | 5,122,417 B | 4,194,304 B | 3,440,863 B |
-| insert/random/value=128/clients=1 | 3,855,000 B | 4,194,304 B | 1,892,573 B |
-| insert/random/value=128/clients=1/batch=10 | 6,866,304 B | 8,388,608 B | 3,469,573 B |
-| insert/random/value=128/clients=1/batch=100 | 6,670,681 B | 8,388,608 B | 3,443,473 B |
-| insert/random/value=128/clients=1/batch=1000 | 6,270,082 B | 8,388,608 B | 3,440,863 B |
-| insert/random/value=128/clients=8 | 4,575,134 B | 8,388,608 B | 2,270,973 B |
-| insert/random/value=128/clients=8/batch=100 | 6,337,755 B | 8,388,608 B | 3,443,473 B |
-| insert/random/value=128/clients=32 | 4,520,417 B | 8,388,608 B | 2,270,973 B |
-| insert/random/value=128/clients=32/batch=100 | 5,833,023 B | 8,388,608 B | 3,443,473 B |
-| insert/random/value=65536/clients=1 | 72,244,992 B | 85,176,320 B | 99,225,706 B |
-| insert/sequential/value=128/clients=1 | 3,923,221 B | 4,194,304 B | 1,892,573 B |
-| insert/sequential/value=128/clients=1/batch=10 | 6,620,138 B | 8,388,608 B | 3,469,573 B |
-| insert/sequential/value=128/clients=1/batch=100 | 5,371,443 B | 8,388,608 B | 3,443,473 B |
-| insert/sequential/value=128/clients=1/batch=1000 | 5,191,218 B | 8,388,608 B | 3,440,863 B |
-| mixed/read=50/value=128/clients=1 | 5,374,667 B | 4,194,304 B | 2,580,573 B |
-| mixed/read=50/value=128/clients=8 | 5,267,222 B | 4,194,304 B | 2,580,573 B |
-| mixed/read=50/value=128/clients=32 | 5,253,882 B | 4,194,304 B | 2,580,573 B |
-| mixed/read=95/value=128/clients=1 | 4,262,339 B | 4,194,304 B | 1,806,573 B |
-| mixed/read=95/value=128/clients=8 | 4,252,630 B | 4,194,304 B | 1,806,573 B |
-| mixed/read=95/value=128/clients=32 | 4,250,553 B | 4,194,304 B | 1,806,573 B |
-| mixed/read=95/value=65536/clients=1 | 39,422,516 B | 51,425,280 B | 50,039,206 B |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| read/random/hits=0/misses=above/value=128/clients=1 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/hits=0/misses=below/value=128/clients=1 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/hits=0/misses=between/value=128/clients=1 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/hits=50/value=128/clients=1 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/hits=100/value=128/clients=8 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/hits=100/value=128/clients=32 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/key=32768/value=128/clients=1 | 41,984,000 B | 52,056,064 B | — | 16,852,096 B |
+| read/random/value=32/clients=1 | 745,472 B | 2,097,152 B | 655,424 B | 620,281 B |
+| read/random/value=128/clients=1 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| read/random/value=1024/clients=1 | 13,950,976 B | 35,549,184 B | 20,684,864 B | 10,560,281 B |
+| read/random/value=3072/clients=1 | 41,689,088 B | 58,118,144 B | 41,369,664 B | 31,040,281 B |
+| read/random/value=65536/clients=1 | 37,863,424 B | 51,425,280 B | 35,704,896 B | 33,571,456 B |
+| read/random/value=1048576/clients=1 | 67,719,168 B | 84,045,824 B | 67,403,840 B | 67,111,231 B |
+| read/sequential/hits=100/value=128/clients=1 | 1,748,992 B | 4,194,304 B | 1,720,384 B | 1,590,281 B |
+| update/random/grow=32-1024/clients=1 | 17,522,688 B | 4,194,304 B | 2,302,016 B | 1,689,431 B |
+| update/random/grow=32-1024/clients=1/batch=100 | 23,246,959 B | 33,640,448 B | 19,202,112 B | 11,182,031 B |
+| update/random/grow=128-65536/clients=1 | 36,368,508 B | 50,573,312 B | 35,938,368 B | 65,663,880 B |
+| update/random/shrink=1024-32/clients=1 | 30,728,192 B | 35,549,184 B | 20,684,864 B | 10,637,419 B |
+| update/random/shrink=1024-32/clients=1/batch=100 | 30,728,192 B | 35,549,184 B | 21,753,920 B | 11,184,019 B |
+| update/random/shrink=65536-128/clients=1 | 54,640,640 B | 51,425,280 B | 35,872,832 B | 33,874,620 B |
+| update/random/value=32/clients=1 | 17,522,688 B | 2,097,152 B | 655,424 B | 695,431 B |
+| update/random/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 1,762,625 B |
+| update/random/value=128/clients=1/batch=10 | 18,526,208 B | 4,194,304 B | 1,810,496 B | 3,195,625 B |
+| update/random/value=128/clients=1/batch=100 | 18,526,208 B | 4,194,304 B | 2,486,336 B | 3,182,225 B |
+| update/random/value=128/clients=1/batch=1000 | 18,526,208 B | 8,388,608 B | 4,841,536 B | 3,180,795 B |
+| update/random/value=128/clients=8 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 2,141,025 B |
+| update/random/value=128/clients=8/batch=100 | 18,526,208 B | 4,194,304 B | 2,486,336 B | 3,182,225 B |
+| update/random/value=128/clients=32 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 2,141,025 B |
+| update/random/value=128/clients=32/batch=100 | 18,526,208 B | 4,194,304 B | 2,490,432 B | 3,182,225 B |
+| update/random/value=1024/clients=1 | 30,728,192 B | 35,549,184 B | 20,684,864 B | 11,631,419 B |
+| update/random/value=3072/clients=1 | 58,466,304 B | 58,118,144 B | 41,377,856 B | 34,163,515 B |
+| update/random/value=65536/clients=1 | 41,539,284 B | 51,425,280 B | 35,942,464 B | 99,284,620 B |
+| update/sequential/value=128/clients=1/batch=10 | 18,526,208 B | 4,194,304 B | 1,724,480 B | 3,195,625 B |
+| update/sequential/value=128/clients=1/batch=100 | 18,526,208 B | 4,194,304 B | 1,744,960 B | 3,182,225 B |
+| update/sequential/value=128/clients=1/batch=1000 | 18,526,208 B | 4,194,304 B | 2,043,968 B | 3,180,795 B |
+| insert/random/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,953,856 B | 1,762,625 B |
+| insert/random/value=128/clients=1/batch=10 | 18,526,208 B | 8,388,608 B | 4,128,832 B | 3,195,625 B |
+| insert/random/value=128/clients=1/batch=100 | 18,526,208 B | 8,388,608 B | 4,767,808 B | 3,182,225 B |
+| insert/random/value=128/clients=1/batch=1000 | 18,526,208 B | 8,388,608 B | 7,360,576 B | 3,180,795 B |
+| insert/random/value=128/clients=8 | 18,526,208 B | 8,388,608 B | 2,469,952 B | 2,141,025 B |
+| insert/random/value=128/clients=8/batch=100 | 18,526,208 B | 8,388,608 B | 4,784,192 B | 3,182,225 B |
+| insert/random/value=128/clients=32 | 18,526,208 B | 8,388,608 B | 2,465,856 B | 2,141,025 B |
+| insert/random/value=128/clients=32/batch=100 | 18,526,208 B | 8,388,608 B | 4,796,480 B | 3,182,225 B |
+| insert/random/value=65536/clients=1 | 71,774,208 B | 85,176,320 B | 71,594,048 B | 99,284,620 B |
+| insert/sequential/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,884,224 B | 1,762,625 B |
+| insert/sequential/value=128/clients=1/batch=10 | 18,526,208 B | 8,388,608 B | 3,371,072 B | 3,195,625 B |
+| insert/sequential/value=128/clients=1/batch=100 | 18,526,208 B | 8,388,608 B | 3,371,072 B | 3,182,225 B |
+| insert/sequential/value=128/clients=1/batch=1000 | 18,526,208 B | 8,388,608 B | 3,371,072 B | 3,180,795 B |
+| mixed/read=50/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 2,450,625 B |
+| mixed/read=50/value=128/clients=8 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 2,450,625 B |
+| mixed/read=50/value=128/clients=32 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 2,450,625 B |
+| mixed/read=95/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 1,676,625 B |
+| mixed/read=95/value=128/clients=8 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 1,676,625 B |
+| mixed/read=95/value=128/clients=32 | 18,526,208 B | 4,194,304 B | 1,720,384 B | 1,676,625 B |
+| mixed/read=95/value=65536/clients=1 | 41,342,364 B | 51,425,280 B | 35,942,464 B | 50,098,120 B |
 
 #### No commit sync
 
-| Case | KVLite | bbolt | Redis |
-| --- | ---: | ---: | ---: |
-| update/random/grow=32-1024/clients=1 | 3,904,151 B | 2,469,888 B | 1,819,476 B |
-| update/random/grow=32-1024/clients=1/batch=100 | 23,491,011 B | 19,460,096 B | 11,443,376 B |
-| update/random/grow=128-65536/clients=1 | 36,556,544 B | 38,326,272 B | 65,670,376 B |
-| update/random/shrink=1024-32/clients=1 | 41,752,600 B | 35,549,184 B | 10,766,470 B |
-| update/random/shrink=1024-32/clients=1/batch=100 | 42,695,143 B | 35,549,184 B | 11,444,370 B |
-| update/random/shrink=65536-128/clients=1 | 35,937,726 B | 51,425,280 B | 33,815,706 B |
-| update/random/value=32/clients=1 | 2,031,954 B | 2,097,152 B | 825,476 B |
-| update/random/value=128/clients=1 | 4,682,885 B | 4,194,304 B | 1,892,573 B |
-| update/random/value=128/clients=1/batch=10 | 5,457,093 B | 4,194,304 B | 3,469,573 B |
-| update/random/value=128/clients=1/batch=100 | 5,421,529 B | 4,194,304 B | 3,443,473 B |
-| update/random/value=128/clients=1/batch=1000 | 5,328,254 B | 6,082,560 B | 3,440,863 B |
-| update/random/value=128/clients=8 | 5,268,569 B | 4,194,304 B | 2,270,973 B |
-| update/random/value=128/clients=8/batch=100 | 5,421,538 B | 4,194,304 B | 3,443,473 B |
-| update/random/value=128/clients=32 | 5,268,569 B | 4,194,304 B | 2,270,973 B |
-| update/random/value=128/clients=32/batch=100 | 5,421,511 B | 4,194,304 B | 3,443,473 B |
-| update/random/value=1024/clients=1 | 42,744,600 B | 35,549,184 B | 11,760,470 B |
-| update/random/value=3072/clients=1 | 44,802,840 B | 58,118,144 B | 34,290,518 B |
-| update/random/value=65536/clients=1 | 36,298,896 B | 51,425,280 B | 99,225,706 B |
-| update/sequential/value=128/clients=1/batch=10 | 5,212,464 B | 4,194,304 B | 3,469,573 B |
-| update/sequential/value=128/clients=1/batch=100 | 5,129,407 B | 4,194,304 B | 3,443,473 B |
-| update/sequential/value=128/clients=1/batch=1000 | 5,122,417 B | 4,194,304 B | 3,440,863 B |
-| insert/random/value=128/clients=1 | 3,855,000 B | 4,194,304 B | 1,892,573 B |
-| insert/random/value=128/clients=1/batch=10 | 6,866,304 B | 5,910,528 B | 3,469,573 B |
-| insert/random/value=128/clients=1/batch=100 | 6,670,681 B | 6,303,744 B | 3,443,473 B |
-| insert/random/value=128/clients=1/batch=1000 | 6,270,082 B | 7,663,616 B | 3,440,863 B |
-| insert/random/value=128/clients=8 | 4,657,330 B | 4,263,936 B | 2,270,973 B |
-| insert/random/value=128/clients=8/batch=100 | 6,671,401 B | 6,279,168 B | 3,443,473 B |
-| insert/random/value=128/clients=32 | 4,656,617 B | 4,259,840 B | 2,270,973 B |
-| insert/random/value=128/clients=32/batch=100 | 6,661,467 B | 6,266,880 B | 3,443,473 B |
-| insert/random/value=65536/clients=1 | 72,244,992 B | 73,461,760 B | 99,225,706 B |
-| insert/sequential/value=128/clients=1 | 3,923,221 B | 4,194,304 B | 1,892,573 B |
-| insert/sequential/value=128/clients=1/batch=10 | 6,620,138 B | 6,971,392 B | 3,469,573 B |
-| insert/sequential/value=128/clients=1/batch=100 | 5,371,443 B | 6,971,392 B | 3,443,473 B |
-| insert/sequential/value=128/clients=1/batch=1000 | 5,191,218 B | 6,971,392 B | 3,440,863 B |
-| mixed/read=50/value=128/clients=1 | 5,374,667 B | 4,194,304 B | 2,580,573 B |
-| mixed/read=50/value=128/clients=8 | 5,374,667 B | 4,575,232 B | 2,580,573 B |
-| mixed/read=50/value=128/clients=32 | 5,374,667 B | 4,743,168 B | 2,580,573 B |
-| mixed/read=95/value=128/clients=1 | 4,262,339 B | 4,194,304 B | 1,806,573 B |
-| mixed/read=95/value=128/clients=8 | 4,262,339 B | 4,751,360 B | 1,806,573 B |
-| mixed/read=95/value=128/clients=32 | 4,262,339 B | 4,997,120 B | 1,806,573 B |
-| mixed/read=95/value=65536/clients=1 | 39,422,516 B | 51,425,280 B | 50,039,206 B |
+| Case | KVLite | bbolt | LMDB | Redis |
+| --- | ---: | ---: | ---: | ---: |
+| update/random/grow=32-1024/clients=1 | 17,522,688 B | 2,469,888 B | 1,073,750,080 B | 1,689,431 B |
+| update/random/grow=32-1024/clients=1/batch=100 | 23,246,959 B | 19,435,520 B | 1,073,750,080 B | 11,182,031 B |
+| update/random/grow=128-65536/clients=1 | 36,328,995 B | 38,326,272 B | 1,073,750,080 B | 65,663,880 B |
+| update/random/shrink=1024-32/clients=1 | 30,728,192 B | 35,549,184 B | 1,073,750,080 B | 10,637,419 B |
+| update/random/shrink=1024-32/clients=1/batch=100 | 30,728,192 B | 35,549,184 B | 1,073,750,080 B | 11,184,019 B |
+| update/random/shrink=65536-128/clients=1 | 54,640,640 B | 51,425,280 B | 1,073,750,080 B | 33,874,620 B |
+| update/random/value=32/clients=1 | 17,522,688 B | 2,097,152 B | 1,073,750,080 B | 695,431 B |
+| update/random/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,762,625 B |
+| update/random/value=128/clients=1/batch=10 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,195,625 B |
+| update/random/value=128/clients=1/batch=100 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,182,225 B |
+| update/random/value=128/clients=1/batch=1000 | 18,526,208 B | 6,082,560 B | 1,073,750,080 B | 3,180,795 B |
+| update/random/value=128/clients=8 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 2,141,025 B |
+| update/random/value=128/clients=8/batch=100 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,182,225 B |
+| update/random/value=128/clients=32 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 2,141,025 B |
+| update/random/value=128/clients=32/batch=100 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,182,225 B |
+| update/random/value=1024/clients=1 | 30,728,192 B | 35,549,184 B | 1,073,750,080 B | 11,631,419 B |
+| update/random/value=3072/clients=1 | 58,466,304 B | 58,118,144 B | 1,073,750,080 B | 34,163,515 B |
+| update/random/value=65536/clients=1 | 38,454,204 B | 51,425,280 B | 1,073,750,080 B | 99,284,620 B |
+| update/sequential/value=128/clients=1/batch=10 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,195,625 B |
+| update/sequential/value=128/clients=1/batch=100 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,182,225 B |
+| update/sequential/value=128/clients=1/batch=1000 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 3,180,795 B |
+| insert/random/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,762,625 B |
+| insert/random/value=128/clients=1/batch=10 | 18,526,208 B | 5,910,528 B | 1,073,750,080 B | 3,195,625 B |
+| insert/random/value=128/clients=1/batch=100 | 18,526,208 B | 6,303,744 B | 1,073,750,080 B | 3,182,225 B |
+| insert/random/value=128/clients=1/batch=1000 | 18,526,208 B | 7,663,616 B | 1,073,750,080 B | 3,180,795 B |
+| insert/random/value=128/clients=8 | 18,526,208 B | 4,268,032 B | 1,073,750,080 B | 2,141,025 B |
+| insert/random/value=128/clients=8/batch=100 | 18,526,208 B | 6,283,264 B | 1,073,750,080 B | 3,182,225 B |
+| insert/random/value=128/clients=32 | 18,526,208 B | 4,268,032 B | 1,073,750,080 B | 2,141,025 B |
+| insert/random/value=128/clients=32/batch=100 | 18,526,208 B | 6,270,976 B | 1,073,750,080 B | 3,182,225 B |
+| insert/random/value=65536/clients=1 | 71,734,271 B | 73,461,760 B | 1,073,750,080 B | 99,284,620 B |
+| insert/sequential/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,762,625 B |
+| insert/sequential/value=128/clients=1/batch=10 | 18,526,208 B | 6,971,392 B | 1,073,750,080 B | 3,195,625 B |
+| insert/sequential/value=128/clients=1/batch=100 | 18,526,208 B | 6,971,392 B | 1,073,750,080 B | 3,182,225 B |
+| insert/sequential/value=128/clients=1/batch=1000 | 18,526,208 B | 6,971,392 B | 1,073,750,080 B | 3,180,795 B |
+| mixed/read=50/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 2,450,625 B |
+| mixed/read=50/value=128/clients=8 | 18,526,208 B | 4,378,624 B | 1,073,750,080 B | 2,450,625 B |
+| mixed/read=50/value=128/clients=32 | 18,526,208 B | 4,853,760 B | 1,073,750,080 B | 2,450,625 B |
+| mixed/read=95/value=128/clients=1 | 18,526,208 B | 4,194,304 B | 1,073,750,080 B | 1,676,625 B |
+| mixed/read=95/value=128/clients=8 | 18,526,208 B | 4,390,912 B | 1,073,750,080 B | 1,676,625 B |
+| mixed/read=95/value=128/clients=32 | 18,526,208 B | 4,780,032 B | 1,073,750,080 B | 1,676,625 B |
+| mixed/read=95/value=65536/clients=1 | 39,110,604 B | 51,425,280 B | 1,073,750,080 B | 50,098,120 B |
