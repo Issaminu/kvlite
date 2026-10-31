@@ -24,7 +24,7 @@ func (writer testWriter) Write(data []byte) (int, error) {
 }
 
 // TestSupervisorRecordsAndShrinks runs the loop of the supervisor with the test binary as the worker.
-// Every run of 5 or more steps fails at step 4, so the status must list each failed seed, and the shrink must make one seed 5 steps long.
+// Every run of 5 or more steps fails at step 4, so the status must count every failure, retain at most maxSeeds seeds, and shrink one seed to 5 steps.
 // The error must also get one GitHub issue, and the shrink must add the 5-step run to it.
 func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	executable, err := os.Executable()
@@ -69,7 +69,7 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	deadline := time.Now().Add(20 * time.Second)
 	for {
 		errors := s.errors.snapshot()
-		if len(errors) == 1 && errors[0].Seeds[0].Steps == 5 && len(github.commentsOf(101)) == 1 {
+		if len(errors) == 1 && errors[0].Count > maxSeeds && errors[0].Seeds[0].Steps == 5 && len(github.commentsOf(101)) == 1 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -93,8 +93,8 @@ func TestSupervisorRecordsAndShrinks(t *testing.T) {
 	if current.Runs == 0 || current.Failures[kindFail] != current.Runs || current.Commit != "test123" || current.Platform != "testos/testarch" {
 		t.Fatalf("status: %s", data)
 	}
-	// The shrink runs with the same error do not count, so the error has one seed for each run.
-	if len(current.Errors) != 1 || current.Errors[0].Error != "fail: Open: page N is bad" || current.Errors[0].Count != current.Runs || len(current.Errors[0].Seeds) != current.Runs {
+	// Shrink runs with the same error do not count; retained seeds are capped at maxSeeds.
+	if len(current.Errors) != 1 || current.Errors[0].Error != "fail: Open: page N is bad" || current.Errors[0].Count != current.Runs || len(current.Errors[0].Seeds) != min(current.Runs, maxSeeds) {
 		t.Fatalf("status errors: %s", data)
 	}
 	shortest := current.Errors[0].Seeds[0]
