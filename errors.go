@@ -17,6 +17,7 @@ var (
 	ErrChecksum             = page.ErrChecksum
 	ErrTxNotWritable        = errors.New("tx not writable")
 	ErrTxClosed             = errors.New("tx closed")
+	ErrTxFailed             = errors.New("tx failed") // ErrTxFailed means a write in the transaction failed after it changed the transaction. Every later operation in that transaction returns it, and [DB.Update] discards the transaction even when its callback returns nil. The error also wraps the first failure.
 	ErrDatabaseReadOnly     = errors.New("database is in read-only mode")
 	ErrBucketNotFound       = errors.New("bucket not found") // ErrBucketNotFound means a bucket is absent or its handle was removed in the current transaction.
 	ErrBucketExists         = errors.New("bucket already exists")

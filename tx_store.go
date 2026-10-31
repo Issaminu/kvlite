@@ -55,6 +55,8 @@ func (store *txTreeStore) EditNode(id page.ID) (*btree.MutableNode, error) {
 	if err := store.tx.writableError(); err != nil {
 		return nil, err
 	}
+	// The caller changes the returned node, so each call is a change.
+	store.tx.changes++
 	if change, ok := store.dirty[id]; ok {
 		return change.final, nil
 	}
@@ -90,6 +92,7 @@ func (store *txTreeStore) AllocatePage() (page.ID, error) {
 	if err := store.tx.writableError(); err != nil {
 		return 0, err
 	}
+	store.tx.changes++
 	id, err := store.tx.writableAllocation().allocate(store.tx.meta.LastPage())
 	if err != nil {
 		return 0, err
@@ -106,6 +109,7 @@ func (store *txTreeStore) FreePage(id page.ID) error {
 	if err := store.tx.writableError(); err != nil {
 		return err
 	}
+	store.tx.changes++
 	node, err := store.ReadNode(id)
 	if err != nil {
 		return err
@@ -118,6 +122,7 @@ func (store *txTreeStore) FreePage(id page.ID) error {
 }
 
 func (store *txTreeStore) StageNode(node *btree.MutableNode) {
+	store.tx.changes++
 	change := store.baseDirty[node.PageID()]
 	change.final = node
 	store.dirty[node.PageID()] = change

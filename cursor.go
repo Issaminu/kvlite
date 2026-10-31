@@ -77,6 +77,9 @@ func (cursor *Cursor) checkValid() error {
 	if cursor.bucket.tx.closed {
 		return ErrTxClosed
 	}
+	if cursor.bucket.tx.failure != nil {
+		return cursor.bucket.tx.failure
+	}
 	if err := cursor.bucket.liveError(); err != nil {
 		return ErrCursorInvalidated
 	}

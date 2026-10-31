@@ -234,6 +234,10 @@ func callWriteCallback(transaction func(*Tx) error, tx *Tx) (result writeResult)
 	}()
 
 	result.err = transaction(tx)
+	// A callback can ignore a failed write and return nil. The half-changed transaction must not commit.
+	if result.err == nil {
+		result.err = tx.failure
+	}
 	returned = true
 	return result
 }

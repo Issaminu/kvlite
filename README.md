@@ -199,6 +199,8 @@ if err != nil {
 
 `DB.Update` starts a read-write transaction. Its callback can read its own writes. KVLite commits all changes when the callback returns `nil`. It discards all changes when the callback returns an error or panics.
 
+A write that fails after it changed the transaction, for example because of a storage read error, stops the transaction. Every later operation in the callback returns `ErrTxFailed`, and `DB.Update` discards the changes and returns `ErrTxFailed`, also when the callback returns `nil`. A write that rejects its input, for example with `ErrKeyTooLarge`, changes nothing, so the callback can continue. LMDB and PostgreSQL treat a failed write in a transaction the same way.
+
 Do not start a transaction inside another transaction callback. Use the `Tx` value that the callback receives.
 
 A `Tx`, `Bucket`, or `Cursor` is valid only until its transaction callback returns. Do not save it or share it with another goroutine.

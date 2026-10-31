@@ -2,6 +2,7 @@ package kvlite
 
 import (
 	"cmp"
+	"fmt"
 	"slices"
 
 	"github.com/Issaminu/kvlite/internal/btree"
@@ -21,6 +22,8 @@ type Tx struct {
 	metaDirty       bool
 	readOnly        bool
 	closed          bool
+	changes         uint64             // changes counts the changes to private state, so keepFailure can see whether a failed write changed the transaction.
+	failure         error              // failure is the ErrTxFailed error of the first write that failed after it changed the transaction.
 	borrowedValue   bool               // A managed put can retain its input until commit.
 	bucket          *Bucket            // most transactions will only interact with a single bucket, we store it here instead of the [Tx.buckets] map attribute
 	buckets         map[string]*Bucket // created after a second top-level bucket so every caller in this tx observes the same in-memory state
@@ -73,6 +76,8 @@ func (tx *Tx) nodeReader() btree.NodeReader {
 //
 // If fn returns nil, Update commits all changes together. Other database operations can then read them. If fn returns an error, Update discards all changes. It returns that error unless a shared WAL commit fails, as described below.
 //
+// A write that fails after it changed the transaction, for example because of a storage read error, stops the transaction. Every later operation in fn returns [ErrTxFailed]. Update then discards all changes and returns [ErrTxFailed], also when fn returns nil. A write that rejects its input, for example with [ErrKeyTooLarge], changes nothing, so fn can continue.
+//
 // If a write or sync of the write-ahead log fails during the commit, Update returns an error that matches [ErrWALWriteFailed]. The changes can be saved or lost, because the failed write can still reach storage. The DB then stops. Later transactions, reads, writes, and backups return the same error without calling fn. Close the DB and open it again. Then check the data before you repeat a change that is not safe to apply twice.
 //
 // With [SyncNone] and [Options.DisableWAL] enabled, Update waits for active backups before it calls fn. A direct main-file commit failure returns [ErrDatabaseWriteFailed] and stops later data operations. The file can be partly changed or corrupt. A process crash during a direct commit can also damage data from earlier successful transactions.
@@ -116,6 +121,10 @@ func (db *DB) updateDirect(transaction func(tx *Tx) error) error {
 
 	if err := transaction(tx); err != nil {
 		return err
+	}
+	// A callback can ignore a failed write and return nil. The half-changed transaction must not commit.
+	if tx.failure != nil {
+		return tx.failure
 	}
 	needsCheckpoint, err := tx.commit()
 	if err != nil {
@@ -278,7 +287,17 @@ func (tx *Tx) writableError() error {
 	if tx.readOnly {
 		return ErrTxNotWritable
 	}
-	return nil
+	return tx.failure
+}
+
+// keepFailure records *err when it stopped a write after that write changed this transaction.
+// changes is the value of tx.changes from before the write started.
+// The private tree can then be half changed, so every later operation and the end of the callback return [ErrTxFailed].
+// An error before the first change, such as a rejected key, leaves the transaction usable.
+func (tx *Tx) keepFailure(changes uint64, err *error) {
+	if *err != nil && tx.changes != changes && tx.failure == nil {
+		tx.failure = fmt.Errorf("%w: %w", ErrTxFailed, *err)
+	}
 }
 
 // putCatalogEntry writes entry to the transaction's top-level tree and records

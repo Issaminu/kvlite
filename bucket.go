@@ -49,6 +49,9 @@ func (bucket *Bucket) liveError() error {
 	if bucket.tx.closed {
 		return ErrTxClosed
 	}
+	if bucket.tx.failure != nil {
+		return bucket.tx.failure
+	}
 	for current := bucket; current != nil; current = current.parentBucket {
 		if current.deleted {
 			return ErrBucketNotFound
@@ -104,10 +107,11 @@ func (tx *Tx) CreateBucket(bucketName []byte) (*Bucket, error) {
 	return tx.createBucket(nil, bucketName)
 }
 
-func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
+func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (_ *Bucket, err error) {
 	if err := tx.writableError(); err != nil {
 		return nil, err
 	}
+	defer tx.keepFailure(tx.changes, &err)
 	if parent != nil {
 		if err := parent.liveError(); err != nil {
 			return nil, err
@@ -118,7 +122,6 @@ func (tx *Tx) createBucket(parent *Bucket, bucketName []byte) (*Bucket, error) {
 	}
 
 	var existing *Bucket
-	var err error
 	if parent == nil {
 		existing, err = tx.lookupBucket(bucketName)
 	} else {
@@ -187,6 +190,9 @@ func (tx *Tx) Bucket(bucketName []byte) (*Bucket, error) {
 func (tx *Tx) lookupBucket(bucketName []byte) (*Bucket, error) {
 	if tx.closed {
 		return nil, ErrTxClosed
+	}
+	if tx.failure != nil {
+		return nil, tx.failure
 	}
 	if tx.bucket != nil && bytes.Equal(tx.bucket.name, bucketName) {
 		return tx.bucket, nil
@@ -295,14 +301,16 @@ func (bucket *Bucket) lookupBucket(bucketName []byte) (*Bucket, error) {
 // A value larger than [MaxValueSize] returns [ErrValueTooLarge].
 // Larger leaf values and branch keys use continuation pages at commit.
 // If key names a nested bucket, Put returns [ErrIncompatibleValue] instead of replacing it.
-// A returned error does not change the bucket, so the caller can continue to use the transaction.
-func (bucket *Bucket) Put(key, value []byte) error {
+// An error that rejects key or value changes nothing, so the caller can continue to use the transaction.
+// A storage error after Put changed the transaction stops the transaction, and later operations return [ErrTxFailed].
+func (bucket *Bucket) Put(key, value []byte) (err error) {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
+	defer bucket.tx.keepFailure(bucket.tx.changes, &err)
 	return bucket.putBucketEntry(btree.NewEntry(0, key, value))
 }
 
@@ -314,21 +322,21 @@ func (bucket *Bucket) Put(key, value []byte) error {
 // PutBatch copies keys and values before it returns and does not change the input order.
 // The caller must keep entries and their bytes unchanged until it returns.
 // Key, value, bucket-conflict and transaction errors match [Bucket.Put].
-// If an error occurs after changes begin, earlier entries can already be changed in the private transaction.
-// Return the error from [DB.Update] to discard those changes.
+// An error after changes begin stops the transaction: later operations return [ErrTxFailed], and [DB.Update] discards the changes.
 func (bucket *Bucket) PutBatch(entries []KeyValue) error {
 	return bucket.putBatch(entries, false)
 }
 
 // putBatch shares ordering and insertion between callback-owned and managed batches.
 // Only a managed call can borrow large values because it commits before caller code resumes.
-func (bucket *Bucket) putBatch(entries []KeyValue, managed bool) error {
+func (bucket *Bucket) putBatch(entries []KeyValue, managed bool) (err error) {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
+	defer bucket.tx.keepFailure(bucket.tx.changes, &err)
 	for _, entry := range entries {
 		if len(entry.Key) == 0 {
 			return ErrKeyRequired
@@ -374,13 +382,14 @@ func (bucket *Bucket) putBucketEntry(entry btree.Entry) error {
 // Delete removes one plain key and value from this bucket in the current write transaction. Later reads in the same transaction see the change. Other database operations see it after [DB.Update] commits.
 //
 // A missing key returns nil. A key that names a nested bucket returns [ErrIncompatibleValue]. Delete returns [ErrTxNotWritable] for a read-only transaction and [ErrTxClosed] after the callback returns. It returns [ErrKeyRequired] for an empty key and [ErrKeyTooLarge] for a large key.
-func (bucket *Bucket) Delete(key []byte) error {
+func (bucket *Bucket) Delete(key []byte) (err error) {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
+	defer bucket.tx.keepFailure(bucket.tx.changes, &err)
 	newRoot, deleted, err := bucket.tx.tree.DeleteEntry(bucket.rootPageID, key)
 	if err != nil || !deleted {
 		return err
@@ -394,14 +403,15 @@ func (bucket *Bucket) Delete(key []byte) error {
 // DeleteBatch does not change the input order or retain caller bytes after it returns.
 // The caller must keep keys and their bytes unchanged until it returns.
 // It returns the same key and bucket errors as [Bucket.Delete].
-// If it returns an error, the caller must return that error from [DB.Update].
-func (bucket *Bucket) DeleteBatch(keys [][]byte) error {
+// An error after changes begin stops the transaction: later operations return [ErrTxFailed], and [DB.Update] discards the changes.
+func (bucket *Bucket) DeleteBatch(keys [][]byte) (err error) {
 	if err := bucket.tx.writableError(); err != nil {
 		return err
 	}
 	if err := bucket.liveError(); err != nil {
 		return err
 	}
+	defer bucket.tx.keepFailure(bucket.tx.changes, &err)
 	newRoot, changed, err := bucket.tx.tree.DeleteEntries(bucket.rootPageID, keys)
 	if !changed || newRoot == 0 {
 		return err
@@ -414,7 +424,7 @@ func (bucket *Bucket) DeleteBatch(keys [][]byte) error {
 // It also removes nested buckets and releases their pages when [DB.Update] commits.
 //
 // A missing bucket returns [ErrBucketNotFound]. A plain value with this name returns [ErrIncompatibleValue]. An empty name returns [ErrBucketNameRequired]. A read-only transaction returns [ErrTxNotWritable]. A closed transaction returns [ErrTxClosed]. Handles to the removed bucket and its children return [ErrBucketNotFound] until the transaction ends.
-// Return a storage error from the [DB.Update] callback to discard the transaction.
+// A storage error after the removal begins stops the transaction: later operations return [ErrTxFailed], and [DB.Update] discards the changes.
 func (tx *Tx) DeleteBucket(bucketName []byte) error {
 	return tx.deleteBucket(nil, bucketName)
 }
@@ -423,15 +433,16 @@ func (tx *Tx) DeleteBucket(bucketName []byte) error {
 // It also removes child buckets and releases their pages when [DB.Update] commits.
 //
 // A missing bucket returns [ErrBucketNotFound]. A plain value with this name returns [ErrIncompatibleValue]. An empty name returns [ErrBucketNameRequired]. A read-only transaction returns [ErrTxNotWritable]. A closed transaction returns [ErrTxClosed]. Handles to the removed bucket and its children return [ErrBucketNotFound] until the transaction ends.
-// Return a storage error from the [DB.Update] callback to discard the transaction.
+// A storage error after the removal begins stops the transaction: later operations return [ErrTxFailed], and [DB.Update] discards the changes.
 func (bucket *Bucket) DeleteBucket(bucketName []byte) error {
 	return bucket.tx.deleteBucket(bucket, bucketName)
 }
 
-func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
+func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) (err error) {
 	if err := tx.writableError(); err != nil {
 		return err
 	}
+	defer tx.keepFailure(tx.changes, &err)
 	if parent != nil {
 		if err := parent.liveError(); err != nil {
 			return err
@@ -442,7 +453,6 @@ func (tx *Tx) deleteBucket(parent *Bucket, bucketName []byte) error {
 	}
 
 	var target *Bucket
-	var err error
 	if parent == nil {
 		target, err = tx.lookupBucket(bucketName)
 	} else {

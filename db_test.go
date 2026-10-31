@@ -959,6 +959,64 @@ func TestBucketPut_RootSplitReturnsCatalogReadError(t *testing.T) {
 	}
 }
 
+// TestUpdate_FailedWriteStopsTheTransaction checks that a write that fails after it changed the transaction stops that transaction.
+// The callback ignores the error and returns nil, so Update must refuse to commit the half-changed tree.
+// LMDB marks such a transaction with MDB_TXN_ERROR, and PostgreSQL aborts it, in the same way.
+func TestUpdate_FailedWriteStopsTheTransaction(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		sync Sync
+	}{{"SyncNormal", SyncNormal}, {"SyncFull", SyncFull}} {
+		t.Run(mode.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "database")
+			fsys := &failMainPageReadFS{name: path}
+			db, err := open(path, 0600, &Options{Synchronous: mode.sync}, fsys)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			createBucket(t, db, testBucketName)
+			// After a checkpoint, reads come from the main file and not from WAL records in memory.
+			if err := db.Checkpoint(); err != nil {
+				t.Fatal(err)
+			}
+			fsys.offset = int64(db.meta.Root()) * db.meta.PageSize()
+
+			// SyncFull runs the callback on another goroutine, so the callback reports through these values and not through t.
+			var putErr, laterErr error
+			err = db.Update(func(tx *Tx) error {
+				bucket, err := tx.Bucket(testBucketName)
+				if err != nil {
+					return err
+				}
+				fsys.armed = true
+				value := bytes.Repeat([]byte("v"), int(tx.meta.PageSize()/3))
+				for index := range 64 {
+					if putErr = bucket.Put(fmt.Appendf(nil, "key-%04d", index), value); putErr != nil {
+						break
+					}
+				}
+				fsys.armed = false
+				_, laterErr = bucket.Get([]byte("key-0000"))
+				// The callback ignores both errors on purpose.
+				return nil
+			})
+			if !errors.Is(putErr, errInjectedRead) {
+				t.Fatalf("Put: got %v, want the injected read error after a root split", putErr)
+			}
+			if !errors.Is(laterErr, ErrTxFailed) {
+				t.Fatalf("later Get in the failed transaction: got %v, want ErrTxFailed", laterErr)
+			}
+			if !errors.Is(err, ErrTxFailed) || !errors.Is(err, errInjectedRead) {
+				t.Fatalf("Update: got %v, want ErrTxFailed that wraps the injected read error", err)
+			}
+			if _, err := db.Get(testBucketName, []byte("key-0000")); !errors.Is(err, ErrKeyNotFound) {
+				t.Fatalf("Update committed the failed transaction: %v", err)
+			}
+		})
+	}
+}
+
 func TestBucketPut_RejectedEntryLeavesTransactionUsable(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "database")
 	db, err := Open(path, 0600, &Options{Synchronous: SyncNone})
