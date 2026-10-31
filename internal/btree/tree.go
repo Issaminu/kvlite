@@ -16,7 +16,7 @@ type Store interface {
 	PageSize() int64
 	// Writable reports whether this transaction permits node and allocation changes.
 	Writable() bool
-	// EditNode returns a private writable node. Repeated edits reuse it.
+	// EditNode returns a private writable node with the entries that ReadNode returns for the same ID. Repeated edits reuse it.
 	// A read-only transaction returns an error.
 	EditNode(page.ID) (*MutableNode, error)
 	// AllocatePage returns a page ID that no other node uses.
@@ -166,7 +166,7 @@ func (tree *Tree) PutEntry(root page.ID, entry Entry) (page.ID, error) {
 	if err != nil {
 		return 0, err
 	}
-	existing, found, _, err := node.Lookup(entry.Key(), true)
+	index, existing, found, err := node.lookupLeaf(entry.Key())
 	if err != nil {
 		return 0, err
 	}
@@ -193,10 +193,8 @@ func (tree *Tree) PutEntry(root page.ID, entry Entry) (page.ID, error) {
 	if err != nil {
 		return 0, err
 	}
-	prepared, err := private.prepareInsert(entry)
-	if err != nil {
-		return 0, err
-	}
+	// The private node has the entries of node, so the search result is valid for it.
+	prepared := leafInsert{entry: entry, index: index, found: found}
 	private.applyInsert(prepared)
 	if err := tree.recordBucketParent(private.PageID(), entry); err != nil {
 		return 0, err

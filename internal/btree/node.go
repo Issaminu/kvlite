@@ -92,6 +92,23 @@ func (view Node) Lookup(key []byte, includeKey bool) (entry Entry, found bool, c
 	return
 }
 
+// lookupLeaf searches a leaf for key, which the caller has already checked.
+// It returns the entry and its index when found, or the index where key would go.
+func (view Node) lookupLeaf(key []byte) (index int, entry Entry, found bool, err error) {
+	if !view.IsLeaf() {
+		return 0, Entry{}, false, ErrNotLeafNode
+	}
+	if view.node != nil {
+		index, found, err = view.node.findKeyIndex(key)
+		if found {
+			entry = view.node.entries[index]
+		}
+		return
+	}
+	index, found, err = lookupLeafBody(view.image, uint32(view.EntryCount()), key, true, &entry)
+	return
+}
+
 // Clone returns a private decoded node with independent entry and child lists.
 // Keys and values remain read-only and can borrow the source storage. Call OwnImageBytes before persistence can overwrite or release an encoded source.
 // The result never aliases the MutableNode backing this read-only view.
