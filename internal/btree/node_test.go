@@ -2273,6 +2273,9 @@ func TestNodeChildrenValidateOnlyRequiredMetadata(t *testing.T) {
 	if err := visitNodeChildren(node, []byte("a"), nil, false, func(page.ID) error { return nil }); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("bounded traversal accepted an invalid separator: %v", err)
 	}
+	if err := visitNodeChildren(node, nil, []byte("z"), false, func(page.ID) error { return nil }); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("bounded traversal accepted an invalid end separator: %v", err)
+	}
 	if err := node.VisitReferences(pageSize, func(page.ID) error { return nil }, nil); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("integrity check accepted an invalid separator: %v", err)
 	}

@@ -369,23 +369,18 @@ func (node Node) visitReverse(visit func(uint32, []byte, []byte) error) error {
 
 // children returns an iterator over branch children whose ranges intersect [start,end).
 // Empty bounds are unbounded. reverse selects descending key order.
-// Encoded child IDs are checked before iteration. Bounded ranges also check separator keys;
-// unbounded traversal does not read them. VisitReferences checks the full node.
+// Encoded child IDs are checked before iteration.
+// Bounded ranges check only the separator keys that they read; unbounded traversal does not read them.
+// VisitReferences checks the full node.
 func (node Node) children(start, end []byte, reverse bool) (childIterator, error) {
 	if node.IsLeaf() {
 		return childIterator{}, ErrNotBranchNode
 	}
 	count := node.EntryCount()
 	if node.node == nil {
-		if len(start) != 0 || len(end) != 0 {
-			if err := checkBranchBody(node.image, NodeHeader{EntryCount: uint32(count)}, true, nil); err != nil {
-				return childIterator{}, err
-			}
-		} else {
-			for index := 0; index <= count; index++ {
-				if _, ok := branchChild(node.image, count, index); !ok {
-					return childIterator{}, childError(index)
-				}
+		for index := 0; index <= count; index++ {
+			if _, ok := branchChild(node.image, count, index); !ok {
+				return childIterator{}, childError(index)
 			}
 		}
 	}
@@ -399,12 +394,9 @@ func (node Node) children(start, end []byte, reverse bool) (childIterator, error
 	}
 	if len(end) > 0 {
 		for index := first; index < count; index++ {
-			var separator []byte
-			if node.node != nil {
-				separator = node.node.entries[index].key
-			} else {
-				from, to := branchKey(node.image, index)
-				separator = node.image[from:to]
+			separator, err := node.separator(index)
+			if err != nil {
+				return childIterator{}, err
 			}
 			if bytes.Compare(separator, end) >= 0 {
 				last = index
