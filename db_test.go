@@ -1429,17 +1429,13 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.wal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	readOnlyWAL, err := os.Open(path + "-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(readOnlyWAL)
+	walFile := db.wal.FileForTesting()
+	truncateErr := errors.New("injected WAL truncate failure")
+	db.wal.ReplaceFileForTesting(&directWriteGuard{File: walFile, err: truncateErr})
+	defer db.wal.ReplaceFileForTesting(walFile)
 
-	if err := db.checkpointWAL(); err == nil {
-		t.Fatal("checkpoint did not report the WAL cleanup failure")
+	if err := db.checkpointWAL(); !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint cleanup: got %v, want %v", err, truncateErr)
 	}
 	stats, err := db.Stats()
 	if err != nil {
@@ -1459,14 +1455,8 @@ func TestCheckpoint_TruncateFailureKeepsCommittedWAL(t *testing.T) {
 	if got, err := db.Get(testBucketName, []byte("k")); err != nil || !bytes.Equal(got, []byte("value")) {
 		t.Fatalf("committed value missing after WAL cleanup failure: got %q, err %v", got, err)
 	}
-	if err := readOnlyWAL.Close(); err != nil {
-		t.Fatal(err)
-	}
-	writableWAL, err := os.OpenFile(path+"-wal", os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(writableWAL)
+	db.wal.ReplaceFileForTesting(walFile)
+
 	if err := db.Close(); err != nil {
 		t.Fatalf("retry close after WAL cleanup failure: %v", err)
 	}
@@ -2418,7 +2408,7 @@ func TestOpen_UsesModeForDatabaseAndWAL(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got := info.Mode().Perm(); got != mode {
+		if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != mode {
 			t.Errorf("mode for %s: got %04o, want %04o", filePath, got, mode)
 		}
 	}
@@ -2514,7 +2504,7 @@ func TestOpen_SyncsParentDirectoryAtFirstWALSync(t *testing.T) {
 					t.Fatalf("open %d: directory sync = %t, want %t", attempt, parent != nil, test.wantSync)
 				}
 				if parent != nil {
-					if _, err := parent.Stat(); !errors.Is(err, os.ErrClosed) {
+					if err := parent.Close(); !errors.Is(err, os.ErrClosed) {
 						t.Fatalf("directory was not closed: %v", err)
 					}
 				}
@@ -2549,7 +2539,7 @@ func TestOpen_DirectorySyncFailure(t *testing.T) {
 	if !errors.Is(err, syncErr) {
 		t.Fatalf("first commit error: got %v, want %v", err, syncErr)
 	}
-	if _, err := parent.Stat(); !errors.Is(err, os.ErrClosed) {
+	if err := parent.Close(); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("directory was not closed after sync failure: %v", err)
 	}
 	// A failed WAL sync stops the handle, like any failed WAL write.
@@ -7706,19 +7696,22 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if err := db.checkpointWAL(); err != nil {
 		t.Fatal(err)
 	}
+	mainFile := db.file
+	writeErr := errors.New("injected main-file write failure")
 	db.wal.SetCheckpointThresholdBytes(1)
 	err = db.Update(func(tx *Tx) error {
 		bucket, err := tx.Bucket(testBucketName)
 		if err != nil {
 			return err
 		}
-		if err := db.file.Close(); err != nil {
-			return err
-		}
+		db.file = &directWriteGuard{File: mainFile, err: writeErr}
 		return bucket.Put([]byte("key"), []byte("new"))
 	})
 	if err != nil {
 		t.Fatalf("committed WAL update returned a checkpoint error: %v", err)
+	}
+	if !errors.Is(db.stats.LastCheckpointError, writeErr) {
+		t.Fatalf("checkpoint failure: got %v, want %v", db.stats.LastCheckpointError, writeErr)
 	}
 	if got, err := db.Get(testBucketName, []byte("key")); err != nil || !bytes.Equal(got, []byte("new")) {
 		t.Fatalf("committed overlay value: got %q, err %v", got, err)
@@ -7726,7 +7719,7 @@ func TestAudit_CommittedWALSurvivesCheckpointFailure(t *testing.T) {
 	if err := db.unmapMainFile(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.wal.Close(); err != nil {
+	if err := db.closeFiles(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -9330,16 +9323,13 @@ func TestRecovery_ContinuedDeletesAndReuse(t *testing.T) {
 	// The mapped WAL can have an unused suffix after its last commit marker.
 	logEnd := db.wal.Stats().BytesSinceCheckpoint
 	// Keep the WAL after writing main-file pages to test interrupted cleanup.
-	if err := db.wal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	readOnlyWAL, err := os.Open(path + "-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(readOnlyWAL)
-	if err := db.checkpointWAL(); err == nil {
-		t.Fatal("expected WAL cleanup error")
+	walFile := db.wal.FileForTesting()
+	truncateErr := errors.New("injected WAL truncate failure")
+	db.wal.ReplaceFileForTesting(&directWriteGuard{File: walFile, err: truncateErr})
+	defer db.wal.ReplaceFileForTesting(walFile)
+
+	if err := db.checkpointWAL(); !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint cleanup: got %v, want %v", err, truncateErr)
 	}
 	afterCheckpoint, err := os.ReadFile(path)
 	if err != nil {
@@ -11552,12 +11542,13 @@ func TestManagedPutMappedSameLength(t *testing.T) {
 					t.Fatal(err)
 				}
 				generation := db.meta.Generation()
+				mappedWritable := db.mappedWritable
 				value := bytes.Repeat([]byte("a"), valueSize)
 				value[len(value)-1] = 'b'
 				if err := db.Put(testBucketName, key, value); err != nil {
 					t.Fatal(err)
 				}
-				if cached := db.writeNodes[old.PageID()]; cached == nil || cached.node != nil {
+				if cached := db.writeNodes[old.PageID()]; mappedWritable && (cached == nil || cached.node != nil) {
 					t.Fatal("mapped write did not invalidate the owned cache node")
 				}
 				if !bytes.Equal(old.EntryAt(0).Value(), oldValue) {

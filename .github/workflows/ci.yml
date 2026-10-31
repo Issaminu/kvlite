@@ -27,34 +27,43 @@ jobs:
         working-directory: benchmarks/kvbench
         run: go test -race -timeout=10m ./...
 
-  test-32-bit:
-    name: Test KVLite on 32-bit Linux
-    runs-on: ubuntu-24.04
-    # The amd64 runner runs 386 programs natively, so these tests run on a real 32-bit build.
+  test-platforms:
+    name: Test KVLite on ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    # The test job above tests linux/amd64.
     # KVBench needs cgo for LMDB, so this job tests KVLite only.
+    # An amd64 runner runs 386 programs natively, so the 386 targets run real 32-bit builds.
+    # Go has no darwin/386 port, and macOS runs no 32-bit programs.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: 386, runner: ubuntu-24.04 }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm }
+          - { goos: linux, goarch: arm, runner: ubuntu-24.04 }
+          - { goos: windows, goarch: amd64, runner: windows-2025 }
+          - { goos: windows, goarch: 386, runner: windows-2025 }
+          - { goos: windows, goarch: arm64, runner: windows-11-arm }
+          - { goos: darwin, goarch: amd64, runner: macos-15-intel }
+          - { goos: darwin, goarch: arm64, runner: macos-15 }
     env:
-      GOARCH: '386'
+      GOARCH: ${{ matrix.goarch }}
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
         with:
           go-version: '1.26.8'
 
-      - name: Test KVLite
-        run: go test -timeout=5m ./...
-
-  test-windows:
-    name: Test KVLite on Windows
-    runs-on: windows-2025
-    # KVBench needs cgo for LMDB, so this job tests KVLite only.
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
-        with:
-          go-version: '1.26.8'
+      # No hosted runner runs 32-bit Arm programs, so QEMU runs the linux/arm tests on the amd64 runner.
+      - name: Install QEMU for linux/arm
+        if: matrix.goarch == 'arm'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          echo "GOFLAGS=-exec=qemu-arm" >> "$GITHUB_ENV"
 
       - name: Test KVLite
-        run: go test -timeout=10m ./...
+        run: go test -timeout=20m ./...
 
   vet:
     name: Vet for each supported platform

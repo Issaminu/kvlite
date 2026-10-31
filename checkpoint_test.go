@@ -232,29 +232,20 @@ func TestDBCheckpointRetriesWALCleanup(t *testing.T) {
 	if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.wal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	readOnly, err := os.Open(path + "-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(readOnly)
-	defer readOnly.Close()
-	if err := db.Checkpoint(); err == nil {
-		t.Fatal("checkpoint hid failed WAL cleanup")
+	walFile := db.wal.FileForTesting()
+	truncateErr := errors.New("injected WAL truncate failure")
+	db.wal.ReplaceFileForTesting(&directWriteGuard{File: walFile, err: truncateErr})
+	defer db.wal.ReplaceFileForTesting(walFile)
+	if err := db.Checkpoint(); !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint cleanup: got %v, want %v", err, truncateErr)
 	}
 	if db.wal.Stats().CommittedRecordCount != 0 {
 		t.Fatal("fixture did not reach WAL cleanup after writing the main file")
 	}
-	if err := db.Checkpoint(); err == nil {
-		t.Fatal("checkpoint skipped failed cleanup because the overlay was empty")
+	if err := db.Checkpoint(); !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint cleanup retry: got %v, want %v", err, truncateErr)
 	}
-	writable, err := os.OpenFile(path+"-wal", os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(writable)
+	db.wal.ReplaceFileForTesting(walFile)
 	if err := db.Checkpoint(); err != nil {
 		t.Fatalf("could not retry WAL cleanup: %v", err)
 	}
