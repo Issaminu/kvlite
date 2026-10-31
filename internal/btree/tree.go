@@ -54,8 +54,7 @@ func NewTree(store Store) *Tree {
 }
 
 // Fork starts an independent tree traversal over a new transaction store.
-// Parent links remain shared until the first change, so a failed batch callback
-// cannot change the links retained by an earlier successful callback.
+// Parent links remain shared until the first change, so a failed batch callback cannot change the links retained by an earlier successful callback.
 func (tree *Tree) Fork(store Store) Tree {
 	return Tree{store: store, parents: tree.parents, parentsShared: true, SkipIdenticalPuts: tree.SkipIdenticalPuts, readOnly: !store.Writable()}
 }
@@ -116,8 +115,7 @@ func (tree *Tree) recordBucketParent(parent page.ID, entry Entry) error {
 }
 
 // FindEntryRef searches the tree at root without cursor state.
-// Returned bytes are read-only and borrow the transaction. includeKey allows
-// an encoded leaf to omit the matched key. A missing key returns found false.
+// Returned bytes are read-only and borrow the transaction. includeKey allows an encoded leaf to omit the matched key. A missing key returns found false.
 // An empty or oversized key returns [ErrKeyRequired] or [ErrKeyTooLarge].
 func (tree *Tree) FindEntryRef(root page.ID, key []byte, includeKey bool) (Entry, bool, error) {
 	if err := validateLookupKey(key); err != nil {

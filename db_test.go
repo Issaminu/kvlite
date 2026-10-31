@@ -1360,10 +1360,8 @@ func TestSplit_PropagatesToParent(t *testing.T) {
 	}
 }
 
-// TestSplit_Cascades: force the tree to depth 3 — enough leaves that the ROOT BRANCH
-// itself overflows a page and must split, minting a new root above two BRANCH children.
-// This is the first test that exercises a BRANCH split (not just a leaf split). Large,
-// same-size keys bloat the separators so the root branch fills fast.
+// TestSplit_Cascades: force the tree to depth 3 — enough leaves that the ROOT BRANCH itself overflows a page and must split, minting a new root above two BRANCH children.
+// This is the first test that exercises a BRANCH split (not just a leaf split). Large, same-size keys bloat the separators so the root branch fills fast.
 func TestSplit_Cascades(t *testing.T) {
 	path := tempfile()
 	defer os.RemoveAll(path)
@@ -6342,8 +6340,7 @@ func TestCreateBucket_OwnsNameAfterCallerMutatesBuffer(t *testing.T) {
 			return err
 		}
 
-		// Simulate the caller reusing its name buffer for something else, the way a
-		// scratch key-building buffer would be reused across iterations.
+		// Simulate the caller reusing its name buffer for something else, the way a scratch key-building buffer would be reused across iterations.
 		copy(name, "bbbb")
 
 		for i := range n {

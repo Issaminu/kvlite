@@ -188,10 +188,7 @@ func LookupNode(node *MutableNode, key []byte) (Entry, bool, page.ID, error) {
 }
 
 // NeedsSplit reports whether the node exceeds one page and has enough entries to split.
-// A leaf needs two entries. A branch needs three keys so both results keep at
-// least two children. Fewer large entries use continuation pages. Splitting
-// a two-key branch would create a one-child side and make large-key inserts
-// grow the tree by one level at each split.
+// A leaf needs two entries. A branch needs three keys so both results keep at least two children. Fewer large entries use continuation pages. Splitting a two-key branch would create a one-child side and make large-key inserts grow the tree by one level at each split.
 // This saves the size for commit preparation. The caller must own the node.
 func (n *MutableNode) NeedsSplit(pageSize int64) bool {
 	minimum := 2
@@ -290,23 +287,16 @@ func (n *MutableNode) Split(newPageID page.ID, pageSize int64) (*MutableNode, []
 	return rightNode, separator, nil
 }
 
-// redistributionScore describes the two pages we would get by moving entries
-// between neighbors. The score is valid only if both pages fit. underfull says
-// how many more bytes the pages need to reach the target size. imbalance says
-// how far apart their sizes are. Smaller values are better.
+// redistributionScore describes the two pages we would get by moving entries between neighbors. The score is valid only if both pages fit. underfull says how many more bytes the pages need to reach the target size. imbalance says how far apart their sizes are. Smaller values are better.
 type redistributionScore struct {
 	underfull int64 // for nuking the node and putting it's content in the left/right nodes. underfull is "how much of the left/right node's size remains to reach the 25% target (a quarter of a page's size)"
 	imbalance int64 // for NOT nuking the node, and taking some of the left/right node's content into the node. imbalance is "if we were to distribute some of the left/right node's content into the node, what's the difference would be between the left/right size and the node's size?"
 	valid     bool
 }
 
-// chooseSiblingRedistribution decides which neighbor should share entries with
-// node. It tries left with node and node with right on copies. The pages stay
-// unchanged until the caller makes the chosen move.
+// chooseSiblingRedistribution decides which neighbor should share entries with node. It tries left with node and node with right on copies. The pages stay unchanged until the caller makes the chosen move.
 //
-// First prefer the pair that leaves fewer bytes below the target size. If the
-// pairs tie, prefer the pair with sizes closer together. An exact tie selects
-// left. ok is false if neither pair can make two pages that fit.
+// First prefer the pair that leaves fewer bytes below the target size. If the pairs tie, prefer the pair with sizes closer together. An exact tie selects left. ok is false if neither pair can make two pages that fit.
 func chooseSiblingRedistribution(parent *MutableNode, childIndex int, left, node, right *MutableNode, pageSize, minimumSize int64) (useLeft, ok bool) {
 	leftScore := redistributionScore{}
 	if left != nil {
@@ -347,8 +337,7 @@ func scoreRedistribution(parent *MutableNode, separatorIndex int, left, right *M
 
 // mergedChildrenSize checks if left can hold all of right before a merge.
 // It counts the bytes that the merged node would write. It changes no node.
-// For leaves, the parent key already occurs in right. For branches, the parent
-// key moves into the merged node, along with the child page IDs.
+// For leaves, the parent key already occurs in right. For branches, the parent key moves into the merged node, along with the child page IDs.
 func mergedChildrenSize(parent *MutableNode, separatorIndex int, left, right *MutableNode) int64 {
 	size := NodeHeaderSize
 	for _, entry := range left.entries {
@@ -358,22 +347,17 @@ func mergedChildrenSize(parent *MutableNode, separatorIndex int, left, right *Mu
 		size += entry.EncodedSize(right.IsLeaf())
 	}
 	if !left.IsLeaf() {
-		// Each branch entry counts one child ID. A branch has one more child
-		// than entries, so count that last ID as well.
+		// Each branch entry counts one child ID. A branch has one more child than entries, so count that last ID as well.
 		size += parent.entries[separatorIndex].EncodedSize(false)
 		size += page.IDSize
 	}
 	return int64(size)
 }
 
-// redistributeChildren moves entries between two adjacent pages that cannot
-// merge. It chooses a place to divide their entries, then changes both pages
-// and the parent key between them. It returns false without changes if no
-// division makes two pages that fit.
+// redistributeChildren moves entries between two adjacent pages that cannot merge. It chooses a place to divide their entries, then changes both pages and the parent key between them. It returns false without changes if no division makes two pages that fit.
 //
 // For leaves, the parent must store the first key in the new right page.
-// For branches, the old parent key goes between the two entry lists. The chosen
-// dividing key then moves from the list into the parent.
+// For branches, the old parent key goes between the two entry lists. The chosen dividing key then moves from the list into the parent.
 func redistributeChildren(parent *MutableNode, separatorIndex int, left, right *MutableNode, pageSize, minimumSize int64) bool {
 	var ok bool
 	if left.IsLeaf() {
@@ -384,8 +368,7 @@ func redistributeChildren(parent *MutableNode, separatorIndex int, left, right *
 	if !ok {
 		return false
 	}
-	// These three pages now have different bytes. Their old checksums no
-	// longer match them.
+	// These three pages now have different bytes. Their old checksums no longer match them.
 	left.header.Checksum = 0
 	right.header.Checksum = 0
 	parent.header.Checksum = 0
@@ -393,22 +376,17 @@ func redistributeChildren(parent *MutableNode, separatorIndex int, left, right *
 }
 
 // redistributionPenalty measures how well two pages use their space.
-// For a target of 64 bytes, pages of 40 and 80 bytes miss the target by 24
-// bytes in total. Their sizes differ by 40 bytes. Callers compare the first
-// result before the second, so they first try to make both pages less empty.
+// For a target of 64 bytes, pages of 40 and 80 bytes miss the target by 24 bytes in total. Their sizes differ by 40 bytes. Callers compare the first result before the second, so they first try to make both pages less empty.
 func redistributionPenalty(leftSize, rightSize, minimumSize int64) (underfull, imbalance int64) {
 	underfull = max(minimumSize-leftSize, 0) + max(minimumSize-rightSize, 0)
 	return underfull, max(leftSize-rightSize, rightSize-leftSize)
 }
 
 // mergeChildren puts right into left and removes right from their parent.
-// The caller first checks that all data will fit in left. After this call,
-// the caller returns right's page to the store.
+// The caller first checks that all data will fit in left. After this call, the caller returns right's page to the store.
 // mergeChildren only reads right, so right can borrow committed storage.
 //
-// For leaves, the parent's key is already the first key in right. For
-// branches, that key exists only in the parent. When branches join, the key
-// moves down between their two groups of keys.
+// For leaves, the parent's key is already the first key in right. For branches, that key exists only in the parent. When branches join, the key moves down between their two groups of keys.
 func mergeChildren(parent *MutableNode, separatorIndex int, left, right *MutableNode) {
 	left.encodedSize = 0
 	parent.encodedSize = 0
@@ -437,8 +415,7 @@ func (n *MutableNode) WALBodyOffset() int {
 }
 
 // VisitNodeReferences visits child nodes and continuation pages separately.
-// visit receives branch children or nested bucket roots. visitContinuation
-// receives storage pages of this node; these pages are not tree children.
+// visit receives branch children or nested bucket roots. visitContinuation receives storage pages of this node; these pages are not tree children.
 // Pass nil for visitContinuation when only child references are needed.
 func VisitNodeReferences(node *MutableNode, visit, visitContinuation func(page.ID) error) error {
 	if visitContinuation != nil {
@@ -465,8 +442,7 @@ func (n *MutableNode) OwnBorrowedValues() {
 }
 
 // OwnImageBytes copies entries borrowed from an encoded node image.
-// Call it before persistence can overwrite or unmap that image. Entries replaced
-// or deleted during the transaction no longer need a copy.
+// Call it before persistence can overwrite or unmap that image. Entries replaced or deleted during the transaction no longer need a copy.
 func (n *MutableNode) OwnImageBytes() {
 	for index := range n.entries {
 		entry := &n.entries[index]

@@ -714,8 +714,7 @@ func (wal *WAL) reachedCheckpointThreshold() bool {
 }
 
 // ReadNode borrows the node stored in a verified committed WAL record.
-// pageSize is the database's physical page size. The record must remain unchanged
-// while the result is in use.
+// pageSize is the database's physical page size. The record must remain unchanged while the result is in use.
 func (record *CommittedPage) ReadNode(pageSize int64) (btree.Node, error) {
 	if record.Node != nil {
 		return record.Node.ReadOnly(), nil

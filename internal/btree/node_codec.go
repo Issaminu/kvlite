@@ -235,8 +235,7 @@ func LookupMappedNode(data []byte, id page.ID, key []byte, readPage func(page.ID
 }
 
 // ReadCheckedNodeSpan borrows a main-file node after storage checked its span.
-// data must be the complete padded span returned after NodeSpan and
-// CheckNodeChecksumMode. checksums still verifies the actual stored bytes.
+// data must be the complete padded span returned after NodeSpan and CheckNodeChecksumMode. checksums still verifies the actual stored bytes.
 func ReadCheckedNodeSpan(data []byte, checksums bool) (Node, error) {
 	if checksums {
 		if err := checkPageChecksum(data, int64(len(data)), nodeChecksumOffset, true); err != nil {

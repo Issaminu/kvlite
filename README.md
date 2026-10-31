@@ -571,6 +571,14 @@ BLACKOUT=1 go test ./... -count=1
 
 To run more seeds or replay a failure, see [Crash testing with Blackout](#crash-testing-with-blackout).
 
+CI also runs the tests on Linux, Windows, and macOS, on amd64 and Arm, and on 32-bit builds. It runs `go vet` on Linux amd64, and it builds KVLite for FreeBSD, OpenBSD, NetBSD, Solaris, and illumos. A Linux amd64 machine can run the 32-bit tests directly. On any machine, `go vet` with another `GOOS` and `GOARCH` checks that the code builds for that platform:
+
+```sh
+GOARCH=386 go test ./... -count=1
+GOOS=windows GOARCH=386 go vet ./...
+GOOS=linux GOARCH=arm go vet ./...
+```
+
 ## License
 
 KVLite is available under the [MIT License](LICENSE).

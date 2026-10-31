@@ -18,8 +18,8 @@ import (
 )
 
 const (
-	MaxKeySize              = btree.MaxKeySize
-	MaxValueSize            = btree.MaxValueSize
+	MaxKeySize              = btree.MaxKeySize   // MaxKeySize is the largest key length in bytes. A longer key returns ErrKeyTooLarge.
+	MaxValueSize            = btree.MaxValueSize // MaxValueSize is the largest value length in bytes. A longer value returns ErrValueTooLarge.
 	maxCachedWriteNodePages = 1024
 )
 

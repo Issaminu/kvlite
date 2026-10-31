@@ -4,14 +4,11 @@
 // MutableNode holds private editable lists. A transaction supplies permission through Store.EditNode and owns surviving image bytes before persistence.
 // Entry keeps each leaf key, value, and kind together.
 //
-// NodeReader has one read operation. Storage resolves committed memory, WAL,
-// and main-file data. The transaction overlays its own and earlier batch edits.
+// NodeReader has one read operation. Storage resolves committed memory, WAL, and main-file data. The transaction overlays its own and earlier batch edits.
 // Tree owns traversal, parent links, splitting, merging, and reference repair.
 // Cursor keeps only a path and position; nodeEntries owns encoded entry bounds.
 //
-// node.go contains read-facing operations; mutable_node.go contains editable
-// node data and local balance operations. Node encoding stays in node_codec.go,
-// leaf_codec.go, and branch_codec.go. Tree operations live in tree.go.
+// node.go contains read-facing operations; mutable_node.go contains editable node data and local balance operations. Node encoding stays in node_codec.go, leaf_codec.go, and branch_codec.go. Tree operations live in tree.go.
 // Searches that keep no state (point, batch, and range reads) live in search.go.
 // Ordered cursor movement lives in cursor.go.
 //

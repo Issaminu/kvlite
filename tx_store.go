@@ -41,8 +41,7 @@ func (store *txTreeStore) privateNode(id page.ID) *btree.MutableNode {
 	return nil
 }
 
-// ReadNode resolves this callback, earlier successful batch callbacks, then
-// committed storage. It does not decode or retain nodes merely to read them.
+// ReadNode resolves this callback, earlier successful batch callbacks, then committed storage. It does not decode or retain nodes merely to read them.
 func (store *txTreeStore) ReadNode(id page.ID) (btree.Node, error) {
 	if node := store.privateNode(id); node != nil {
 		return node.ReadOnly(), nil

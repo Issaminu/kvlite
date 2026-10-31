@@ -13,8 +13,7 @@ import (
 // The caller must keep the visible tree unchanged during a traversal.
 type NodeReader interface {
 	// ReadNode returns the read-only node whose first storage page is id.
-	// It borrows storage for the enclosing operation's lifetime. An unreadable,
-	// unallocated node returns an error, rather than a missing key.
+	// It borrows storage for the enclosing operation's lifetime. An unreadable, unallocated node returns an error, rather than a missing key.
 	// Acquisition checks the header and checksum; operations check the entries they use.
 	ReadNode(id page.ID) (Node, error)
 }
@@ -43,8 +42,7 @@ func (view Node) IsLeaf() bool {
 	return mappedNodeType(view.image) == NodeTypeLeaf
 }
 
-// Entry returns the checked leaf entry at index. Its bytes are read-only and
-// borrow the node. An invalid index or descriptor returns ErrInvalid.
+// Entry returns the checked leaf entry at index. Its bytes are read-only and borrow the node. An invalid index or descriptor returns ErrInvalid.
 func (view Node) Entry(index int) (Entry, error) {
 	if !view.IsLeaf() || index < 0 || index >= view.EntryCount() {
 		return Entry{}, ErrInvalid
@@ -77,8 +75,7 @@ func (view Node) Child(index int) (page.ID, error) {
 	return id, nil
 }
 
-// Lookup searches one node. A leaf returns an entry and found; a branch returns
-// the child page to search next. A missing leaf key returns found false and child zero.
+// Lookup searches one node. A leaf returns an entry and found; a branch returns the child page to search next. A missing leaf key returns found false and child zero.
 // includeKey allows an encoded leaf to omit the matched key. Values remain read-only.
 func (view Node) Lookup(key []byte, includeKey bool) (entry Entry, found bool, child page.ID, err error) {
 	if err = validateLookupKey(key); err != nil {
@@ -96,8 +93,7 @@ func (view Node) Lookup(key []byte, includeKey bool) (entry Entry, found bool, c
 }
 
 // Clone returns a private decoded node with independent entry and child lists.
-// Keys and values remain read-only and can borrow the source storage. Call
-// OwnImageBytes before persistence can overwrite or release an encoded source.
+// Keys and values remain read-only and can borrow the source storage. Call OwnImageBytes before persistence can overwrite or release an encoded source.
 // The result never aliases the MutableNode backing this read-only view.
 func (view Node) Clone(pageSize int64) (*MutableNode, error) {
 	if view.node != nil {
@@ -284,8 +280,7 @@ func nodeFromImage(image []byte) (Node, error) {
 	return Node{image: image}, nil
 }
 
-// nodeEntries keeps the checked bounds of one leaf entry. Adjacent moves reuse
-// those bounds without reading the previous descriptor again.
+// nodeEntries keeps the checked bounds of one leaf entry. Adjacent moves reuse those bounds without reading the previous descriptor again.
 type nodeEntries struct {
 	index                      int
 	valid                      bool

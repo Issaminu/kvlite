@@ -54,8 +54,7 @@ func findLeaf(reader NodeReader, view Node, key []byte, path []treePathStep) (No
 }
 
 // ReadBatch reads sorted request positions into their original result slots.
-// keys and order remain unchanged. Missing keys leave nil values; bucket names
-// return ErrIncompatibleValue. Values borrow reader's storage.
+// keys and order remain unchanged. Missing keys leave nil values; bucket names return ErrIncompatibleValue. Values borrow reader's storage.
 func ReadBatch(reader NodeReader, root page.ID, keys [][]byte, order []int, values [][]byte) error {
 	if len(order) == 0 {
 		return nil
