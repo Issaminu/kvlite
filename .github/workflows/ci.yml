@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   test:
-    name: Test both Go modules
+    name: Test both Go modules with the race detector
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
@@ -21,11 +21,11 @@ jobs:
           go-version: '1.26.8'
 
       - name: Test KVLite
-        run: go test -timeout=2m ./...
+        run: go test -race -timeout=10m ./...
 
       - name: Test KVBench
         working-directory: benchmarks/kvbench
-        run: go test ./...
+        run: go test -race -timeout=10m ./...
 
   test-32-bit:
     name: Test KVLite on 32-bit Linux

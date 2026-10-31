@@ -23,14 +23,16 @@ jobs:
 
       # Each commit gets its own fixed seed range: the first 15 hexadecimal digits of the commit SHA give the first seed.
       # A failure report prints its seed and a replay command.
+      # This step runs without the race detector: a seed runs one goroutine at a time, so -race finds almost nothing and makes the seeds about 9 times slower.
       - name: Run 200 Blackout seeds for this commit
         run: |
           start=$((16#${GITHUB_SHA:0:15}))
           echo "Blackout seeds $start to $((start + 199)) of commit $GITHUB_SHA"
           go test -timeout=20m -run 'TestBlackout$' -blackout.start="$start" -blackout.seeds=200 .
 
+      # TestBlackoutStress runs its clients in parallel, so the race detector checks real concurrent work here.
       - name: Run the fixed Blackout seeds and the other Blackout tests of KVLite
-        run: go test -timeout=20m -run '^Test(Blackout|SimulatedDisk_)' .
+        run: go test -race -timeout=20m -run '^Test(Blackout|SimulatedDisk_)' .
 
       - name: Test the Blackout packages
-        run: go test ./internal/blackout/...
+        run: go test -race ./internal/blackout/...
