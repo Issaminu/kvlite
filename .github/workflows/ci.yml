@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A manual run tests a branch before it reaches main.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,3 +26,56 @@ jobs:
       - name: Test KVBench
         working-directory: benchmarks/kvbench
         run: go test ./...
+
+  test-32-bit:
+    name: Test KVLite on 32-bit Linux
+    runs-on: ubuntu-24.04
+    # The amd64 runner runs 386 programs natively, so these tests run on a real 32-bit build.
+    # KVBench needs cgo for LMDB, so this job tests KVLite only.
+    env:
+      GOARCH: '386'
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - name: Test KVLite
+        run: go test -timeout=5m ./...
+
+  test-windows:
+    name: Test KVLite on Windows
+    runs-on: windows-2025
+    # KVBench needs cgo for LMDB, so this job tests KVLite only.
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      - name: Test KVLite
+        run: go test -timeout=10m ./...
+
+  vet:
+    name: Vet for each supported platform
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26.8'
+
+      # go vet type-checks the test files of each target too.
+      # The loop reports every failing target before the step fails.
+      - name: Vet KVLite for each target
+        run: |
+          failed=0
+          for target in linux/amd64 linux/arm64 linux/386 linux/arm darwin/amd64 darwin/arm64 windows/amd64 windows/arm64 windows/386 freebsd/amd64 openbsd/amd64 netbsd/amd64 solaris/amd64 illumos/amd64; do
+            echo "go vet for $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./... || failed=1
+          done
+          exit "$failed"
+
+      - name: Vet KVBench
+        working-directory: benchmarks/kvbench
+        run: go vet ./...
