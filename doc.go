@@ -40,7 +40,7 @@
 // A key can have up to [MaxKeySize] bytes. A value can have up to [MaxValueSize] bytes.
 // An entry can exceed one database page. Large leaf values and branch separator keys use consecutive pages. The first page has the node header. Later pages contain the rest of its body, with no separate headers or page ID list.
 //
-// Main-file point reads and ordered scans can search encoded node bytes directly. They use the complete mapped node when available. Otherwise, the reader loads the complete node into a buffer. Writes decode nodes when they need their full contents. Memory use increases with the node size.
+// Every read searches encoded node bytes directly: point reads, batch reads, cursors, scans, and [Bucket.Stats], in read-only and read-write transactions. A read uses the complete mapped node when available. Otherwise, it loads the complete node into a buffer. A write decodes a node only when it first changes that node. Memory use increases with the node size.
 // The WAL stores a compact node image or a patch against an earlier complete WAL image. Compact images omit final page padding. A memory database keeps complete decoded nodes and uses the same logical page-allocation rules.
 // A growing node extends into adjacent free pages when possible. Otherwise, it moves to another consecutive area and its parent pointer changes in the same transaction. Shrink and deletion release pages through the same transaction and page-reuse rules.
 //
