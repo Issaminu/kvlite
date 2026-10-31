@@ -477,7 +477,10 @@ func TestRecovery_UsesSyncMode(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer db.closeFiles()
+			defer func() {
+				_ = db.unmapMainFile()
+				_ = db.closeFiles()
+			}()
 			createBucket(t, db, testBucketName)
 			if err := db.Put(testBucketName, []byte("key"), []byte("value")); err != nil {
 				t.Fatal(err)
@@ -1103,18 +1106,16 @@ func TestEntryPatchWALReplayAfterCheckpointWrite(t *testing.T) {
 	if err := db.Delete(name, []byte("key-010")); err != nil {
 		t.Fatal(err)
 	}
+	walFile := db.wal.FileForTesting()
+	truncateErr := errors.New("injected WAL truncate failure")
+	db.wal.ReplaceFileForTesting(&directWriteGuard{File: walFile, err: truncateErr})
+	err = db.checkpointWAL()
+	db.wal.ReplaceFileForTesting(walFile)
+	if !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint cleanup: got %v, want %v", err, truncateErr)
+	}
+
 	if err := db.wal.Close(); err != nil {
-		t.Fatal(err)
-	}
-	readOnlyLog, err := os.Open(path + "-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(readOnlyLog)
-	if err := db.checkpointWAL(); err == nil {
-		t.Fatal("checkpoint did not report the WAL cleanup failure")
-	}
-	if err := readOnlyLog.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.unmapMainFile(); err != nil {
@@ -1167,25 +1168,15 @@ func TestEntryPatchWALReplayAfterFailedCleanupAndMoreWrites(t *testing.T) {
 	if err := db.Delete(name, []byte("key-010")); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.wal.Close(); err != nil {
-		t.Fatal(err)
+	walFile := db.wal.FileForTesting()
+	truncateErr := errors.New("injected WAL truncate failure")
+	db.wal.ReplaceFileForTesting(&directWriteGuard{File: walFile, err: truncateErr})
+	err = db.checkpointWAL()
+	db.wal.ReplaceFileForTesting(walFile)
+	if !errors.Is(err, truncateErr) {
+		t.Fatalf("checkpoint cleanup: got %v, want %v", err, truncateErr)
 	}
-	readOnlyLog, err := os.Open(path + "-wal")
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(readOnlyLog)
-	if err := db.checkpointWAL(); err == nil {
-		t.Fatal("checkpoint did not report the WAL cleanup failure")
-	}
-	if err := readOnlyLog.Close(); err != nil {
-		t.Fatal(err)
-	}
-	writableLog, err := os.OpenFile(path+"-wal", os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	db.wal.ReplaceFileForTesting(writableLog)
+
 	if err := db.Put(name, []byte("key-011"), []byte("VALUE")); err != nil {
 		t.Fatal(err)
 	}

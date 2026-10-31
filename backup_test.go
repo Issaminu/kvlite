@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -107,8 +108,11 @@ func TestBackupLiveSnapshot(t *testing.T) {
 				t.Fatal(err)
 			}
 			info, err := os.Stat(path)
-			if err != nil || info.Mode().Perm() != 0600 {
-				t.Fatalf("backup permissions: %v, %v", info, err)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if runtime.GOOS != "windows" && info.Mode().Perm() != 0600 {
+				t.Fatalf("backup permissions: got %04o, want 0600", info.Mode().Perm())
 			}
 			if _, err := os.Stat(path + "-wal"); !errors.Is(err, os.ErrNotExist) {
 				t.Fatalf("backup WAL: %v", err)

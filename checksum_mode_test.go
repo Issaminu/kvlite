@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/Issaminu/kvlite/internal/btree"
+	"github.com/Issaminu/kvlite/internal/fileio"
 	"github.com/Issaminu/kvlite/internal/page"
 )
 
@@ -328,7 +329,7 @@ func TestSetDataPageChecksums_BackupWait(t *testing.T) {
 			backupDone := make(chan error, 1)
 			backup := path + ".backup"
 			go func() {
-				backupDone <- db.backup(backup, func(w io.Writer, r io.Reader) (int64, error) { close(started); <-release; return io.Copy(w, r) }, (*os.File).Sync)
+				backupDone <- db.backup(backup, func(w io.Writer, r io.Reader) (int64, error) { close(started); <-release; return io.Copy(w, r) }, fileio.Sync)
 			}()
 			<-started
 			modeDone := make(chan error, 1)

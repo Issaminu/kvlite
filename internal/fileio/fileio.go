@@ -54,10 +54,7 @@ var SkipDriveCacheFlushForTesting bool
 func Sync(file *os.File) error {
 	if runtime.GOOS == "windows" {
 		info, err := file.Stat()
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
+		if err == nil && info.IsDir() {
 			return nil
 		}
 	}
